@@ -28,6 +28,9 @@ static_assert(std::is_same_v<decltype(&LLVMCopyStringRepOfTargetData), char * (*
 static_assert(std::is_same_v<decltype(&LLVMSetDataLayout), void (*)(LLVMModuleRef, const char *)>);
 static_assert(std::is_same_v<decltype(&LLVMDisposeTargetData), void (*)(LLVMTargetDataRef)>);
 static_assert(std::is_same_v<decltype(&LLVMBlazeInitializeAArch64), void (*)()>);
+static_assert(std::is_same_v<decltype(&LLVMBlazeCreateLibcalls), LLVMBlazeLibcallsRef (*)(LLVMModuleRef)>);
+static_assert(std::is_same_v<decltype(&LLVMBlazeDisposeLibcalls), void (*)(LLVMBlazeLibcallsRef)>);
+static_assert(std::is_same_v<decltype(&LLVMBlazeIsSynthesizedLibcall), LLVMBool (*)(LLVMBlazeLibcallsRef, const char *, size_t)>);
 static_assert(std::is_same_v<decltype(&LLVMBlazeCreatePasses), LLVMBlazePassesRef (*)(LLVMTargetMachineRef)>);
 static_assert(std::is_same_v<decltype(&LLVMBlazeDisposePasses), void (*)(LLVMBlazePassesRef)>);
 static_assert(std::is_same_v<decltype(&LLVMBlazeRequireDwarfUnwind), void (*)(LLVMTargetMachineRef)>);

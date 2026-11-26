@@ -81,6 +81,11 @@ pub struct LLVMOpaqueTargetData { _private: [u8; 0] }
 pub type LLVMTargetDataRef = *mut LLVMOpaqueTargetData;
 
 #[repr(C)]
+pub struct LLVMBlazeOpaqueLibcalls { _private: [u8; 0] }
+
+pub type LLVMBlazeLibcallsRef = *mut LLVMBlazeOpaqueLibcalls;
+
+#[repr(C)]
 pub struct LLVMBlazeOpaquePasses { _private: [u8; 0] }
 
 pub type LLVMBlazePassesRef = *mut LLVMBlazeOpaquePasses;
@@ -113,6 +118,9 @@ unsafe extern "C" {
     pub fn LLVMSetDataLayout(arg0: LLVMModuleRef, arg1: *const core::ffi::c_char);
     pub fn LLVMDisposeTargetData(arg0: LLVMTargetDataRef);
     pub fn LLVMBlazeInitializeAArch64();
+    pub fn LLVMBlazeCreateLibcalls(arg0: LLVMModuleRef) -> LLVMBlazeLibcallsRef;
+    pub fn LLVMBlazeDisposeLibcalls(arg0: LLVMBlazeLibcallsRef);
+    pub fn LLVMBlazeIsSynthesizedLibcall(arg0: LLVMBlazeLibcallsRef, arg1: *const core::ffi::c_char, arg2: usize) -> LLVMBool;
     pub fn LLVMBlazeCreatePasses(arg0: LLVMTargetMachineRef) -> LLVMBlazePassesRef;
     pub fn LLVMBlazeDisposePasses(arg0: LLVMBlazePassesRef);
     pub fn LLVMBlazeRequireDwarfUnwind(arg0: LLVMTargetMachineRef);

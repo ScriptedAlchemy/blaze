@@ -25,6 +25,9 @@ LLVMCopyStringRepOfTargetData
 LLVMSetDataLayout
 LLVMDisposeTargetData
 LLVMBlazeInitializeAArch64
+LLVMBlazeCreateLibcalls
+LLVMBlazeDisposeLibcalls
+LLVMBlazeIsSynthesizedLibcall
 LLVMBlazeCreatePasses
 LLVMBlazeDisposePasses
 LLVMBlazeRequireDwarfUnwind

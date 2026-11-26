@@ -113,7 +113,7 @@ impl Named<'_> {
 }
 
 /// Reads `object` (what LLVM wrote for `module`) as a sealed code record in `alloc`.
-pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, imports: &[&LlvmModule<'_>], tags: &Tags<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ReadError> {
+pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, imports: &[&LlvmModule<'_>], tags: &Tags<'_>, is_libcall: &impl Fn(&str) -> bool, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ReadError> {
     let file = object::File::parse(object).map_err(|_| ReadError::Object)?;
     if file.kind() != object::ObjectKind::Relocatable {
         return Err(ReadError::Unwind { at: 0, what: "unwind input must be a relocatable object" });
@@ -228,7 +228,7 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, imports: &[&LlvmM
         }
         for (at, relocation) in section.relocations() {
             if index == text && !range.contains(&at) { continue; }
-            if let Destination::Section { index: target, .. } = destination(&file, &relocation, at, name, &references)? {
+            if let Destination::Section { index: target, .. } = destination(&file, &relocation, at, name, &references, is_libcall)? {
                 pending.push(target);
             }
         }
@@ -237,7 +237,7 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, imports: &[&LlvmM
         let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
         for (offset, relocation) in section.relocations() {
             if index == text && !range.contains(&offset) { continue; }
-            let dest = destination(&file, &relocation, offset, name, &references)?;
+            let dest = destination(&file, &relocation, offset, name, &references, is_libcall)?;
             if index == text {
                 instruction(&file, &relocation, offset - range.start, dest, &placed, text, range.start, &mut record)?;
             } else {
@@ -300,21 +300,23 @@ fn atom(file: &object::File<'_>, section: &object::Section<'_, '_>, address: u64
 /// A global function outside the root atom names its own record even if LLVM emitted its
 /// definition into this object. Other defined symbols carry section offsets, including the
 /// root function itself for a recursive call.
-fn destination<'o>(file: &object::File<'o>, relocation: &object::Relocation, at: u64, root: &str, references: &ABTreeSet<'_, Target>) -> Result<Destination<'o>, ReadError> {
+fn destination<'o>(file: &object::File<'o>, relocation: &object::Relocation, at: u64, root: &str, references: &ABTreeSet<'_, Target>, is_libcall: &impl Fn(&str) -> bool) -> Result<Destination<'o>, ReadError> {
     match relocation.target() {
         RelocationTarget::Section(index) => Ok(Destination::Section { index, offset: 0 }),
         RelocationTarget::Symbol(index) => {
             let symbol = file.symbol_by_index(index).map_err(|_| ReadError::Object)?;
             let name = plain(file.format() == BinaryFormat::MachO, symbol.name().map_err(|_| ReadError::Object)?);
-            if symbol.kind() == object::SymbolKind::Text && symbol.is_global() && name != root {
-                return target_of(references, name).map(Destination::Named);
-            }
             if let SymbolSection::Section(index) = symbol.section() {
+                if symbol.kind() == object::SymbolKind::Text && symbol.is_global() && name != root {
+                    return target_of(references, name, || false).map(Destination::Named);
+                }
                 let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
                 let offset = symbol.address().checked_sub(section.address()).and_then(|n| i64::try_from(n).ok()).ok_or(ReadError::CodeOutside)?;
                 Ok(Destination::Section { index, offset })
             } else {
-                target_of(references, name).map(Destination::Named)
+                target_of(references, name, || {
+                    symbol.is_undefined() && branch_relocation(relocation.flags()) && is_libcall(name)
+                }).map(Destination::Named)
             }
         }
         _ => Err(ReadError::Section { at }),
@@ -355,11 +357,17 @@ fn scale(kind: SiteKind) -> u32 {
     match kind { SiteKind::LdstLo12_2 => 1, SiteKind::LdstLo12_4 => 2, SiteKind::LdstLo12_8 | SiteKind::GotLo12 => 3, SiteKind::LdstLo12_16 => 4, _ => 0 }
 }
 
+fn branch_relocation(flags: RelocationFlags) -> bool {
+    matches!(flags,
+        RelocationFlags::MachO { r_type: macho::ARM64_RELOC_BRANCH26, r_pcrel: true, r_length: 2 } |
+        RelocationFlags::Elf { r_type: elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 }
+    )
+}
+
 fn instruction(file: &object::File<'_>, relocation: &object::Relocation, at: u64, dest: Destination<'_>, placed: &[(SectionIndex, u64)], text: SectionIndex, start: u64, record: &mut CodeRecord<'_>) -> Result<(), ReadError> {
     let original = word(&record.code, at)?;
     let kind = match relocation.flags() {
-        RelocationFlags::MachO { r_type: macho::ARM64_RELOC_BRANCH26, r_pcrel: true, r_length: 2 } |
-        RelocationFlags::Elf { r_type: elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 } => SiteKind::Branch26,
+        flags if branch_relocation(flags) => SiteKind::Branch26,
         RelocationFlags::MachO { r_type: macho::ARM64_RELOC_PAGE21, r_pcrel: true, r_length: 2 } |
         RelocationFlags::Elf { r_type: elf::R_AARCH64_ADR_PREL_PG_HI21 } => SiteKind::Page21,
         RelocationFlags::MachO { r_type: macho::ARM64_RELOC_GOT_LOAD_PAGE21, r_pcrel: true, r_length: 2 } |
@@ -508,11 +516,11 @@ fn plain<'n>(macho: bool, name: &'n str) -> &'n str {
     if macho { name.strip_prefix('_').unwrap_or(name) } else { name }
 }
 
-/// Resolve a spelling only if the actual linked module set supplied its typed target.
-fn target_of<'n>(references: &ABTreeSet<'_, Target>, name: &'n str) -> Result<Named<'n>, ReadError> {
+/// Resolve a spelling from the linked modules or an LLVM-synthesized C call.
+fn target_of<'n>(references: &ABTreeSet<'_, Target>, name: &'n str, is_libcall: impl FnOnce() -> bool) -> Result<Named<'n>, ReadError> {
     let internal = LinkName::parse(name).filter(|target| references.contains(target));
-    let outside = Target { space: Space::Outside, symbol: blaze_code::record::Symbol::of_name(name) };
-    let outside = references.contains(&outside).then_some(outside);
+    let c_target = Target { space: Space::Outside, symbol: blaze_code::record::Symbol::of_name(name) };
+    let outside = references.contains(&c_target).then_some(c_target);
     let spelled = || {
         let mut spelled = FixedString::<80>::new();
         spelled.try_push_str(name).ok();
@@ -521,6 +529,7 @@ fn target_of<'n>(references: &ABTreeSet<'_, Target>, name: &'n str) -> Result<Na
     match (internal, outside) {
         (Some(target), None) | (None, Some(target)) => Ok(Named { target, name }),
         (Some(_), Some(_)) => Err(ReadError::AmbiguousSymbol { name: spelled() }),
+        (None, None) if is_libcall() => Ok(Named { target: c_target, name }),
         (None, None) => Err(ReadError::UnknownSymbol { name: spelled() }),
     }
 }

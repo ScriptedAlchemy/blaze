@@ -11,10 +11,15 @@
 
 /* The emitter's native wrappers. build.rs includes this header before their implementations. */
 typedef struct LLVMBlazeOpaquePasses *LLVMBlazePassesRef;
+typedef struct LLVMBlazeOpaqueLibcalls *LLVMBlazeLibcallsRef;
 #ifdef __cplusplus
 extern "C" {
 #endif
 void LLVMBlazeInitializeAArch64(void);
+LLVMBlazeLibcallsRef LLVMBlazeCreateLibcalls(LLVMModuleRef Module);
+void LLVMBlazeDisposeLibcalls(LLVMBlazeLibcallsRef Libcalls);
+LLVMBool LLVMBlazeIsSynthesizedLibcall(LLVMBlazeLibcallsRef Libcalls,
+                                      const char *Name, size_t Length);
 LLVMBlazePassesRef LLVMBlazeCreatePasses(LLVMTargetMachineRef Machine);
 void LLVMBlazeDisposePasses(LLVMBlazePassesRef Passes);
 void LLVMBlazeRequireDwarfUnwind(LLVMTargetMachineRef Machine);

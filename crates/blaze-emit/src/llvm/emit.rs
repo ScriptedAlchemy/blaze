@@ -26,7 +26,9 @@ use blaze_own::{AVec, Alloc, CollectIn, FixedString};
 use blaze_pins::{LLVM_COMMIT, LLVM_VERSION};
 use blaze_tier::{Arch, Machine, Os};
 use blaze_llvm_abi::{
-    LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazeInitializeAArch64, LLVMBlazePassesRef, LLVMBlazeRequireDwarfUnwind, LLVMBlazeRunPasses,
+    LLVMBlazeCreateLibcalls, LLVMBlazeCreatePasses, LLVMBlazeDisposeLibcalls, LLVMBlazeDisposePasses,
+    LLVMBlazeInitializeAArch64, LLVMBlazeIsSynthesizedLibcall, LLVMBlazeLibcallsRef,
+    LLVMBlazePassesRef, LLVMBlazeRequireDwarfUnwind, LLVMBlazeRunPasses,
     LLVMCodeGenFileType, LLVMCodeGenOptLevel, LLVMCodeModel, LLVMContextCreate, LLVMContextDispose,
     LLVMContextRef, LLVMCopyStringRepOfTargetData, LLVMCreateMemoryBufferWithMemoryRangeCopy,
     LLVMCreateTargetDataLayout, LLVMCreateTargetMachine, LLVMDisposeErrorMessage,
@@ -173,6 +175,7 @@ struct Session {
     module: LLVMModuleRef,
     machine: LLVMTargetMachineRef,
     passes: LLVMBlazePassesRef,
+    libcalls: LLVMBlazeLibcallsRef,
 }
 
 /// The pipeline `opt` asks for.
@@ -347,11 +350,13 @@ impl Session {
         }
         // SAFETY: the passes are made for `machine_ref` and disposed with it.
         let passes = unsafe { LLVMBlazeCreatePasses(machine_ref) };
-        Ok(Session { context, module, machine: machine_ref, passes })
+        // SAFETY: the libcall query borrows `module`, which stays live until it is disposed.
+        let libcalls = unsafe { LLVMBlazeCreateLibcalls(module) };
+        Ok(Session { context, module, machine: machine_ref, passes, libcalls })
     }
 
     /// Runs the `O2`/`O3` pipeline over the module and emits it to an object file.
-    fn emit(self, opt: u8, alloc: Alloc<'_>) -> Result<AVec<'_, u8>, EmitError> {
+    fn emit<'a>(&mut self, opt: u8, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, EmitError> {
         let pipeline = pipeline_of(opt);
         // SAFETY: `self.passes` is live for `self.module`; the pipeline is NUL-terminated.
         let error = unsafe { LLVMBlazeRunPasses(self.passes, self.module, pipeline.as_ptr(), pipeline.to_bytes().len(), 1) };
@@ -378,12 +383,18 @@ impl Session {
         unsafe { LLVMDisposeMemoryBuffer(out) };
         Ok(bytes)
     }
+
+    fn synthesized_libcall(&self, name: &str) -> bool {
+        // SAFETY: the query and its module are live, and name is borrowed only for this call.
+        unsafe { LLVMBlazeIsSynthesizedLibcall(self.libcalls, name.as_ptr().cast(), name.len()) != 0 }
+    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         // SAFETY: each was made in `new` and is disposed once here.
         unsafe {
+            LLVMBlazeDisposeLibcalls(self.libcalls);
             LLVMBlazeDisposePasses(self.passes);
             LLVMDisposeTargetMachine(self.machine);
             LLVMDisposeModule(self.module);
@@ -414,9 +425,9 @@ fn record<'a>(
     let imported: AVec<'_, &[u8]> = imports.iter().zip(&marked)
         .map(|(module, marked)| marked.as_deref().unwrap_or(module.ir.as_slice()))
         .collect_in(alloc);
-    let session = Session::new(root.as_deref().unwrap_or(module.ir.as_slice()), &imported, machine)?;
+    let mut session = Session::new(root.as_deref().unwrap_or(module.ir.as_slice()), &imported, machine)?;
     let object = session.emit(opt, alloc)?;
-    super::object::read(&object, module, imports, &tags, alloc).map_err(EmitError::Read)
+    super::object::read(&object, module, imports, &tags, &|name| session.synthesized_libcall(name), alloc).map_err(EmitError::Read)
 }
 
 /// Emits a folded group: its body and one thunk per other member.

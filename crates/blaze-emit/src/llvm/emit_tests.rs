@@ -779,6 +779,62 @@ fn object_reader_refuses_an_unassigned_trap_id() {
     assert!(matches!(error, EmitError::Read(ReadError::TrapTag { immediate: 65535, .. })));
 }
 
+#[test]
+fn release_record_names_synthesized_libcalls_and_requires_metadata_for_input_externs() {
+    use super::{emit::EmitError, object::ReadError};
+    use blaze_lir::builder::MemAttrs;
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut b = Builder::<_, Full>::new_in(64, alloc);
+    let ptr = Param::of(Ty::PTR);
+    let sig = b.sig(Conv::C, Variadic::No, &[ptr, ptr, Param::of(Ty::I64)], &[Param::of(Ty::I1)]);
+    b.set_signature(sig);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    let left = b.param(Ty::PTR);
+    let right = b.param(Ty::PTR);
+    let len = b.param(Ty::I64);
+    let compared = b.memcmp(left, right, len, MemAttrs::aligned(0));
+    let zero = b.iconst(Ty::I32, 0);
+    let equal = b.icmp(blaze_lir::IntCond::Eq, compared, zero);
+    b.ret(&[equal]);
+    let body = b.finish_verified().unwrap();
+    let module = prepare(Symbol([19; 32]), body.verified(), &ByPlace, alloc).unwrap();
+    let memcmp = Target { space: Space::Outside, symbol: Symbol::of_name("memcmp") };
+    assert_eq!(module.implicit_references.as_slice(), &[memcmp]);
+
+    let copy = object_fixture("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)\n\
+        define void @entry(ptr %dst, ptr %src, i64 %len) uwtable {\n\
+          call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %src, i64 %len, i1 false)\n\
+          ret void\n\
+        }\n");
+    // Explicit, ABI-compatible input declarations still require metadata. The signed
+    // memcmp result remains observable, so LLVM cannot replace it with bcmp.
+    let input = object_fixture("declare i32 @memcmp(ptr, ptr, i64)\n\
+        define i32 @entry(ptr %a, ptr %b, i64 %n) uwtable {\n\
+          %result = call i32 @memcmp(ptr %a, ptr %b, i64 %n)\n\
+          ret i32 %result\n\
+        }\n");
+
+    for (os, equality_name) in [(blaze_tier::Os::Linux, "bcmp"), (blaze_tier::Os::MacOs, "memcmp")] {
+        let machine = blaze_tier::Machine { os, ..machine() };
+        let emit = |module| emit_release(ReleaseTask { module, imports: &[], opt: 2, machine }, alloc);
+        // The target library table offers bcmp on Linux. Darwin keeps memcmp.
+        for (module, name) in [(&module, equality_name), (&copy, "memcpy")] {
+            let emission = emit(module).unwrap_or_else(|error| panic!("{os:?}: {error}"));
+            let view = CodeView::read(&emission.record).unwrap();
+            let target = Target { space: Space::Outside, symbol: Symbol::of_name(name) };
+            assert_eq!(view.targets(), 1, "{os:?}, {name}");
+            assert_eq!(view.target(0), target, "{os:?}, {name}");
+            assert_eq!(view.name(target.symbol), Some(name));
+            assert!((0..view.sites()).any(|i| view.site(i).kind == SiteKind::Branch26));
+        }
+
+        let error = emit(&input).err().expect("input extern has no metadata");
+        assert!(matches!(error, EmitError::Read(ReadError::UnknownSymbol { name }) if name.as_str() == "memcmp"), "{os:?}");
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 fn place_with_callable(
     view: &CodeView<'_>,
