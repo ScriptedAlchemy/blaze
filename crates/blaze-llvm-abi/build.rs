@@ -68,13 +68,14 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo output"));
     let wrapper = root.join("../../vendor/llvm-sys/wrappers/passes.cpp");
     let target_wrapper = root.join("target.cpp");
+    let checks = root.join("abi-checks.cpp");
     for file in [
-        root.join("abi.h"),
-        root.join("abi-checks.cpp"),
-        root.join("src/lib.rs"),
-        wrapper.clone(),
-        target_wrapper.clone(),
-        root.join("../../vendor/llvm-sys/pin.rs"),
+        &root.join("abi.h"),
+        &checks,
+        &root.join("src/lib.rs"),
+        &wrapper,
+        &target_wrapper,
+        &root.join("../../vendor/llvm-sys/pin.rs"),
     ] {
         println!("cargo::rerun-if-changed={}", file.display());
     }
@@ -87,10 +88,7 @@ fn main() {
     let unit = out.join("passes.cpp");
     fs::write(
         &unit,
-        format!(
-            "#include {:?}\n#include {target_wrapper:?}\n#include {wrapper:?}\n",
-            root.join("abi-checks.cpp"),
-        ),
+        format!("#include {checks:?}\n#include {target_wrapper:?}\n#include {wrapper:?}\n"),
     )
     .expect("write wrapper translation unit");
     let object = out.join("passes.o");
