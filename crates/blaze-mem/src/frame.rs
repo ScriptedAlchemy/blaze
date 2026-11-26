@@ -1215,10 +1215,42 @@ impl SpanPoolShard {
     }
 }
 
+type SpanPoolShards = [SpanPoolShard; SPAN_POOL_SHARDS];
+const EMPTY_SPAN_POOL: SpanPoolShards = [const { SpanPoolShard::new() }; SPAN_POOL_SHARDS];
+
 /// The process's sharded [`SpanPool`]. `std` mutexes (as os.rs's and region.rs's): blaze-mem is
 /// below blaze-core's named locks, and each shard is 128-byte padded and indexed by thread id.
-static SPANS_POOLED: [SpanPoolShard; SPAN_POOL_SHARDS] =
-    [const { SpanPoolShard::new() }; SPAN_POOL_SHARDS];
+static SPANS_POOLED: SpanPoolShards = EMPTY_SPAN_POOL;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SPAN_POOL: Cell<Option<&'static SpanPoolShards>> = const { Cell::new(None) };
+}
+
+/// Tests making assertions across several pool operations select their own shards on each
+/// participating thread. Other tests can continue taking, returning and trimming process spans.
+#[cfg(test)]
+fn with_span_pool<R>(shards: &'static SpanPoolShards, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<&'static SpanPoolShards>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_SPAN_POOL.set(self.0);
+        }
+    }
+
+    let _restore = Restore(TEST_SPAN_POOL.replace(Some(shards)));
+    run()
+}
+
+#[inline]
+fn span_pool_shards() -> &'static SpanPoolShards {
+    #[cfg(test)]
+    if let Ok(Some(shards)) = TEST_SPAN_POOL.try_with(Cell::get) {
+        return shards;
+    }
+    &SPANS_POOLED
+}
 
 /// Monotonic counter assigning threads round-robin to [`SPANS_POOLED`] shards so 128 workers
 /// distribute evenly (4 workers/shard) without hash collisions.
@@ -1256,7 +1288,8 @@ fn thread_span_shard() -> usize {
 }
 
 fn span_pool_shard(idx: usize) -> MutexGuard<'static, SpanPool> {
-    let shard = SPANS_POOLED.get(idx & (SPAN_POOL_SHARDS - 1)).unwrap_or(&SPANS_POOLED[0]);
+    let shards = span_pool_shards();
+    let shard = shards.get(idx & (SPAN_POOL_SHARDS - 1)).unwrap_or(&shards[0]);
     // A panic while it was held left a consistent pool: each push and pop is one store each.
     shard.0.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -1326,9 +1359,10 @@ fn take_pooled_span(need: usize) -> Option<*mut Block> {
     if let Some(span) = span_pool_shard(home).take_matching(need) {
         return Some(span);
     }
+    let shards = span_pool_shards();
     for step in 1..SPAN_POOL_SHARDS {
         let idx = (home + step) & (SPAN_POOL_SHARDS - 1);
-        let Some(shard) = SPANS_POOLED.get(idx) else { continue };
+        let Some(shard) = shards.get(idx) else { continue };
         let Ok(mut pool) = shard.0.try_lock() else { continue };
         if let Some(span) = pool.take_matching(need) {
             return Some(span);
@@ -2275,34 +2309,41 @@ mod tests {
 
     #[test]
     fn sharded_span_pool_handles_concurrent_non_task_frames_within_budget() {
-        trim_span_pool();
-        let handles: Vec<_> = (0..16)
-            .map(|tid| {
-                std::thread::spawn(move || {
-                    for round in 0..4u8 {
-                        let frame = Frame::with_reserve(16 << 20, Tag::Other).expect("non-task frame");
-                        let slice = frame.alloc_slice_fill_with(3 << 20, |i| {
-                            u8::try_from((i.wrapping_add(tid).wrapping_add(usize::from(round))) & 0xff).unwrap_or(0)
+        static SHARDS: SpanPoolShards = EMPTY_SPAN_POOL;
+        with_span_pool(&SHARDS, || {
+            trim_span_pool();
+            let handles: Vec<_> = (0..16)
+                .map(|tid| {
+                    std::thread::spawn(move || {
+                        with_span_pool(&SHARDS, || {
+                            for round in 0..4u8 {
+                                let frame =
+                                    Frame::with_reserve(16 << 20, Tag::Other).expect("non-task frame");
+                                let slice = frame.alloc_slice_fill_with(3 << 20, |i| {
+                                    u8::try_from((i.wrapping_add(tid).wrapping_add(usize::from(round))) & 0xff)
+                                        .unwrap_or(0)
+                                });
+                                assert_eq!(slice.len(), 3 << 20);
+                            }
                         });
-                        assert_eq!(slice.len(), 3 << 20);
-                    }
+                    })
                 })
-            })
-            .collect();
-        for h in handles {
-            h.join().expect("worker joined");
-        }
-        let pooled = pooled_span_bytes();
-        assert!(pooled > 0, "concurrent non-task frames populate sharded span pool");
-        assert!(
-            pooled <= SPAN_POOL * SPAN_WARM,
-            "sharded span pool committed {pooled} bytes, past budget {}",
-            SPAN_POOL * SPAN_WARM
-        );
-        cool_span_pool();
-        let cooled = pooled_span_bytes();
-        assert!(cooled > 0 && cooled < pooled, "cool_span_pool reduced {pooled} -> {cooled}");
-        trim_span_pool();
-        assert_eq!(pooled_span_bytes(), 0, "trim_span_pool emptied all shards");
+                .collect();
+            for h in handles {
+                h.join().expect("worker joined");
+            }
+            let pooled = pooled_span_bytes();
+            assert!(pooled > 0, "concurrent non-task frames populate sharded span pool");
+            assert!(
+                pooled <= SPAN_POOL * SPAN_WARM,
+                "sharded span pool committed {pooled} bytes, past budget {}",
+                SPAN_POOL * SPAN_WARM
+            );
+            cool_span_pool();
+            let cooled = pooled_span_bytes();
+            assert!(cooled > 0 && cooled < pooled, "cool_span_pool reduced {pooled} -> {cooled}");
+            trim_span_pool();
+            assert_eq!(pooled_span_bytes(), 0, "trim_span_pool emptied all shards");
+        });
     }
 }
