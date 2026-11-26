@@ -6336,9 +6336,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             if self.relate_projected_object(from_inner, source, obj, object, e)? {
                 if ref_skip == 1 {
                     let (Some(&source_ref), Some(&dest_ref), Some(&object_lifetime)) = (
-                        self.origs.get(to_usize(s.start)),
-                        self.origs.get(to_usize(d.start)),
-                        self.origs.get(to_usize(object.start)),
+                        self.origs.get(closure::to_usize(s.start)),
+                        self.origs.get(closure::to_usize(d.start)),
+                        self.origs.get(closure::to_usize(object.start)),
                     ) else {
                         return self.refuse(Form::Bound, e);
                     };

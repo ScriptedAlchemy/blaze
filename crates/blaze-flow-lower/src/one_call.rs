@@ -41,13 +41,13 @@ use blaze_borrow::{
 };
 use blaze_borrow::inst::{AskArgs, ImplWhere, Keyed, SelfHead, Unkeyed};
 use blaze_flow::{Origin, Place};
-use blaze_int::idx;
 use blaze_own::Vec;
 use blaze_typeck::region_facts::{ClauseView, Outlives};
 use blaze_typeck::regions::{Arity, Count, Region};
 use blaze_typeck::{ExprId, ItemKey, List, Name, PNode, PTy, PTys, Projected};
 
 use crate::builder::{Builder, Label, Site};
+use crate::closure::to_usize;
 use crate::grain::{BodyTypes, Grain, Positions, RegionSlots};
 use crate::param_outlives::ParamOrigin;
 use crate::{At, Facts, Form, Lower, MOST_POSITIONS, PInfo, Refusal, TyD, Val, Variance};
@@ -956,7 +956,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             at += 1;
             if let PNode::Closure { owner, ordinal, .. } = self.node(ty, e)?
                 && owner == self.body.owner
-                && let Some(&sig) = self.ck.closures.column::<2>().get(idx(ordinal))
+                && let Some(&sig) = self.ck.closures.column::<2>().get(to_usize(ordinal))
             {
                 self.body_slots(sig, bodies, e)?;
             }
@@ -990,8 +990,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 && let PNode::Closure { owner, ordinal, .. } = self.node(ty, e)?
                 && owner == self.body.owner
                 && !body.closures.iter().any(|r| r.0 == ordinal)
-                && let Some(&sig) = self.ck.closures.column::<2>().get(idx(ordinal))
-                && self.sig_slots(idx(ordinal), e, &mut slots).is_ok()
+                && let Some(&sig) = self.ck.closures.column::<2>().get(to_usize(ordinal))
+                && self.sig_slots(to_usize(ordinal), e, &mut slots).is_ok()
                 && let Ok(count) = u32::try_from(slots.len())
                 && caller.count(sig) == Ok(SlotCount::new(count))
             {
