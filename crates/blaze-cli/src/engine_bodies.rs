@@ -8447,10 +8447,23 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
             if one.items.is_empty() {
                 reads.push(CellId { of: group.own, cell: WHOLE });
             }
+            let checker_reads = reads.len();
             reads.extend_from_slice(&eval.ids);
             mem.before = reads.len() as u64;
             mem.work.cells = (reads.capacity() * core::mem::size_of::<CellId>()) as u64;
             let (wide, unfrozen) = widen_as(shared, &reads, group, &mut owners, opened.records, w, &mut mem);
+            if name.kind == Kind::BodyCheck && matches!(&name.subject.0[..12],
+                [0x79, 0x10, 0xd3, 0x1c, 0x7a, 0xe1, 0x00, 0x69, 0xbd, 0xb3, 0x09, 0x49]
+                | [0xb2, 0x06, 0x84, 0x5d, 0xd5, 0xdb, 0xb7, 0x05, 0x04, 0xa8, 0x26, 0xb5]
+            ) {
+                let target = CellId { of: Name::new(Kind::ImplBucket, ContentId([
+                    0x75, 0xe5, 0x2d, 0x24, 0xf5, 0xf4, 0x9b, 0x4d, 0xf3, 0x55, 0xcb, 0x9f, 0x42, 0x08, 0x1a, 0x8a,
+                    0x0c, 0xf8, 0xe1, 0xbf, 0xa8, 0xf1, 0xb5, 0xa1, 0xa2, 0x36, 0x5f, 0x72, 0x81, 0x4d, 0x0b, 0x5e,
+                ])), cell: WHOLE };
+                let hits = |ids: &[CellId]| ids.iter().any(|&id| shared.grains.place(id, shared.plants.fine_buckets) == target);
+                std::eprintln!("body-read-origin {} item={} widened={} checker={} evaluator={}",
+                    name.subject, one.label, wide.contains(&target), hits(&reads[..checker_reads]), hits(&eval.ids));
+            }
             // The row, made now from what it keeps: its reads copied out of the scratch at their
             // length, its one define (rule 11; lane BD3).
             let mut defines: SVec<'a, (Cell, ContentId)> = SVec::with_capacity_in(usize::from(defines_verdict), alloc);
