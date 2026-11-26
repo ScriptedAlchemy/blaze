@@ -1,4 +1,4 @@
-//! Constant promotion (ASYNC.md D-A10, P10): which shared borrows of a fn body are borrows of a
+//! Constant promotion (ASYNC.md D-A10, P10): which borrows of a fn body are borrows of a
 //! `'static` slot rather than of a frame temporary.
 //!
 //! The Reference, "Destructors", "Constant promotion": "Promotion of a value expression to a
@@ -28,6 +28,9 @@
 //!   trait Freeze {}`, `impl<T: PointeeSized> !Freeze for UnsafeCell<T> {}`) and the ADT's
 //!   fields for an ADT.
 //!
+//! An empty array literal also permits a promoted mutable borrow. It has no element to
+//! mutate or drop. This includes an implicit method-receiver autoref of the literal.
+//!
 //! "Where possible" is narrowed, never widened: a type this rule cannot decide (a parameter, a
 //! projection, an opaque, a closure, a future, a trait object, a variable) is not listed, and
 //! nor is an ADT when the world has no `freeze` lang item. A borrow not listed is a frame
@@ -55,10 +58,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     pub(crate) fn analyze_promotions(&mut self) -> Result<(), Stop> {
         self.promoted.clear();
         let bound = self.body.exprs.len() + self.body.pats.len() + self.body.stmts.len() + 1;
-        // Each expression's first adjustment (O(exprs + adjusts)): a leading shared non-raw
-        // autoref (`AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. }` with no leading
-        // derefs, e.g. `EthereumHardfork::Frontier.boxed()` or `[1, 2, 3].as_slice()`) borrows
-        // the expression's own rvalue, and is promoted by the same rule as `&operand`.
+        // A leading non-raw borrow with no preceding dereference borrows the expression's
+        // own rvalue. It uses the same promotion rule as an explicit borrow.
         let mut first_adjust: Vec<Option<AdjustKind>, Alloc<'a>> = Vec::with_capacity_in(self.body.exprs.len(), self.alloc);
         first_adjust.resize(self.body.exprs.len(), None);
         let mut has_deref: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.exprs.len(), self.alloc);
@@ -96,16 +97,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             found.push(x);
                         }
                     }
-                    Expr::Ref { mutbl: Mutbl::Mut, .. } => {}
-                    _ => {
-                        if matches!(
-                            first_adjust.get(x.ix()).copied().flatten(),
-                            Some(AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
-                        ) && let Some(&ty) = self.expr_ty.get(x.ix())
-                            && self.promotable(x, &has_deref)?
-                            && self.freeze_without_drop(ty)?
-                        {
+                    Expr::Ref { mutbl: Mutbl::Mut, operand } => {
+                        if self.empty_array_literal(operand)? {
                             found.push(x);
+                        }
+                    }
+                    _ => {
+                        if let Some(AdjustKind::Borrow { mutbl, raw: false, .. }) = first_adjust[x.ix()]
+                            && let Some(&ty) = self.expr_ty.get(x.ix())
+                        {
+                            let promote = match mutbl {
+                                Mutbl::Not => self.promotable(x, &has_deref)? && self.freeze_without_drop(ty)?,
+                                Mutbl::Mut => self.empty_array_literal(x)?,
+                            };
+                            if promote {
+                                found.push(x);
+                            }
                         }
                     }
                 }
@@ -121,6 +128,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         found.dedup();
         self.promoted.extend_from_slice(&found);
         Ok(())
+    }
+
+    /// Parentheses do not change the literal's value category. A local of the same type
+    /// still has the lifetime of its storage.
+    fn empty_array_literal(&self, mut e: ExprId) -> Result<bool, Stop> {
+        for _ in 0..=self.body.exprs.len() {
+            match self.body.expr(e)? {
+                Expr::Paren(inner) => e = inner,
+                Expr::Array { elems } => return Ok(self.body.expr_list(elems)?.is_empty()),
+                _ => return Ok(false),
+            }
+        }
+        Err(CheckError::Limit(Limit::Steps).into())
     }
 
     /// What value path or ctor `x` resolved to, if the walk recorded it.

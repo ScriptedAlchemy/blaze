@@ -224,11 +224,11 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
 
     fn val_inner(&mut self, e: ExprId) -> Result<Val, LowerError> {
         let (lo, hi) = self.adjust_rows(e);
-        // A shared autoref promoted to `'static` (`Checked::promoted`): the constant's address,
+        // An autoref promoted to `'static` (`Checked::promoted`): the constant's address,
         // never a frame temporary; any coercions after it (e.g. `Unsize`) run from `lo + 1`.
         if hi > lo
             && !matches!(self.expr(e)?, Expr::Ref { .. })
-            && let Some((AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. }, to)) = self.adjust(lo)
+            && let Some((AdjustKind::Borrow { raw: false, .. }, to)) = self.adjust(lo)
             && self.is_promoted(e)
         {
             let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty: to });
@@ -740,7 +740,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     }
 
     /// `e` as a constant operand, when it is one: a literal, a fn item, a constant, or a promoted
-    /// shared borrow.
+    /// borrow.
     fn const_operand(&mut self, e: ExprId) -> Result<Option<Operand>, LowerError> {
         match self.expr(e)? {
             Expr::Lit(l) => Ok(Some(self.lit(e, l)?)),
@@ -749,7 +749,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
                 let ty = self.expr_ty(e)?;
                 Ok(Some(Operand::Const(self.b.new_const(ConstDecl { kind: ConstKind::Anon(e), ty }))))
             }
-            Expr::Ref { mutbl: Mutbl::Not, .. } if self.is_promoted(e) => {
+            Expr::Ref { .. } if self.is_promoted(e) => {
                 let ty = self.expr_ty(e)?;
                 Ok(Some(Operand::Const(self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty }))))
             }
@@ -1485,26 +1485,26 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     /// (`Checked::promoted`) is the promoted constant, and its operand's code does not run here.
     fn ref_into(&mut self, dest: Place, e: ExprId, mutbl: Mutbl, operand: ExprId) -> Result<(), LowerError> {
         let span = self.span(e);
-        if mutbl == Mutbl::Not && self.is_const_promoted(e) {
+        let kind = match mutbl {
+            Mutbl::Not => BorrowKind::Shared,
+            Mutbl::Mut => BorrowKind::Mut,
+        };
+        if self.is_const_promoted(e) {
             let oty = self.adjusted_ty(operand)?;
             let l = self.b.new_local(LocalDecl { ty: oty, kind: LocalKind::Temp(operand, Role::Value), mutbl: Mutbl::Mut });
             let p = self.b.local_place(l);
             self.lower_into(p, operand)?;
             let o = self.b.origin(false);
-            self.b.borrow(dest, BorrowKind::Shared, p, o, span);
+            self.b.borrow(dest, kind, p, o, span);
             return Ok(());
         }
-        if mutbl == Mutbl::Not && self.is_promoted(e) {
+        if self.is_promoted(e) {
             let ty = self.expr_ty(e)?;
             let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(e.0), ty });
             self.b.assign(dest, Value::Use(Operand::Const(c)), span);
             return Ok(());
         }
         let p = self.place(operand)?;
-        let kind = match mutbl {
-            Mutbl::Not => BorrowKind::Shared,
-            Mutbl::Mut => BorrowKind::Mut,
-        };
         let o = self.b.origin(false);
         self.b.borrow(dest, kind, p, o, span);
         Ok(())

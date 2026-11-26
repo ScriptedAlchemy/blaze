@@ -4587,13 +4587,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
         match (lead, borrow) {
             (0, false) => self.raw(e)?,
-            // A shared autoref promoted to a `'static` slot (walk/promote.rs): the address of
+            // An autoref promoted to a `'static` slot (walk/promote.rs): the address of
             // `e`'s constant row, never a frame temporary; any coercions after it (e.g. `Unsize`)
             // were already pushed above as `Task::Adjust(e, 1)`. An `Expr::Ref` listed in
             // `Checked::promoted` promotes its own `&operand`, not a further autoref of it.
             (0, true)
                 if !matches!(self.expr(e)?, Expr::Ref { .. })
-                    && matches!(kinds[0], AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
+                    && matches!(kinds[0], AdjustKind::Borrow { raw: false, .. })
                     && self.is_promoted(e) =>
             {
                 self.promoted_ref(e)?;
@@ -6470,7 +6470,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             // The Reference, "Constant promotion": a borrow the checker promoted is of a
             // `'static` slot: the address of the value's constant row (walk/promote.rs).
-            Expr::Ref { mutbl: Mutbl::Not, .. } if self.is_promoted(e) => self.promoted_ref(e)?,
+            Expr::Ref { .. } if self.is_promoted(e) => self.promoted_ref(e)?,
             Expr::Ref { operand, mutbl } => {
                 if mutbl == Mutbl::Mut {
                     self.refuse_mut_through_overloaded_index(operand)?;
