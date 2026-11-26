@@ -746,8 +746,10 @@ mod tests {
         let copied = member.clone_in(bump).unwrap();
         assert_eq!(copied.get("APP_TEST_VALUE"), Ok(Some("private")));
         assert_eq!(copied.caller_fact("APP_TEST_EMPTY"), Some(ContentId([1; 32])));
-        let shared = CrateEnv::of(member.facts(), alloc).unwrap();
-        assert_eq!(shared.get("APP_TEST_VALUE"), Ok(None));
+        {
+            let shared = CrateEnv::of(member.facts(), alloc).unwrap();
+            assert_eq!(shared.get("APP_TEST_VALUE"), Ok(None));
+        }
         assert!(member.vars().all(|(name, _)| !name.starts_with("APP_TEST_")));
         let mut dependency = CrateEnv::of(facts("1.0.0"), alloc).unwrap();
         dependency.grant_caller(grants, alloc);
