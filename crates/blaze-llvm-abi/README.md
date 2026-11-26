@@ -4,14 +4,15 @@ This is LLVM option 1 in `docs/v2/plan/third-party.md`: an owned, zero-dependenc
 Rust crate declaring only the C APIs used by the release emitter. LLVM remains the
 pinned native library. This crate does not wrap or copy llvm-sys's Rust bindings.
 
-`functions.txt` selects declarations from `abi.h`. `generate.py` asks Clang to parse
+`functions.txt` selects declarations from `abi.h`. The `llvm_abi` script asks Clang to parse
 the pinned headers, then emits their opaque types, enums and function signatures:
 
 ```
-python3 crates/blaze-llvm-abi/generate.py '{"prefix":"/absolute/pinned/llvm","check":false}'
+blaze run -q -p scripts --bin llvm_abi -- '{"prefix":"/absolute/pinned/llvm","check":false}'
 ```
 
-Use `check: true` to verify regeneration. The generated C++ assertions are compiled
+Use `check: true` to compare both generated files with the committed bytes. If needed,
+set `clang` to the path of the Clang executable. The generated C++ assertions are compiled
 against the installed headers on every build. Unsupported C shapes stop generation.
 The three blaze pass-manager declarations in `abi.h` are checked by including them
 before the existing `vendor/llvm-sys/wrappers/passes.cpp` implementation; the wrapper
