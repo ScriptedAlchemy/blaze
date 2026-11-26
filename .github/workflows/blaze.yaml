@@ -13,7 +13,7 @@ on:
       suite:
         description: Protocol packages to exercise
         type: choice
-        options: [wire-and-serve, local]
+        options: [wire-and-serve, local, serve-abort]
         default: wire-and-serve
 permissions:
   actions: read
@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: ${{ fromJSON(inputs.suite == 'local' && '["blaze-dist-local"]' || '["blaze-wire", "blaze-serve"]') }}
+        package: ${{ fromJSON(inputs.suite == 'local' && '["blaze-dist-local"]' || inputs.suite == 'serve-abort' && '["blaze-serve"]' || '["blaze-wire", "blaze-serve"]') }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -57,6 +57,7 @@ jobs:
       - name: Verify exact source and execute its protocol tests
         env:
           PACKAGE: ${{ matrix.package }}
+          SUITE: ${{ inputs.suite }}
         run: |
           mkdir -p "$RUNNER_TEMP/source-binaries" "$RUNNER_TEMP/source-shelf"
           timeout 45 tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries"
@@ -65,8 +66,11 @@ jobs:
           # shellcheck disable=SC2016
           timeout 20 jq -n --arg blaze "$RUNNER_TEMP/source-binaries/blaze" --arg cwd "$GITHUB_WORKSPACE" \
             --arg home "$RUNNER_TEMP/blaze-fs/protocol-home" --arg out "$RUNNER_TEMP/package-evidence" \
-            --arg shelf "$RUNNER_TEMP/source-shelf/toolchain" --arg package "$PACKAGE" \
-            '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:2070,commands:[{name:$package,args:["test","-p",$package,"--view","json","--","--run-all","--format","json"]}]}' \
+            --arg shelf "$RUNNER_TEMP/source-shelf/toolchain" --arg package "$PACKAGE" --arg suite "$SUITE" \
+            '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:2070,commands:
+              (if $suite == "serve-abort" then
+                [range(0; 12) | {name:("serve-" + tostring),args:["test","-p","blaze-serve","--","--run-all","--format","pretty"]}]
+              else [{name:$package,args:["test","-p",$package,"--view","json","--","--run-all","--format","json"]}] end)}' \
             > "$RUNNER_TEMP/package-input.json"
           status=0
           timeout -k 20 2130 python3 harness/v2/exec_observer.py "$RUNNER_TEMP/package-input.json" || status=$?
