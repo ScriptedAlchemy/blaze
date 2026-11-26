@@ -53,6 +53,7 @@ use blaze_own::{AString, AVec, Alloc, String, Vec};
 use blaze_proc_macro::native_c::Laid;
 use blaze_proc_macro::native_c_tasks::{self, COMPILE_DEADLINE, CTasksSetting};
 use blaze_proc_macro::native_setting::{OwnedNativeSetting, command_native_setting};
+use blaze_text::Code;
 use blaze_world::crate_list::CrateList;
 use bstd::cx::Cx;
 use bstd::mem::Frame;
@@ -537,7 +538,7 @@ fn dep_tree<'d, 's, 'a>(
         return Err(lay(format_args!("a request names `{guest}`, and no package of the graph has `links = \"{links}\"`")));
     };
     let Some(at) = (0..list.len()).find(|&at| list.package(at) == name.as_str() && list.version(at) == version.as_str()) else {
-        return Err(lay(format_args!("a request names `{guest}`, but the crate list lacks {} {}", name.as_str(), version.as_str())));
+        return Err(lay(format_args!("a request names {}, but the crate list lacks {} {}", Code(guest), name.as_str(), version.as_str())));
     };
     let package = PackageSource::read(list, at, leaves, scratch)?;
     Ok(DepTree { guest, digest: package.digest(list, at).0, source: DepSource::Tree { r: at, package } })
@@ -599,8 +600,12 @@ impl PackageSource {
             Place::Fetched { source, files } => Ok(Self::Fetched(Pinned { source: source.0, files })),
             Place::Checkout | Place::CheckoutDep => {
                 let shown = list.shown_from(r);
-                let dir = shown.strip_prefix("/0/").ok_or_else(|| CTaskWhy::Lay { words: kept(scratch, format_args!("checkout package folder `{shown}` is outside tree 0")) })?.trim_end_matches('/');
-                let digest = checkout_digest(leaves, dir).ok_or_else(|| CTaskWhy::Lay { words: kept(scratch, format_args!("no checked package-files snapshot for `{shown}`")) })?;
+                let dir = shown
+                    .strip_prefix("/0/")
+                    .ok_or_else(|| CTaskWhy::Lay { words: kept(scratch, format_args!("checkout package folder {} is outside tree 0", Code(shown))) })?
+                    .trim_end_matches('/');
+                let digest = checkout_digest(leaves, dir)
+                    .ok_or_else(|| CTaskWhy::Lay { words: kept(scratch, format_args!("no checked package-files snapshot for {}", Code(shown))) })?;
                 Ok(Self::Checkout(digest))
             }
             Place::Toolchain => Err(CTaskWhy::NotPinned { why: "a toolchain crate with C requests" }),
@@ -672,7 +677,7 @@ fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, 
     let mut laid = 0u32;
     let mut write = |rest: &str, bytes: &[u8]| -> Result<(), CTaskWhy<'s>> {
         if rest.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
-            return Err(lay(format_args!("its package names `{rest}`, which is not a path in a folder")));
+            return Err(lay(format_args!("its package names {}, which is not a path in a folder", Code(rest))));
         }
         let path = bstd::mem::format_in!(scratch, "{}/{rest}", part.as_str());
         if let Some((parent, _)) = path.as_str().rsplit_once('/') {
@@ -706,15 +711,15 @@ fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, 
             }
         }
         PackageSource::Checkout(expected) => {
-            let checkout = c.checkout.root.ok_or_else(|| lay(format_args!("no served checkout folder for `{shown}`")))?;
+            let checkout = c.checkout.root.ok_or_else(|| lay(format_args!("no served checkout folder for {}", Code(shown))))?;
             if !dir.is_empty() && dir.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
-                return Err(lay(format_args!("invalid checkout-relative package folder `{dir}`")));
+                return Err(lay(format_args!("invalid checkout-relative package folder {}", Code(dir))));
             }
             let host = bstd::mem::format_in!(scratch, "{}/{dir}", checkout.trim_end_matches('/'));
             let mut files = blaze_proc_macro::module::package_files(host.as_str().as_ref()).map_err(|e| lay(format_args!("{}: {e}", host.as_str())))?;
             let found = blaze_proc_macro::module::files_digest(&mut files);
             if hex32(&found) != Some(expected.0) {
-                return Err(lay(format_args!("checkout package `{shown}` changed after the check: expected {expected:?}, found {found}")));
+                return Err(lay(format_args!("checkout package {} changed after the check: expected {expected:?}, found {found}", Code(shown))));
             }
             for (path, bytes) in &files {
                 write(path, bytes)?;
@@ -722,7 +727,7 @@ fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, 
         }
     }
     if laid == 0 {
-        return Err(lay(format_args!("its package holds no file under `{dir}`")));
+        return Err(lay(format_args!("its package holds no file under {}", Code(dir))));
     }
     match std::fs::rename(part.as_str(), folder) {
         Ok(()) => {}

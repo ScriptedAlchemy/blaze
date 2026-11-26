@@ -268,6 +268,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::bool_pair_state",
             "blaze::out_parameter",
             "blaze::parallel_collections",
+            "blaze::parallel_vecs",
             "blaze::untyped_index",
             "blaze::validated_but_raw",
             "blaze::claim_contradicts_facts",

@@ -1177,7 +1177,8 @@ pub(crate) fn one_head<'n, 's: 'n>(
     job.evals.leave();
     let const_cells = match constant_read_cells(job, data_mark, caller_mark, failed) {
         Ok(cells) => cells,
-        Err(why) => {
+        Err(mismatch) => {
+            let why = mismatch.message(job.g);
             job.engine_refusal.set(Some(why));
             failed.get_or_insert(why);
             return Err(Cause::new(RootKind::Engine, why));
@@ -1218,8 +1219,17 @@ pub(crate) fn one_head<'n, 's: 'n>(
 
 const UNPLANNED_DATA_CELL: &str = "a data file read while evaluating a head's constant has no planned cell in this request (rule 21)";
 
+struct CallerReadMismatch(CellId);
+
+impl CallerReadMismatch {
+    fn message(self, alloc: Alloc<'static>) -> &'static str {
+        let Self(cell) = self;
+        leak(alloc, format_args!("caller environment cell {cell:?} read by a head's constant disagrees with this request (rule 21)"))
+    }
+}
+
 /// Bind the constant evaluation's observations to this request's view before publishing heads.
-fn constant_read_cells(job: &JobCx<'_, '_, '_, '_, '_>, data_mark: usize, caller_mark: usize, failed: &mut Option<&'static str>) -> Result<Vec<CellId, Alloc<'static>>, &'static str> {
+fn constant_read_cells(job: &JobCx<'_, '_, '_, '_, '_>, data_mark: usize, caller_mark: usize, failed: &mut Option<&'static str>) -> Result<Vec<CellId, Alloc<'static>>, CallerReadMismatch> {
     let mut cells = match data_read_cells(job, data_mark) {
         Some(cells) => cells,
         None => {
@@ -1231,7 +1241,7 @@ fn constant_read_cells(job: &JobCx<'_, '_, '_, '_, '_>, data_mark: usize, caller
     let bound = (|| {
         for &(cell, observed) in &caller_reads[caller_mark..] {
             if job.view.cell(&cell) != observed {
-                return Err(leak(job.g, format_args!("caller environment cell {cell:?} read by a head's constant disagrees with this request (rule 21)")));
+                return Err(CallerReadMismatch(cell));
             }
             cells.push(cell);
         }
@@ -1570,7 +1580,8 @@ fn alone<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
                 push(id);
             }
         }
-        Err(why) => {
+        Err(mismatch) => {
+            let why = mismatch.message(job.g);
             failed.get_or_insert(why);
             return Err(Cause::new(RootKind::Engine, why));
         }

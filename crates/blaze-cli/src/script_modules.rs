@@ -194,6 +194,8 @@ pub(crate) fn differing<'i>(asked: &'i [std::string::String], ran_as: RanAs, ide
 
 #[cfg(test)]
 mod tests {
+    use blaze_text::Code;
+
     use super::{RanAs, asked_lines, differing, subject};
 
     /// tempo 2026-11-17: libproc's store record is a native host binary (`target` line). A wasm
@@ -208,7 +210,14 @@ mod tests {
         let [shim, wasi_std] = blaze_proc_macro::script_unit::wasm_runner_lines();
         let wasm = asked_lines(RanAs::Wasm, "libproc", "0.14.11", &[], host);
         let said: std::vec::Vec<_> = differing(&wasm, RanAs::Wasm, libproc).collect();
-        assert_eq!(said, [std::format!("no `{shim}` line"), std::format!("no `{wasi_std}` line"), "target aarch64-apple-darwin (a native host binary; asked: a wasm module)".to_owned()]);
+        assert_eq!(
+            said,
+            [
+                std::format!("no {} line", Code(&shim)),
+                std::format!("no {} line", Code(&wasi_std)),
+                "target aarch64-apple-darwin (a native host binary; asked: a wasm module)".to_owned(),
+            ]
+        );
         let nix = std::format!("blaze build-script module 3\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\n{shim}\n{wasi_std}\nbuilder bootstrap\n");
         let asked = asked_lines(RanAs::Wasm, "nix", "0.31.3", &["time", "default", "ioctl", "memoffset", "socket"], host);
         let said: std::vec::Vec<_> = differing(&asked, RanAs::Wasm, &nix).collect();
@@ -221,7 +230,7 @@ mod tests {
         assert_eq!(said, [std::format!("shim c1a4bffa83fc8f619c4daf0a3c0121cc1079b345b415a6d553a910a8e8a6ede6 (asked: {shim})")]);
         assert_eq!(differing(&asked, RanAs::Wasm, &nix).count(), 0, "CONTROL: the record with this host's shim answers the ask");
         let without_std = nix.replace(&std::format!("{wasi_std}\n"), "");
-        assert_eq!(differing(&asked, RanAs::Wasm, &without_std).collect::<std::vec::Vec<_>>(), [std::format!("no `{wasi_std}` line")]);
+        assert_eq!(differing(&asked, RanAs::Wasm, &without_std).collect::<std::vec::Vec<_>>(), [std::format!("no {} line", Code(&wasi_std))]);
         // A native and a wasm ask of one script are two lookups.
         assert_ne!(subject(RanAs::Native, "libproc", "0.14.11", &[]), subject(RanAs::Wasm, "libproc", "0.14.11", &[]));
     }

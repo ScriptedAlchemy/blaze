@@ -5,9 +5,8 @@
 //! sources write that rule inline again: a line naming `"target"` and testing a name's leading
 //! dot.
 //!
-//! Exempt by name: walks of blaze's OWN tree for a source scan, which are no package walk
-//! (blaze-scope tests/no_spelled_dollar_crate.rs, parser lexed_str/differential.rs, scripts
-//! toolchain_cut.rs), and this file.
+//! Exempt by name: source scans of blaze's own tree, the shell's bounded directory suggestions
+//! for `cd`, and this file.
 //!
 //! Prints `no_package_walk_writes_its_own_rule: N files scanned, 0 uses`.
 //! Control: the same scan over a planted line finds it.
@@ -15,7 +14,13 @@
 use std::string::{String, ToString};
 use std::vec::Vec;
 
-const EXEMPT: [&str; 4] = ["served_ban_tests.rs", "no_spelled_dollar_crate.rs", "differential.rs", "toolchain_cut.rs"];
+const EXEMPT: [&str; 5] = [
+    "served_ban_tests.rs",
+    "no_spelled_dollar_crate.rs",
+    "differential.rs",
+    "toolchain_cut.rs",
+    "blaze-shell/src/zoxide.rs",
+];
 
 /// A line that writes the rule inline: it names the folder `target` and tests a leading dot.
 fn writes_the_rule(line: &str) -> bool {
@@ -38,7 +43,7 @@ fn sources(mut work: Vec<std::path::PathBuf>, out: &mut Vec<(String, String)>) {
             let p = entry.expect("a directory entry").path();
             if p.is_dir() {
                 work.push(p);
-            } else if p.extension().is_some_and(|e| e == "rs") && !p.file_name().is_some_and(|f| EXEMPT.iter().any(|x| f == *x)) {
+            } else if p.extension().is_some_and(|e| e == "rs") && !EXEMPT.iter().any(|x| p.ends_with(x)) {
                 // A source that is not UTF-8 is no Rust file; it cannot write the rule.
                 if let Ok(text) = std::fs::read_to_string(&p) {
                     out.push((p.display().to_string(), text));

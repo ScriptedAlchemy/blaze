@@ -11,7 +11,7 @@ blaze-build-script 34
 blaze-c 6
 blaze-cas 9
 blaze-check 4
-blaze-cli 282
+blaze-cli 281
 blaze-code 1
 blaze-comptime-sys 2
 blaze-cond 2
