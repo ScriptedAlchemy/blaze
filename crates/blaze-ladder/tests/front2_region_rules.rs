@@ -94,7 +94,9 @@ fn heads_in(edition_name: &str, text: &'static str, asks: &[Ask]) -> Vec<Result<
     let crates = inputs.crates();
     // The test's one heap handle, named once.
     let g = Alloc::global();
-    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Nameres).expect("names frame");
+    let names_alloc = blaze_own::Erased::new(&names_frame);
+    let names = inputs.resolve(&crates, names_alloc.bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let mut front = Front2::new(&names, &frame, &sources, g).unwrap_or_else(|e| panic!("front2: {e}"));

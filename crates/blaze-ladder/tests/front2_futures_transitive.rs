@@ -111,10 +111,6 @@ struct Got {
     shown: String,
 }
 
-fn leak(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
-}
-
 /// The texts of the two-crate layout: the dependency's file for crate `dep`, the rest as
 /// [`Inputs`] reads them.
 struct WithDep<'t> {
@@ -134,7 +130,7 @@ impl<'t> SourceTexts<'t> for WithDep<'t> {
 
 /// Checks each of `bodies` (fns of the program crate) in one world: the program `user`, with
 /// the library crate `w3dep` of text `dep` when given.
-fn check_bodies(user: &'static str, dep: Option<&'static str>, bodies: &[&str]) -> Vec<Got> {
+fn check_bodies(user: &str, dep: Option<&str>, bodies: &[&str]) -> Vec<Got> {
     let alloc = blaze_own::testing::heap().alloc();
     let home = std::env::var("HOME").expect("HOME");
     let tc = Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
@@ -147,15 +143,18 @@ fn check_bodies(user: &'static str, dep: Option<&'static str>, bodies: &[&str]) 
     let inputs = Inputs::new(&program, &tc).expect("fixture crate");
     let mut crates: Vec<CrateInput<'_>> = inputs.crates();
     let dep_files = [("/w3dep/src/lib.rs".to_owned(), dep.unwrap_or("").to_owned())];
+    let dep_at = crates.len();
+    let user_deps = [("w3dep", dep_at)];
+    let names_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Nameres).expect("names frame");
+    let names_alloc = blaze_own::Erased::new(&names_frame);
+    let bump = names_alloc.bump();
     let names = match dep {
-        None => inputs.resolve(&crates, blaze_own::testing::bump()).expect("fixture names"),
+        None => inputs.resolve(&crates, bump).expect("fixture names"),
         Some(_) => {
             let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(i as u32));
             let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
-            let dep_at = crates.len();
-            let user_deps: &'static [(&'static str, usize)] = Box::leak(vec![("w3dep", dep_at)].into_boxed_slice());
             let (cfg, crate_edition, implicit) = (crates[0].cfg, crates[0].edition, crates[0].implicit);
-            crates[0].deps = user_deps;
+            crates[0].deps = &user_deps;
             crates.push(CrateInput {
                 name: "w3dep",
                 key: CrateItemKey(ContentId::of("blaze-ladder W3 cross-crate test crate", b"w3dep")),
@@ -169,7 +168,7 @@ fn check_bodies(user: &'static str, dep: Option<&'static str>, bodies: &[&str]) 
                 script: None,
             });
             let texts = WithDep { base: &inputs.texts, dep: dep_at, files: &dep_files };
-            resolve_crates(&crates, sysroot, &texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"))
+            resolve_crates(&crates, sysroot, &texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"))
         }
     };
     let sources = [SourceFile { path: "src/main.rs", text: user }];
@@ -186,8 +185,8 @@ fn check_bodies(user: &'static str, dep: Option<&'static str>, bodies: &[&str]) 
     out
 }
 
-fn one_crate(held: &str) -> &'static str {
-    leak(ONE_CRATE.replace("HELD", held))
+fn one_crate(held: &str) -> String {
+    ONE_CRATE.replace("HELD", held)
 }
 
 /// Cases 1 to 4 and the rule-23 control, in one program.
@@ -195,9 +194,9 @@ fn one_crate(held: &str) -> &'static str {
 fn another_fns_future_is_decided_through_its_own() {
     let mut askers: Vec<&str> = REACH_C.to_vec();
     askers.push("recursive");
-    let small = check_bodies(one_crate(HELD_U8), None, &askers);
-    let wide = check_bodies(one_crate(HELD_U16), None, &askers);
-    let rc = check_bodies(one_crate(HELD_RC), None, &askers);
+    let small = check_bodies(&one_crate(HELD_U8), None, &askers);
+    let wide = check_bodies(&one_crate(HELD_U16), None, &askers);
+    let rc = check_bodies(&one_crate(HELD_RC), None, &askers);
 
     // ORACLE (rustc accepts each): every asker is clean on a `Send` value, with a digest.
     for (name, got) in askers.iter().zip(small.iter()) {
@@ -244,10 +243,10 @@ fn another_fns_future_is_decided_through_its_own() {
 /// Case 5: the futures are another crate's.
 #[test]
 fn another_crates_future_is_decided_through_its_own() {
-    let dep = |held: &str| leak(DEP.replace("HELD", held));
-    let small = check_bodies(USER, Some(dep(HELD_U8)), &["cross"]);
-    let wide = check_bodies(USER, Some(dep(HELD_U16)), &["cross"]);
-    let rc = check_bodies(USER, Some(dep(HELD_RC)), &["cross"]);
+    let dep = |held: &str| DEP.replace("HELD", held);
+    let small = check_bodies(USER, Some(&dep(HELD_U8)), &["cross"]);
+    let wide = check_bodies(USER, Some(&dep(HELD_U16)), &["cross"]);
+    let rc = check_bodies(USER, Some(&dep(HELD_RC)), &["cross"]);
     assert!(small[0].clean && small[0].reads.is_some(), "`cross` (u8): clean (rustc accepts it): {}", small[0].shown);
     assert!(wide[0].clean && wide[0].reads.is_some(), "`cross` (u16): clean: {}", wide[0].shown);
     assert_ne!(small[0].reads, wide[0].reads, "`cross` reads the dependency's `leaf` future: its digest moves with what `leaf` holds");
@@ -265,17 +264,17 @@ fn another_crates_future_is_decided_through_its_own() {
 /// NOT YET RUN (written 2026-11-21 by a write-only lane).
 #[test]
 fn a_recursive_future_holding_an_rc_across_its_await_is_not_send() {
-    let held_rc = leak(one_crate(HELD_U8).replace(
+    let held_rc = one_crate(HELD_U8).replace(
         "async fn f(n: u32) { if n > 0 { Box::pin(f(n - 1)).await } }",
         "async fn f(n: u32) { let held = std::rc::Rc::new(1u8); if n > 0 { Box::pin(f(n - 1)).await } drop(held); }",
-    ));
+    );
     assert!(held_rc.contains("let held = std::rc::Rc::new(1u8); if n > 0"), "the fixture's `f` was replaced");
-    let rc = check_bodies(held_rc, None, &["recursive"]);
+    let rc = check_bodies(&held_rc, None, &["recursive"]);
     let [(code, text)] = rc[0].diags.as_slice() else { panic!("TWIN: `recursive` must be one Send error: {}", rc[0].shown) };
     assert_eq!(*code, "E0277", "TWIN: {}", rc[0].shown);
     assert!(text.contains("Send") && text.contains("Rc<u8"), "TWIN: names `Send` and the `Rc<u8>` held on the cycle: {text}");
     println!("recursive (Rc on the cycle): E0277: {text}");
-    let small = check_bodies(one_crate(HELD_U8), None, &["recursive"]);
+    let small = check_bodies(&one_crate(HELD_U8), None, &["recursive"]);
     assert!(small[0].clean && small[0].reads.is_some(), "CONTROL: `recursive` holding nothing on the cycle is clean: {}", small[0].shown);
 }
 
@@ -370,13 +369,13 @@ fn main() {}
 /// (front2_witness_records.rs, `ping`/`pong`). NOT YET RUN.
 #[test]
 fn a_cycle_of_two_futures_is_decided_through_both_witnesses() {
-    let small = check_bodies(one_crate(HELD_U8), None, &["go"]);
-    let wide = check_bodies(one_crate(HELD_U16), None, &["go"]);
-    let rc = check_bodies(one_crate(HELD_RC), None, &["go"]);
+    let small = check_bodies(&one_crate(HELD_U8), None, &["go"]);
+    let wide = check_bodies(&one_crate(HELD_U16), None, &["go"]);
+    let rc = check_bodies(&one_crate(HELD_RC), None, &["go"]);
     let ping_text = "async fn ping(n: u32) { if n > 0 { Box::pin(pong(n - 1)).await } }";
-    let ping_holds = leak(one_crate(HELD_U8).replace(ping_text, "async fn ping(n: u32) { let h = 1u16; if n > 0 { Box::pin(pong(n - 1)).await } drop(h); }"));
+    let ping_holds = one_crate(HELD_U8).replace(ping_text, "async fn ping(n: u32) { let h = 1u16; if n > 0 { Box::pin(pong(n - 1)).await } drop(h); }");
     assert!(ping_holds.contains("let h = 1u16;"), "the fixture's `ping` was replaced");
-    let other_ping = check_bodies(ping_holds, None, &["go"]);
+    let other_ping = check_bodies(&ping_holds, None, &["go"]);
     for (world, got) in [("u8", &small[0]), ("u16", &wide[0]), ("ping holds u16", &other_ping[0])] {
         assert!(got.clean && got.reads.is_some(), "`go` ({world}): clean with a read list (rustc accepts it): {}", got.shown);
     }

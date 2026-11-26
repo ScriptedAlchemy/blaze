@@ -20,8 +20,8 @@
 //! toolchain under `$HOME/.blaze/v2/toolchain`. Prints the verdicts first:
 //! `impls differential: AGREE ..`, `impls control: ..`.
 
-use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
-use blaze_own::AVec;
+use blaze_ladder::crates::{DirShelf, Inputs, Texts, Toolchain, UserCrate};
+use blaze_own::{AVec, Bump, Erased};
 use blaze_scope::body_scope::{BodyScope, BodyScopeReadError, BodyScopeView, ImplHeaders, ImplRow, bodies_impl_table, body_scope, impl_diff, modules_impl_table};
 use blaze_scope::items_record::buckets::Filing;
 use blaze_scope::graph::{CrateId, Sysroot};
@@ -98,26 +98,27 @@ impl Par for Bodies {
 #[test]
 fn the_impl_table_is_the_same_under_both_strategies() {
     let alloc = blaze_own::testing::heap().alloc();
-    let bump = blaze_own::testing::bump();
     let home = std::env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc: &'static Toolchain = Box::leak(Box::new(Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"))));
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let edition = edition::PackageEdition::of_manifest("2021").expect("a known edition");
-    let files: &'static [(String, String)] = Box::leak(vec![("/user/src/main.rs".to_string(), USER.to_string())].into_boxed_slice());
-    let user: &'static UserCrate<'static> = Box::leak(Box::new(UserCrate { name: "user", dir: "/user/", root: "/user/src/main.rs", files, edition, panic: blaze_build::Panic::Unwind }));
-    let inputs: &'static Inputs<'static> = Box::leak(Box::new(Inputs::new(user, tc).unwrap_or_else(|e| panic!("the crates: {e}"))));
-    let crates: &'static [CrateInput<'static>] = Vec::leak(inputs.crates());
-    let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
-    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let files = [("/user/src/main.rs".to_string(), USER.to_string())];
+    let user = UserCrate { name: "user", dir: "/user/", root: "/user/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
     let texts = &inputs.texts;
-    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
-    let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
+    let modules_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Nameres).expect("Modules names frame");
+    let bodies_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Nameres).expect("Bodies names frame");
+    let modules_alloc = Erased::new(&modules_frame);
+    let bodies_alloc = Erased::new(&bodies_frame);
+    let bump = bodies_alloc.bump();
+    let (modules, bodies) = both_strategies(&crates, texts, modules_alloc.bump(), bump);
     let (c_mod, c_bod) = (modules.crates()[0], bodies.crates()[0]);
 
     // Every held body solved as its own; a refusal is a verdict, never skipped.
-    let deps = BodyDeps::of_names(bodies, 0, alloc);
+    let deps = BodyDeps::of_names(&bodies, 0, alloc);
     let prepares = Prepares::new_in(bump);
-    let mut scopes: AVec<'static, BodyScope<'static>> = AVec::new_in(alloc);
+    let mut scopes: AVec<'_, BodyScope<'_>> = AVec::new_in(alloc);
     let mut refused = Vec::new();
     let mut deterministic = true;
     for held in c_bod.bodies.iter() {
@@ -180,7 +181,7 @@ fn the_impl_table_is_the_same_under_both_strategies() {
     // The records read back in place (rule 26): each view answers every declared name as its
     // builder does. Controls: another body's record, a record cut short, an old version.
     let mut round_trips = 0usize;
-    let mut first_bytes: Option<&'static [u8]> = None;
+    let mut first_bytes = None;
     for s in scopes.iter() {
         let bytes = blaze_scope::resolve::aligned(&s.write(alloc).unwrap_or_else(|e| panic!("write: {e:?}")), bump);
         let view = BodyScopeView::read(bytes, alloc).unwrap_or_else(|e| panic!("a written body scope reads back: {e}"));
@@ -273,7 +274,7 @@ pub fn main() {}
 
 /// The planted bug (rule 23): the same texts, with a body solve placing no finished module
 /// ([`ReachPlant::Unplaced`]), as before the fix. The glob bodies must be refused again.
-struct Unplaced<'t>(&'t blaze_ladder::crates::Texts<'t>);
+struct Unplaced<'t>(&'t Texts<'t>);
 
 impl<'t> SourceTexts<'t> for Unplaced<'t> {
     fn read(&self, krate: usize, path: &str) -> Option<&'t str> {
@@ -285,35 +286,37 @@ impl<'t> SourceTexts<'t> for Unplaced<'t> {
     }
 }
 
-/// `text` as the user crate over the installed toolchain, its names solved under both
-/// strategies: (crates, the `Modules` names, the `Bodies` names, the texts).
-fn both_strategies(text: &'static str) -> (&'static [CrateInput<'static>], &'static Names<'static>, &'static Names<'static>, &'static blaze_ladder::crates::Texts<'static>) {
-    let bump = blaze_own::testing::bump();
-    let home = std::env::var("HOME").expect("HOME is set");
-    let shelf = format!("{home}/.blaze/v2/toolchain");
-    let tc: &'static Toolchain = Box::leak(Box::new(Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"))));
-    let edition = edition::PackageEdition::of_manifest("2021").expect("a known edition");
-    let files: &'static [(String, String)] = Box::leak(vec![("/user/src/main.rs".to_string(), text.to_string())].into_boxed_slice());
-    let user: &'static UserCrate<'static> = Box::leak(Box::new(UserCrate { name: "user", dir: "/user/", root: "/user/src/main.rs", files, edition, panic: blaze_build::Panic::Unwind }));
-    let inputs: &'static Inputs<'static> = Box::leak(Box::new(Inputs::new(user, tc).unwrap_or_else(|e| panic!("the crates: {e}"))));
-    let crates: &'static [CrateInput<'static>] = Vec::leak(inputs.crates());
+/// Solve the fixture's names under `Modules` and `Bodies`, each in its own frame.
+fn both_strategies<'a>(crates: &[CrateInput<'a>], texts: &Texts<'a>, modules_bump: Bump<'a>, bodies_bump: Bump<'a>) -> (Names<'a>, Names<'a>) {
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
     let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
-    let texts = &inputs.texts;
-    let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
-    let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
-    (crates, modules, bodies, texts)
+    let modules = resolve_crates(crates, sysroot, texts, &Serial, modules_bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"));
+    let bodies = resolve_crates(crates, sysroot, texts, &Bodies, bodies_bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"));
+    (modules, bodies)
 }
 
 #[test]
 fn a_body_s_globs_reach_modules_an_expansion_wrote_enums_and_its_own_modules() {
     let alloc = blaze_own::testing::heap().alloc();
-    let bump = blaze_own::testing::bump();
-    let (crates, modules, bodies, texts) = both_strategies(GLOBS);
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let edition = edition::PackageEdition::of_manifest("2021").expect("a known edition");
+    let files = [("/user/src/main.rs".to_string(), GLOBS.to_string())];
+    let user = UserCrate { name: "user", dir: "/user/", root: "/user/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let texts = &inputs.texts;
+    let modules_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Nameres).expect("Modules names frame");
+    let bodies_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Nameres).expect("Bodies names frame");
+    let modules_alloc = Erased::new(&modules_frame);
+    let bodies_alloc = Erased::new(&bodies_frame);
+    let bump = bodies_alloc.bump();
+    let (modules, bodies) = both_strategies(&crates, texts, modules_alloc.bump(), bump);
     let (c_mod, c_bod) = (modules.crates()[0], bodies.crates()[0]);
-    let deps = BodyDeps::of_names(bodies, 0, alloc);
+    let deps = BodyDeps::of_names(&bodies, 0, alloc);
     let prepares = Prepares::new_in(bump);
-    let mut scopes: AVec<'static, BodyScope<'static>> = AVec::new_in(alloc);
+    let mut scopes: AVec<'_, BodyScope<'_>> = AVec::new_in(alloc);
     let mut refused: Vec<String> = Vec::new();
     // Each fixture body by the struct only it declares.
     let marks = ["struct L;", "struct R;", "struct S;", "struct K;", "mod m ", "mod a "];
