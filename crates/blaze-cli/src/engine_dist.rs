@@ -31,6 +31,7 @@ use blaze_dist_local::agent::{self, Arrived, Config, Grant, Granted, Source, Uni
 use blaze_dist_local::blobs::Blobs;
 use blaze_dist_local::pack::{Value, ValueRef};
 use blaze_dist_local::sys::{append_file, path_is_file, random_id, read_file, write_file};
+use blaze_engine::LastAnswer as _;
 use blaze_ids::ContentId;
 use blaze_ladder::body_ids::{self, BodyIds, RowKind, Scratch, Stepped, Walk};
 use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, PanicStrategy, StoreError};
@@ -696,7 +697,13 @@ fn json_digests(digests: &[Digest], alloc: WireAlloc) -> WireString {
 }
 
 /// Write the complete plan before a worker can be held or stopped by the coordinator.
-fn write_unit_plans(report_path: Option<&str>, plans: &[CratePlan<'_>], ids: &RunIds<'_>, alloc: WireAlloc) {
+fn write_unit_plans(
+    report_path: Option<&str>,
+    plans: &[CratePlan<'_>],
+    ids: &RunIds<'_>,
+    answer: &blaze_engine::Answer<'_>,
+    alloc: WireAlloc,
+) {
     let Some(path) = report_path else { return };
     let mut file = WireString::from_str_in(path, alloc);
     file.push_str(".plans");
@@ -725,6 +732,20 @@ fn write_unit_plans(report_path: Option<&str>, plans: &[CratePlan<'_>], ids: &Ru
                     let _ = write!(body, "[\"{}\",\"{}\"]", hex(&read.fact), hex(&read.digest));
                 }
                 body.push(']');
+            }
+            if let Some(check) = ids.check_of(item.tabled) {
+                let _ = write!(body, ",\"check\":[\"{}\",\"{}\"]", check.kind.name(), hex(&check.subject.0));
+                if let Ok(Some(seen)) = answer.observations(check) {
+                    body.push_str(",\"observations\":[");
+                    for (index, (id, saw)) in seen.enumerate() {
+                        if index > 0 {
+                            body.push(',');
+                        }
+                        let _ = write!(body, "[\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]",
+                            id.of.kind.name(), hex(&id.of.subject.0), hex(&id.cell.0), hex(&saw.0), hex(&answer.cell(&id).0));
+                    }
+                    body.push(']');
+                }
             }
             // Planned work has no generic arguments, so the owner is the name's only item.
             if let Some(read) = ids.instance_fact(item.tabled) {
@@ -1009,6 +1030,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
     closure: &[CrateAt],
     program_crate_name: &str,
     ids: &'a RunIds<'b>,
+    answer: &blaze_engine::Answer<'_>,
     builder: &'a Builder,
     maker: &'a mut Maker<'b, crate::run_ids::Runnable, T>,
     store: &'a mut DistStore<'s, 'm, D>,
@@ -1057,7 +1079,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         });
     }
 
-    write_unit_plans(dist.report.as_ref().map(|path| path.as_str()), plans.as_slice(), ids, wire_alloc);
+    write_unit_plans(dist.report.as_ref().map(|path| path.as_str()), plans.as_slice(), ids, answer, wire_alloc);
 
     // Whole-program output fingerprint covering every unit digest and output path.
     let fp = unit_digest_of(output_path, builder, release, prior_digests.as_slice(), &[], scratch_alloc);

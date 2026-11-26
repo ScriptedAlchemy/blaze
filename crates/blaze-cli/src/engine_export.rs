@@ -944,6 +944,7 @@ fn export_program<'f>(
             closure.as_slice(),
             picked.bin,
             &ids,
+            standing.rows(),
             &builder,
             &mut maker,
             &mut dist_store,
