@@ -27,7 +27,7 @@ const DOC: &str = r#"ci_test: builds and runs workspace cargo test binaries in p
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use blaze_script::{
@@ -262,6 +262,7 @@ fn main_with(args: &Args) {
     let mut failed: Vec<String> = Vec::new();
     let indexed: Vec<(usize, String, String)> =
         bins.into_iter().enumerate().map(|(i, (d, b))| (i, d, b)).collect();
+    let total = indexed.len();
     fan_out(
         jobs,
         &indexed,
@@ -274,6 +275,10 @@ fn main_with(args: &Args) {
             env.push(("CARGO_MANIFEST_DIR", dir.clone()));
             let log = log_dir.join(format!("bin-{idx}"));
             let argv = [bin.clone()];
+            // Log from the worker so a slow earlier binary cannot hide later completions.
+            let started = Instant::now();
+            let ordinal = idx + 1;
+            println!("{SCRIPT}: start {ordinal}/{total} {name}");
             let ended = run_logged(&argv, Path::new(dir), &env, &log, limit);
             let out_path = log.with_extension("out");
             let err_path = log.with_extension("err");
@@ -299,6 +304,12 @@ fn main_with(args: &Args) {
                     output: String::new(),
                 },
             };
+            let result = outcome.failed.as_deref().unwrap_or("passed");
+            println!(
+                "{SCRIPT}: end {ordinal}/{total} {} ({result}, {:.2}s)",
+                outcome.name,
+                started.elapsed().as_secs_f64()
+            );
             if retained_logs.is_none() {
                 let _ = std::fs::remove_file(&out_path);
                 let _ = std::fs::remove_file(&err_path);
