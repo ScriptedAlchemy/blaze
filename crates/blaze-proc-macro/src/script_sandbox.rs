@@ -24,6 +24,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use blaze_own::SharedAlloc;
 
 use blaze_build_script::key::{CMode, RunLimits};
 use blaze_build_script::git::{self, GitFiles};
@@ -397,9 +398,9 @@ pub struct Script {
     /// What the script sees as its root: where `tree` is served and the package's folder in it.
     pub root: ScriptRoot,
     /// The environment, `(name, value)` sorted by name, paths in it virtual.
-    pub env: Vec<(String, String)>,
+    pub env: OwnedEnv,
     /// Caller-granted names that may never enter a persisted process recipe or worker request.
-    pub private_env_names: Vec<String>,
+    pub private_env_names: blaze_own::Vec<PrivateName, SharedAlloc<'static>>,
     /// The target the script is run for, which a try-compile's key holds.
     pub target: String,
     /// The host, for `rustc -vV`.
@@ -427,10 +428,16 @@ pub struct Script {
     pub deps: Arc<DepViews>,
 }
 
+/// The name/value pairs which WASI owns for one script or its requested child.
+pub type OwnedEnv = Vec<(String, String)>;
+
+/// The name of a caller setting a child process request would persist.
+pub type PrivateName = blaze_own::Arc<str, SharedAlloc<'static>>;
+
 /// The environment a wasm run is given, owned, for [`Script::env`]: `env`'s variables and
 /// `NUM_JOBS` `1` (`Jobs::One`: a wasm run has no threads, and no jobserver), made in `alloc`
 /// and copied out. The job count is never in the key: the key takes `env` ([`crate::script`]).
-pub fn owned_env(env: &blaze_build_script::Env<'_>, alloc: blaze_own::Alloc<'_>) -> Vec<(String, String)> {
+pub fn owned_env(env: &blaze_build_script::Env<'_>, alloc: blaze_own::Alloc<'_>) -> OwnedEnv {
     let run = env.for_run(blaze_build_script::Jobs::One, alloc);
     run.vars.iter().map(|(name, value)| (name.as_str().to_owned(), value.as_str().to_owned())).collect()
 }
@@ -465,7 +472,7 @@ pub enum Refusal {
 /// A spawn the sandbox does not answer.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SpawnRefusal {
-    PrivateEnv { name: String },
+    PrivateEnv { name: PrivateName },
     /// A try-compile no row of the table answers: its key, arguments and snippet, so the row
     /// can be written (with its reason) from this, and the target its key was made for (a
     /// macro-side run asks for wasm32-wasip1: a row of another target never answers it).

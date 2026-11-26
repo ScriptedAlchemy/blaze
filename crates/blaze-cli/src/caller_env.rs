@@ -2,18 +2,21 @@
 //! passed on as a cache input. Neither the key nor the caller's values are producer records.
 
 use std::{
-    fmt, fs::{File, OpenOptions}, io::{self, Read, Write},
+    fs::{self, File, OpenOptions}, io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt}, path::{Path, PathBuf},
 };
+use core::fmt;
 
 use blaze_build_script::env::CallerEnv;
 use blaze_ids::{ContentId, Hasher};
+use blaze_int::Int;
 use blaze_sys::posix::{io::{OpenFlags, getentropy}, thread::geteuid};
-use bstd::{digest::HmacSha256, env::{Env, VarName}, mem::Frame};
+use bstd::{digest::HmacSha256, env::{Env, VarName, VarNameError}, mem::Frame};
 
 #[derive(Debug)]
 pub enum Error {
-    Denied(String),
+    Denied(VarName),
+    BadName(VarNameError),
     Home,
     Key { path: PathBuf, source: io::Error },
 }
@@ -22,6 +25,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Denied(name) => write!(f, "--build-env cannot read {name} from this request"),
+            Self::BadName(error) => write!(f, "--build-env: {error}"),
             Self::Home => f.write_str("--build-env requires an absolute HOME for its private key"),
             Self::Key { path, source } => write!(f, "--build-env private key {}: {source}", path.display()),
         }
@@ -30,7 +34,7 @@ impl fmt::Display for Error {
 
 fn read_key(path: &Path) -> io::Result<[u8; 32]> {
     let flags = OpenFlags::NONBLOCK.with(OpenFlags::NO_FOLLOW);
-    let mut file = OpenOptions::new().read(true).custom_flags(flags.bits() as i32).open(path)?;
+    let mut file = OpenOptions::new().read(true).custom_flags(flags.bits().cast_signed()).open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() || meta.uid() != geteuid() || meta.mode() & 0o077 != 0 || meta.len() != 32 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "expected a private 32-byte regular file owned by this user"));
@@ -42,39 +46,42 @@ fn read_key(path: &Path) -> io::Result<[u8; 32]> {
 
 fn key(home: &Path) -> Result<[u8; 32], Error> {
     let path = home.join(".blaze-build-env-key");
-    let error = |source| Error::Key { path: path.clone(), source };
-    match read_key(&path) {
+    open_or_create_key(home, &path).map_err(|source| Error::Key { path, source })
+}
+
+fn open_or_create_key(home: &Path, path: &Path) -> io::Result<[u8; 32]> {
+    match read_key(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        found => return found.map_err(error),
+        found => return found,
     }
     // Each contender publishes a complete key with link(2). A loser reads the installed key.
     // The temporary name uses independent entropy and reveals none of the key.
     let mut key = [0; 32];
     let mut nonce = [0; 16];
-    let entropy = |buf: &mut [u8]| getentropy(buf).map_err(|e| error(io::Error::other(format!("getentropy: {e:?}"))));
+    let entropy = |buf: &mut [u8]| getentropy(buf).map_err(|e| io::Error::other(format!("getentropy: {e:?}")));
     entropy(&mut key)?;
     entropy(&mut nonce)?;
     let temp = home.join(format!(".blaze-build-env-{:032x}.tmp", u128::from_le_bytes(nonce)));
-    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp).map_err(error)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp)?;
     let publish = (|| {
         file.write_all(&key)?;
         file.sync_all()?;
-        match std::fs::hard_link(&temp, &path) {
+        match fs::hard_link(&temp, path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
             Err(e) => Err(e),
         }
     })();
-    std::fs::remove_file(&temp).map_err(error)?;
-    publish.map_err(error)?;
-    File::open(home).and_then(|dir| dir.sync_all()).map_err(error)?;
-    read_key(&path).map_err(error)
+    fs::remove_file(&temp)?;
+    publish?;
+    File::open(home)?.sync_all()?;
+    read_key(path)
 }
 
 fn present(key: &[u8; 32], name: &str, value: &str) -> ContentId {
     let mut h = HmacSha256::new(key);
     h.update(b"blaze caller build environment value 1\0");
-    h.update(&(name.len() as u64).to_le_bytes()).update(name.as_bytes()).update(value.as_bytes());
+    h.update(&name.len().widen_to::<u64>().to_le_bytes()).update(name.as_bytes()).update(value.as_bytes());
     ContentId(h.finish())
 }
 
@@ -83,9 +90,9 @@ pub(crate) fn project<'a>(names: &[&'a str], env: Option<&'a Env>, frame: &'a Fr
         return Ok(CallerEnv::default());
     }
     let read = |name: &str| {
-        let denied = || crate::CliError::BuildEnv(Error::Denied(name.to_owned()));
-        let name = VarName::new(name).map_err(|_| denied())?;
-        env.ok_or_else(denied)?.get(&name).map_err(|_| denied())
+        let name = VarName::new(name).map_err(|e| crate::CliError::BuildEnv(Error::BadName(e)))?;
+        let Some(env) = env else { return Err(crate::CliError::BuildEnv(Error::Denied(name))) };
+        env.get(&name).map_err(|e| crate::CliError::BuildEnv(Error::Denied(e.name)))
     };
     let home = read("HOME")?.map(Path::new).filter(|path| path.is_absolute()).ok_or(crate::CliError::BuildEnv(Error::Home))?;
     let key = key(home).map_err(crate::CliError::BuildEnv)?;
@@ -98,15 +105,6 @@ pub(crate) fn project<'a>(names: &[&'a str], env: Option<&'a Env>, frame: &'a Fr
         rows.push((name, value, fact));
     }
     CallerEnv::new(rows.into_bump_slice(), h.finish()).ok_or(crate::CliError::Usage("invalid --build-env grant"))
-}
-
-pub(crate) fn hold<'a>(env: CallerEnv<'_>, frame: &'a Frame) -> CallerEnv<'a> {
-    let Some(mac) = env.identity() else { return CallerEnv::default() };
-    let mut rows = blaze_own::Vec::with_capacity_in(env.iter().len(), frame);
-    for &(name, value, fact) in env.rows() {
-        rows.push((crate::work::held_str(name, frame), value.map(|v| crate::work::held_str(v, frame)), fact));
-    }
-    CallerEnv::new(rows.into_bump_slice(), mac).expect("copied verified caller environment")
 }
 
 #[cfg(test)]
@@ -131,7 +129,7 @@ mod tests {
         assert_eq!(grant.answer("MISSING"), blaze_drive::key::ABSENT);
         assert_eq!(grant.answer("SECRET"), default.answer("SECRET"));
         assert_ne!(grant.answer("App"), grant.answer("MISSING"));
-        assert_eq!(hold(grant, &frame).answer("App"), grant.answer("App"));
+        assert_eq!(grant.copy_in(&frame).answer("App"), grant.answer("App"));
         assert!(project(&["SECRET"], Some(&env), &frame).is_err());
         let key_path = home.path().join(".blaze-build-env-key");
         assert_eq!(key_path.metadata().expect("key").permissions().mode() & 0o777, 0o600);

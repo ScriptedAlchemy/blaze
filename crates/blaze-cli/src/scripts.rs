@@ -945,7 +945,7 @@ pub(crate) fn job<'f: 'j, 'j>(
         Err(words) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true }),
     };
     let caller_env = match files {
-        Files::Member { .. } => crate::caller_env::hold(env.caller_env, jobs),
+        Files::Member { .. } => env.caller_env.copy_in(jobs),
         Files::Pack { .. } | Files::External { .. } => Default::default(),
     };
     Ok(Prepared::Ready(ScriptJob { caller_env, name: task.name, shared, script, module, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole }))
@@ -996,10 +996,7 @@ pub(crate) fn pooled(cx: &Cx, job: &ScriptJob<'_>, clock: &bstd::clock::Clock) -
 /// A run's failure with its words; `hole` when its cause is outside its key and its reads (it is
 /// asked again next command). Also a test's runner's (engine_scripts.rs `ScriptRunner`).
 pub(crate) fn failed(what: &'static str, words: core::fmt::Arguments<'_>, hole: bool) -> Ran {
-    let mut held = blaze_own::Vec::new_in(Global);
-    let text = std::fmt::format(words);
-    held.extend_from_slice(text.as_bytes());
-    Ran::Failed { what, words: held, hole }
+    Ran::Failed { what, words: blaze_own::text::format(Global, words).into_bytes(), hole }
 }
 
 /// The run on the worker; a kept member run's reads of the checkout onto `checkout`, or why its

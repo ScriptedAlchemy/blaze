@@ -404,7 +404,7 @@ struct Flags<'a> {
     origin_key: Option<&'a str>,
     /// `--grant name=value`, each a capability the program is given (run.md).
     grants: std::vec::Vec<(&'a str, &'a str)>,
-    build_env: std::vec::Vec<&'a str>,
+    build_env: blaze_own::FixedVec<&'a str, 64>,
     /// The words after `--`: the program's own arguments.
     program: std::vec::Vec<&'a str>,
     /// `--workers N`: at most N of a batch's tasks at once (default: one per core). For
@@ -458,7 +458,7 @@ impl<'a> Flags<'a> {
             origin: None,
             origin_key: None,
             grants: std::vec::Vec::new(),
-            build_env: std::vec::Vec::new(),
+            build_env: blaze_own::FixedVec::new(),
             program: std::vec::Vec::new(),
             workers: None,
             status_every: None,
@@ -543,10 +543,7 @@ fn parse_flags_with<'a>(args: &'a Args, mut package: impl FnMut(&'a str), mut fe
                     return Err(CliError::Usage("--build-env requires an unreserved application variable such as APP_SETTING"));
                 }
                 if let Err(at) = flags.build_env.binary_search(&name) {
-                    if flags.build_env.len() == 64 {
-                        return Err(CliError::Usage("--build-env grants at most 64 distinct variable names"));
-                    }
-                    flags.build_env.insert(at, name);
+                    flags.build_env.insert_shift(at, name).map_err(|_| CliError::Usage("--build-env grants at most 64 distinct variable names"))?;
                 }
             }
             "--grant" => {

@@ -58,7 +58,7 @@ pub(crate) fn script(c_mode: CMode, spawner: Option<Arc<dyn Executor + Send + Sy
         // `/workspace/gen.pl`).
         root: crate::script_sandbox::ScriptRoot::member("").expect("the root package"),
         env: vec![("OUT_DIR".to_owned(), "/out".to_owned())],
-        private_env_names: Vec::new(),
+        private_env_names: blaze_own::Vec::new_in(blaze_own::SharedAlloc::global()),
         target: "aarch64-apple-darwin".to_owned(),
         host: "aarch64-apple-darwin".to_owned(),
         c_mode,
@@ -250,9 +250,9 @@ fn a_private_script_value_is_not_disclosed_to_a_process_work_request() {
     let mut script = script(CMode::Deferred, None, SpawnSetting::off());
     let script = Arc::make_mut(&mut script);
     script.env.push(("APP_SETTING".to_owned(), "private-test-marker".to_owned()));
-    script.private_env_names.push("APP_SETTING".to_owned());
+    script.private_env_names.push(blaze_own::Arc::from_str_in("APP_SETTING", blaze_own::SharedAlloc::global()));
     let refused = script.work_env(&decoded(false, &[])).expect_err("a worker would inherit the grant");
-    assert!(matches!(&refused, SpawnRefusal::PrivateEnv { name } if name == "APP_SETTING"));
+    assert!(matches!(&refused, SpawnRefusal::PrivateEnv { name } if name.as_ref() == "APP_SETTING"));
     assert!(!format!("{refused:?} {script:?}").contains("private-test-marker"));
     let cleared = script.work_env(&decoded(false, &[(false, "APP_SETTING", "")])).expect("grant removed");
     assert_eq!(cleared, pairs(&[("OUT_DIR", "/out")]));

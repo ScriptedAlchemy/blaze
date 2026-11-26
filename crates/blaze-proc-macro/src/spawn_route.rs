@@ -25,7 +25,7 @@ use blaze_wasi::Stop;
 
 use blaze_expand::seen::SeenRoot;
 
-use crate::script_sandbox::{Malformed, Refusal, STDERR_TAIL, Script, ScriptSandbox, SpawnRefusal, Tree, git_words};
+use crate::script_sandbox::{Malformed, OwnedEnv, Refusal, STDERR_TAIL, Script, ScriptSandbox, SpawnRefusal, Tree, git_words};
 
 /// One spawn as the shim encoded it, whole: what `decode` used to read past (the environment
 /// and the two output modes) is kept, because the executor's request holds the child's whole
@@ -102,8 +102,8 @@ pub(crate) fn decode_full(bytes: &[u8]) -> Result<Decoded, Malformed> {
 
 /// The child's environment by std's `Command` semantics: the script's own unless `env_clear`,
 /// then each operation in order (a set inserts or replaces, an unset removes); sorted by name.
-pub(crate) fn child_env(script_env: &[(String, String)], d: &Decoded) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = if d.env_clear { Vec::new() } else { script_env.to_vec() };
+pub(crate) fn child_env(script_env: &[(String, String)], d: &Decoded) -> OwnedEnv {
+    let mut env = if d.env_clear { OwnedEnv::new() } else { script_env.to_vec() };
     env.sort_by(|a, b| a.0.cmp(&b.0));
     // A name given twice in the script's list keeps its last value, as a later `env` call does.
     env.dedup_by(|later, earlier| {
@@ -372,10 +372,12 @@ impl core::fmt::Debug for Script {
 
 impl Script {
     /// A child process whose environment is persisted receives no caller-granted values.
-    pub(crate) fn work_env(&self, spawned: &Decoded) -> Result<Vec<(String, String)>, SpawnRefusal> {
+    pub(crate) fn work_env(&self, spawned: &Decoded) -> Result<OwnedEnv, SpawnRefusal> {
         let env = child_env(&self.env, spawned);
-        if let Some((name, _)) = env.iter().find(|(name, _)| self.private_env_names.binary_search(name).is_ok()) {
-            return Err(SpawnRefusal::PrivateEnv { name: name.clone() });
+        for name in &self.private_env_names {
+            if env.binary_search_by(|(k, _)| k.as_str().cmp(name.as_ref())).is_ok() {
+                return Err(SpawnRefusal::PrivateEnv { name: blaze_own::Share::share(name) });
+            }
         }
         Ok(env)
     }

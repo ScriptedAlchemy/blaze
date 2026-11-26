@@ -74,7 +74,7 @@ impl<'a> CallerEnv<'a> {
 
     /// Construct from already projected rows. Invalid or duplicate names never reach a runner.
     pub fn new(rows: &'a [(&'a str, Option<&'a str>, ContentId)], mac: ContentId) -> Option<Self> {
-        if rows.len() > 64 || !rows.iter().all(|(name, v, fact)| Self::allows(name) && (v.is_some() || *fact == ContentId::default())) || !rows.windows(2).all(|p| p[0].0 < p[1].0) {
+        if rows.len() > 64 || !rows.iter().all(|(name, v, fact)| Self::allows(name) && (v.is_some() || *fact == ContentId::default())) || !rows.is_sorted_by(|a, b| a.0 < b.0) {
             return None;
         }
         Some(Self { rows, mac: (!rows.is_empty()).then_some(mac) })
@@ -82,7 +82,7 @@ impl<'a> CallerEnv<'a> {
 
     /// The named grant's value, when set.
     pub fn get(self, name: &str) -> Option<&'a str> {
-        self.rows.binary_search_by_key(&name, |row| row.0).ok().and_then(|at| self.rows[at].1)
+        self.row(name).and_then(|row| row.1)
     }
 
     /// All granted names in ascending order, including explicit absences.
@@ -92,7 +92,11 @@ impl<'a> CallerEnv<'a> {
 
     /// Authentication tag for an authorized read. Absent and present-empty are distinct.
     pub fn fact(self, name: &str) -> Option<ContentId> {
-        self.rows.binary_search_by_key(&name, |row| row.0).ok().map(|at| self.rows[at].2)
+        self.row(name).map(|row| row.2)
+    }
+
+    fn row(self, name: &str) -> Option<&'a (&'a str, Option<&'a str>, ContentId)> {
+        self.rows.get(self.rows.binary_search_by_key(&name, |row| row.0).ok()?)
     }
 
     /// An ungranted or absent name answers the same absent cell.
@@ -103,6 +107,14 @@ impl<'a> CallerEnv<'a> {
     /// Verified rows, for transferring a projection into a worker's memory.
     pub fn rows(self) -> &'a [(&'a str, Option<&'a str>, ContentId)] {
         self.rows
+    }
+
+    /// Transfer the verified projection into a worker's arena, retaining its identity.
+    pub fn copy_in<'b>(self, alloc: impl blaze_own::BumpAlloc + Copy + 'b) -> CallerEnv<'b> {
+        let copy = |s: &str| -> &'b str { String::from_str_in(s, alloc).into_bump_str() };
+        let mut rows = Vec::with_capacity_in(self.rows.len(), alloc);
+        rows.extend(self.rows.iter().map(|&(name, value, fact)| (copy(name), value.map(copy), fact)));
+        CallerEnv { rows: rows.into_bump_slice(), mac: self.mac }
     }
 
     /// Digest of the named grants and their individual facts. An empty grant has no identity.

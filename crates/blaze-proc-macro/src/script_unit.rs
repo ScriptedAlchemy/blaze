@@ -321,8 +321,11 @@ pub fn prepare_viewing_on<'a>(
         package,
         tree,
         root,
-        env: Vec::new(),
-        private_env_names: caller.iter().map(|(name, _)| name.to_owned()).collect(),
+        env: Default::default(),
+        private_env_names: {
+            let heap = blaze_own::SharedAlloc::global();
+            blaze_own::Vec::from_iter_in(caller.iter().map(|(name, _)| blaze_own::Arc::from_str_in(name, heap)), heap)
+        },
         target: setting.target.to_owned(),
         host: setting.host.to_owned(),
         c_mode: setting.c_mode,
