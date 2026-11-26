@@ -575,6 +575,101 @@ fn publication_replaces_a_pointer_swept_from_the_current_generation() {
     }
 }
 
+/// A request can reuse a preexisting unrooted pointer. Its publication pin protects the
+/// old row from a sparse sweep already planned when the pin was acquired.
+#[test]
+fn publication_pin_preserves_an_old_pointer_against_a_planned_sweep() {
+    assert!(publication_pin_sweep(Plant::None));
+    assert!(!publication_pin_sweep(Plant::SweepIgnoresNewLease));
+}
+
+fn publication_pin_sweep(plant: Plant) -> bool {
+    use blaze_keyed::kind::ReservedTag;
+
+    let root = test_root();
+    let reached = |n| {
+        let mut config = cfg(n, 1, false, &root);
+        config.liveness = super::Liveness::Reached;
+        config
+    };
+    let mut sim = Sim::new(165, Faults::default());
+    let mut owner = Actor::new(reached(1), &root, Plant::None);
+    settle(&mut sim, core::slice::from_mut(&mut owner));
+    assert!(!owner.store.pin_publication(sim.wall_ns(), &mut owner.effects).expect("empty view needs no pin"));
+    let pointer = key(86);
+    let target = key(87);
+    let pointer_tag = ReservedTag::Pointer.tag();
+    let target_bytes = b"preexisting target";
+    owner.store.put(target, Namespace::LOCAL, TAG, target_bytes).expect("seed target");
+    owner.store.put(pointer, Namespace::LOCAL, pointer_tag, &target.0.0).expect("seed pointer");
+    owner.store.release_lease();
+    owner.store.commit(&[], sim.wall_ns(), &mut owner.effects).expect("commit old pointer");
+    settle(&mut sim, core::slice::from_mut(&mut owner));
+    assert!(matches!(owner.store.take_committed(), Some(Ok(_))));
+
+    let mut writer = Actor::new(reached(2), &root, Plant::None);
+    settle(&mut sim, core::slice::from_mut(&mut writer));
+    let latest = key(88);
+    owner.store.put(latest, Namespace::LOCAL, TAG, &[1; 1024]).expect("put newer record");
+    owner.store.root("newer", &[latest]).expect("root newer record");
+    owner.store.commit(&[], sim.wall_ns(), &mut owner.effects).expect("commit newer generation");
+    settle(&mut sim, core::slice::from_mut(&mut owner));
+    assert!(matches!(owner.store.take_committed(), Some(Ok(_))));
+    assert!(writer.store.get(&latest).is_none());
+
+    let mut gc = Actor::new(reached(3), &root, plant);
+    settle(&mut sim, core::slice::from_mut(&mut gc));
+    assert!(gc.store.fold_slice(&mut gc.effects).expect("plan sparse sweep"));
+    settle(&mut sim, core::slice::from_mut(&mut gc));
+    assert!(gc.store.slice_parked());
+
+    assert!(writer.store.pin_publication(sim.wall_ns(), &mut writer.effects).expect("start publication pin"));
+    settle(&mut sim, core::slice::from_mut(&mut writer));
+    let pinned = writer.store.take_committed().expect("pin verdict").expect("publish pin");
+    assert!(pinned.segments.is_empty());
+    assert!(writer.store.get(&latest).is_some(), "pin did not adopt the newer generation");
+    assert_eq!(writer.store.get(&target).expect("read old target").bytes, target_bytes);
+
+    gc.store.commit(&[], sim.wall_ns(), &mut gc.effects).expect("flip planned sweep");
+    settle(&mut sim, core::slice::from_mut(&mut gc));
+    assert!(matches!(gc.store.take_committed(), Some(Ok(_))));
+    let sweep = gc.store.take_sliced().expect("planned sweep verdict");
+    if !sweep.aborted {
+        assert!(gc.store.newest_mapped(Namespace::LOCAL, &pointer).is_none());
+        return false;
+    }
+    assert!(gc.store.newest_mapped(Namespace::LOCAL, &pointer).is_some());
+
+    let fresh = key(89);
+    writer.store.put(fresh, Namespace::LOCAL, TAG, b"phase record").expect("put phase record");
+    writer.store.commit(&[], sim.wall_ns(), &mut writer.effects).expect("commit phase and renew lease");
+    settle(&mut sim, core::slice::from_mut(&mut writer));
+    assert!(matches!(writer.store.take_committed(), Some(Ok(_))));
+    assert_eq!(writer.store.leases_len(), 1);
+
+    let mut gc = Actor::new(reached(4), &root, Plant::None);
+    settle(&mut sim, core::slice::from_mut(&mut gc));
+    assert!(gc.store.compact(&mut gc.effects));
+    settle(&mut sim, core::slice::from_mut(&mut gc));
+    assert!(gc.store.take_sliced().is_some());
+    assert!(gc.store.newest_mapped(Namespace::LOCAL, &pointer).is_some(), "phase renewal narrowed the pin");
+
+    let answer = writer.store.root("answer", &[pointer, target, fresh]).expect("stage answer root");
+    writer.store.release_lease();
+    writer.store.commit(&[], sim.wall_ns(), &mut writer.effects).expect("publish answer and release pin");
+    settle(&mut sim, core::slice::from_mut(&mut writer));
+    assert!(matches!(writer.store.take_committed(), Some(Ok(_))));
+
+    let mut reader = Actor::new(reached(5), &root, Plant::None);
+    settle(&mut sim, core::slice::from_mut(&mut reader));
+    let (at, entry) = reader.store.newest_mapped(Namespace::LOCAL, &pointer).expect("reopen old pointer");
+    assert_eq!(reader.store.mapped_at(at).payload(&entry), &target.0.0);
+    assert_eq!(reader.store.get(&target).expect("reopen old target").bytes, target_bytes);
+    assert_eq!(reader.store.root_named("answer"), Some(answer));
+    assert_eq!(reader.store.leases_len(), 0);
+    true
+}
+
 /// One effect of the test's own, run to its completion.
 fn ask(sim: &mut Sim, effect: Effect) -> Done {
     let mut effects = vec![effect];

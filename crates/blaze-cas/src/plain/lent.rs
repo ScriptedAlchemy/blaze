@@ -1297,6 +1297,17 @@ impl<D: Driver, A: Allocator + Clone> Lent<D, A> {
         self.inner.borrow().store.core().named()
     }
 
+    /// Pins reusable records before this request's first store read. The answer's root commit
+    /// releases the pin with [`Lent::release_lease`].
+    pub fn pin_publication(&self) -> Result<(), LentError> {
+        let mut inner = self.inner.borrow_mut();
+        let doing = "pinning the store for publication";
+        if inner.committed != inner.order.len() {
+            return Err(stopped(doing)(StoreError::Busy { phase: "starting a publication pin with uncommitted records" }));
+        }
+        inner.store.pin_publication().map_err(stopped(doing))
+    }
+
     /// This command's lease let go of at the next commit: its answer roots its records
     /// (`Plain::release_lease`).
     pub fn release_lease(&self) {

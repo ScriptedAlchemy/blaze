@@ -1075,6 +1075,8 @@ pub(crate) enum Plant {
     /// A commit whose roots name a record a slice swept since flips anyway without carrying
     /// it forward: the generation's root names a record no live segment holds (cleanup_tests).
     CarrySkipped,
+    /// A sweep ignores a lease acquired after its copy plan was made.
+    SweepIgnoresNewLease,
     /// Reach takes an indexed root's record as a plain root's: the indexes it names are live,
     /// the keys they hold are not (index_tests).
     IndexNotFollowed,
@@ -1392,10 +1394,22 @@ impl<A: Allocator> EvictPlan<A> {
 /// replaces, the orphans it retires, and any roots LRU-evicted under the byte budget.
 struct Folded<A: Allocator + Clone> {
     seg: Option<(Segment, FileName)>,
-    candidates: Vec<u64, A>,
+    candidates: CompactCandidates<A>,
     orphans: Vec<(u64, bool), A>,
     evict: Option<EvictPlan<A>>,
     stats: Sliced,
+}
+
+struct CompactCandidates<A: Allocator> {
+    ids: Vec<u64, A>,
+    /// The newest candidate whose records could be swept for lack of a lease at copy time.
+    newest_unleased: Option<u64>,
+}
+
+impl<A: Allocator> CompactCandidates<A> {
+    fn empty(alloc: A) -> Self {
+        Self { ids: Vec::new_in(alloc), newest_unleased: None }
+    }
 }
 
 /// Why a head is being read: at the open, or under the lock for a flip.
@@ -1415,7 +1429,7 @@ enum Why<A: Allocator + Clone> {
     /// A commit's segments are written one after another, one for each namespace with
     /// records, then flipped at once: `rest` still to write, `done` written.
     Commit { started_ns: u64, roots: Vec<RootEdit, A>, rest: Vec<NextCommit<A>, A>, done: Vec<(Segment, FileName), A> },
-    Compact { candidates: Vec<u64, A>, stats: Sliced },
+    Compact { candidates: CompactCandidates<A>, stats: Sliced },
 }
 
 /// Next segment queued behind the current commit write: either a zero-copy streamed plan
@@ -1911,7 +1925,7 @@ enum Change<A: Allocator + Clone> {
     Commit { segs: Vec<(Segment, FileName), A>, started_ns: u64, roots: Vec<RootEdit, A> },
     /// Only what an open found (segments checked or lost): [`Plain::pending_stamps`].
     Stamp,
-    Compact { seg: Option<(Segment, FileName)>, candidates: Vec<u64, A>, orphans: Vec<(u64, bool), A>, evict: Option<EvictPlan<A>>, stats: Sliced },
+    Compact { seg: Option<(Segment, FileName)>, candidates: CompactCandidates<A>, orphans: Vec<(u64, bool), A>, evict: Option<EvictPlan<A>>, stats: Sliced },
     /// Segments fetched from a source, written here: named here and published.
     Adopt { segs: Vec<Segment, A> },
     /// Segments pushed to a shared bucket.
@@ -3084,9 +3098,9 @@ impl<A: Allocator + Clone> Plain<A> {
 
         let folded = if matches!(change, Change::Commit { .. }) { self.folding.as_ref() } else { None };
         let (drop_candidates, add_slice_seg, evict_plan): (&[u64], Option<Segment>, Option<&EvictPlan<A>>) = match change {
-            Change::Compact { seg, candidates, evict, .. } => (candidates.as_slice(), seg.as_ref().map(|(s, _)| *s), evict.as_ref()),
+            Change::Compact { seg, candidates, evict, .. } => (candidates.ids.as_slice(), seg.as_ref().map(|(s, _)| *s), evict.as_ref()),
             Change::Commit { .. } => match folded {
-                Some(slice) => (slice.candidates.as_slice(), slice.seg.as_ref().map(|(s, _)| *s), slice.evict.as_ref()),
+                Some(slice) => (slice.candidates.ids.as_slice(), slice.seg.as_ref().map(|(s, _)| *s), slice.evict.as_ref()),
                 None => (&[], None, None),
             },
             _ => (&[], None, None),
@@ -3815,6 +3829,27 @@ impl<A: Allocator + Clone> Plain<A> {
     /// Lets go of the root `name` at the next commit.
     pub fn unroot(&mut self, name: &str) {
         self.roots_pending.push(RootEdit::Unset(name.to_owned()));
+    }
+
+    /// Pins the existing readable segments through the request's root publication. The lease
+    /// flip adopts the locked generation before the caller reads any records from it.
+    pub(super) fn pin_publication(&mut self, now_ns: u64, effects: &mut Vec<Effect>) -> Result<bool, StoreError> {
+        if let Some(why) = &self.broken {
+            return Err(why.clone());
+        }
+        if !self.ready() || self.holds_uncommitted() || !self.roots_pending.is_empty() || self.folding.is_some() {
+            return Err(StoreError::Busy { phase: "starting a publication pin with pending store work" });
+        }
+        if self.cfg.liveness != Liveness::Reached
+            || !self.manifest.segments.iter().any(|seg| seg.local && seg.count != 0 && self.cfg.reads.contains(&seg.namespace))
+            || self.manifest.leases.iter().any(|lease| lease.holder == self.cfg.nonce && lease.since == 0 && self.lease_live(lease, now_ns))
+        {
+            return Ok(false);
+        }
+        self.released = false;
+        self.roots_pending.push(RootEdit::Lease { since: 0, opened_ns: self.opened_ns });
+        self.commit(&[], now_ns, effects)?;
+        Ok(true)
     }
 
     /// Lets go of this process's lease at the next commit: the command's records are rooted by
@@ -4761,7 +4796,7 @@ impl<A: Allocator + Clone> Plain<A> {
             self.record_pending_bloom(seg.digest, builder.finish(&seg.digest));
         }
         let file = self.segment_file(seg.id);
-        let back = matches!(&why, Why::Compact { candidates, .. } if candidates.contains(&seg.id));
+        let back = matches!(&why, Why::Compact { candidates, .. } if candidates.ids.contains(&seg.id));
         let named = Writing { seg, file: file.share(), pieces: Vec::new_in(self.alloc.clone()), left: 0, stream: None, commit: None };
         if back || self.by_id.contains_key(&seg.id) {
             effects.push(Effect::Remove { file: temp.share(), tag: self.tag(SEG_UNWRITE, 0) });
@@ -4811,7 +4846,7 @@ impl<A: Allocator + Clone> Plain<A> {
         seg.boot = self.cfg.boot;
         let file = self.segment_file(seg.id);
         if let Why::Compact { candidates, stats } = &why
-            && candidates.contains(&seg.id)
+            && candidates.ids.contains(&seg.id)
         {
             // The slice would write back what it read: nothing to do.
             self.fold_asked = false;
@@ -6187,8 +6222,8 @@ impl<A: Allocator + Clone> Plain<A> {
         // starved by a concurrent foreground commit conflicting with a segment copy slice.
         if expired && !self.fold_asked && self.plant() != Plant::MixRetiredWithCopy {
             let stats = Sliced { orphans: u32::try_from(orphans.len()).unwrap_or(u32::MAX), ..Sliced::default() };
-            let empty_ids = self.alloc_vec();
-            self.slice_ready(None, empty_ids, orphans, None, stats, effects);
+            let candidates = CompactCandidates::empty(self.alloc.clone());
+            self.slice_ready(None, candidates, orphans, None, stats, effects);
             return;
         }
         let over = self.over_budget();
@@ -6225,8 +6260,8 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.phase = Phase::Ready;
                 return;
             }
-            let empty_ids = self.alloc_vec();
-            self.slice_ready(None, empty_ids, orphans, evict, stats, effects);
+            let candidates = CompactCandidates::empty(self.alloc.clone());
+            self.slice_ready(None, candidates, orphans, evict, stats, effects);
             return;
         }
         let copied = self.copy_live(candidates, prune, now_ns, kept_count, &mut stats);
@@ -6249,7 +6284,7 @@ impl<A: Allocator + Clone> Plain<A> {
     fn slice_ready(
         &mut self,
         seg: Option<(Segment, FileName)>,
-        candidates: Vec<u64, A>,
+        candidates: CompactCandidates<A>,
         orphans: Vec<(u64, bool), A>,
         evict: Option<EvictPlan<A>>,
         stats: Sliced,
@@ -6269,7 +6304,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// is copied and no entry kept ([`Plain::stream_segment`] walks it again for both). And the
     /// candidates it replaces (a published one only when it holds nothing live: it is let go
     /// of whole, or kept whole, never rewritten).
-    fn copy_live(&mut self, candidates: Vec<Segment, A>, prune: bool, now_ns: u64, kept_count: Option<u32>, stats: &mut Sliced) -> Result<(Copied<A>, Vec<u64, A>), StoreError> {
+    fn copy_live(&mut self, candidates: Vec<Segment, A>, prune: bool, now_ns: u64, kept_count: Option<u32>, stats: &mut Sliced) -> Result<(Copied<A>, CompactCandidates<A>), StoreError> {
         let keep = if !prune {
             Keep::All
         } else {
@@ -6299,14 +6334,18 @@ impl<A: Allocator + Clone> Plain<A> {
         let candidates = kept_candidates;
         let namespace = candidates.first().map_or(Namespace::LOCAL, |it| it.namespace);
         let mut cursors = Vec::with_capacity_in(candidates.len(), self.alloc.clone());
+        let mut newest_unleased = None;
         for seg in &candidates {
             stats.bytes_in += seg.file_len();
+            let leased = self.cfg.liveness == Liveness::Reached && self.leased(seg, now_ns);
+            if matches!(keep, Keep::Reached { .. }) && !leased {
+                newest_unleased = newest_unleased.max(Some(seg.generation));
+            }
             if seg.published {
                 stats.dropped += u64::from(seg.count);
                 continue;
             }
             let Some(&map_idx) = self.by_id.get(&seg.id) else { continue };
-            let leased = self.cfg.liveness == Liveness::Reached && self.leased(seg, now_ns);
             cursors.push(Cursor { map: u32::try_from(map_idx).unwrap_or(u32::MAX), next: 0, count: seg.count, young: seg.generation + WINDOW > current, leased });
         }
         let heap = Vec::with_capacity_in(cursors.len(), self.alloc.clone());
@@ -6347,7 +6386,7 @@ impl<A: Allocator + Clone> Plain<A> {
         stats.segments = candidates.len() as u32;
         let mut ids: Vec<u64, A> = Vec::with_capacity_in(candidates.len(), self.alloc.clone());
         ids.extend(candidates.iter().map(|it| it.id));
-        Ok((Copied { merge, count, index_at, lowest, highest }, ids))
+        Ok((Copied { merge, count, index_at, lowest, highest }, CompactCandidates { ids, newest_unleased }))
     }
 
     // ---- the flip: the one lock, held for it alone ----
@@ -6459,7 +6498,8 @@ impl<A: Allocator + Clone> Plain<A> {
             ignore_dead_pid || !reclaimed.contains(&it.holder)
         };
         let own_segments = &self.manifest.segments;
-        let apply_slice = |m: &mut Manifest, seg: &mut Option<(Segment, FileName)>, candidates: &[u64], orphans: &[(u64, bool)], evict: Option<&EvictPlan<A>>, stats: &mut Sliced| -> bool {
+        let sweep_ignores_new_lease = self.plant() == Plant::SweepIgnoresNewLease;
+        let apply_slice = |m: &mut Manifest, seg: &mut Option<(Segment, FileName)>, candidates: &CompactCandidates<A>, orphans: &[(u64, bool)], evict: Option<&EvictPlan<A>>, stats: &mut Sliced| -> bool {
             // As planned: named, here, of the same generation, and touched by no commit since
             // (a root that reuses a record the plan judged dead: [`Plain::reused`]).
             let planned = |id: &u64| own_segments.iter().find(|it| it.id == *id).map(|it| (it.generation, it.touched));
@@ -6467,6 +6507,13 @@ impl<A: Allocator + Clone> Plain<A> {
             // name's newest value alone, which can be one candidate's whole content or an
             // older row's): that file is the copy, so it is never removed or retired here.
             let copy = seg.as_ref().map(|(it, _)| it.id);
+            // The copy could omit unrooted records from previously unleased rows. A lease
+            // installed since planning must protect those records before a reader uses them.
+            let lease_conflict = !sweep_ignores_new_lease
+                && candidates.newest_unleased.is_some_and(|generation| {
+                    m.leases.iter().any(|lease| lease.since <= generation && is_lease_live(lease))
+                });
+            let candidates = &candidates.ids;
             let evict_conflict = evict.is_some_and(|plan| {
                 let min_lease = m
                     .leases
@@ -6481,7 +6528,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     m.roots.iter().any(|it| it.name == name && (it.generation != exp_gen || it.expires_ns != exp_ns))
                 })
             });
-            if evict_conflict || candidates.iter().any(|id| !m.segments.iter().any(|it| it.id == *id && it.local && Some((it.generation, it.touched)) == planned(id))) {
+            if lease_conflict || evict_conflict || candidates.iter().any(|id| !m.segments.iter().any(|it| it.id == *id && it.local && Some((it.generation, it.touched)) == planned(id))) {
                 if copy.is_some_and(|id| m.segments.iter().any(|it| it.id == id)) {
                     *seg = None;
                 }
@@ -6555,7 +6602,7 @@ impl<A: Allocator + Clone> Plain<A> {
                             current.name == old.name && current.key == old.key && current.expires_ns > now_ns
                         })
                     });
-                let extra_carry = if old_protection_changed {
+                let mut extra_carry = if old_protection_changed {
                     match self.missing_after_root_change(roots, &present_segs) {
                         Ok(list) => list,
                         Err(why) => {
@@ -6589,6 +6636,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     }
                     true
                 };
+                extra_carry.retain(|(id, _)| touch_missing(id));
                 if refused.is_some() {
                 } else if now_ns.saturating_sub(*started_ns) > GRACE_NS / 2 {
                     // A compaction may have retired its segment as named by no generation:
@@ -6688,7 +6736,7 @@ impl<A: Allocator + Clone> Plain<A> {
                         slice.stats.aborted = apply_slice(&mut m, &mut slice.seg, &slice.candidates, &slice.orphans, slice.evict.as_ref(), &mut slice.stats);
                         if !slice.stats.aborted && self.plant() == Plant::UnlinkEarly {
                             let copy = slice.seg.as_ref().map(|(it, _)| it.id);
-                            for id in slice.candidates.iter().copied().filter(|id| copy != Some(*id)) {
+                            for id in slice.candidates.ids.iter().copied().filter(|id| copy != Some(*id)) {
                                 m.retired.retain(|it| !(it.id == id && !it.log));
                                 early.push(self.segment_file(id));
                             }
@@ -8006,14 +8054,14 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
                 let Phase::Unwriting { writing, why, .. } = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
                 if let Why::Compact { candidates, stats } = &*why
-                    && candidates.contains(&writing.seg.id)
+                    && candidates.ids.contains(&writing.seg.id)
                 {
                     let evict = self.evict_for_compact.take();
                     let empty_orphans = self.alloc_vec();
                     let orphans = core::mem::replace(&mut self.orphans_for_compact, empty_orphans);
                     if evict.is_some() || !orphans.is_empty() {
-                        let empty_ids = self.alloc_vec();
-                        self.slice_ready(None, empty_ids, orphans, evict, Sliced { segments: 0, ..*stats }, effects);
+                        let candidates = CompactCandidates::empty(self.alloc.clone());
+                        self.slice_ready(None, candidates, orphans, evict, Sliced { segments: 0, ..*stats }, effects);
                         return Ok(());
                     }
                     // The slice would write back what it read: nothing to do.

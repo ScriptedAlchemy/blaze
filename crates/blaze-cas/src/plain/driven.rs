@@ -844,6 +844,16 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         self.core.index_beside(owner, keys)
     }
 
+    /// Acquires the request's publication pin and adopts the generation the flip names.
+    pub(super) fn pin_publication(&mut self) -> Result<(), StoreError> {
+        let now = self.driver.wall_ns();
+        if self.core.pin_publication(now, &mut self.effects)? {
+            self.run("pinning the store for publication")?;
+            self.core.take_committed().ok_or(StoreError::Unfinished { what: "a publication pin" })??;
+        }
+        Ok(())
+    }
+
     /// [`Plain::release_lease`].
     pub fn release_lease(&mut self) {
         self.core.release_lease()

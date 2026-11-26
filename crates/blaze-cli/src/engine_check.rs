@@ -2187,6 +2187,10 @@ fn check_and_open<R>(
         // and closed its own (`checking`), so every record it put is in a segment, read in place.
         // No origin: the check made every record it read local.
         let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, place.max_store_bytes, root, place.checkout, phases.clock(), err, heap)?;
+        {
+            let _pin = cx.span("store open: pin the run snapshot through publication");
+            opened.lent.pin_publication().map_err(crate::store::PlaceError::Lent)?;
+        }
         let erased = blaze_own::Erased::new(frame);
         let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
         let request_mem = crate::engine_phase_mem::RequestMem::new()?;
