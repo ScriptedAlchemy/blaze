@@ -15,9 +15,10 @@ use blaze_surface::{Namespace, PathKind};
 use blaze_unit_graph::{Implicit, Prelude, StdIs};
 
 use super::entry::{Texts, input};
+use crate::expansion_origins::OriginsView;
 use crate::graph::Sysroot;
 use crate::names::Written;
-use crate::resolve::{CrateInput, Names, resolve_crates};
+use crate::resolve::{At, CrateInput, Names, resolve_crates};
 use crate::task::{PROC_MACRO_DECLS, Serial, proc_macro_decls_key};
 
 /// One macro of each kind, the attribute's fn named by a raw identifier, an ordinary fn between
@@ -75,6 +76,19 @@ fn a_proc_macro_crate_lists_its_macros_in_one_unnamed_static() {
     let at: Vec<usize> = wanted.iter().map(|w| text.find(w.as_str()).unwrap_or_else(|| panic!("`{w}` in {text}"))).collect();
     assert!(at.windows(2).all(|w| w[0] < w[1]), "declaration order: {at:?} in {text}");
     assert_eq!(text.matches(client).count(), 3, "three macros, the plain fn in no list: {text}");
+    // A body check can claim the generated initializer at the first contributing declaration.
+    // No generated token maps back to the declaration's source.
+    let krate = names.krate(1);
+    let (_, At::Expansion(call)) = krate.tables.texts[&key] else {
+        panic!("`_DECLS` must be generated text");
+    };
+    let (first, first_at) = krate.tables.texts.values().find(|(text, _)| text.name == Some("derive_hello")).expect("the first registered macro's declaration");
+    let expansion = krate.expansions[&call].made.expect("the harness call's expansion");
+    let origins = OriginsView::open(expansion.origins.expect("the generated initializer's check anchor")).expect("read the anchor");
+    assert_eq!((origins.text, origins.item), (*first_at, first.item));
+    assert!(origins.implicit);
+    assert_eq!(origins.input_len, 0);
+    assert_eq!(origins.column.len(), 0);
     // Bound to no name, as rustc's def-site `_DECLS`.
     let g = Alloc::global();
     let bound = names.item_at(names.root(1), Namespace::Values, Written { kind: PathKind::Plain, segments: &["_DECLS"] }, g);

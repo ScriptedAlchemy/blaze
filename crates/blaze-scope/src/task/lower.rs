@@ -2463,6 +2463,12 @@ fn children_run(outline: &Outline<'_>, parent: Option<ItemIndex>) -> (usize, usi
     }
 }
 
+struct HarnessExport<'t> {
+    kind: ProcKind,
+    function: &'t str,
+    entry: ItemIndex,
+}
+
 struct Lower<'c, 'o, 's, 't, 'a, W: ?Sized> {
     /// [`LowerCx::entry`], and the file exports no entry of its own.
     entry: bool,
@@ -2470,7 +2476,7 @@ struct Lower<'c, 'o, 's, 't, 'a, W: ?Sized> {
     harness: bool,
     /// Under `harness`: each `#[proc_macro*]` fn at the root, in declaration order, its kind
     /// and its name as written (a raw `r#name` kept raw): the harness's list.
-    harnessed: AVec<'s, (ProcKind, &'t str)>,
+    harnessed: AVec<'s, HarnessExport<'t>>,
     krate: CrateItemKey,
     /// [`LowerCx::tools`].
     tools: &'c [&'c str],
@@ -2673,13 +2679,13 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
     fn proc_macro_harness(&mut self) {
         let mut text = BString::new_in(self.bump);
         text.push_str(HARNESS_HEAD);
-        for &(kind, function) in self.harnessed.iter() {
+        for export in self.harnessed.iter() {
             text.push_str(HARNESS_CLIENT);
-            text.push_str(match kind {
+            text.push_str(match export.kind {
                 ProcKind::Derive | ProcKind::FnLike => "expand1(crate::",
                 ProcKind::Attr => "expand2(crate::",
             });
-            text.push_str(function);
+            text.push_str(export.function);
             text.push_str("), ");
         }
         text.push_str("];\n");
@@ -2701,8 +2707,14 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
             written: self.written,
             depth: self.depth,
             implicit: false,
-            // No written text holds it: its expansion keeps no column (resolve.rs `KeepAs`).
-            place: None,
+            // The first registration's declaration owns the generated initializer's check.
+            // The initializer has no input bytes in that declaration.
+            place: self.harnessed.first().map(|export| crate::expansion_origins::CallInText {
+                text: None,
+                item: export.entry,
+                input_start: 0,
+                input_len: 0,
+            }),
             tokens: crate::nested_input::CallTokens::Text,
             answered: 0,
             on: None,
@@ -2862,7 +2874,7 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                         && let Some(proc) = attrs.proc_macro
                         && let Some(written) = item.name.map(|r| item.text(text, r))
                     {
-                        self.harnessed.push((proc.kind, written));
+                        self.harnessed.push(HarnessExport { kind: proc.kind, function: written, entry: idx });
                     }
                     self.declare(name, Namespace::Values, key, DefKind::Other, vis);
                 }

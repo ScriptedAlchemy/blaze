@@ -4315,11 +4315,14 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     };
     // Its origins: the identity column and the entry the call is at, the item itself
     // (expansion_origins.rs `kept`), so a head it declares is covered by that entry's check.
-    // The harness's text is blaze's own, no slice of any written text: no column, its tokens
-    // read at the module with no marks (front2 item_site.rs `marks_of_column`: `Rewritten` is
-    // `None`), a finding in it filed at its own place.
+    // The harness's text is blaze's own. Its first registration anchors the initializer's
+    // check, and the empty column leaves every generated token without a source origin.
     let origins = match keep {
         KeepAs::Item => crate::expansion_origins::kept(call, src.place, text, src.name, base.edition, bump),
+        KeepAs::Harness if src.place.is_some() => {
+            use blaze_expand::origin_column::{InputShape, OriginColumn};
+            crate::expansion_origins::write(call, src.place, InputShape::Whole, name, true, &OriginColumn::new_in(alloc), bump)
+        }
         KeepAs::Harness => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a proc-macro crate's harness (`_DECLS`)" }),
     };
     let made: &'a ExpansionText<'a> = bump.alloc_val(ExpansionText::new(text, outline(text, base.edition, alloc), origins));
