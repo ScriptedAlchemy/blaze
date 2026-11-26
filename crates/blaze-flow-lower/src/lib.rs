@@ -3883,6 +3883,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// projection's own region: reading one as the other would take a `'static` an impl
     /// demands for a region the caller chose).
     fn lay_positions(&self, t: PTy, slots: &[Region], out: &mut Vec<Option<Region>, A>, e: ExprId) -> Result<bool, Refusal> {
+        self.lay_positions_in(self.facts.region_tys().unwrap_or(self.tys), t, slots, out, e)
+    }
+
+    fn lay_positions_in(&self, tys: PTys<'_>, t: PTy, slots: &[Region], out: &mut Vec<Option<Region>, A>, e: ExprId) -> Result<bool, Refusal> {
+        let node = |t| tys.node(t).or_else(|_| self.refuse(Form::SigColumnType, e));
+        let list = |l| tys.list(l).or_else(|_| self.refuse(Form::SigColumnType, e));
         out.clear();
         let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         // Pass 1: the slots the flow's walk accounts for, and the subtrees it does not.
@@ -3895,16 +3901,16 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             if steps > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
             }
-            match self.head_node(x, e)? {
+            match node(x)? {
                 PNode::Ref(_, i) => {
                     regular += 1;
                     stack.push(i);
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
-                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(self.head_list(l, e)?),
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::FnPtr(l, _) => stack.extend_from_slice(list(l)?),
                 PNode::Adt(k, l) => {
                     regular += self.adt_facts(k, e)?.lifetimes;
-                    stack.extend_from_slice(self.head_list(l, e)?);
+                    stack.extend_from_slice(list(l)?);
                 }
                 PNode::Dynamic(_) => {
                     regular += 1;
@@ -3937,7 +3943,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return Ok(false);
         }
         let arity = crate::one_call::FactsArity { facts: self.facts };
-        let heads = blaze_borrow::Columns::new(self.facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+        let heads = blaze_borrow::Columns::new(tys, &arity, &arity);
         // Pass 2: each position's slot, in the flow's order.
         stack.clear();
         stack.push(t);
@@ -3948,7 +3954,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             if steps > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
             }
-            match self.head_node(x, e)? {
+            match node(x)? {
                 PNode::Ref(_, i) => {
                     let Some(&r) = slots.get(at) else { return Ok(false) };
                     out.push(Some(r));
@@ -3957,7 +3963,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
                 PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
                 PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) | PNode::FnPtr(l, _) => {
-                    for &y in self.head_list(l, e)?.iter().rev() {
+                    for &y in list(l)?.iter().rev() {
                         stack.push(y);
                     }
                 }
@@ -3967,7 +3973,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         out.push(Some(r));
                         at += 1;
                     }
-                    for &y in self.head_list(l, e)?.iter().rev() {
+                    for &y in list(l)?.iter().rev() {
                         stack.push(y);
                     }
                 }
@@ -6641,6 +6647,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         };
         let facts: &'b F = self.facts;
         let Some(param) = param else {
+            let (bindings, regions) = self.body.local_fn_pointers;
+            if let Expr::Local(p) = self.expr(c)?
+                && let Some(&(_, init, slots)) = bindings.iter().find(|(binding, ..)| *binding == p)
+                && let PNode::FnDef(item, _) = self.node(self.expr_ty(init)?, init)?
+                && let At::Place(own) = vs[0].at
+                && vs[0].ty.wrap.is_none()
+            {
+                let Some(slots) = regions.get(slots.range()) else { return self.refuse(Form::Malformed, e) };
+                if let Ok(sig) = facts.sig(item)
+                    && sig.inputs() as usize == args.len()
+                    && self.reified_pointer_signature(sig, slots)
+                {
+                    return self.call_fn_pointer_column(self.tys, vs[0].ty.ty, slots, own, 0, args, dest, dest_ty, e);
+                }
+            }
             if let Expr::Local(p) = self.expr(c)?
                 && let Some(&(_, adt, variant, field)) = self.local_field_source.iter().find(|&&(pat, ..)| pat == p)
                 && let Ok(col) = facts.regions().field(adt, variant, field)
@@ -6827,24 +6848,50 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             self.stats.calls_by_signature += 1;
             return Ok(());
         }
-        // Fn pointer parameter (`fn(&u8) -> &u8`, or `&fn(..)`):
-        let PNode::FnPtr(list, _) = self.head_node(declared, e)? else {
-            return self.refuse(Form::CalleeValueUnknown, e);
-        };
-        let kids = self.head_list(list, e)?.len();
-        if kids != args.len() + 1 {
+        let (own, own_ty) = self.binding_place(self.body.params[param], e)?;
+        if own_ty.wrap.is_some() {
             return self.refuse(Form::CalleeValueUnknown, e);
         }
-        // The parameter's own place: its positions hold the regions of its column slots
-        // (`signature` laid them from the same column), so a FREE lifetime of the callable (`f:
-        // fn() -> &'a u8`: the fn's `'a`, a `Param`) is the origin at the position that holds it
-        // (lane B15: the Reference, "Function pointer types" and "Subtyping and Variance", the
-        // call relates the pointer's free regions; its bound ones, `Late`, are fresh per call).
-        // The column indexes the enclosing fn's parameters. A nested flow indexes its
-        // captures first and can reach the callable through a borrowed environment.
-        let (own, own_ty) = self.binding_place(self.body.params[param], e)?;
-        let mut held: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
-        if own_ty.wrap.is_some() || !self.lay_positions(declared, slots, &mut held, e)? || held.iter().any(Option::is_none) {
+        self.call_fn_pointer_column(facts.region_tys().unwrap_or(self.tys), declared, slots, own, peel_skip, args, dest, dest_ty, e)
+    }
+
+    /// The destination may instantiate the item's late-bound lifetimes. Each occurrence of
+    /// one source variable must take the same destination region, and an item requiring
+    /// `'static` cannot acquire a higher-ranked input from the local annotation.
+    fn reified_pointer_signature(&self, sig: SigLife<'_>, slots: &[Region]) -> bool {
+        if !sig.well_formed() || !sig.bounds().is_empty() || sig.slots().len() != slots.len() {
+            return false;
+        }
+        let mut substitutions = Vec::new_in(self.alloc);
+        for (&source, &target) in sig.slots().iter().zip(slots) {
+            match source {
+                Region::Static if target == Region::Static => {}
+                Region::Param(i) if sig.is_late(i) == Some(true) && matches!(target, Region::Static | Region::Late { binder: 0, .. }) => {
+                    if let Some(&(_, earlier)) = substitutions.iter().find(|&&(p, _)| p == i) {
+                        if target != earlier {
+                            return false;
+                        }
+                    } else {
+                        substitutions.push((i, target));
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// A function pointer's free regions are carried by its place. Instantiate its bound
+    /// regions afresh at each call, for local annotations and parameter signatures alike.
+    fn call_fn_pointer_column(&mut self, table: PTys<'_>, declared: PTy, slots: &[Region], own: Place, peel_skip: u32, args: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<(), Refusal> {
+        let Ok(PNode::FnPtr(inputs_output, _)) = table.node(declared) else {
+            return self.refuse(Form::CalleeValueUnknown, e);
+        };
+        if !table.list(inputs_output).is_ok_and(|kids| kids.len() == args.len() + 1) {
+            return self.refuse(Form::CalleeValueUnknown, e);
+        }
+        let mut held = Vec::new_in(self.alloc);
+        if !self.lay_positions_in(table, declared, slots, &mut held, e)? || held.iter().any(Option::is_none) {
             return self.refuse(Form::CalleeValueUnknown, e);
         }
         let pi = self.info(own);
@@ -6871,7 +6918,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // Each free region of the parameter's type, at its first position. Under the control
         // (`Facts::fn_binders` false) a bound one is taken as free too: one region for every
         // call, the parameter's own.
-        let binders = facts.fn_binders();
+        let binders = self.facts.fn_binders();
         let mut seed: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
         for (j, &r) in regions.iter().enumerate() {
             let free = matches!(r, Region::Param(_)) || (!binders && matches!(r, Region::Late { .. }));

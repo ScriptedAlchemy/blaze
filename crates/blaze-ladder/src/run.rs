@@ -1152,8 +1152,17 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     /// The front end resolves the function's own or inherited caller-tracking attribute.
     /// At a call from an untracked function, the fast emitter records the item-relative
     /// caller site. Placement supplies its current line and column.
-    fn track_caller(&self, instance: Instance, _ground: &mut PortableTys<'_>) -> Option<bool> {
-        self.0.track_caller(instance.item)
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+        let declaration = self.0.track_caller(instance.item);
+        if instance.args == List::EMPTY || declaration == Some(true) {
+            return declaration;
+        }
+        let (item, _) = self.0.resolve(self.1, instance.item, instance.args, ground).ok()?;
+        self.0.track_caller(item)
+    }
+
+    fn declared_track_caller(&self, item: ItemKey) -> Option<bool> {
+        self.0.track_caller(item)
     }
 
     /// The library's `#[lang = "panic_location"]` struct (core/src/panic/location.rs).
@@ -3092,8 +3101,10 @@ fn build_from<P: FrontEnd>(
                                 let Some(c) = c else {
                                     return Err(callee_refusal(&*program, name(), instance.args, Instance { item, args }, crate::callee_shown::CalleeGap::VtableWord, ground.view()));
                                 };
-                                let key = key_of(program, c, Instance { item, args }, &mut ground, &adts)?;
-                                VtableWord::Slot(reached.slot(Instance { item, args }, c, key)?)
+                                let target = crate::fn_item_resolve::vtable_target(&adts, f.item, Instance { item, args }, &mut ground)
+                                    .map_err(|error| fail(VtableFail::Build(error)))?;
+                                let key = key_of(program, c, target, &mut ground, &adts)?;
+                                VtableWord::Slot(reached.slot(target, c, key)?)
                             }
                             VtableTarget::Super(sup) => match tables.refs.iter().position(|r| *r == sup) {
                                 Some(n) => VtableWord::Table(u32::try_from(n).map_err(|_| RunError::TooManyInstances)?),

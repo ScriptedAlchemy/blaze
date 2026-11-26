@@ -85,6 +85,11 @@ pub(crate) fn subject_of(package: &str, version: &str) -> ContentId {
     blaze_ids::Hasher::new(SUBJECT_DOMAIN).update(package.as_bytes()).update(b" ").update(version.as_bytes()).finish()
 }
 
+pub(crate) fn module_of(list: &blaze_world::crate_list::CrateList<'_>, at: usize) -> Option<Name> {
+    use blaze_world::crate_list::CrateGraph;
+    list.proc_macro(at).then(|| Name::new(Kind::MacroModule, subject_of(list.package(at), list.version(at))))
+}
+
 /// The `MacroModule` parts of a graph record `graph_record` made over the graph source
 /// `graph_source`: one per proc-macro unit, by subject, sorted and without repeats. The decoded
 /// graph is scratch, made over `scratch` and dropped here.

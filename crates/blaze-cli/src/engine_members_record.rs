@@ -59,7 +59,7 @@ use crate::engine_body_plan::Unit;
 use crate::engine_heads::Subject;
 
 /// The form's first bytes; the last is its version.
-const MAGIC: [u8; 8] = *b"BLZMEMB\x03";
+const MAGIC: [u8; 8] = *b"BLZMEMB\x04";
 
 /// The setup's strategy (rule 78: a type parameter at one seam, engine_bodies.rs `groups`).
 pub(crate) trait SetupInputs {

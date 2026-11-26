@@ -120,3 +120,25 @@ fn a_body_call_of_a_fn_like_proc_macro_goes_to_the_runner() {
     assert!(said.contains(CALL), "the body's unexpanded call is named by its path:\n{said}");
     println!("named: {NAMED}");
 }
+
+#[test]
+fn a_source_registration_checks_the_signature_of_its_macro() {
+    let home = fresh_home("proc_macro_registration_signature", true);
+    let at = home.join("pm");
+    workspace(&at);
+    let source = at.join("mac/src/lib.rs");
+    let good = std::fs::read_to_string(&source).expect("the macro crate source");
+    let bad = good.replace("-> TokenStream {\n    input", "-> u32 {\n    42");
+    assert_ne!(bad, good);
+    let label = "compiler-generated proc-macro registration of crate `mac`";
+    for (text, wrong_signature) in [(&good, false), (&bad, true), (&good, false)] {
+        std::fs::write(&source, text).expect("set the macro signature");
+        let said = check(&at, &home.join("home"));
+        let error = said.lines().any(|line| line.contains(label) && ["E0271", "E0277", "E0308", "E0631"].iter().any(|code| line.contains(code)));
+        assert_eq!(error, wrong_signature, "the registration requires TokenStream -> TokenStream:\n{said}");
+        assert!(!said.contains("::_DECLS"), "the registration has its own body task:\n{said}");
+        if !wrong_signature {
+            assert!(!said.contains(label), "the valid initializer must check completely:\n{said}");
+        }
+    }
+}

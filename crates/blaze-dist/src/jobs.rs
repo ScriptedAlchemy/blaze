@@ -535,7 +535,10 @@ impl Execution {
         req: &WorkLeaseRequest,
         out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<WorkLeaseAnswer, Refusal> {
-        self.work_call(now, from, req.attempt, out, |work, log| work.lease(now, from, req, log))
+        let executors = 1 + self.helpers.len();
+        self.work_call(now, from, req.attempt, out, |work, log| {
+            work.lease_among(now, from, req, executors, log)
+        })
     }
 
     /// `POST /v1/work/result`.

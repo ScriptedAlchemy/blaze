@@ -496,6 +496,7 @@ pub(crate) fn unit_view(list: &CrateList<'_>, at: usize) -> ViewKey {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Reacher {
     pub(crate) unit: Name,
+    registration: Option<Registration>,
     pub(crate) view: ViewKey,
     pub(crate) test: bool,
     /// What plan time knows of its cfg's `test` (engine_plan_cfg.rs `test_atom`): what a body's
@@ -503,6 +504,13 @@ pub(crate) struct Reacher {
     pub(crate) test_atom: Tri,
     /// Its crate's name in [`Reach`]'s names: (from, past).
     name: (u32, u32),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Registration {
+    root: Name,
+    pub(crate) key: blaze_id::ItemKey,
+    pub(crate) module: Name,
 }
 
 /// A member unit the members record does not hold, or holds as another unit: its reach is not
@@ -607,7 +615,10 @@ impl Reach {
             let from = u32::try_from(names.len()).unwrap_or(u32::MAX);
             names.extend_from_slice(CrateGraph::name(list, at).as_bytes());
             let name = (from, u32::try_from(names.len()).unwrap_or(u32::MAX));
-            units.push((at, Reacher { unit: blaze_drive::key::crate_scope_name(&key), view: unit_view(list, at), test: list.test(at), test_atom: crate::engine_plan_cfg::test_atom(list, at), name }));
+            let registration = crate::macros::module_of(list, at).map(|module| Registration {
+                root: root_file(list, at), key: blaze_scope::task::proc_macro_decls_key(key), module,
+            });
+            units.push((at, Reacher { unit: blaze_drive::key::crate_scope_name(&key), registration, view: unit_view(list, at), test: list.test(at), test_atom: crate::engine_plan_cfg::test_atom(list, at), name }));
         }
         units.sort_by_key(|(at, _)| (list.test(*at), *at));
         units
@@ -719,6 +730,24 @@ impl Reach {
         &rest[..rest.partition_point(|one| one.0 == file)]
     }
 
+    /// A proc-macro crate owns its registration at its root, including an empty root file.
+    /// The item key includes the crate identity, so each unit has precisely its own row.
+    pub(crate) fn registrations(&self, file: Name) -> impl Iterator<Item = TaskRow> + '_ {
+        self.ranks(file).iter().filter_map(move |&(_, rank)| {
+            let registration = self.registration_in(file, rank)?;
+            let name = Name::new(Kind::BodyCheck, registration.key.0);
+            Some(TaskRow { name, base: name, rank, file, at: 0, cut: Cut::HOLDS, rows: 1 })
+        })
+    }
+
+    pub(crate) fn registration_in(&self, file: Name, rank: u32) -> Option<Registration> {
+        self.unit(rank)?.registration.filter(|one| one.root == file)
+    }
+
+    pub(crate) fn registration(&self, row: TaskRow) -> Option<Registration> {
+        self.registration_in(row.file, row.rank).filter(|one| Name::new(Kind::BodyCheck, one.key.0) == row.name)
+    }
+
     /// How many member units are ranked.
     pub(crate) fn len(&self) -> u32 {
         u32::try_from(self.units.len()).unwrap_or(u32::MAX)
@@ -818,6 +847,7 @@ pub(crate) fn task_rows<P: ViewPlan>(tasks: &[Task], outlined: &[Outlined<'_>], 
         let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(&file)) else { continue };
         let Ok(record) = &outlined[at].made else { continue };
         let reached = !reach.ranks(file).is_empty();
+        all.extend(reach.registrations(file));
         let cuts = file_cuts(&outlined[at], g);
         for part in record.parts.iter().filter(|part| matches!((part.name.kind, part.locate), (Kind::BodyCheck, Locate::Source(_)))) {
             let cut = part_cut(cuts.as_ref(), part);

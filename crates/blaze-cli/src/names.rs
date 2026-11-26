@@ -1196,8 +1196,7 @@ impl Names<'_> {
 
     /// The lookup that determines whether this proc-macro crate uses D52's registration.
     pub(crate) fn proc_module_of(&self, at: usize) -> Option<Name> {
-        self.list.proc_macro(at).then(|| Name::new(Kind::MacroModule,
-            crate::macros::subject_of(self.list.package(at), self.list.version(at))))
+        crate::macros::module_of(&self.list, at)
     }
 
     /// The world index of the crate whose `CrateScope` subject is `subject`.

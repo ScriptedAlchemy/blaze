@@ -68,6 +68,25 @@ fn call_elided(f: fn(&u8) -> &u8, x: &u8) -> &u8 {
     f(x)
 }
 
+fn identity(x: &u8) -> &u8 { x }
+
+fn local_bound(x: &u8) -> &u8 {
+    let p: fn(&u8) -> &u8 = identity;
+    p(x)
+}
+
+fn static_only(x: &'static u8) -> &'static u8 { x }
+
+fn local_widened_bad(x: &u8) -> &u8 {
+    let p: fn(&u8) -> &u8 = static_only;
+    p(x)
+}
+
+fn local_static_bad(x: &u8) -> &u8 {
+    let p: fn(&'static u8) -> &'static u8 = identity;
+    p(x)
+}
+
 fn store_static_bad<'a>(s: &mut S<'a>, g: fn(&'static u8)) {
     s.f = g;
 }
@@ -146,15 +165,17 @@ fn b15_fn_pointer_binders() {
     };
 
     // (a), (b)'s clean halves, (c)'s clean half.
-    for n in ["call", "call_elided", "store_any_ok", "grow", "get"] {
+    for n in ["call", "call_elided", "store_any_ok", "grow", "get", "local_bound"] {
         let (clean, _, _, line) = check(n, FactsPlant::None);
         assert!(clean, "{n}: {line}");
     }
     // (b) and (c): rustc refuses each (the module's rules); a finding, never a refusal.
-    for n in ["store_static_bad", "shrink", "get_static"] {
+    for n in ["store_static_bad", "shrink", "get_static", "local_static_bad"] {
         let (_, found, refused, line) = check(n, FactsPlant::None);
         assert!(found && !refused, "{n}: no finding: {line}");
     }
+    let (clean, _, _, line) = check("local_widened_bad", FactsPlant::None);
+    assert!(!clean, "a local annotation widened a static-only item: {line}");
     // (d) CONTROL: a reading that knew no binder makes (a) wrong; (c)'s free lifetime is not
     // the binder's and stays clean.
     for n in ["call", "call_elided"] {

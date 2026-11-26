@@ -2139,7 +2139,8 @@ fn vtable_rows<P: FrontEnd>(
             if !bodied(program, asking.checked(), c) {
                 return Err(refusal());
             }
-            word(reach.declare(program.function(c).key, Instance { item, args }, ground, alloc).map_err(|e| named(e, Instance { item, args }, &*ground))?);
+            let target = crate::fn_item_resolve::vtable_target(adts, f.item, Instance { item, args }, ground).map_err(|error| fail(VtableFail::Build(error)))?;
+            word(reach.declare(program.function(c).key, target, ground, alloc).map_err(|e| named(e, target, &*ground))?);
         }
         if whole {
             let symbol = vtable_symbol(t, ground.view(), alloc).map_err(sym)?;

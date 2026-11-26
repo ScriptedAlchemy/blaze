@@ -425,8 +425,8 @@ impl LegacyPositions for super::rows::Rows<ItemKey, FnHead<'_>, Alloc<'static>> 
     }
 }
 
-impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
-    fn ty(&mut self, view: &View<'_>, t: lf::TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
+impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
+    fn written_ty(&mut self, sink: Option<&mut super::types::RegionSink<'_>>, view: &View<'_>, t: lf::TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
         if let Some((at, out)) = self.async_ret {
             if at == t {
                 return Ok(out);
@@ -443,7 +443,11 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         {
             env.module = block.module;
         }
-        match self.builder.ty(tys, &env, view, t) {
+        let made = match sink {
+            Some(sink) => self.builder.ty_regions(tys, &env, view, t, sink),
+            None => self.builder.ty(tys, &env, view, t),
+        };
+        match made {
             Ok(ty) => Ok(ty),
             Err(why) => {
                 // A type the body's module does not resolve, in a body with a glob import in
@@ -486,6 +490,37 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                 Err(Refused::Form { what: "a written type", range: view.site(range)? })
             }
         }
+    }
+}
+
+impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
+    fn ty(&mut self, view: &View<'_>, t: lf::TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
+        self.written_ty(None, view, t, tys)
+    }
+
+    fn fn_pointer_ty(&mut self, view: &View<'_>, t: lf::TypeId, tys: &mut PortableTys<'_>, regions: &mut blaze_own::AVec<'_, blaze_typeck::regions::Region>) -> Result<PTy, Refused> {
+        use super::types::{RegionSink, SlotKind};
+        use blaze_typeck::regions::Region;
+        let mut sink = RegionSink::new_in(self.mark_alloc);
+        let ty = self.written_ty(Some(&mut sink), view, t, tys)?;
+        if matches!(tys.view().node(ty), Ok(blaze_typeck::PNode::FnPtr(..)))
+            && let ([frag], None) = (sink.frags(), sink.refused())
+        {
+            let start = regions.len();
+            for slot in sink.slots_of(*frag) {
+                match slot.kind {
+                    SlotKind::Static => regions.push(Region::Static),
+                    SlotKind::Late { binder, var } => regions.push(Region::Late { binder, var }),
+                    // A free name needs the enclosing lifetime scope. Leave the column
+                    // unavailable until that scope can supply every slot.
+                    _ => {
+                        regions.truncate(start);
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(ty)
     }
 
     /// `[x; N]`'s length, as a written array type's ([`Builder::array_len`]): a literal, or a

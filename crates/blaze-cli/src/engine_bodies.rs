@@ -218,6 +218,11 @@ pub(crate) fn plan_views<'h, P: ViewPlan>(outlined: &[Outlined<'_>], skipped: &[
             continue;
         }
         let Ok(record) = &one.made else { continue };
+        if let Some(reach) = reach {
+            planned.extend(reach.registrations(one.name).map(|row| Planned {
+                name: row.name, phase: Phase::new(Stage::Bodies, 0), source: row.name.subject, file: row.file,
+            }));
+        }
         // Its bodies' cuts are read only where a unit reaches it (no crate list: none).
         let reached = reach.is_some_and(|reach| !reach.ranks(one.name).is_empty());
         let cuts = match reached {
@@ -356,8 +361,8 @@ pub(crate) struct Ran<'f> {
     /// How many bytes its check grew its stretch's frame by (0 when it was not checked): what
     /// the profile's largest-frame line reads.
     pub(crate) bytes: u64,
-    /// Its entry's chain (work.rs `item_chain`; 0 when it was not found).
-    chain: u64,
+    /// The source entry's chain, when the task checked a body with a file entry.
+    chain: Option<u64>,
     note: Option<&'f BodyNote<'f>>,
     /// Offset and length in the stage's findings, stable across row sorts and phases.
     found: FindingRange,
@@ -369,7 +374,7 @@ pub(crate) struct Ran<'f> {
 
 impl<'f> Ran<'f> {
     fn without_check(name: Name, label: &'f str, file: u32) -> Self {
-        Self { name, label, ns: 0, bytes: 0, chain: 0, note: None, found: FindingRange::default(), file, stretch: InStretch::No }
+        Self { name, label, ns: 0, bytes: 0, chain: None, note: None, found: FindingRange::default(), file, stretch: InStretch::No }
     }
 
     fn said(&self) -> Option<&Said<&'f str>> {
@@ -419,12 +424,7 @@ fn asked_keys<'n, A: core::alloc::Allocator>(records: &'n blaze_ladder::front2::
 /// file's outline as it is when printed (engine_lines.rs, a placed finding; rule 71).
 #[derive(Clone, Copy)]
 struct Place<'f> {
-    chain: u64,
-    /// The entry's file, as its crate's records number it (front2 `Records::file_now`), and the
-    /// entry's range in that text: where a stretch reads the item's text to say its findings'
-    /// ranges as token places ([`found_of`]).
-    file: u32,
-    item: blaze_surface::Range,
+    origin: Origin,
     /// One a body the task checks, in the order of its keys: `None` for the entry's own body
     /// (its findings' ranges are from the item's start); else a body whose text's place in the
     /// file is not known, by its label, so each finding is at the item's start, said so: a body
@@ -432,6 +432,22 @@ struct Place<'f> {
     /// `WRITTEN_UNPLACED`), or a body of a block's module (covered.rs `in_blocks`,
     /// `BLOCK_UNPLACED`). Shorter than the keys: the rest are `None`.
     written: &'f [Option<Unplaced<'f>>],
+}
+
+#[derive(Clone, Copy)]
+enum Origin {
+    Entry { chain: u64, file: u32, item: blaze_surface::Range },
+    ProcRegistration,
+    WasmRegistration(ContentId),
+}
+
+impl Origin {
+    fn chain(self) -> Option<u64> {
+        match self {
+            Self::Entry { chain, .. } => Some(chain),
+            Self::ProcRegistration | Self::WasmRegistration(_) => None,
+        }
+    }
 }
 
 /// A body of a task whose text's place in its file is not known: its label and the words that
@@ -3653,6 +3669,12 @@ impl<'f> BodiesStage<'f> {
                         // (owed: entered again), never another unit's row (rule 3).
                         (_, None) => Decision::Refused { why: NO_CLAIM, took: None },
                     };
+                    if let Some(registration) = reach.registration(row) {
+                        let own = reach.unit(row.rank).expect("the registration has a unit").unit;
+                        let item = blaze_scope::names_cells::NameCell::Item { key: registration.key };
+                        met.push(found.grains.place(CellId { of: own, cell: Cell(item.key()) }, false));
+                        met.push(CellId { of: registration.module, cell: WHOLE });
+                    }
                     let label_of = |took: Option<u32>| took.and_then(|at| found.took.get(at as usize)).map_or("", |one| one.label);
                     let plan_cells = || crate::engine_body_plan::Holders::cells(unit_cells.as_deref().expect("a found plan has its unit cells"), decided, &passed, &met, frame);
                     let ordered = || -> &'f [CellId] {
@@ -3669,6 +3691,13 @@ impl<'f> BodiesStage<'f> {
                             // `views_of`). Counted by its verdict in the plan's line.
                             match found.took.get(took as usize).map(|one| (one, one.item)) {
                                 Some((one, Ok((group, items)))) => {
+                                    if let Origin::WasmRegistration(out) = one.place.origin {
+                                        let mut reads = SVec::new_in(alloc);
+                                        reads.extend(ordered().iter().map(|id| (*id, view.cell(id))));
+                                        buffer.done.push(Outcome::made(task, out, SVec::new_in(alloc), reads, 0, false));
+                                        self.ran.push(Ran::without_check(name, one.label, file));
+                                        continue;
+                                    }
                                     if file as usize >= handles.outlined.len() {
                                         return Err(EngineCheckError::Unplaced { body: name, what: "its file is none of the planner's outlines" }.into());
                                     }
@@ -3743,8 +3772,11 @@ impl<'f> BodiesStage<'f> {
             // (engine_lines.rs `ViewFold`), so a grouped line names and counts the body once.
             let label = match label.is_empty() {
                 true => {
-                    let base = crate::engine_body_plan::row_named(&rows, name).map_or(name, |row| row.base);
-                    planned_label(&mut labels, &cx, handles.root, handles.outlined, file, base, frame)
+                    let row = crate::engine_body_plan::row_named(&rows, name);
+                    match reach.as_ref().zip(row).and_then(|(reach, row)| reach.registration(*row).and_then(|_| reach.label(row.rank))) {
+                        Some(unit) => leak(heap.alloc(), format_args!("compiler-generated proc-macro registration of crate `{}`", unit.name)),
+                        None => planned_label(&mut labels, &cx, handles.root, handles.outlined, file, row.map_or(name, |row| row.base), frame),
+                    }
                 }
                 false => label,
             };
@@ -4959,6 +4991,43 @@ impl<'f> BodiesStage<'f> {
                 // `Reach::view_in`, by each entry's cfg cut); the base where the plan has no
                 // reach (no rows at a view). An entry this unit's `test` cuts is no row of it.
                 let own_rank = plan_reach.and_then(|plan| plan.rank_of(own_name).map(|rank| (plan, rank)));
+                if let Some(registration) = own_rank.and_then(|(plan, rank)| plan.registration_in(file_name, rank)) {
+                    let key = registration.key;
+                    let name = Name::new(Kind::BodyCheck, key.0);
+                    if entered.binary_search(&name).is_ok() {
+                        let label = leak(g, format_args!("compiler-generated proc-macro registration of crate `{}`", CrateGraph::name(&list, member)));
+                        let digest = view.cell(&CellId { of: registration.module, cell: WHOLE });
+                        let table = match procs {
+                            Some(runner) if digest != ABSENT => runner.exports(member, digest),
+                            _ => Ok(None),
+                        };
+                        let mut origin = Origin::ProcRegistration;
+                        let mut costs = Vec::new_in(g);
+                        let mut called = Vec::new_in(g);
+                        let found = match (table, row.registration, &row.blocks) {
+                            (Err(why), _, _) => Err(why),
+                            (Ok(Some(_)), true, _) => Err("its records contain both a compiler-generated initializer and a Wasm registration"),
+                            (Ok(Some(_)), false, _) => {
+                                origin = Origin::WasmRegistration(digest);
+                                Ok((at, &[][..]))
+                            }
+                            (Ok(None), _, Err(why)) => Err(why.words()),
+                            (Ok(None), false, _) => Err("its crate lists neither the source registration initializer nor a verified Wasm registration"),
+                            (Ok(None), true, _) => match NamesSource::text_of(records, key) {
+                                None => Err("its registration initializer's text could not be read"),
+                                Some(initializer) => {
+                                    let keys = frame.alloc_slice_copy(&[key]);
+                                    asked_keys(records, keys, &mut called);
+                                    costs.push(u32::try_from(initializer.text.len()).unwrap_or(u32::MAX).max(MIN_BODY_BYTES));
+                                    Ok((at, &*keys))
+                                }
+                            },
+                        };
+                        let written = frame.alloc_slice_copy(&[Some(Unplaced { label, words: "" })]);
+                        let place = Place { origin, written };
+                        EngineCheckError::push(&mut took, Took { name, label, item: found, place, unit, costs: costs.leak_static(), asked: called.leak_static() }, "the proc-macro crate's registration")?;
+                    }
+                }
                 let file_cuts = match own_rank {
                     Some(_) => plan_cuts.get_or_insert_with(|| crate::engine_plan_cfg::PlanCuts::of(handles.outlined, g)).file(outline_at as usize),
                     None => None,
@@ -5125,7 +5194,7 @@ impl<'f> BodiesStage<'f> {
                                 Ok((at, &*keys.leak_static()))
                             }
                         };
-                        let place = Place { chain: work::item_chain(outline, item, text), file, item: item.range, written: &*labels.leak_static() };
+                        let place = Place { origin: Origin::Entry { chain: work::item_chain(outline, item, text), file, item: item.range }, written: &*labels.leak_static() };
                         let costs: &'f [u32] = costs.leak_static();
                         // Each key as a program calls it, over the records it was found in.
                         let mut called: Vec<blaze_typeck::ItemKey, _> = Vec::new_in(g);
@@ -5282,10 +5351,11 @@ impl<'f> BodiesStage<'f> {
             let findings = self.findings.as_deref().and_then(|all| all.get(start..start + one.found.len as usize))
                 .ok_or(EngineCheckError::Unplaced { body: name, what: "its finding range is outside the Bodies stage's list" })?;
             for found in findings {
-                match found.at {
-                    FoundAt::Start => lines.placed(name, found.rule, 0, 0, &file.path, one.chain, edition, &found.message),
+                match (one.chain, found.at) {
+                    (None, _) => lines.finding(name, found.rule, 0, 0, None, &found.message),
+                    (Some(chain), FoundAt::Start) => lines.placed(name, found.rule, 0, 0, &file.path, chain, edition, &found.message),
                     // Printed at the tokens' bytes in the item as it is when printed (print.rs).
-                    FoundAt::Tokens(at) => lines.placed_tokens(name, found.rule, at, &file.path, one.chain, edition, &found.message),
+                    (Some(chain), FoundAt::Tokens(at)) => lines.placed_tokens(name, found.rule, at, &file.path, chain, edition, &found.message),
                 }
             }
         }
@@ -6100,7 +6170,7 @@ fn join_slices<'a, 'f>(
     reads.sort_unstable_by_key(|read| read.0);
     reads.dedup_by_key(|read| read.0);
     let mut ran: SVec<'a, Ran<'f>> = SVec::with_capacity_in(1, alloc);
-    ran.push(Ran { name, label: entry.label, ns, bytes, chain: entry.place.chain, note: None, found: FindingRange::default(), file: entry.file, stretch });
+    ran.push(Ran { name, label: entry.label, ns, bytes, chain: entry.place.origin.chain(), note: None, found: FindingRange::default(), file: entry.file, stretch });
     if let Some(at) = stopped {
         let (out, _, run_out) = &mut slices[at];
         let Some(mut done) = out.done.pop() else {
@@ -6538,7 +6608,11 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
             let mut scope_required = false;
             // The entry's text as its bodies were checked from (its crate's records, the member at
             // 0), and its crate's edition: what its findings' ranges are said as tokens of.
-            let item_text = opened.records.file_now(0, one.place.file).and_then(|text| text.get(one.place.item.to_usize())).zip(NamesSource::edition_of(opened.records, 0));
+            let source = match one.place.origin {
+                Origin::Entry { file, item, .. } => Some((file, item)),
+                Origin::ProcRegistration | Origin::WasmRegistration(_) => None,
+            };
+            let item_text = source.and_then(|(file, item)| opened.records.file_now(0, file)?.get(item.to_usize())).zip(NamesSource::edition_of(opened.records, 0));
             for (at, item) in one.items.iter().enumerate() {
                 let mut asked = one.task;
                 asked.planned.name = Name::new(Kind::BodyCheck, item.0);
@@ -6814,7 +6888,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
             let package = group.crates.world_at(0).map(|at| group.list.shown_from(at));
             for &(from, at, shape, call, path) in &opened.sources.0.left.borrow()[left_at..] {
                 findings = findings.saturating_add(1);
-                found.push(left_found((from, at, shape, call, path), package, one.place.item, item_text, sc));
+                found.push(left_found((from, at, shape, call, path), package, source.map(|(_, item)| item), item_text, sc));
             }
             // A scope crate opened by need whose record did not open (front_load.rs
             // `StoreLoad::refused`): the records answered this body, and every later one of the
@@ -7153,7 +7227,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         run_out.scratch_most = run_out.scratch_most.max(mem.scratch);
         let ns = clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
         let bytes = frame.used().saturating_sub(at_start) as u64;
-        ran.push(Ran { name, label: one.label, ns, bytes, chain: one.place.chain, note: None, found: FindingRange::default(), file: one.file, stretch });
+        ran.push(Ran { name, label: one.label, ns, bytes, chain: one.place.origin.chain(), note: None, found: FindingRange::default(), file: one.file, stretch });
         out.push(result.done, result.stands);
         shared.record_memory(one, &mem);
         running.end(shared.board.now(clock));
@@ -7247,7 +7321,7 @@ fn syntax_found<'s>(line: &Line<'_>, written: Option<Unplaced<'_>>, item: Option
 fn left_found<'s>(
     (from, at, shape, call, path): crate::names::include_outside::Left<'_>,
     package: Option<&str>,
-    entry: blaze_surface::Range,
+    entry: Option<blaze_surface::Range>,
     item: Option<(&str, blaze_surface::Edition)>,
     scratch: &'s Frame,
 ) -> BodyFinding<'s> {
@@ -7267,8 +7341,8 @@ fn left_found<'s>(
     message.extend_from_slice(cut(path).as_bytes());
     message.push(0x1F);
     message.extend_from_slice(cut(package.unwrap_or("its member's package (not in its crate list)")).as_bytes());
-    let placed = match item {
-        Some((text, edition)) if !from.is_empty() && entry.start <= at && at < entry.end => {
+    let placed = match item.zip(entry) {
+        Some(((text, edition), entry)) if !from.is_empty() && entry.start <= at && at < entry.end => {
             let start = (at - entry.start) as usize;
             blaze_file_items::token_place(text, edition, start..start + call.len()).ok()
         }

@@ -59,7 +59,8 @@
 //! `VERSION` u32; the uncovered count u32, the named count u32 and each label (u32 length,
 //! UTF-8); the written count u32 and each (file u32, entry u32, key tag u8 [0 none, 1 a key]
 //! and 32 key bytes, macro text, label text); the blocks tag u8 (0: count u32 and each owner 32,
-//! key 32, name text; 1: the cause's code u8); nothing after. Two builders of one key write
+//! key 32, name text; 1: the cause's code u8); one byte for the crate's registration initializer.
+//! Two builders of one key write
 //! equal bytes (rule 25): nothing in it is the machine's or a map's order.
 //!
 //! ONE PATH: a row made this command is encoded and then OPENED from its own bytes, as a stored
@@ -81,7 +82,7 @@ use crate::engine_tasks::Outlined;
 use crate::names::expansion_texts::ExpansionTexts;
 
 /// The form's version: in the key's hash and in the bytes.
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 
 /// The key's domain.
 const KEY_DOMAIN: &str = "blaze-cli engine member listing row 1";
@@ -188,6 +189,8 @@ pub(crate) struct Block<'r> {
 /// texts (the row's bytes, read in place); `'a`: its lists.
 #[derive(Debug, PartialEq)]
 pub(crate) struct MemberRow<'r, 'a> {
+    /// The listing contains the crate's compiler-owned proc-macro registration initializer.
+    pub(crate) registration: bool,
     /// Bodies a macro wrote that no entry covers.
     pub(crate) uncovered: u32,
     /// The first of them by label, at most [`MOST_UNCOVERED_NAMED`].
@@ -231,10 +234,17 @@ pub(crate) fn make<'n>(records: &'n Records<'n>, texts: Option<&ExpansionTexts<'
     // The bodies a macro wrote that no entry covers: neither at a file entry nor in a block's
     // module (counted only when the blocks were told apart, as before).
     let mut uncovered = 0u32;
+    let harness = NamesSource::proc_macro(records, 0).filter(|yes| *yes)
+        .and_then(|_| NamesSource::crate_key(records, 0)).map(blaze_scope::task::proc_macro_decls_key);
+    let mut registration = false;
     let mut named: AVec<'n, &'n str> = AVec::new_in(alloc);
     if let Ok(blocks) = blocks.as_ref() {
         for w in written.iter().filter(|w| w.top.is_err()) {
             let key = covered::body_key(records, w.listed.body);
+            if key.is_some() && key == harness {
+                registration = true;
+                continue;
+            }
             if !key.is_some_and(|key| blocks.iter().any(|one| one.key == key)) {
                 uncovered = uncovered.saturating_add(1);
                 if named.len() < MOST_UNCOVERED_NAMED {
@@ -253,7 +263,7 @@ pub(crate) fn make<'n>(records: &'n Records<'n>, texts: Option<&ExpansionTexts<'
         out.extend(blocks.iter().map(|b| Block { owner: b.owner, key: b.key, name: body_name(records, b.listed.body) }));
         out
     });
-    MemberRow { uncovered, named, written: placed, blocks }
+    MemberRow { registration, uncovered, named, written: placed, blocks }
 }
 
 /// `row`'s bytes appended to `into` (module doc, THE FORM).
@@ -301,6 +311,7 @@ pub(crate) fn encode(row: &MemberRow<'_, '_>, into: &mut AVec<'_, u8>) {
             into.push(why.code());
         }
     }
+    into.push(u8::from(row.registration));
 }
 
 /// Why a row's bytes do not open: each names the byte offset it is about.
@@ -448,10 +459,16 @@ pub(crate) fn open<'r, 'a>(bytes: &'r [u8], alloc: Alloc<'a>) -> Result<MemberRo
         }
         found => return Err(RowRefused::Tag { at, what: "blocks", found }),
     };
+    let at = c.at;
+    let registration = match c.u8("registration initializer")? {
+        0 => false,
+        1 => true,
+        found => return Err(RowRefused::Tag { at, what: "registration initializer", found }),
+    };
     if c.at != bytes.len() {
         return Err(RowRefused::Trailing { at: c.at, left: bytes.len() - c.at });
     }
-    Ok(MemberRow { uncovered, named, written, blocks })
+    Ok(MemberRow { registration, uncovered, named, written, blocks })
 }
 
 /// What the Bodies phase did with members' rows, a request's phases summed (the profile's
@@ -502,7 +519,7 @@ mod tests {
         let mut blocks = AVec::new_in(alloc);
         blocks.push(Block { owner: key(1), key: key(2), name: "serialize" });
         blocks.push(Block { owner: key(4), key: key(3), name: "_" });
-        MemberRow { uncovered: 3, named, written, blocks: Ok(blocks) }
+        MemberRow { registration: true, uncovered: 3, named, written, blocks: Ok(blocks) }
     }
 
     fn bytes_of<'a>(row: &MemberRow<'_, '_>, alloc: Alloc<'a>) -> AVec<'a, u8> {
@@ -525,7 +542,7 @@ mod tests {
         assert_eq!(back, row, "the opened row is the row encoded");
         assert_eq!(&bytes_of(&back, g)[..], &bytes[..], "restore equals fresh in bytes");
         for why in InBlocksError::ALL {
-            let refused = MemberRow { uncovered: 0, named: AVec::new_in(g), written: AVec::new_in(g), blocks: Err(why) };
+            let refused = MemberRow { registration: false, uncovered: 0, named: AVec::new_in(g), written: AVec::new_in(g), blocks: Err(why) };
             let bytes = bytes_of(&refused, g);
             assert_eq!(open(&bytes, g).expect("a refused row opens").blocks, Err(why), "the cause is kept");
         }
