@@ -43,7 +43,7 @@ jobs:
         env:
           PACKAGE: ${{ matrix.package }}
         run: |
-          mkdir -p "$RUNNER_TEMP/source-binaries" "$RUNNER_TEMP/source-shelf" "$RUNNER_TEMP/package-evidence"
+          mkdir -p "$RUNNER_TEMP/source-binaries" "$RUNNER_TEMP/source-shelf"
           timeout 45 tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries"
           timeout 45 tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$RUNNER_TEMP/source-shelf"
           timeout 90 python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
