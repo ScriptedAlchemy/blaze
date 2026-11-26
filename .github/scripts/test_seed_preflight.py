@@ -787,6 +787,8 @@ sys.exit(int(os.environ["FAIL_CODE"]) if name == os.environ["FAIL_STAGE"] else 0
         )
         for name, wanted in commands:
             body = action_step(name, workflow)
+            partition = 7
+            body = body.replace("${{ matrix.partition }}", str(partition))
             for code in (0, 23):
                 with self.subTest(name=name, code=code), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -802,6 +804,9 @@ sys.exit(int(os.environ["FAIL_CODE"]) if name == os.environ["FAIL_STAGE"] else 0
                         self.assertEqual(json.loads(trace[0][1]), {
                             "exclude": ["blaze-std"],
                             "evidence": env["RUNNER_TEMP"] + "/workspace-storage-evidence",
+                            "partition": partition,
+                            "partitions": 9,
+                            "build_timeout_s": 2400,
                         })
                     else:
                         self.assertEqual(trace, [wanted])
