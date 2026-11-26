@@ -102,6 +102,28 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaises(observer.Failed):
                     self.inspect()
 
+    def test_a_nonreturning_exit_can_end_at_its_syscall_entry(self) -> None:
+        for name, argument, status in (("exit_group", 0, 0), ("exit", 279, 23), ("exit_group", -1, 255)):
+            with self.subTest(name=name, argument=argument):
+                terminal = f"+++ exited with {status} +++"
+                self.traces[11] = execute("/tmp/blaze") + f"{name}({argument} <unfinished ...>\n{terminal}\n"
+                result = self.inspect()
+                self.assertEqual(result["terminations"], {"10": "+++ exited with 0 +++", "11": terminal})
+                receipt = observer.Receipt(10, (observer.CommandResult("protocol", 11, status, False),))
+                observer.verify_commands(result, receipt, "/tmp/blaze")
+
+    def test_the_oracle_requires_the_matching_immediate_termination_of_an_exit_entry(self) -> None:
+        exit_entry = "exit_group(0 <unfinished ...>\n"
+        terminal = "+++ exited with 0 +++\n"
+        for value in (exit_entry, exit_entry + "+++ exited with 1 +++\n",
+                      exit_entry + "+++ killed by SIGKILL +++\n",
+                      exit_entry + execute("/tmp/blaze") + terminal,
+                      "clone(flags=SIGCHLD <unfinished ...>\n" + exit_entry + terminal,
+                      f"execve({quoted('/usr/bin/cargo')} <unfinished ...>\n" + terminal):
+            with self.subTest(trace=value), self.assertRaises(observer.Failed):
+                self.traces[11] = value
+                self.inspect()
+
     def test_the_oracle_catches_absolute_and_descriptor_compiler_executions(self) -> None:
         for tool in ("cargo", "rustc", "rustdoc", "rustc.real", "cargo.exe"):
             with self.subTest(tool=tool):

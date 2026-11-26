@@ -57,6 +57,7 @@ TERMINAL = re.compile(r"^\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9_+]+(?: \
 SIGNAL = re.compile(r"^--- SIG[A-Z0-9_+]+ .* ---$")
 GROUP_STOP = re.compile(r"^--- stopped by SIG[A-Z0-9_+]+ ---$")
 ABORTED_ENTRY = "???( <unfinished ...>"
+NONRETURNING_EXIT = re.compile(r"^(exit|exit_group)\((-?[0-9]{1,10}) <unfinished \.\.\.>$")
 
 
 class Failed(Exception):
@@ -296,15 +297,20 @@ def parse_trace(pid: int, data: str) -> Trace:
                 raise Failed(f"{where}: resumed syscall has no matching entry")
             line, pending = pending + match[2], None
         elif line.endswith(" <unfinished ...>"):
-            # strace 6.8 syscall_entering_decode emits "???(" when ptrace cannot
-            # read the syscall number on entry. dispatch_event returns without
-            # resuming the syscall. A following terminal record proves the task
-            # died at that stop (for example, during another thread's exit_group).
-            # A known syscall's incomplete exit or any later activity is still an error.
-            if (line == ABORTED_ENTRY and pending is None and switched is None
-                    and number == len(lines) - 1 and TERMINAL.fullmatch(lines[-1])):
-                result.aborted_entry = True
-                continue
+            if pending is None and switched is None and number == len(lines) - 1:
+                terminal = lines[-1]
+                # strace 6.8 dispatch_event leaves the syscall stopped when
+                # syscall_entering_decode cannot read its number on entry.
+                if line == ABORTED_ENTRY and TERMINAL.fullmatch(terminal):
+                    result.aborted_entry = True
+                    continue
+                # Linux exit and exit_group do not return. Their argument's
+                # low eight bits must agree with the immediate terminal record.
+                if match := NONRETURNING_EXIT.fullmatch(line):
+                    status = int(match[2]) & 0xff
+                    if terminal == f"+++ exited with {status} +++":
+                        result.calls.append(f"{match[1]}({match[2]}) = ?")
+                        continue
             if pending is not None or switched is not None or CALL.match(line) is None:
                 raise Failed(f"{where}: invalid unfinished syscall")
             pending = line.removesuffix(" <unfinished ...>")
