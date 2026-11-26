@@ -12,6 +12,7 @@ use core::{fmt, ops::Range};
 
 mod abi;
 mod control;
+pub mod folding;
 mod instruction;
 mod memory;
 #[cfg(test)]
@@ -32,6 +33,8 @@ pub struct LlvmModule<'a> {
     pub symbol: Symbol,
     pub ir: AVec<'a, u8>,
     pub definition_name: Range<usize>,
+    /// The original ABI and the parameter insertion point of a forwardable definition.
+    pub fold_abi: Option<folding::Abi<'a>>,
     /// One entry per LIR ref, including local data, whose identity is inside this module.
     pub references: AVec<'a, Option<Target>>,
     /// Additional targets introduced by lowering, in first-use order (indexed TLS and libc).
@@ -42,6 +45,8 @@ pub struct LlvmModule<'a> {
     /// Placement patches these bytes in the named `blaze_pos_blaze_fn_<hex>_<row>`
     /// data symbol. Data with position fields is opaque to LLVM load folding.
     pub positions: AVec<'a, (u32, blaze_lir::func::DataPositionRec)>,
+    /// The source build's item-relative trap metadata, by its original LIR trap ordinal.
+    pub traps: AVec<'a, blaze_code::record::TrapSource>,
     pub instructions: usize,
 }
 
@@ -205,6 +210,7 @@ pub fn prepare<'a>(
     lower.ir.push_str(&llvm_name);
     let definition_name = start..lower.ir.len();
     own.parameters(&mut lower.ir, abi::Args::Definition);
+    let end_parameters = lower.ir.len();
     abi::attributes(&mut lower.ir, view.head.attrs);
     if !view.features.is_empty() {
         lower.ir.push_str(" \"target-features\"=\"");
@@ -225,6 +231,7 @@ pub fn prepare<'a>(
         )?;
     }
     lower.ir.push_str(" {\n");
+    let end_header = lower.ir.len();
     for (b, _) in (0u32..).zip(view.block_starts) {
         let block = Block(b);
         format_into!(&mut lower.ir, "b{b}:\n");
@@ -261,13 +268,16 @@ pub fn prepare<'a>(
             positions.push((k, p));
         }
     }
+    let fold_abi = folding::Abi::of(&lower, own, end_parameters, end_header);
     Ok(LlvmModule {
         symbol,
         ir: lower.ir.into_bytes(),
         definition_name,
+        fold_abi,
         references: lower.references,
         implicit_references: lower.implicit_references,
         positions,
+        traps: AVec::new_in(alloc),
         calls: lower.calls,
         literals: lower.literals,
         instructions: view.len(),

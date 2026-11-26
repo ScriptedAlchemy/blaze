@@ -57,6 +57,8 @@ use crate::front2::program::lazy::LazyRefusal;
 use super::lay_states::{Lay, lay_and_build, roots_of_instance, unchecked_owner};
 use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, vtable_symbol};
 
+pub mod source_unit;
+
 /// How many bodies were checked for a walk's makes: the claim "a run that finds every record
 /// checks no body" is read here. A plain counter, owned by the maker and read by the test.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -743,7 +745,7 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
     let made_from = state.work.clock.map(|c| c.now());
     state.work.times = MakeTimes::default();
     state.work.reported = None;
-    make_instance_timed(program, typing, state, checks, tabled, name, entry)?;
+    make_instance_timed(program, typing, state, checks, tabled, name, &mut BuildSink::Entry(entry))?;
     // The make's report, when it was large or slow (rule 16): its times split, the checks and
     // pulls (`lower`) being what the builds and emits leave of the whole.
     if let (Some(c), Some(from)) = (state.work.clock, made_from) {
@@ -760,6 +762,23 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
     Ok(())
 }
 
+/// The inputs at the source-codegen boundary. A backend consumes them while the verified
+/// LIR and its resolution tables are alive, and may keep an owned prepared module.
+pub struct Grounded<'a> {
+    pub body: blaze_lir::Verified<'a>,
+    pub names: &'a InstanceNames<'a>,
+    pub declared: &'a [Declared<'a>],
+    pub vtables: &'a [VtableDatum<'a>],
+    pub reads: &'a reads::ReadList,
+    pub traps: &'a [blaze_code::record::TrapSource],
+    pub routines: crate::front2::builtins_shim::Routines<'a>,
+}
+
+enum BuildSink<'s, 'a> {
+    Entry(&'s mut AVec<'a, u8>),
+    Grounded(&'s mut dyn FnMut(Grounded<'_>)),
+}
+
 /// [`make_instance`]'s work, timed by it.
 fn make_instance_timed<P: FrontEnd, T: Typing<P>>(
     program: &mut P,
@@ -768,7 +787,7 @@ fn make_instance_timed<P: FrontEnd, T: Typing<P>>(
     checks: &mut CheckCount,
     tabled: ItemKey,
     name: &[u8],
-    entry: &mut AVec<'_, u8>,
+    sink: &mut BuildSink<'_, '_>,
 ) -> Result<(), RunError> {
     let alloc = state.work.alloc;
     // The bodies this ONE instance reads: its fn's, and each owner its name holds.
@@ -870,7 +889,7 @@ fn make_instance_timed<P: FrontEnd, T: Typing<P>>(
         let MakerState { checked, tables, work, .. } = &mut *state;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
         let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
-        let step = build_one(&*program, &bodies, work, build_i, build_instance, entry);
+        let step = build_one(&*program, &bodies, work, build_i, build_instance, sink);
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
         let step = match step {
             Err(e) if asks_again(&e) && asked < crate::front2::check::MOST_ROUNDS => {
@@ -1421,7 +1440,7 @@ fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: 
 
 /// build_from's step for one instance, from "A closure's `Fn*` method instance" to
 /// `make_entry`, over one borrow of the bodies.
-fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: usize, instance: Instance, entry: &mut AVec<'_, u8>) -> Result<Step, RunError> {
+fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: usize, instance: Instance, sink: &mut BuildSink<'_, '_>) -> Result<Step, RunError> {
     let function = program.function(i);
     let name = || function.named();
     // A ctor's row has no body: its own instance is built as a fn, and a `Fn*` shim of it
@@ -1632,14 +1651,22 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     // The read list: every question this build asked, named for good now that the build is
     // done (code_reads.rs `ReadLog::seal`); a question answered two ways is refused (rule 21).
     let read_list = work.reads.seal(&mut work.ground, work.alloc).map_err(|error| RunError::CodeRecord { function: name(), error: CodeRecordError::Reads(error) })?;
-    let emitted_from = work.clock.map(|c| c.now());
-    let made = make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
-        .map_err(|error| RunError::CodeRecord { function: name(), error })?;
-    if let (Some(c), Some(from)) = (work.clock, emitted_from) {
-        work.times.emit += c.now().saturating_sub(from);
-        work.times.last = Some(MadeSizes::of(name(), built, &made));
+    match sink {
+        BuildSink::Entry(entry) => {
+            let emitted_from = work.clock.map(|c| c.now());
+            let made = make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
+                .map_err(|error| RunError::CodeRecord { function: name(), error })?;
+            if let (Some(c), Some(from)) = (work.clock, emitted_from) {
+                work.times.emit += c.now().saturating_sub(from);
+                work.times.last = Some(MadeSizes::of(name(), built, &made));
+            }
+            entry.extend_from_slice(&made);
+        }
+        BuildSink::Grounded(prepare) => prepare(Grounded {
+            body: built.func.verified(), names: &names, declared: &declared, vtables: &carried,
+            reads: &read_list, traps: &built.traps, routines,
+        }),
     }
-    entry.extend_from_slice(&made);
     // The coroutine's part leaves the stash with its entry made, not before.
     if let Some((at, part)) = from_coroutine {
         work.stash[at].parts[part] = None;
@@ -2215,6 +2242,25 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         let first = errors.first()?;
         let first = std::format!("{first}").into_boxed_str();
         Some(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, first, kept: errors.len(), dropped: log.dropped() })))
+    }
+
+    /// Prepare one reached instance at the same verified, resolved LIR stage as local codegen.
+    pub fn prepare<R>(&mut self, _grant: &G, tabled: ItemKey, encoded: &[u8], mut prepare: impl FnMut(Grounded<'_>) -> R) -> Result<R, RunError> {
+        if let Some(why) = self.void(tabled) {
+            return Err(why);
+        }
+        self.construct(tabled)?;
+        let Some((program, state)) = self.made.as_mut() else {
+            return Err(RunError::OneBody { key: tabled, why: "the maker could not construct the program for backend preparation" });
+        };
+        let mut prepared = None;
+        let made = make_instance_timed(program, &mut self.typing, state, &mut self.checks, tabled, encoded,
+            &mut BuildSink::Grounded(&mut |body| { prepared = Some(prepare(body)); }));
+        if let Some(why) = self.void(tabled) {
+            return Err(why);
+        }
+        made?;
+        prepared.ok_or(RunError::OneBody { key: tabled, why: "backend preparation completed without a grounded body" })
     }
 
     /// The program made on the first call, then the one instance.

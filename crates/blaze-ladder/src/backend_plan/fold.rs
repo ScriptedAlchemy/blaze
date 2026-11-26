@@ -1,7 +1,7 @@
 //! Constant-masked IR grouping. Members retain their original symbols through their thunks.
 
 use super::*;
-use blaze_own::{CollectIn, FixedVec};
+use blaze_own::{BTreeMap, CollectIn, FixedVec, Vec};
 
 const MASK_DOMAIN: &str = "blaze-ladder fold mask 1";
 const BODY_DOMAIN: &str = "blaze-ladder folded body 1";
@@ -238,7 +238,7 @@ pub(super) fn groups<'a>(
 ) -> Result<AVec<'a, Fold<'a>>, PlanError> {
     let mut buckets = BTreeMap::new_in(alloc);
     for (&symbol, &function) in functions {
-        let Backend::Foldable { recipe, mask } = function.backend else { continue };
+        let Some((recipe, mask)) = function.backend.masked() else { continue };
         let mut shape = Hasher::new(MASK_DOMAIN);
         shape.id(&recipe.settings).id(&mask.shape).update(&mask.instructions.to_le_bytes());
         count(&mut shape, function.references.len());

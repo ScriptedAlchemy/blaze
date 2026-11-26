@@ -10,6 +10,8 @@ use blaze_own::{ABTreeMap, AVec, Alloc, BTreeMap, BTreeSet, Vec};
 use crate::code_records::{CodeKey, StoreError};
 
 mod fold;
+pub mod execute;
+pub mod native;
 pub use fold::{Constant, Fold, Mask, Member, Parameter};
 
 const UNIT_DOMAIN: &str = "blaze-ladder backend unit 1";
@@ -63,9 +65,8 @@ pub struct Summary<'a> {
 pub struct Release<'a> {
     pub recipe: Recipe<'a>,
     pub summary: Summary<'a>,
-    /// Canonical encoding of the chosen transformations, including specialized arguments,
-    /// inferred callee attributes, discarded parameters and the mapping of places into the
-    /// merged import table. The emitter must consume these same decisions.
+    /// Transformations chosen before emission, if any. A pipeline that delegates all
+    /// transformations to LLVM needs only its pipeline identity and the ordered imports.
     pub decisions: &'a [u8],
     /// The LLVM decider's full ordered closure, with each imported instance listed once.
     pub imports: &'a [Symbol],
@@ -76,6 +77,26 @@ pub enum Backend<'a> {
     Standalone,
     Foldable { recipe: Recipe<'a>, mask: Mask<'a> },
     Release(Release<'a>),
+    /// Native LLVM may generalize a profitable group of its prepared modules. Other modules
+    /// follow their original release decisions.
+    ReleaseFold { release: Release<'a>, mask: Mask<'a> },
+}
+
+impl<'a> Backend<'a> {
+    fn release(self) -> Option<Release<'a>> {
+        match self {
+            Self::Release(release) | Self::ReleaseFold { release, .. } => Some(release),
+            _ => None,
+        }
+    }
+
+    fn masked(self) -> Option<(Recipe<'a>, Mask<'a>)> {
+        match self {
+            Self::Foldable { recipe, mask } => Some((recipe, mask)),
+            Self::ReleaseFold { release, mask } => Some((release.recipe, mask)),
+            _ => None,
+        }
+    }
 }
 
 pub struct Function<'a> {
@@ -175,6 +196,22 @@ pub enum PlanError {
     RepeatedGrant(GrantName),
 }
 
+impl core::fmt::Display for PlanError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RepeatedFunction(s) => write!(f, "two prepared functions define {s}"),
+            Self::RepeatedStatic(s) => write!(f, "two static records define {s}"),
+            Self::MissingRoot(s) => write!(f, "root {s} has no prepared definition"),
+            Self::SummaryConflict(key) => write!(f, "two different import summaries have key {key}"),
+            Self::InvalidImport { root, import } => write!(f, "{root} names an absent, repeated, or recursive import {import}"),
+            Self::InvalidPlace { function, place } => write!(f, "folded operand {place} exceeds the reference table for {function}"),
+            Self::GrantCollision(key) => write!(f, "different native tasks have grant {}", key.0),
+            Self::UnknownGrant(key) => write!(f, "grant {} is outside this backend plan", key.0),
+            Self::RepeatedGrant(key) => write!(f, "the lease repeats grant {}", key.0),
+        }
+    }
+}
+
 fn count(hash: &mut Hasher, len: usize) {
     hash.update(&len.widen_to::<u64>().to_le_bytes());
 }
@@ -212,7 +249,7 @@ impl<'a> WorkSet<'a> {
             if functions.insert(function.symbol, function).is_some() {
                 return Err(PlanError::RepeatedFunction(function.symbol));
             }
-            if let Backend::Release(release) = function.backend {
+            if let Some(release) = function.backend.release() {
                 let summary = release.summary;
                 if summaries
                     .insert(summary.key, summary.bytes)
@@ -233,7 +270,7 @@ impl<'a> WorkSet<'a> {
         for (&symbol, function) in &functions {
             hash.update(&symbol.0).id(&function.template.0).id(&function.reads);
             references(&mut hash, function.references);
-            if let Backend::Release(release) = function.backend {
+            if let Some(release) = function.backend.release() {
                 hash.update(&[1]).id(&release.summary.key);
             } else {
                 hash.update(&[0]);

@@ -509,7 +509,7 @@ fn unit_digest_of(
 
 /// The final unit walks the roots of this product. A library exporting the same functions as
 /// an executable, or exporting a symbol under another C name, requests a different product.
-fn product_digest(roots: &ProductRoots<'_>, exports: &[blaze_export::CExport<'_>]) -> Digest {
+pub(crate) fn product_digest(roots: &ProductRoots<'_>, exports: &[blaze_export::CExport<'_>]) -> Digest {
     use bstd::int::Int;
     let mut hash = blaze_sha256::Sha256::new();
     hash.update(b"blaze/distributed-export-product/1\0");
@@ -647,7 +647,7 @@ fn json_digests(digests: &[Digest], alloc: WireAlloc) -> WireString {
 
 /// Appends one JSONL unit report row to `BLAZE_DIST_REPORT`.
 #[expect(clippy::too_many_arguments, reason = "explicit report row fields, zero hidden globals")]
-fn append_report_row(
+pub(crate) fn append_report_row(
     report_path: Option<&str>,
     unit_name: &str,
     unit: &Unit,
@@ -704,6 +704,7 @@ pub(crate) enum DistExportOutcome {
 }
 
 mod fingerprint;
+pub(crate) mod prepared;
 use fingerprint::matches_output_fingerprint;
 pub(crate) use fingerprint::write_output_fingerprint;
 

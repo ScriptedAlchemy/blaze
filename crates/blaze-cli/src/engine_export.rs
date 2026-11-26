@@ -54,6 +54,8 @@ use crate::phases::Phases;
 use crate::run_ids::NotRunnable;
 use crate::{CliError, program, run_names, run_package};
 
+mod release;
+
 /// Virtual reservation for the export scratch frame (walk tables, materialized records, data
 /// words, native image layout, and the emitted executable bytes). Untouched pages cost zero RSS.
 const EXPORT_FRAME_RESERVE: usize = 2 << 30;
@@ -544,7 +546,7 @@ fn push_datum<'a>(
 
 /// Checks whether a `CodeView` references any Rust thread-local symbol (`Space::Tls`,
 /// `tls_getter_symbol`, or `tls_desc_symbol`).
-fn code_touches_tls(view: &CodeView<'_>, getter: CodeSymbol, descriptor: CodeSymbol) -> bool {
+pub(crate) fn code_touches_tls(view: &CodeView<'_>, getter: CodeSymbol, descriptor: CodeSymbol) -> bool {
     for i in 0..view.targets() {
         let t = view.target(i);
         match t.space {
@@ -674,9 +676,28 @@ fn export_program<'f>(
     let mut maker = Maker::of_start(names, roots.maker_entry(), roots.maker_start(), ByKind::new(typed.over(ids)), &builder, heap.alloc());
     let mut codes = HomeCodeStore::new(lent);
 
-    // Optional distributed compilation pass over workspace crates (D11).
+    let (mut compiled, mut cached, mut unkeyed, mut stubs) = (0usize, 0usize, 0usize, 0usize);
     let mut dist_fp: Option<blaze_wire::Digest> = None;
-    if let Some(dist_cfg) = dist {
+    let mut image = None;
+    let mut up_to_date = false;
+    if release {
+        let compiler = blaze_ladder::backend_plan::native::render::Compiler::new(builder.isa);
+        let request = crate::engine_dist::prepared::Request {
+            names, closure: &closure, builder: &builder, product: crate::engine_dist::product_digest(&roots, &native_export.exports),
+            native_image: native_export.key.0, compiler: compiler.identity(&builder), checked: standing.root,
+            program: picked.bin, destination: output_path, heap,
+        };
+        let (outcome, fp) = release::build(&request, compiler, &roots, &ids, &mut maker, &mut codes, dist, frame, alloc)?;
+        dist_fp = fp;
+        match outcome {
+            crate::engine_dist::prepared::ResultImage::UpToDate => up_to_date = true,
+            crate::engine_dist::prepared::ResultImage::Ready { image: placed, compiled: made, cached: hits } => {
+                image = Some(placed);
+                compiled = made;
+                cached = hits;
+            }
+        }
+    } else if let Some(dist_cfg) = dist {
         let mut dist_store = crate::engine_dist::DistStore::new(&mut codes, dist_cfg.wire_alloc);
         let (outcome, fp) = crate::engine_dist::run_distributed(
             dist_cfg,
@@ -699,52 +720,38 @@ fn export_program<'f>(
         .map_err(|error| box_err(ExportCliError::Dist(error), heap))?;
         drop(dist_store);
         match outcome {
-            crate::engine_dist::DistExportOutcome::NoOp => {
-                end_procs(cx, &maker_procs, standing.err, "export")?;
-                return Ok(ExportSummary {
-                    output: output_path,
-                    exported: Exported {
-                        platform,
-                        functions: 0,
-                        folded: 0,
-                        fast: 0,
-                        optimized: 0,
-                        made: 0,
-                        imports: 0,
-                        len: 0,
-                        identity: [0u8; 16],
-                        profile: None,
-                        panics: blaze_export::Panics::Abort { functions: 0 },
-                    },
-                    data_count: 0,
-                    tls_count: 0,
-                    compiled: 0,
-                    cached: 0,
-                    unkeyed: 0,
-                    stubs: 0,
-                });
-            }
+            crate::engine_dist::DistExportOutcome::NoOp => up_to_date = true,
             crate::engine_dist::DistExportOutcome::Completed { .. } => {
                 dist_fp = Some(fp);
             }
             crate::engine_dist::DistExportOutcome::FallbackLocal => {}
         }
     }
+    if up_to_date {
+        end_procs(cx, &maker_procs, standing.err, "export")?;
+        return Ok(ExportSummary {
+            output: output_path,
+            exported: Exported { platform, functions: 0, folded: 0, fast: 0, optimized: 0, made: 0,
+                imports: 0, len: 0, identity: [0u8; 16], profile: None, panics: blaze_export::Panics::Abort { functions: 0 } },
+            data_count: 0, tls_count: 0, compiled: 0, cached: 0, unkeyed: 0, stubs: 0,
+        });
+    }
 
-    // Whole-program reachability closure from all roots.
+    // The release holder has already returned every reached record for placement.
     let mut walk = Walk::new_in(alloc);
-    for (i, symbol) in roots.symbols().iter().enumerate() {
-        walk.root::<RunError>(roots.row(i), MOST_WALKED).map_err(|why| {
-            box_err(
-                ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                heap,
-            )
-        })?;
+    if image.is_none() {
+        for (i, symbol) in roots.symbols().iter().enumerate() {
+            walk.root::<RunError>(roots.row(i), MOST_WALKED).map_err(|why| {
+                box_err(
+                    ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                    heap,
+                )
+            })?;
+        }
     }
 
     let mut scratch = Scratch::new_in(alloc);
     let mut outcomes: AVec<'_, RowOutcome<'_>> = Vec::new_in(alloc);
-    let (mut compiled, mut cached, mut unkeyed, mut stubs) = (0usize, 0usize, 0usize, 0usize);
     let root_count = roots.len();
 
     let mut next_row = 0usize;
@@ -798,7 +805,7 @@ fn export_program<'f>(
     let tls_getter_sym = blaze_ladder::symbols::tls_getter_symbol();
     let tls_desc_sym = blaze_ladder::symbols::tls_desc_symbol();
     let tls_ender_sym = blaze_ladder::tls_index::tls_ender_symbol();
-    let mut has_tls = false;
+    let mut has_tls = image.as_ref().is_some_and(|native| native.has_tls);
     for (row, outcome) in outcomes.iter().enumerate() {
         match walk.kind(row) {
             RowKind::ThreadLocal => {
@@ -855,6 +862,9 @@ fn export_program<'f>(
     let mut seen_data: AVec<'_, Target> = Vec::new_in(alloc);
     let mut tls_count = 0usize;
 
+    if let Some(native) = &image {
+        release::place(native, names, &codes, frame, export_bump, heap, &mut functions, &mut data, &mut seen_data, &mut tls_count)?;
+    }
     for (row, outcome) in outcomes.iter().enumerate() {
         let symbol = walk.symbol(row);
         if let RowOutcome::UnbuiltStub(stub_bytes) = outcome {

@@ -280,6 +280,11 @@ pub enum TrapKind {
 }
 
 impl TrapKind {
+    /// Its byte in a code record's trap table.
+    pub const fn byte(self) -> u8 {
+        self as u8
+    }
+
     const ALL: [TrapKind; 10] = [
         TrapKind::MatchNoArm,
         TrapKind::LetElse,
@@ -805,7 +810,7 @@ impl<'a> Sealed<'a> {
         }
         for t in r.traps.iter() {
             put32(out, t.at);
-            out.push(t.kind as u8);
+            out.push(t.kind.byte());
             out.push(t.held.tag());
             out.push(match t.held {
                 Held::Reg(reg) => reg,

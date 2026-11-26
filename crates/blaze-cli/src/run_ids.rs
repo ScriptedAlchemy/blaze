@@ -151,7 +151,7 @@ pub(crate) fn fact_of(name: Name) -> [u8; 32] {
 }
 
 /// The checker key's crate prefix: its first 8 bytes as front2 keys.rs `checker_of` made it.
-fn prefix_of(item: ItemKey) -> [u8; 8] {
+pub(crate) fn prefix_of(item: ItemKey) -> [u8; 8] {
     let b = item.0.to_be_bytes();
     [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]
 }
