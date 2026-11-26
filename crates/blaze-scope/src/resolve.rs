@@ -175,7 +175,10 @@ pub trait SourceTexts<'a> {
 
     /// A compiler builtin's environment read, shared by item and body expansion. Only
     /// caller-provided inputs are observed here; Cargo and script facts have their own reads.
-    fn read_env(&self, krate: usize, name: &str) -> Result<Option<&str>, HostError> {
+    fn read_env<'s>(&'s self, krate: usize, name: &str) -> Result<Option<&'s str>, HostError>
+    where
+        'a: 's,
+    {
         let refused = HostError { ask: HostAsk::Env, why: HostWhy::Refused };
         let env = self.crate_env(krate).ok_or(refused)?;
         let value = env.get(name).map_err(|_| refused)?;
