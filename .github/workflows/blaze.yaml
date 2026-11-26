@@ -59,6 +59,17 @@ jobs:
           input=$(timeout 10 jq -nc --arg prefix "$prefix" '{command:"fetch",target:"aarch64-unknown-linux-gnu",dir:$prefix}')
           timeout -k 15 600 python3 .github/scripts/llvm.py "$input"
           echo "LLVM_SYS_231_PREFIX=$prefix" >> "$GITHUB_ENV"
+      - name: Check the source CLI in both feature configurations
+        id: source_check
+        run: |
+          evidence="$RUNNER_TEMP/plan-evidence"
+          mkdir -p "$evidence"
+          git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
+          tc="$(cat pins/toolchain)"
+          timeout -k 30 1400 cargo +"$tc" check --locked --release -p blaze-cli --bin blaze \
+            2>&1 | tee "$evidence/check-default.log"
+          timeout -k 30 1400 cargo +"$tc" check --locked --release -p blaze-cli --bin blaze --features llvm \
+            2>&1 | tee "$evidence/check-llvm.log"
       - name: Build and seal the exact source binaries
         run: |
           evidence="$RUNNER_TEMP/plan-evidence"
@@ -95,7 +106,7 @@ jobs:
           timeout -k 20 1200 cargo +"$(cat pins/toolchain)" run --release --locked -p scripts --bin llvm_abi -- "$input" \
             2>&1 | tee "$RUNNER_TEMP/plan-evidence/llvm-generator.log"
       - name: Verify focused compiler regressions
-        if: ${{ !cancelled() && env.LLVM_SYS_231_PREFIX != '' }}
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
         run: |
           evidence="$RUNNER_TEMP/plan-evidence"
           tc="$(cat pins/toolchain)"
@@ -109,14 +120,14 @@ jobs:
           timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-ladder --test front2_body_const_paths \
             a_gat_const_arg_on_a_type_param_self_or_qualified_type_lowers -- --exact --nocapture \
             2>&1 | tee "$evidence/gat-const-paths.log" || status=$?
-          for name in signature_regions_come_from_the_head_record a_frozen_head_carries_the_store_s_side_tables; do
+          for name in signature_regions_come_from_the_head_record a_frozen_head_carries_the_store_s_side_tables a_store_filed_from_frozen_heads_alone_lowers_nothing; do
             timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-ladder --lib "$name" \
               2>&1 | tee "$evidence/$name.log" || status=$?
           done
           grep -Fq 'an_absent_member_is_observed_before_and_after_importing_its_trait ... ok' "$evidence/member-observation.log" || status=1
           grep -Fq 'bounds_through_front2 ... ok' "$evidence/gat-bounds.log" || status=1
           grep -Fq 'a_gat_const_arg_on_a_type_param_self_or_qualified_type_lowers ... ok' "$evidence/gat-const-paths.log" || status=1
-          for name in signature_regions_come_from_the_head_record a_frozen_head_carries_the_store_s_side_tables; do
+          for name in signature_regions_come_from_the_head_record a_frozen_head_carries_the_store_s_side_tables a_store_filed_from_frozen_heads_alone_lowers_nothing; do
             grep -Fq "$name ... ok" "$evidence/$name.log" || status=1
           done
           exit "$status"
