@@ -3074,6 +3074,9 @@ impl BodyIds for &RunIds<'_> {
     fn crate_fact(&self, item: ItemKey) -> Option<Read> {
         (**self).crate_fact(item)
     }
+    fn instance_fact(&self, item: ItemKey) -> Option<Read> {
+        (**self).instance_fact(item)
+    }
     fn class(&self, item: ItemKey) -> CodeClass {
         (**self).class(item)
     }
