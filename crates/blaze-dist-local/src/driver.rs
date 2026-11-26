@@ -18,7 +18,7 @@ use blaze_dist::holder::{
     BatchCompiler, Call, Compiled, Effect, Event, Holder, Plan, Reply, StopWhy,
 };
 use blaze_own::{BTreeSet, Vec, format_in};
-use blaze_wire::{JobContent, WireAlloc, WireString, WireVec, WorkName};
+use blaze_wire::{JobContent, WireAlloc, WireString, WireVec, WorkName, WorkersEventsRequest};
 
 use crate::Error;
 use crate::client::Client;
@@ -264,15 +264,29 @@ fn send(
     config: &DriverConfig,
 ) -> Result<Reply, Error> {
     let alloc = client.alloc();
-    // Capture only after Holder produced its actual Call::Result. This driver thread is
-    // the heartbeat sender too, so an intentional gate cannot silently consume a fencing
-    // reply and discard the result before it reaches Client and the real coordinator.
+    // Capture only after Holder produced its actual Call::Result. An opt-in fault gate
+    // sends ordinary heartbeats here until release or until its process stops.
     let mut outgoing = None;
     let captured = if *pending != Some(id)
         && let Some(gate) = &config.result_gate
+        && let Call::Result(result) = call
     {
         let request = command(content, executor, call, alloc);
-        let captured = gate.hold(&request)?;
+        let captured = gate.hold(&request, || {
+            let heartbeat = Command::WorkerEvents(WorkerEvents {
+                content,
+                executor: WireString::from_str_in(executor, alloc),
+                request: WorkersEventsRequest {
+                    execution: result.lease.execution,
+                    attempt: result.lease.attempt,
+                    events: Vec::new_in(alloc),
+                },
+            });
+            match client.call(heartbeat)? {
+                Answer::WorkerEvents(answer) if answer.verdict == 0 => Ok(()),
+                answer => Err(Error::Protocol(format_in!(alloc, "the held result's heartbeat answered {answer:?}"))),
+            }
+        })?;
         outgoing = Some(request);
         captured
     } else {

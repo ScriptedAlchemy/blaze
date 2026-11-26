@@ -256,6 +256,10 @@ class Run:
                 return answer
             ended = [p.pid for p in processes if p.poll() is not None]
             if ended:
+                # A child can exit after the snapshot that missed its final event.
+                answer = predicate()
+                if answer:
+                    return answer
                 raise Failed(f"{what}: children {ended} exited before the required evidence; see {self.root / 'logs'}")
             time.sleep(0.02)
         raise Failed(f"{what}: timed out; see {self.root / 'logs'}")
@@ -489,13 +493,16 @@ class Run:
                     shutil.copyfile(path, target)
 
     def build(self, home: str, dist: bool = True, wait: bool = True, project: Path | None = None,
-              *, result_gate: Path | None = None, result_unit: str | None = None, **extra):
+              *, result_gate: Path | None = None, result_unit: str | None = None,
+              keep_gate_lease: bool = False, **extra):
         self.prepare_modules(home, project or self.project)
         if result_gate is not None:
             check(dist, "a result gate belongs to a distributed export")
             if result_gate not in self.result_gates:
                 result_gate.mkdir(parents=True, exist_ok=False)
                 self.result_gates.append(result_gate)
+                if keep_gate_lease:
+                    (result_gate / "keepalive").touch()
             extra["BLAZE_DIST_TEST_RESULT_GATE"] = str(result_gate.resolve())
             if result_unit is not None:
                 extra["BLAZE_DIST_TEST_RESULT_UNIT"] = result_unit
@@ -574,7 +581,7 @@ class Run:
         check(not evidence.accepted(self.events()[after:], grant), "the exact captured result remains uncommitted at its gate")
         return grant
 
-    def release_after_peer_result(self, gate: Path, a: subprocess.Popen, b: subprocess.Popen, after: int) -> None:
+    def peer_result_while_held(self, gate: Path, a: subprocess.Popen, b: subprocess.Popen, after: int) -> dict:
         """Keep a real lead batch open until a second holder commits disjoint work."""
         def captured():
             events = self.events()[after:]
@@ -587,10 +594,22 @@ class Run:
         peer = b if grant["pid"] == a.pid else a
         self.until("the peer submits its own mathy result before the first worker releases",
                    lambda: evidence.peer_result_before_release(self.events()[after:], grant, peer.pid), [a, b])
+        return grant
+
+    def release_after_peer_result(self, gate: Path, a: subprocess.Popen, b: subprocess.Popen, after: int) -> None:
+        grant = self.peer_result_while_held(gate, a, b, after)
         (gate / "release").touch()
         self.until("the released mathy result is accepted by Client and the coordinator",
                    lambda: evidence.gate_answer(gate, grant, refused=False)
                    and evidence.accepted(self.events()[after:], grant), [a, b])
+
+    def fault_pair(self, gate: Path, after: int):
+        a, a_log = self.build("a", wait=False, result_gate=gate, result_unit="mathy", keep_gate_lease=True)
+        b, b_log = self.build("b", wait=False, result_gate=gate, result_unit="mathy", keep_gate_lease=True)
+        grant = self.peer_result_while_held(gate, a, b, after)
+        a_build, b_build = ("a", a, a_log), ("b", b, b_log)
+        victim, peer = (a_build, b_build) if grant["pid"] == a.pid else (b_build, a_build)
+        return grant, victim, peer
 
 
 def file_hash(path: Path) -> str:
@@ -599,7 +618,10 @@ def file_hash(path: Path) -> str:
 
 
 def stopped_status(pid: int) -> bool:
-    child, status = os.waitpid(pid, os.WUNTRACED | os.WNOHANG)
+    try:
+        child, status = os.waitpid(pid, os.WUNTRACED | os.WNOHANG)
+    except ChildProcessError as why:
+        raise Failed(f"daemon {pid} exited before acknowledging SIGSTOP") from why
     if child and not os.WIFSTOPPED(status):
         raise Failed(f"daemon {pid} exited while injecting SIGSTOP: status {status}")
     return bool(child)
@@ -649,25 +671,21 @@ def faults(run: Run, edited: Path) -> None:
     check(run.behaviour("a") == wanted, "the released valid-result artifact equals solo in bytes and behavior")
     edit(edited, 'format!("9 gated valid:{sum}', 'format!("9:{sum}')
 
-    # Freeze a known uncommitted grant before killing: a completed unit/report is no evidence
-    # that the victim had outstanding work. Give the survivor the exact same edited input.
+    # Establish both holders in the same attempt before killing the lead with uncommitted work.
     edit(edited, 'format!("7:{sum}', 'format!("7 lost:{sum}')
     wanted = control(run)
     lost_gate = run.root / "gates" / "killed-result"
     mark = len(run.events())
-    lost, lost_log = run.build("a", wait=False, result_gate=lost_gate, result_unit="mathy")
-    grant = run.held_result("a", lost, lost_gate, mark, suspend=True)
-    survivor, survivor_log = run.build("b", wait=False)
-    os.killpg(grant["pid"], signal.SIGKILL)
+    grant, (_, lost, lost_log), (survivor_home, survivor, survivor_log) = run.fault_pair(lost_gate, mark)
     killed_at = len(run.events()) - mark
-    run.suspended.discard(grant["pid"])
+    os.killpg(grant["pid"], signal.SIGKILL)
     check(run.wait(lost) == -signal.SIGKILL, f"worker {grant['pid']} exits from SIGKILL (log {lost_log})")
     run.until("survivor commits every name held by the killed worker",
               lambda: evidence.recovered(run.events()[mark:], grant, accepted_after=killed_at), [survivor])
     code = run.wait(survivor)
     check(code == 0, f"the survivor finishes within the bound: {Path(survivor_log).read_text()[-800:] if code else ''}")
     check(not evidence.accepted(run.events()[mark:], grant), "the killed worker's outstanding result was never committed")
-    check(run.behaviour("b") == wanted, "worker-death recovery equals solo in bytes and behavior")
+    check(run.behaviour(survivor_home) == wanted, "worker-death recovery equals solo in bytes and behavior")
     edit(edited, 'format!("7 lost:{sum}', 'format!("7:{sum}')
 
     # A short lease is a test input, not a timing inference: keep the victim stopped until
@@ -679,14 +697,14 @@ def faults(run: Run, edited: Path) -> None:
     wanted = control(run)
     stale_gate = run.root / "gates" / "stale-result"
     mark = len(run.events())
-    stalled, stalled_log = run.build("a", wait=False, result_gate=stale_gate, result_unit="mathy")
-    # The victim reaches its real result before the survivor submits, so the selected
-    # holder is this execution's lead. Its silence advances the attempt even if the
-    # survivor publishes Done before SIGCONT and the stale submission.
-    grant = run.held_result("a", stalled, stale_gate, mark, suspend=True)
-    healthy, healthy_log = run.build("b", wait=False)
+    grant, (_, stalled, stalled_log), (_, healthy, healthy_log) = run.fault_pair(stale_gate, mark)
+    stopped_at = len(run.events()) - mark
+    os.kill(grant["pid"], signal.SIGSTOP)
+    run.suspended.add(grant["pid"])
+    run.until("the lead acknowledges SIGSTOP with its result still held",
+              lambda: stopped_status(grant["pid"]), [stalled, healthy], timeout=run.given.command_timeout)
     run.until("replacement commits while stale holder remains stopped",
-              lambda: evidence.recovered(run.events()[mark:], grant), [healthy])
+              lambda: evidence.recovered(run.events()[mark:], grant, accepted_after=stopped_at), [healthy])
     check(not evidence.accepted(run.events()[mark:], grant), "the stopped lease was uncommitted when its work was taken back")
     (stale_gate / "release").touch()
     resumed_at = len(run.events()) - mark

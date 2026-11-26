@@ -81,9 +81,10 @@ or counters. Stale-fault acceptance stops an actual compiler process holding a g
 replacement **accepted commits of every outstanding name in the same execution**, then resumes it
 and demands a refusal of that exact stale batch and no accepted commit from it. The explicit `BLAZE_DIST_TEST_RESULT_GATE` hook on the victim daemon captures the
 actual Holder-produced `Command::Result` immediately before transport. It selects only the current
-lead, and stops its driver and heartbeats at a bounded gate, so the coordinator advances its attempt
-before the resumed carrier is sent. The production path with this setting absent performs no capture
-or gate IO. The harness also releases a real captured result before expiry as a positive control.
+lead and pauses the result at a bounded gate. In the worker-death and stale controls, ordinary
+heartbeats keep the held lease live until the peer commits disjoint work in the same attempt.
+The harness then signals the lead. The production path with this setting absent performs no
+capture or gate IO. The harness also releases a real captured result before expiry as a positive control.
 Both controls require the normal Client's actual answer and the coordinator's corresponding event;
 neither a discarded result nor a `holder-lost` event can satisfy the stale case. Worker-death recovery likewise requires real replacement
 commits; an unrelated completed unit is insufficient. The oracle accepts each
@@ -110,8 +111,10 @@ any send it writes the exact canonical `Command::Result` to `result.cbor`, then 
 `command_sha256` and the full wire JSON rendering under `command`. It appends `result_held` with
 the same identity, pid, work and hash to `BLAZE_DIST_EVENTS`. No authority is created by this record.
 
-The harness binds these values to an actual preceding `grant`, stops that process, and waits for
-replacement accepted commits covering every captured name in the same execution. Creating `release`
+The harness binds these values to a preceding `grant`. Its fault cases create a `keepalive` file
+when they create the gate, then start both exports against it. The lead keeps sending normal
+heartbeats until the harness kills or stops it after seeing the peer's independent accepted work.
+The replacement commits must cover every captured name in the same execution. Creating `release`
 and resuming the process lets the original unchanged result pass through `Client::call` and the
 normal server route. A fresh transport session, created before any request is pending, prevents an
 expired idle connection from hiding the work lease refusal; sessions carry no work authority. The

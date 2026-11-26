@@ -275,7 +275,7 @@ fn a_capture_roundtrips_the_exact_command_and_actual_answer_and_is_claimed_once(
         alloc,
     )
     .unwrap();
-    let capture = gate.hold(&command).unwrap().unwrap();
+    let capture = gate.hold(&command, || panic!("the gate has no keepalive marker")).unwrap().unwrap();
     let saved = read_file(directory.join("result.cbor").as_str(), alloc).unwrap();
     assert_eq!(decode::<Command>(&saved, &Limits::DOCUMENTED, alloc).unwrap(), command);
     assert_eq!(saved, encode(&command, alloc));
@@ -292,7 +292,7 @@ fn a_capture_roundtrips_the_exact_command_and_actual_answer_and_is_claimed_once(
         answer
     );
     assert!(
-        gate.hold(&command).unwrap().is_none(),
+        gate.hold(&command, || panic!("a claimed gate does not wait")).unwrap().is_none(),
         "another unit must not pause on the same one-shot gate"
     );
     assert!(!path_exists(directory.join(".ready.json.tmp").as_str()));
@@ -309,7 +309,7 @@ fn a_missing_release_times_out_and_leaves_complete_failure_evidence() {
     assert!(ResultGate::new(dir_str.clone(), Duration::ZERO, alloc).is_err());
     assert!(ResultGate::new(dir_str.clone(), Duration::MAX, alloc).is_err());
     let gate = ResultGate::new(dir_str, Duration::from_nanos(1), alloc).unwrap();
-    assert!(matches!(gate.hold(&command), Err(Error::Protocol(_))));
+    assert!(matches!(gate.hold(&command, || panic!("the gate has no keepalive marker")), Err(Error::Protocol(_))));
     assert!(path_is_file(directory.join("error.txt").as_str()));
     assert!(!path_exists(directory.join("answer.cbor").as_str()));
     assert_eq!(
@@ -321,4 +321,29 @@ fn a_missing_release_times_out_and_leaves_complete_failure_evidence() {
         .unwrap(),
         command
     );
+}
+
+#[test]
+fn a_released_keepalive_gate_preserves_its_result_after_a_heartbeat_refusal() {
+    let alloc = test_alloc();
+    let mut world = World::new();
+    let helper = world.helper.clone();
+    let command = world.result(helper.as_str());
+    let directory = TempDir::new("blaze-gate", alloc).unwrap();
+    write_file(directory.join("keepalive").as_str(), b"").unwrap();
+    let gate = ResultGate::new(
+        WireString::from_str_in(directory.path(), alloc),
+        Duration::from_secs(2),
+        alloc,
+    )
+    .unwrap();
+    let mut beats = 0;
+    assert!(gate.hold(&command, || {
+        beats += 1;
+        write_file(directory.join("release").as_str(), b"").unwrap();
+        Err(Error::Protocol(WireString::from_str_in("heartbeat refused during release", alloc)))
+    }).unwrap().is_some());
+    assert_eq!(beats, 1);
+    assert_eq!(read_file(directory.join("result.cbor").as_str(), alloc).unwrap(), encode(&command, alloc));
+    assert!(!path_exists(directory.join("error.txt").as_str()));
 }

@@ -235,6 +235,7 @@ class ResultGateOracles(unittest.TestCase):
                 process, _ = run.build("a", wait=False, result_gate=gate, result_unit="mathy")
                 run.build("b", wait=False, result_gate=gate, result_unit="mathy")
             self.assertEqual(run.result_gates, [gate])
+            self.assertFalse((gate / "keepalive").exists())
             self.assertIs(process, child)
             self.assertEqual(start.call_args.args[0][:2], ["/unused", "export"])
             self.assertTrue(start.call_args.kwargs["start_new_session"])
@@ -252,6 +253,25 @@ class ResultGateOracles(unittest.TestCase):
             with patch.object(h.os, "kill", side_effect=resumed), patch.object(h.Run, "terminate"):
                 run.stop()
             self.assertTrue((gate / "release").exists())
+
+    def test_fault_pair_uses_one_keepalive_gate_and_selects_the_peer_of_the_actual_lead(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(h, "free_port", return_value=12345), patch.dict(os.environ, {"HOME": directory}):
+                run = h.Run(h.Input("/unused", "/unused", "/unused", directory))
+            run.project = run.root / "project"
+            run.socket = run.root / "coordinator.sock"
+            a, b = unittest.mock.Mock(pid=123), unittest.mock.Mock(pid=124)
+            gate = run.root / "fault"
+            captured = {"pid": b.pid}
+            with patch.object(h.subprocess, "Popen", side_effect=[a, b]) as start, \
+                 patch.object(run, "peer_result_while_held", return_value=captured) as peer:
+                held, victim, survivor = run.fault_pair(gate, 7)
+            peer.assert_called_once_with(gate, a, b, 7)
+            self.assertEqual((held, victim[:2], survivor[:2]), (captured, ("b", b), ("a", a)))
+            self.assertTrue((gate / "keepalive").is_file())
+            self.assertEqual(run.result_gates, [gate])
+            for call in start.call_args_list:
+                self.assertEqual(call.kwargs["env"]["BLAZE_DIST_TEST_RESULT_GATE"], str(gate.resolve()))
 
     def test_a_failed_release_write_still_resumes_and_terminates_owned_children(self):
         run = object.__new__(h.Run)
@@ -617,6 +637,8 @@ class Oracles(unittest.TestCase):
         dead = unittest.mock.Mock()
         dead.poll.return_value = 0
         self.assertTrue(run.until("already committed", lambda: True, [dead], timeout=1))
+        evidence = unittest.mock.Mock(side_effect=[False, True])
+        self.assertTrue(run.until("committed before exit", evidence, [dead], timeout=1))
 
     def test_cleanup_resumes_then_terminates_and_bounds_escalation(self):
         child = unittest.mock.Mock(pid=123, stdin=None)

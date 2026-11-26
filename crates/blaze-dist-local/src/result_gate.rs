@@ -1,7 +1,8 @@
 //! An explicit acceptance-test gate for one actual holder result. With no configured gate,
 //! the driver allocates no capture and performs no file operation. The gate has no authority:
-//! it records the real command, pauses its sender's heartbeats, then sends that same command
-//! through Client. Only the coordinator decides whether the issued lease is still live.
+//! it records the real command, waits for release, then sends that same command through Client.
+//! An opt-in fault gate keeps ordinary heartbeats running until the harness stops the process.
+//! Only the coordinator decides whether the issued lease is still live.
 
 use core::time::Duration;
 
@@ -16,6 +17,9 @@ use crate::sys::{
     sleep, stat_path, unlink_path, write_all_fd,
 };
 use crate::telemetry::{emit, json, quoted};
+
+/// A fault gate's heartbeat cadence, below the harness's shortest lease.
+const HEARTBEAT_NS: u64 = 250_000_000;
 
 /// An opt-in test gate, shared by the selected workers and claimed once. The caller
 /// supplies a new empty directory and a finite timeout; retained captures are evidence,
@@ -62,7 +66,7 @@ impl ResultGate {
         Ok(Self { directory, clock, deadline_ns, timeout, alloc })
     }
 
-    pub(crate) fn hold(&self, command: &Command) -> Result<Option<Capture<'_>>, Error> {
+    pub(crate) fn hold(&self, command: &Command, mut heartbeat: impl FnMut() -> Result<(), Error>) -> Result<Option<Capture<'_>>, Error> {
         let Command::Result(submission) = command else { return Ok(None) };
         let claimed_path = join_path(self.directory.as_str(), "claimed", self.alloc);
         // An exclusive creation is the whole one-shot selection. No lock or open file is
@@ -107,6 +111,15 @@ impl ResultGate {
             capture.write("ready.json", ready.as_bytes())?;
             emit("result_held", &fields, self.alloc);
             let release_path = join_path(self.directory.as_str(), "release", self.alloc);
+            let keepalive = join_path(self.directory.as_str(), "keepalive", self.alloc);
+            let keepalive = match stat_path(keepalive.as_str()) {
+                Ok(metadata) if metadata.is_file => true,
+                Ok(_) => return Err(Error::Protocol(format_in!(self.alloc, "test result gate {}: keepalive is not a file", self.directory))),
+                Err(Errno::NoEnt) => false,
+                Err(why) => return Err(gate_io(self.directory.as_str(), why, self.alloc)),
+            };
+            let mut next_beat = 0;
+            let mut heartbeat_error = None;
             loop {
                 // Check expiry first: an old release file cannot revive a timed-out gate.
                 let now = self.clock.monotonic_nanos()?;
@@ -129,6 +142,16 @@ impl ResultGate {
                     }
                     Err(Errno::NoEnt) => {}
                     Err(why) => return Err(gate_io(self.directory.as_str(), why, self.alloc)),
+                }
+                // SIGSTOP may interrupt a heartbeat already in flight. On SIGCONT, a
+                // released gate must submit the captured Result even if that heartbeat
+                // was itself refused while the process was stopped.
+                if let Some(error) = heartbeat_error.take() {
+                    return Err(error);
+                }
+                if keepalive && now >= next_beat {
+                    heartbeat_error = heartbeat().err();
+                    next_beat = now.saturating_add(HEARTBEAT_NS);
                 }
                 let remaining_ns = self.deadline_ns.saturating_sub(now);
                 let step_ns = remaining_ns.min(5_000_000);
