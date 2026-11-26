@@ -1,137 +1,73 @@
-name: PR 81 test cache address diagnosis
-on: workflow_dispatch
+name: PR 81 compiler fixture regressions
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        required: true
+        type: string
+      suite:
+        required: true
+        type: choice
+        options: [items, front-equal, test-cache]
 permissions:
-  actions: read
   contents: read
 defaults:
   run:
     shell: bash
 env:
-  BLAZE_CORES: all
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_BACKTRACE: "0"
+  BLAZE_CORES: all
 jobs:
-  address:
+  fixtures:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 14
+    timeout-minutes: 43
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 43c10c9b6fcce584b71cc3dbdf2a1cdd7c97ee68
+          ref: ${{ inputs.source }}
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
-      - name: Enable sandbox user namespaces
+      - uses: ./.github/actions/toolchain
+      - name: Give workspace tests a short same-filesystem home
         run: |
-          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
-            timeout 10 sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-      - uses: actions/download-artifact@v8
+          mkdir "$RUNNER_TEMP/blaze-fs/workspace-home"
+          test_home=$(timeout 10 mktemp -d /tmp/bc.XXXXXX)
+          timeout 10 sudo mount --bind "$RUNNER_TEMP/blaze-fs/workspace-home" "$test_home"
+          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
+          echo "HOME=$test_home" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/script
         with:
-          name: source-compiler
-          path: ${{ runner.temp }}/source-package
-          run-id: 45840194107
-          github-token: ${{ github.token }}
-      - name: Verify source and compare independent serial and pooled homes
+          job: cargo
+      - uses: ./.github/actions/toolchain-shelf
+      - name: Build and run the selected regression
+        env:
+          SUITE: ${{ inputs.suite }}
         run: |
-          mkdir -p "$RUNNER_TEMP/source-binaries" "$RUNNER_TEMP/source-shelf" "$RUNNER_TEMP/address-evidence"
-          timeout 30 tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries"
-          timeout 30 tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$RUNNER_TEMP/source-shelf"
-          timeout 90 python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-          timeout -k 15 480 python3 - <<'PY' | tee "$RUNNER_TEMP/address-evidence/result.log"
-          import ast
-          import os
-          import shutil
-          import struct
-          import subprocess
-          import tempfile
-          from pathlib import Path
-
-          temp = Path(os.environ["RUNNER_TEMP"])
-          evidence = temp / "address-evidence"
-          root = Path(tempfile.mkdtemp(prefix="pa."))
-          project = root / "project"
-          (project / "src").mkdir(parents=True)
-          fixture = Path("crates/blaze-cli/tests/test_command_runs.rs").read_text()
-          manifest = fixture.split("const MANIFEST: &str = ", 1)[1].split(";\n", 1)[0]
-          body = fixture.split("fn pooled_workers_match_serial_bztr_and_purity() {", 1)[1]
-          library = body.split('let lib = r#"', 1)[1].split('"#;', 1)[0]
-          (project / "Cargo.toml").write_text(ast.literal_eval(manifest))
-          (project / "src/lib.rs").write_text(library)
-
-          def run(home, label, args):
-              env = {**os.environ, "PWD": str(project), "HOME": str(home), "CARGO_HOME": str(home / ".cargo")}
-              exe = temp / "source-binaries/blaze"
-              child = subprocess.run([exe, "test", *args], cwd=project, env=env, capture_output=True, timeout=75)
-              (evidence / (label + ".stdout")).write_bytes(child.stdout)
-              (evidence / (label + ".stderr")).write_bytes(child.stderr)
-              if child.returncode:
-                  raise RuntimeError(f"{label} returned {child.returncode}: {child.stderr[-1500:]!r}")
-              return child.stdout
-
-          modes = [("serial-a", "1"), ("pooled", "4"), ("serial-b", "1")]
-          for label, _ in modes:
-              home = root / label
-              shutil.copytree(temp / "source-shelf/toolchain", home / ".blaze/v2/toolchain", symlinks=True)
-              assert b"5 tests, 0 benchmarks" in run(home, label + ".list", ["--", "--list"])
-          for label, width in modes:
-              stdout = run(root / label, label + ".cold", ["--workers", width, "--", "--deadline", "20s"])
-              assert b"ran 5: 5 passed, 0 failed; 0 reused from kept results; 1 not kept" in stdout
-
-          def records(store):
-              heads = set()
-              states = set()
-              for path in store.rglob("*"):
-                  if not path.is_file() or path.is_symlink():
-                      continue
-                  raw = path.read_bytes()
-                  for magic in [b"BZTH", b"BZTS"]:
-                      cursor = 0
-                      while (at := raw.find(magic, cursor)) != -1:
-                          cursor = at + len(magic)
-                          if magic == b"BZTH" and len(raw) >= at + 24:
-                              version, rows, asks, reads, pad = struct.unpack_from("<IIIII", raw, at + 4)
-                              if (version, rows, pad) != (1, 5, 0) or asks > 300 or reads > 300:
-                                  continue
-                              blob = bytearray(raw[at:at+24+rows*88+asks*40+reads*64])
-                              for i in range(rows):
-                                  start = 24 + 88*i + 72
-                                  blob[start:start+8] = bytes(8)
-                              heads.add(bytes(blob))
-                          if magic == b"BZTS" and len(raw) >= at + 184:
-                              version = struct.unpack_from("<I", raw, at + 4)[0]
-                              count, results, crates, pad = struct.unpack_from("<IIII", raw, at + 168)
-                              if version != 3 or pad or not 0 < count < 300 or results != 4 or crates > 64:
-                                  continue
-                              rows = []
-                              off = at + 184
-                              for _ in range(count):
-                                  if off + 88 > len(raw):
-                                      break
-                                  length = struct.unpack_from("<I", raw, off + 84)[0]
-                                  rows.append((raw[off:off+32].hex(), raw[off+32:off+64].hex(), raw[off+64:off+80].hex(), raw[off+80]))
-                                  off += 88 + length
-                              if len(rows) == count:
-                                  states.add(tuple(rows))
-              assert len(heads) == 1, f"expected one normalized five-test head, got {len(heads)}"
-              return heads.pop(), states
-
-          captured = {label: records(root / label / ".blaze/v2/store") for label, _ in modes}
-          serial, serial_states = captured["serial-a"]
-          for label, (head, states) in captured.items():
-              addresses = [head[24+i*88+40:24+i*88+72].hex()[:12] for i in range(5)]
-              print(label, "head matches serial-a:", head == serial,
-                    "addresses:", addresses, "suite states:", len(states), flush=True)
-              if len(states) == len(serial_states) == 1:
-                  old_rows = {row[0]: row[1:] for row in next(iter(serial_states))}
-                  new_rows = {row[0]: row[1:] for row in next(iter(states))}
-                  moved = [sym for sym in sorted(old_rows.keys() & new_rows.keys()) if old_rows[sym] != new_rows[sym]]
-                  for sym in moved:
-                      print(label, "changed code identity", sym, old_rows[sym], new_rows[sym])
-                  print(label, "symbol sets equal:", old_rows.keys() == new_rows.keys(), "moved:", len(moved))
-          PY
+          evidence="$RUNNER_TEMP/fixture-evidence"
+          mkdir -p "$evidence"
+          timeout 15 git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
+          tc=$(timeout 10 cat pins/toolchain)
+          case "$SUITE" in
+            items) crate=blaze-ladder; target=front2_items; selection=(--test-threads=4) ;;
+            front-equal) crate=blaze-ladder; target=front_equal; selection=(--test-threads=4) ;;
+            test-cache) crate=blaze-cli; target=test_command_runs; selection=(pooled_workers_match_serial_bztr_and_purity --exact) ;;
+            *) exit 2 ;;
+          esac
+          timeout -k 20 1760 cargo +"$tc" test --locked -p "$crate" --test "$target" \
+            --no-run --message-format=json > "$evidence/build.jsonl"
+          binary=$(timeout 20 jq -er --arg target "$target" \
+            'select(.target.name==$target and .executable!=null).executable' "$evidence/build.jsonl")
+          timeout -k 20 480 /usr/bin/time -v "$binary" --nocapture "${selection[@]}" 2>&1 | tee "$evidence/test.log"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: pooled-cache-address-evidence
-          path: ${{ runner.temp }}/address-evidence
-          if-no-files-found: error
+          name: focused-compiler-fixtures
+          path: |
+            ${{ runner.temp }}/fixture-evidence
+            ${{ runner.temp }}/toolchain-cut
+          if-no-files-found: warn
