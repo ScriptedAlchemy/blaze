@@ -503,17 +503,33 @@ jobs:
       - name: blaze-sys imports, per target
         if: ${{ success() && matrix.partition == 0 }}
         run: |
-          tc="$(cat pins/toolchain)"
-          sysroot="$(rustc +"$tc" --print sysroot)"
+          tc="$(timeout 10 cat pins/toolchain)"
+          sysroot="$(timeout 10 rustc +"$tc" --print sysroot)"
           nm="$sysroot/lib/rustlib/aarch64-unknown-linux-gnu/bin/llvm-nm"
           for triple in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu aarch64-apple-darwin; do
-            timeout -k 30 600 cargo +"$tc" build --locked -p blaze-sys --lib --target "$triple" --target-dir target/sys-imports
-            builtins=$(echo "$sysroot/lib/rustlib/$triple/lib/"libcompiler_builtins-*.rlib)
-            case "$triple" in
-              *-linux-*) extra='' ; os=linux ;;
-              *) extra=', "ratchet": "tools/ratchets/blaze-sys-libsystem.txt"' ; os=macos ;;
-            esac
-            timeout -k 30 120 "$BLAZE_SCRIPTS/sys_imports" "{\"command\": \"check\", \"target\": \"$os\", \"objects\": [\"target/sys-imports/$triple/debug/libblaze_sys.rlib\"], \"builtins\": \"$builtins\", \"nm\": \"$nm\"$extra}"
+            receipt="$RUNNER_TEMP/sys-imports-$triple.jsonl"
+            timeout -k 30 600 cargo +"$tc" build --locked -p blaze-sys --lib --target "$triple" \
+              --target-dir "$RUNNER_TEMP/blaze-fs/sys-imports" --message-format=json-render-diagnostics > "$receipt"
+            object=$(timeout 10 jq -esr '
+              [ .[] | select(.reason == "compiler-artifact" and .target.name == "blaze_sys"
+                             and (.target.kind | index("lib") != null))
+                    | .filenames[] | select(endswith(".rlib")) ] | unique
+              | if length == 1 then .[0] else error("expected one blaze-sys rlib in the Cargo receipt") end
+            ' "$receipt")
+            builtins=("$sysroot/lib/rustlib/$triple/lib/"libcompiler_builtins-*.rlib)
+            if [[ ${#builtins[@]} != 1 || ! -f ${builtins[0]} ]]; then
+              printf 'Expected one compiler_builtins rlib for %s in %s\n' "$triple" "$sysroot" >&2
+              exit 1
+            fi
+            printf 'Checking system imports for %s in %s\n' "$triple" "$object"
+            # shellcheck disable=SC2016
+            input=$(timeout 10 jq -cn --arg triple "$triple" --arg object "$object" \
+              --arg builtins "${builtins[0]}" --arg nm "$nm" '
+                {command:"check",objects:[$object],builtins:$builtins,nm:$nm}
+                + (if $triple == "aarch64-apple-darwin" then
+                    {target:"macos",ratchet:"tools/ratchets/blaze-sys-libsystem.txt"}
+                  else {target:"linux"} end)')
+            timeout -k 30 120 "$BLAZE_SCRIPTS/sys_imports" "$input"
           done
       - name: keep workspace shelf verification evidence
         if: always()
