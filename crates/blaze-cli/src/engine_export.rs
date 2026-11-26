@@ -26,9 +26,9 @@ use blaze_code::datum::{DatumView, OWN_DATUM, Place as DatumPlace};
 use blaze_code::record::{CodeRecord, CodeView, NO_TARGET, PositionPart, Site, SiteKind, Space, Symbol as CodeSymbol, Target};
 use blaze_export::{Data, DataPlace, DataWord, Entry, ExportError, Exported, Function, Panic, Platform, ProgramIn, Tier, TlsRuntime};
 use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
-use blaze_ladder::code_records::{CodeKey, entry_of, statics};
-use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker};
-use blaze_ladder::run::special::{EntryForm, Roots, Special, make_special, run_roots};
+use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, entry_of, statics};
+use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker, RecordsProgram, Typing};
+use blaze_ladder::run::special::{EntryForm, Roots, Special, SpecialMade, make_special, run_roots};
 use blaze_ladder::run::RunError;
 use blaze_own::{AString, AVec, Alloc, Box, Bump, Erased, String, Vec};
 use blaze_typeck::ItemKey;
@@ -46,7 +46,7 @@ use crate::engine_check::{Standing, check_for_start};
 use crate::engine_records::EngineRecords;
 use crate::engine_start::{RunProcs, StartError, body_ids, end_procs, start_facts, write_start_profile};
 use crate::phases::Phases;
-use crate::run_ids::NotRunnable;
+use crate::run_ids::{NotRunnable, RunIds, Runnable};
 use crate::{CliError, program, run_names, run_package};
 
 /// Virtual reservation for the export scratch frame (walk tables, materialized records, data
@@ -567,6 +567,249 @@ fn code_touches_tls(view: &CodeView<'_>, getter: CodeSymbol, descriptor: CodeSym
     false
 }
 
+/// The code and datums ready for the export layout, before source positions are materialized.
+pub(crate) struct PreparedExport<'a> {
+    walk: Walk<'a>,
+    outcomes: AVec<'a, RowOutcome<'a>>,
+    tls: Option<PreparedTls>,
+    compiled: usize,
+    cached: usize,
+    unkeyed: usize,
+    stubs: usize,
+    lto_bodies: usize,
+    lto_inlined: usize,
+}
+
+struct PreparedTls {
+    getter: SpecialMade,
+    ender: SpecialMade,
+}
+
+/// Prepares the selected roots and their closure over the supplied code store. The caller
+/// finishes its source reads after the walk and before touching the TLS runtime records.
+#[expect(clippy::too_many_arguments, reason = "export preparation takes the caller's checked roots, maker, code store and capabilities")]
+pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
+    cx: &Cx,
+    list: &blaze_world::crate_list::CrateList<'_>,
+    ids: &RunIds<'_>,
+    builder: &Builder,
+    maker: &mut Maker<'n, Runnable, T>,
+    codes: &mut dyn CodeStore,
+    roots: &Roots<'_>,
+    alloc: Alloc<'a>,
+    frame: &Frame,
+    heap: &'static blaze_own::Heap,
+    after_walk: impl FnOnce() -> Result<(), CliError>,
+) -> Result<PreparedExport<'a>, CliError> {
+    // Whole-program reachability closure from all roots.
+    let mut walk = Walk::new_in(alloc);
+    for i in 0..roots.len() {
+        walk.root::<RunError>(roots.row(i), MOST_WALKED).map_err(|why| {
+            box_err(
+                ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+    }
+
+    let mut scratch = Scratch::new_in(alloc);
+    let mut outcomes: AVec<'_, RowOutcome<'_>> = Vec::new_in(alloc);
+    let (mut compiled, mut cached, mut unkeyed, mut stubs) = (0usize, 0usize, 0usize, 0usize);
+    let root_count = roots.len();
+
+    let mut next_row = 0usize;
+    {
+        let _walk_span = cx.span("export: walk reachable functions");
+        while next_row < walk.len() {
+            let row = next_row;
+            next_row += 1;
+            let tabled = walk.tabled(row);
+            let symbol = walk.symbol(row);
+            let kind = walk.kind(row);
+            let proof = ids.runnable(tabled).map_err(|why| {
+                let krate = crate_of_item(list, tabled, heap.alloc());
+                box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
+            })?;
+            match walk.one(row, ids, codes, builder, &builder.producer, maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
+                Ok(one) => match one.stepped {
+                    Stepped::Found(key) => {
+                        cached += 1;
+                        outcomes.push(RowOutcome::Keyed(key));
+                    }
+                    Stepped::Made(key) => {
+                        compiled += 1;
+                        outcomes.push(RowOutcome::Keyed(key));
+                    }
+                    Stepped::Unkeyed(_) => {
+                        unkeyed += 1;
+                        let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
+                        copied.extend_from_slice(scratch.made());
+                        outcomes.push(RowOutcome::Unkeyed(copied));
+                    }
+                },
+                Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
+                    let msg = bstd::mem::format_in!(frame, "blaze export: called unbuilt function: {why}");
+                    let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
+                    stubs += 1;
+                    outcomes.push(RowOutcome::UnbuiltStub(stub_bytes));
+                }
+                Err(why) => {
+                    return Err(box_err(
+                        ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                        heap,
+                    ));
+                }
+            }
+        }
+    }
+
+    // Whole-program demand-driven cross-function LIR inlining + host-ISA SOTA emission over
+    // workspace functions and their non-cold reachable callees, held in the export allocator.
+    let mut lto_seeds: AVec<'_, usize> = Vec::new_in(alloc);
+    for (row, outcome) in outcomes.iter().enumerate() {
+        if walk.kind(row) == RowKind::Instance
+            && !matches!(outcome, RowOutcome::UnbuiltStub(_))
+            && ids.grain(walk.tabled(row)) == Some(crate::run_ids::Grain::Workspace)
+        {
+            lto_seeds.push(row);
+        }
+    }
+    let lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(builder.isa);
+    let lto_out = {
+        let _lto_span = cx.span("export: workspace LTO");
+        blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
+            &walk,
+            lto_seeds.as_slice(),
+            |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
+            |tabled| ids.runnable(tabled).ok(),
+            maker,
+            lto_opts,
+            alloc,
+            heap.alloc(),
+        )
+        .map_err(|why| {
+            box_err(
+                ExportCliError::Lto { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?
+    };
+    let lto_bodies = lto_out.bodies.len();
+    let lto_inlined = lto_out.total_inlined;
+    let mut extra_roots: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::new_in(alloc);
+    for body in lto_out.bodies {
+        if let Some(slot) = outcomes.get_mut(body.row) {
+            *slot = RowOutcome::Lto {
+                record: body.record,
+                vtable_data: body.vtable_data,
+            };
+        }
+        for decl in body.extra_declared {
+            extra_roots.push(decl);
+        }
+    }
+    for (tabled, name_bytes) in extra_roots {
+        walk.root::<RunError>((tabled, name_bytes.as_slice()), MOST_WALKED).map_err(|why| {
+            box_err(
+                ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+    }
+    while next_row < walk.len() {
+        let row = next_row;
+        next_row += 1;
+        let tabled = walk.tabled(row);
+        let symbol = walk.symbol(row);
+        let proof = ids.runnable(tabled).map_err(|why| {
+            let krate = crate_of_item(list, tabled, heap.alloc());
+            box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
+        })?;
+        match walk.one(row, ids, codes, builder, &builder.producer, maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
+            Ok(one) => match one.stepped {
+                Stepped::Found(key) => {
+                    cached += 1;
+                    outcomes.push(RowOutcome::Keyed(key));
+                }
+                Stepped::Made(key) => {
+                    compiled += 1;
+                    outcomes.push(RowOutcome::Keyed(key));
+                }
+                Stepped::Unkeyed(_) => {
+                    unkeyed += 1;
+                    let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
+                    copied.extend_from_slice(scratch.made());
+                    outcomes.push(RowOutcome::Unkeyed(copied));
+                }
+            },
+            Err(why) => {
+                return Err(box_err(
+                    ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                    heap,
+                ));
+            }
+        }
+    }
+    after_walk()?;
+
+    // Detect whether any walked row or code record touches Rust thread-locals.
+    let tls_getter_sym = blaze_ladder::symbols::tls_getter_symbol();
+    let tls_desc_sym = blaze_ladder::symbols::tls_desc_symbol();
+    let mut has_tls = false;
+    for (row, outcome) in outcomes.iter().enumerate() {
+        match walk.kind(row) {
+            RowKind::ThreadLocal => {
+                has_tls = true;
+                break;
+            }
+            RowKind::Instance => {
+                let symbol = walk.symbol(row);
+                let rec_bytes = match outcome {
+                    RowOutcome::Keyed(key) => {
+                        let entry_bytes = entry_of(codes, *key)
+                            .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
+                            .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: symbol.0 }, heap))?;
+                        statics::entry_record(entry_bytes)
+                            .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
+                    }
+                    RowOutcome::Unkeyed(bytes) => statics::entry_record(bytes.as_slice())
+                        .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?,
+                    RowOutcome::Lto { record, .. } => record.as_slice(),
+                    RowOutcome::UnbuiltStub(bytes) => bytes.as_slice(),
+                };
+                let view = CodeView::read(rec_bytes)
+                    .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
+                if code_touches_tls(&view, tls_getter_sym, tls_desc_sym) {
+                    has_tls = true;
+                    break;
+                }
+            }
+            RowKind::Static => {}
+        }
+    }
+
+    // Emit TLS getter + ender special records into `codes` before borrowing `&codes` immutably.
+    let tls = if has_tls {
+        let getter = make_special(Special::Getter, builder, codes, alloc).map_err(|why| {
+            box_err(
+                ExportCliError::Special { what: "TLS getter", shown: owned_fmt(format_args!("{why:?}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+        let ender = make_special(Special::Ender, builder, codes, alloc).map_err(|why| {
+            box_err(
+                ExportCliError::Special { what: "TLS ender", shown: owned_fmt(format_args!("{why:?}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+        Some(PreparedTls { getter, ender })
+    } else {
+        None
+    };
+
+    Ok(PreparedExport { walk, outcomes, tls, compiled, cached, unkeyed, stubs, lto_bodies, lto_inlined })
+}
+
 /// Core whole-program reachability closure + `blaze_export::export` + atomic write + chmod.
 #[expect(clippy::too_many_arguments, reason = "export pipeline: explicit capabilities, release profile, and optional distributed config")]
 fn export_program<'f>(
@@ -746,219 +989,17 @@ fn export_program<'f>(
         }
     }
 
-    // Whole-program reachability closure from all roots.
-    let mut walk = Walk::new_in(alloc);
-    for i in 0..roots.len() {
-        walk.root::<RunError>(roots.row(i), MOST_WALKED).map_err(|why| {
-            box_err(
-                ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                heap,
-            )
-        })?;
-    }
+    let PreparedExport { walk, outcomes, tls, compiled, cached, unkeyed, stubs, lto_bodies, lto_inlined } =
+        prepare_export(cx, list, &ids, &builder, &mut maker, &mut codes, &roots, alloc, frame, heap, || {
+            end_procs(cx, &maker_procs, standing.err, "export")?;
 
-    let mut scratch = Scratch::new_in(alloc);
-    let mut outcomes: AVec<'_, RowOutcome<'_>> = Vec::new_in(alloc);
-    let (mut compiled, mut cached, mut unkeyed, mut stubs) = (0usize, 0usize, 0usize, 0usize);
-    let root_count = roots.len();
-
-    let mut next_row = 0usize;
-    {
-        let _walk_span = cx.span("export: walk reachable functions");
-        while next_row < walk.len() {
-            let row = next_row;
-            next_row += 1;
-            let tabled = walk.tabled(row);
-            let symbol = walk.symbol(row);
-            let kind = walk.kind(row);
-            let proof = ids.runnable(tabled).map_err(|why| {
-                let krate = crate_of_item(list, tabled, heap.alloc());
-                box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
-            })?;
-            match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
-                Ok(one) => match one.stepped {
-                    Stepped::Found(key) => {
-                        cached += 1;
-                        outcomes.push(RowOutcome::Keyed(key));
-                    }
-                    Stepped::Made(key) => {
-                        compiled += 1;
-                        outcomes.push(RowOutcome::Keyed(key));
-                    }
-                    Stepped::Unkeyed(_) => {
-                        unkeyed += 1;
-                        let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
-                        copied.extend_from_slice(scratch.made());
-                        outcomes.push(RowOutcome::Unkeyed(copied));
-                    }
-                },
-                Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
-                    let msg = bstd::mem::format_in!(frame, "blaze export: called unbuilt function: {why}");
-                    let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
-                    stubs += 1;
-                    outcomes.push(RowOutcome::UnbuiltStub(stub_bytes));
-                }
-                Err(why) => {
-                    return Err(box_err(
-                        ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                        heap,
-                    ));
-                }
+            let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
+            phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
+            if let Some(why) = seen.refused() {
+                return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
             }
-        }
-    }
-
-    // Whole-program demand-driven cross-function LIR inlining + host-ISA SOTA emission over
-    // workspace functions and their non-cold reachable callees (kept ephemeral in `export_bump`,
-    // never written into portable `HomeCodeStore`).
-    let mut lto_seeds: AVec<'_, usize> = Vec::new_in(alloc);
-    for (row, outcome) in outcomes.iter().enumerate() {
-        if walk.kind(row) == RowKind::Instance
-            && !matches!(outcome, RowOutcome::UnbuiltStub(_))
-            && ids.grain(walk.tabled(row)) == Some(crate::run_ids::Grain::Workspace)
-        {
-            lto_seeds.push(row);
-        }
-    }
-    let lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
-    let lto_out = {
-        let _lto_span = cx.span("export: workspace LTO");
-        blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
-            &walk,
-            lto_seeds.as_slice(),
-            |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
-            |tabled| ids.runnable(tabled).ok(),
-            &mut maker,
-            lto_opts,
-            alloc,
-            heap.alloc(),
-        )
-        .map_err(|why| {
-            box_err(
-                ExportCliError::Lto { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                heap,
-            )
-        })?
-    };
-    let lto_bodies = lto_out.bodies.len();
-    let lto_inlined = lto_out.total_inlined;
-    let mut extra_roots: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::new_in(alloc);
-    for body in lto_out.bodies {
-        if let Some(slot) = outcomes.get_mut(body.row) {
-            *slot = RowOutcome::Lto {
-                record: body.record,
-                vtable_data: body.vtable_data,
-            };
-        }
-        for decl in body.extra_declared {
-            extra_roots.push(decl);
-        }
-    }
-    for (tabled, name_bytes) in extra_roots {
-        walk.root::<RunError>((tabled, name_bytes.as_slice()), MOST_WALKED).map_err(|why| {
-            box_err(
-                ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                heap,
-            )
+            Ok(())
         })?;
-    }
-    while next_row < walk.len() {
-        let row = next_row;
-        next_row += 1;
-        let tabled = walk.tabled(row);
-        let symbol = walk.symbol(row);
-        let proof = ids.runnable(tabled).map_err(|why| {
-            let krate = crate_of_item(list, tabled, heap.alloc());
-            box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
-        })?;
-        match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
-            Ok(one) => match one.stepped {
-                Stepped::Found(key) => {
-                    cached += 1;
-                    outcomes.push(RowOutcome::Keyed(key));
-                }
-                Stepped::Made(key) => {
-                    compiled += 1;
-                    outcomes.push(RowOutcome::Keyed(key));
-                }
-                Stepped::Unkeyed(_) => {
-                    unkeyed += 1;
-                    let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
-                    copied.extend_from_slice(scratch.made());
-                    outcomes.push(RowOutcome::Unkeyed(copied));
-                }
-            },
-            Err(why) => {
-                return Err(box_err(
-                    ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                    heap,
-                ));
-            }
-        }
-    }
-    end_procs(cx, &maker_procs, standing.err, "export")?;
-
-    let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
-    phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
-    if let Some(why) = seen.refused() {
-        return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
-    }
-
-    // Detect whether any walked row or code record touches Rust thread-locals.
-    let tls_getter_sym = blaze_ladder::symbols::tls_getter_symbol();
-    let tls_desc_sym = blaze_ladder::symbols::tls_desc_symbol();
-    let tls_ender_sym = blaze_ladder::tls_index::tls_ender_symbol();
-    let mut has_tls = false;
-    for (row, outcome) in outcomes.iter().enumerate() {
-        match walk.kind(row) {
-            RowKind::ThreadLocal => {
-                has_tls = true;
-                break;
-            }
-            RowKind::Instance => {
-                let symbol = walk.symbol(row);
-                let rec_bytes = match outcome {
-                    RowOutcome::Keyed(key) => {
-                        let entry_bytes = entry_of(&codes, *key)
-                            .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
-                            .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: symbol.0 }, heap))?;
-                        statics::entry_record(entry_bytes)
-                            .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
-                    }
-                    RowOutcome::Unkeyed(bytes) => statics::entry_record(bytes.as_slice())
-                        .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?,
-                    RowOutcome::Lto { record, .. } => record.as_slice(),
-                    RowOutcome::UnbuiltStub(bytes) => bytes.as_slice(),
-                };
-                let view = CodeView::read(rec_bytes)
-                    .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
-                if code_touches_tls(&view, tls_getter_sym, tls_desc_sym) {
-                    has_tls = true;
-                    break;
-                }
-            }
-            RowKind::Static => {}
-        }
-    }
-
-    // Emit TLS getter + ender special records into `codes` before borrowing `&codes` immutably.
-    let tls_keys = if has_tls {
-        let getter = make_special(Special::Getter, &builder, &mut codes, alloc).map_err(|why| {
-            box_err(
-                ExportCliError::Special { what: "TLS getter", shown: owned_fmt(format_args!("{why:?}"), frame, heap.alloc()) },
-                heap,
-            )
-        })?;
-        let ender = make_special(Special::Ender, &builder, &mut codes, alloc).map_err(|why| {
-            box_err(
-                ExportCliError::Special { what: "TLS ender", shown: owned_fmt(format_args!("{why:?}"), frame, heap.alloc()) },
-                heap,
-            )
-        })?;
-        Some((getter.key, ender.key))
-    } else {
-        None
-    };
 
     // Assemble `ProgramIn` functions and data (zero-copy for cached positionless records).
     let mut functions: AVec<'_, Function<'_>> = Vec::with_capacity_in(outcomes.len() + 2, alloc);
@@ -1100,10 +1141,11 @@ fn export_program<'f>(
         }
     }
 
-    let tls_runtime = match tls_keys {
-        Some((getter_key, ender_key)) => {
-            for (sym, key, what) in [(tls_getter_sym, getter_key, "TLS getter"), (tls_ender_sym, ender_key, "TLS ender")] {
-                let entry_bytes = entry_of(&codes, key)
+    let tls_runtime = match tls {
+        Some(PreparedTls { getter, ender }) => {
+            for (special, what) in [(getter, "TLS getter"), (ender, "TLS ender")] {
+                let sym = special.symbol;
+                let entry_bytes = entry_of(&codes, special.key)
                     .map_err(|why| box_err(ExportCliError::Store { symbol: sym.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
                     .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: sym.0 }, heap))?;
                 let rec_bytes = statics::entry_record(entry_bytes)
@@ -1112,7 +1154,7 @@ fn export_program<'f>(
                     .map_err(|why| box_err(ExportCliError::Decode { symbol: sym.0, what, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
                 functions.push(Function { symbol: sym, record: view, tier: Tier::Fast });
             }
-            Some(TlsRuntime { descriptor: tls_desc_sym, ender: tls_ender_sym })
+            Some(TlsRuntime { descriptor: blaze_ladder::symbols::tls_desc_symbol(), ender: ender.symbol })
         }
         None => None,
     };
