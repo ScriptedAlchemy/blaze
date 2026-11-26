@@ -13,7 +13,8 @@
 //! The set is what the dependencies of tempo, reth and blaze hold in `asm!` on arm64 (the
 //! survey in pass/asm.rs's lane report): barriers and hints, system registers (the DIT and
 //! timer reads), `pacib`, `tst`/`csel`/`eor`/`cmp` (cmov's), scalar `fmadd`/`frintn`/`fsqrt`/
-//! `fcvt`, CRC32, and NEON `cmeq`/`and`/`shrn` (constant_time_eq's).
+//! `fcvt`, CRC32, NEON `cmeq`/`and`/`shrn` (constant_time_eq's), and `svc` (blaze-sys's raw
+//! Linux syscall entry).
 
 use crate::enc::{self, Cond, Field, Fp1, Ftype, Pstate, Reg, Size, SysReg, ZR};
 
@@ -145,6 +146,7 @@ const ROWS: &[Row] = &[
     Row { mnemonic: "stlxr", encode: |o| store_exclusive(o, true) }, // L=0 pair=0 ordered=1 Rt2=31
     Row { mnemonic: "ldxp", encode: load_pair },                    // L=1 pair=1 Rs=31 ordered=0
     Row { mnemonic: "stxp", encode: store_pair },                   // L=0 pair=1 ordered=0
+    Row { mnemonic: "svc", encode: svc },                           // 11010100000 imm16 00001
     Row { mnemonic: "nop", encode: nop },
     Row { mnemonic: "isb", encode: isb },
     Row { mnemonic: "dsb", encode: dsb },
@@ -554,6 +556,14 @@ fn store_pair(ops: &Ops<'_>) -> Fit {
         return Fit::Bad { why: "exclusive store status overlaps data or address", at: 0 };
     }
     Fit::Word(enc::exclusive_pair_width(wide, enc::stxp(false, status, reg, other, base)))
+}
+
+fn svc(ops: &Ops<'_>) -> Fit {
+    let [Arg::Imm(imm)] = *ops.args() else { return Fit::No };
+    match u16::try_from(imm) {
+        Ok(imm) => Fit::Word(enc::svc(imm)),
+        Err(_) => Fit::Bad { why: "an `svc` immediate outside 0..=65535", at: 0 },
+    }
 }
 
 fn nop(ops: &Ops<'_>) -> Fit {

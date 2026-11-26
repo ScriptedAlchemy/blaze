@@ -42,6 +42,10 @@ fn rows_match_the_a64_layouts() {
         ("ldxp w3, w4, [x5]",        0b10_001000_0_1_1_11111_0_00100_00101_00011),
         ("stxp w3, x4, x5, [x6]",    0b11_001000_0_0_1_00011_0_00101_00110_00100),
         ("stxp w3, w4, w5, [x6]",    0b10_001000_0_0_1_00011_0_00101_00110_00100),
+        // Exception generation (SVC): 11010100000 imm16 00001.
+        ("svc 0",                   0b11010100000_0000000000000000_00001),
+        ("SVC #0x1234",             0b11010100000_0001001000110100_00001),
+        ("svc #65535",              0b11010100000_1111111111111111_00001),
         // System: 1101010100 L op0 op1 CRn CRm op2 Rt. Barriers and hints: L 0, op0 00,
         // op1 011, CRn 0010 (hints) or 0011 (barriers), Rt 11111.
         ("nop",                     0b1101010100_0_00_011_0010_0000_000_11111),
@@ -155,6 +159,9 @@ fn refusals_name_the_token() {
         ("ldxp w1, x2, [x3]", none, "ldxp w1, x2, [x3]"),
         ("ldxp w2, w2, [x3]", "exclusive pair load has overlapping destinations", "w2"),
         ("stxp w3, x1, x2, [x3]", "exclusive store status overlaps data or address", "w3"),
+        ("svc x0", none, "svc x0"),
+        ("svc #-1", "an `svc` immediate outside 0..=65535", "#-1"),
+        ("svc #65536", "an `svc` immediate outside 0..=65535", "#65536"),
         ("csel w0, x1, w2, ne", none, "csel w0, x1, w2, ne"),
         ("and x0, x1, x2", none, "and x0, x1, x2"),
         ("crc32b w0, w0, x1", none, "crc32b w0, w0, x1"),

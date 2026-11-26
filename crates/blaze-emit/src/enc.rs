@@ -657,6 +657,11 @@ pub(crate) const fn brk(imm16: u32) -> u32 {
     0xd420_0000 | (imm16 << 5)
 }
 
+/// `svc #imm16`: exception generation with the supervisor-call selector.
+pub(crate) fn svc(imm16: u16) -> u32 {
+    0xd400_0001 | (u32::from(imm16) << 5)
+}
+
 // The forms below are pinned by `new_encodings` (src/enc_tests.rs) against words computed by
 // hand from the Arm ARM's field layouts (C6.2, each instruction's page named in the test).
 
