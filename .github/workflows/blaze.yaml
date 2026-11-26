@@ -1,4 +1,4 @@
-name: PR 81 distributed native compiler verification
+name: PR 81 retained compiler migration verification
 on: workflow_dispatch
 permissions:
   contents: read
@@ -7,34 +7,60 @@ defaults:
     shell: bash
 env:
   CARGO_BUILD_JOBS: "2"
+  BLAZE_CORES: "2"
+  BLAZE_DAEMON_MEMORY_GB: "2"
   RUST_BACKTRACE: "0"
 jobs:
-  native:
+  migrations:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 85
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 567e2e2dcfd999428cc333e465bf43282c62ceeb
+          ref: 6bc4b74f8b6a2dd951ddca7ef37982e7c1ecf440
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
       - uses: ./.github/actions/toolchain
-      - uses: ./.github/actions/llvm-prefix
-      - name: compile native planner and CLI integration
+        with:
+          targets: wasm32-wasip1
+      - name: generate a source pin and verify the complete shelf
         run: |
-          timeout -k 30 2400 cargo +"$(cat pins/toolchain)" check --locked -p blaze-cli --bins --message-format short
-      - name: compile and execute LLVM-emitted code
-        if: ${{ !cancelled() }}
+          set -eu -o pipefail
+          tc=$(cat pins/toolchain)
+          mkdir "$RUNNER_TEMP/migration-identity"
+          timeout -k 15 600 cargo +"$tc" fetch --locked --quiet
+          timeout -k 30 900 cargo +"$tc" build --locked -p scripts --bin toolchain_cut --bin proc_macro_modules
+          registries=("${CARGO_HOME:-$HOME/.cargo}"/registry/cache/index.crates.io-*)
+          test "${#registries[@]}" -eq 1
+          input=$(jq -nc --arg reg "${registries[0]}" --arg shelf "$HOME/.blaze/v2/toolchain" '{tree:".",targets:["aarch64-apple-darwin","aarch64-unknown-linux-gnu"],registry:$reg,shelf:$shelf,write_pin:true,check:false,macro_side:true}')
+          timeout -k 20 900 "$CARGO_TARGET_DIR/debug/toolchain_cut" "$input"
+          timeout -k 20 900 "$CARGO_TARGET_DIR/debug/toolchain_cut" "$(jq -c '.write_pin=false | .check=true' <<< "$input")"
+          git add -- crates/blaze-toolchain/PINNED
+          if ! git diff --cached --quiet; then
+            git -c user.name='Blaze validation' -c user.email='validation@localhost' commit -m 'Validate canonical shelf for migration compiler'
+          fi
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD HEAD^{tree} | tee "$RUNNER_TEMP/migration-identity/source.txt"
+          cp crates/blaze-toolchain/PINNED "$RUNNER_TEMP/migration-identity/pin"
+      - name: build the exact release and module producer
         run: |
-          timeout -k 30 1500 cargo +"$(cat pins/toolchain)" test --locked -p blaze-emit --lib llvm::emit_tests -- --nocapture | tee "$RUNNER_TEMP/emit.txt"
-          grep -Fq 'llvm::emit_tests::release_record_runs ... ok' "$RUNNER_TEMP/emit.txt"
-      - name: verify imported and folded module planning
-        if: ${{ !cancelled() }}
+          tc=$(cat pins/toolchain)
+          timeout -k 30 3500 cargo +"$tc" build --locked --release --bins -p blaze-cli -p blaze-launcher
+          timeout -k 20 600 cargo +"$tc" build --locked -p scripts --bin proc_macro_modules
+          sha256sum "$CARGO_TARGET_DIR"/release/{blaze,blaze-launcher,blaze-fact-shim} "$CARGO_TARGET_DIR/debug/proc_macro_modules" > "$RUNNER_TEMP/migration-identity/binaries.txt"
+      - uses: ./.github/actions/linux-c-shelf
+      - name: execute every retained fixture on the recorded tree
         run: |
-          timeout -k 30 900 cargo +"$(cat pins/toolchain)" test --locked -p blaze-emit --lib llvm:: -- --nocapture
-      - name: execute exported Rust cdylibs with glibc
-        if: ${{ !cancelled() }}
-        run: |
-          timeout -k 20 600 cargo +"$(cat pins/toolchain)" test --locked -p blaze-export --test native_dylib rust_cdylib:: -- --nocapture | tee "$RUNNER_TEMP/dlopen.txt"
-          grep -Fq 'rust_cdylib::cdylib_loader_rebases_data_binds_allocator_and_initializes_rust_tls ... ok' "$RUNNER_TEMP/dlopen.txt"
+          scratch="$RUNNER_TEMP/blaze-fs/forkfixes"
+          input=$(jq -nc --arg blaze "$CARGO_TARGET_DIR/release/blaze" --arg builder "$CARGO_TARGET_DIR/debug/proc_macro_modules" --arg scratch "$scratch" --arg source "$GITHUB_WORKSPACE" '{blaze:$blaze,module_builder:$builder,scratch:$scratch,source:$source,workers:2,timeout:900,stall_bound:300}')
+          timeout -k 30 3300 python3 harness/forkfixes.py "$input"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: migration-controls-linux-a880
+          path: |
+            ${{ runner.temp }}/migration-identity
+            ${{ runner.temp }}/blaze-fs/forkfixes/*.json
+            ${{ runner.temp }}/blaze-fs/forkfixes/cases/*/logs/*.err
+          if-no-files-found: warn
