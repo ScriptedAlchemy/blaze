@@ -140,7 +140,13 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
             let kind = section.kind();
             match kind {
                 SectionKind::ReadOnlyData | SectionKind::ReadOnlyString | SectionKind::ReadOnlyDataWithRel => {}
-                SectionKind::Data if section.name().map(|n| n == "__const").unwrap_or(false) => {}
+                SectionKind::Data if section.name().is_ok_and(|name| {
+                    if macho {
+                        name == "__const"
+                    } else {
+                        name == ".data.rel.ro" || name.starts_with(".data.rel.ro.")
+                    }
+                }) => {}
                 SectionKind::Data | SectionKind::UninitializedData if position_section(&file, index, module, alloc)? => {}
                 _ => {
                     let mut spelled = FixedString::<32>::new();
