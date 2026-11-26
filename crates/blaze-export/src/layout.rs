@@ -454,6 +454,9 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
         let member = &members[idx(i)];
         let relro = member.relro();
         if relro.is_empty() {
+            // Empty relro owns no bytes, but an address relocation can still name its base.
+            // The start of the const region satisfies every allowed part alignment.
+            relro_at[i as usize] = const_at;
             continue;
         }
         pad_to(&mut konst, const_at, (1u64 << member.relro_align()).max(16));

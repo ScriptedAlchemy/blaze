@@ -4,8 +4,8 @@
 //! record whose calls are `Branch26` placed with direct `bl`s and one stub for a C name; a poll
 //! removed with its page left unbound. Each test prints the line its doc comment names.
 
-use blaze_code::a64::{adrp_ldr_target, bl_target, read32};
-use blaze_code::record::{CodeRecord, CodeView, Site, SiteKind, Space, Symbol, Target};
+use blaze_code::a64::{adrp_add_target, adrp_ldr_target, bl_target, read32};
+use blaze_code::record::{CodeRecord, CodeView, MOST_PART_ALIGN, OWN_RELRO, Site, SiteKind, Space, Symbol, Target};
 use blaze_code::unwind::cfi::{self, CfiInput};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_tier::record::{Declare, DeclaredKind, Declares, Emitted, LoopHeader, Poll, Reloc, RelocKind, declare, encode, read, seal};
@@ -24,6 +24,7 @@ const ADRP_X16: u32 = 0x9000_0010;
 const LDR_X16: u32 = 0xF940_0210;
 const BLR_X16: u32 = 0xD63F_0200;
 const ADRP_X0: u32 = 0x9000_0000;
+const ADD_X0: u32 = 0x9100_0000;
 const LDR_X0: u32 = 0xF940_0000;
 const LDR_W0_X0: u32 = 0xB940_0000;
 const MOV_W0_42: u32 = 0x5280_0540;
@@ -31,6 +32,37 @@ const NOP: u32 = 0xD503_201F;
 const BL_0: u32 = 0x9400_0000;
 const LDR_XZR_X16: u32 = 0xF940_021F;
 const BR_X16: u32 = 0xD61F_0200;
+
+#[test]
+fn both_native_export_layouts_address_empty_relro() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut record = CodeRecord::new_in(alloc);
+    for instruction in [ADRP_X0, ADD_X0, RET] {
+        record.code.extend_from_slice(&instruction.to_le_bytes());
+    }
+    record.relro_align = MOST_PART_ALIGN;
+    record.sites.extend([
+        Site { at: 0, kind: SiteKind::Page21, target: OWN_RELRO, addend: 0 },
+        Site { at: 4, kind: SiteKind::AddLo12, target: OWN_RELRO, addend: 0 },
+    ]);
+    let mut bytes = Vec::new_in(alloc);
+    record.seal().unwrap().encode(&mut bytes);
+    let optimized = v2(&bytes);
+    let main = sym("main");
+    let native = [crate::layout::Member { symbol: main, record: CodeView::read(&bytes).unwrap(), tier: Some(Tier::Fast) }];
+    let optimized = [Member02 { symbol: main, record: read(&optimized).unwrap(), tier: Some(Tier::Optimized) }];
+    for plan in [crate::elf::plan(), macho::plan()] {
+        let base = crate::layout::lay_out(&native, &[], main, None, plan, 0, alloc).unwrap();
+        let released = lay_out_records(&optimized, &[], main, None, plan, 0, alloc).unwrap();
+        for laid in [base, released] {
+            let off = laid.entry - laid.text_at;
+            let address = adrp_add_target(read32(&laid.text, off), read32(&laid.text, off + 4), laid.entry);
+            assert_eq!(address, Some(laid.const_at));
+            assert_ne!(laid.const_at, 0);
+            assert_eq!(laid.const_at % (1u64 << MOST_PART_ALIGN), 0);
+        }
+    }
+}
 
 #[test]
 fn machine_cfi_participates_in_optimized_folding() {

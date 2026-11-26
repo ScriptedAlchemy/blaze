@@ -1066,6 +1066,64 @@ fn release_record_preserves_an_exact_one_past_relro_address() {
 }
 
 #[test]
+fn release_record_returns_the_address_of_zero_sized_data() {
+    use super::{emit::EmitError, object::ReadError};
+    use blaze_code::record::OWN_RELRO;
+
+    const DATA: &str = "@empty = hidden constant [0 x i8] zeroinitializer, align 64\n";
+    let alloc = blaze_own::testing::heap().alloc();
+    let module = object_fixture(&blaze_own::format_in!(alloc, r#"
+{DATA}define ptr @entry() uwtable {{
+  ret ptr getelementptr inbounds ([0 x i8], ptr @empty, i64 0, i64 0)
+}}
+"#));
+    let host = machine();
+    for os in [blaze_tier::Os::MacOs, blaze_tier::Os::Linux] {
+        let machine = blaze_tier::Machine { os, ..host };
+        let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine }, alloc)
+            .unwrap_or_else(|error| panic!("{os:?}: {error}"));
+        let view = CodeView::read(&emission.record).unwrap();
+        assert!(view.relro().is_empty(), "{os:?}");
+        assert!(view.relro_align() >= 6, "{os:?}");
+        assert_eq!(view.sites(), 2, "{os:?}");
+        assert_eq!([view.site(0).kind, view.site(1).kind], [SiteKind::Page21, SiteKind::AddLo12], "{os:?}");
+        for site in [view.site(0), view.site(1)] {
+            assert_eq!((site.target, site.addend), (OWN_RELRO, 0), "{os:?}");
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if os == host.os {
+            let placed = place_leaf(&view, module.symbol);
+            let addr = usize::try_from(placed.data_address()).unwrap();
+            assert_ne!(addr, 0);
+            assert_eq!(addr % 64, 0);
+            // SAFETY: this leaf has the declared C ABI and returns its placed data address.
+            let entry: unsafe extern "C" fn() -> *const u8 = unsafe { placed.as_fn() };
+            // SAFETY: the placed executable is live; the returned pointer is never dereferenced.
+            assert_eq!(unsafe { entry() }.addr(), addr);
+        }
+    }
+
+    let machine = blaze_tier::Machine { os: blaze_tier::Os::Linux, ..host };
+    for (asm, kind, expected) in [
+        (r"adrp $0, empty+1", SiteKind::Page21, 1),
+        (r"adrp $0, empty\0Aldrb ${0:w}, [$0, :lo12:empty]", SiteKind::LdstLo12_1, 0),
+    ] {
+        let module = object_fixture(&blaze_own::format_in!(alloc, r#"
+{DATA}define i64 @entry() uwtable {{
+  %result = call i64 asm sideeffect "{asm}", "=r"()
+  ret i64 %result
+}}
+"#));
+        let error = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine }, alloc)
+            .err().expect("the zero-byte section has no loadable bytes");
+        assert!(matches!(error, EmitError::Read(ReadError::LocalRelroBounds {
+            kind: actual, offset, section_len: 0, relro_at, relro_len: 0, ..
+        }) if (actual, offset, relro_at) == (kind, expected, expected)), "unexpected refusal {error:?}");
+    }
+}
+
+#[test]
 fn release_record_keeps_source_positions_from_an_inlined_import() {
     use super::{emit::EmitError, object::ReadError};
     use blaze_code::record::{OWN_RELRO, PositionField, PositionPart};

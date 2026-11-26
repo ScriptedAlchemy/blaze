@@ -181,7 +181,7 @@ pub struct Site {
     /// [`OWN_CODE`]/[`OWN_RELRO`] for a single own-address instruction.
     pub target: u32,
     /// The byte offset within an own-address site's code or relro part. Address formation
-    /// may name the end of nonempty relro. Import sites have zero addend.
+    /// may name the end of relro, including the base of an empty part. Import sites have zero addend.
     pub addend: u32,
 }
 
@@ -189,7 +189,7 @@ impl Site {
     fn check_part_addend(self, len: u32) -> Result<(), RecordError> {
         let forms_relro_address = self.kind == SiteKind::Relro
             || self.target == OWN_RELRO && matches!(self.kind, SiteKind::Page21 | SiteKind::AddLo12);
-        if self.addend < len || (self.addend == len && len != 0 && forms_relro_address) {
+        if self.addend < len || (self.addend == len && forms_relro_address) {
             return Ok(());
         }
         Err(RecordError::RelroOutside { at: self.at, addend: self.addend, relro: len })

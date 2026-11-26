@@ -18,30 +18,36 @@ const RET: u32 = 0xD65F_03C0;
 #[test]
 fn relro_end_addresses_place_across_a_page_boundary() {
     let alloc = blaze_own::testing::heap().alloc();
-    let mut record = CodeRecord::new_in(alloc);
-    for instruction in [ADRP_X0, ADD_X0, RET] {
-        record.code.extend_from_slice(&instruction.to_le_bytes());
-    }
-    record.relro.extend_from_slice(&[42; 16]);
-    record.sites.extend([
-        Site { at: 0, kind: SiteKind::Page21, target: OWN_RELRO, addend: 16 },
-        Site { at: 4, kind: SiteKind::AddLo12, target: OWN_RELRO, addend: 16 },
-    ]);
-    let mut bytes = Vec::new_in(alloc);
-    record.seal().unwrap().encode(&mut bytes);
-    let view = CodeView::read(&bytes).unwrap();
-    let at = At { code: CODE + 0x40, relro: CODE + 0x8ff0 };
-    let (mut code, mut relro) = ([0u8; 12], [0u8; 16]);
-    place(&view, Symbol::of_name("one_past"), at, &mut Table { far: false }, &mut code, &mut relro).unwrap();
-    assert_eq!(adrp_add_target(inst(&code, 0), inst(&code, 4), at.code), Some(at.relro + 16));
-    assert_eq!(relro, [42; 16]);
-
-    for (kind, addend) in [(SiteKind::AddLo12, 17), (SiteKind::LdstLo12_1, 16)] {
+    for data in [&[][..], &[42; 16][..]] {
+        let end = u32::try_from(data.len()).unwrap();
         let mut record = CodeRecord::new_in(alloc);
-        record.code.extend_from_slice(&ADD_X0.to_le_bytes());
-        record.relro.extend_from_slice(&relro);
-        record.sites.push(Site { at: 0, kind, target: OWN_RELRO, addend });
-        assert!(matches!(record.seal(), Err(RecordError::RelroOutside { at: 0, addend: bad, relro: 16 }) if addend == bad));
+        for instruction in [ADRP_X0, ADD_X0, RET] {
+            record.code.extend_from_slice(&instruction.to_le_bytes());
+        }
+        record.relro.extend_from_slice(data);
+        record.sites.extend([
+            Site { at: 0, kind: SiteKind::Page21, target: OWN_RELRO, addend: end },
+            Site { at: 4, kind: SiteKind::AddLo12, target: OWN_RELRO, addend: end },
+        ]);
+        let mut bytes = Vec::new_in(alloc);
+        record.seal().unwrap().encode(&mut bytes);
+        let view = CodeView::read(&bytes).unwrap();
+        let boundary = CODE + 0x9000;
+        let at = At { code: CODE + 0x40, relro: boundary - u64::from(end) };
+        let (mut code, mut relro) = ([0u8; 12], [0u8; 16]);
+        let relro = &mut relro[..data.len()];
+        place(&view, Symbol::of_name("one_past"), at, &mut Table { far: false }, &mut code, relro).unwrap();
+        assert_eq!(adrp_add_target(inst(&code, 0), inst(&code, 4), at.code), Some(boundary));
+        assert_eq!(&*relro, data);
+
+        for (kind, addend) in [(SiteKind::AddLo12, end + 1), (SiteKind::LdstLo12_1, end)] {
+            let mut record = CodeRecord::new_in(alloc);
+            record.code.extend_from_slice(&ADD_X0.to_le_bytes());
+            record.relro.extend_from_slice(data);
+            record.sites.push(Site { at: 0, kind, target: OWN_RELRO, addend });
+            assert!(matches!(record.seal(), Err(RecordError::RelroOutside { at: 0, addend: bad, relro })
+                if (bad, relro) == (addend, end)));
+        }
     }
 }
 

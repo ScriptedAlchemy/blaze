@@ -435,15 +435,18 @@ fn instruction(file: &object::File<'_>, relocation: &object::Relocation, at: u64
             }
             let offset = offset.checked_add(addend).ok_or(ReadError::CodeOutside)?;
             let (target, relro_at) = local(index, offset, placed, text, start, at)?;
-            let relro_len = i64::try_from(record.relro.len()).map_err(|_| ReadError::CodeOutside)?;
-            if target == OWN_RELRO && relro_at >= relro_len {
+            if target == OWN_RELRO {
+                let relro_len = i64::try_from(record.relro.len()).map_err(|_| ReadError::CodeOutside)?;
                 let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
-                // ADRP/ADD may construct a one-past pointer. The original object section
-                // must end there too, or a bad addend could look like a valid record end.
-                let one_past = relro_len != 0 && relro_at == relro_len
-                    && u64::try_from(offset).ok() == Some(section.size())
-                    && matches!(kind, SiteKind::Page21 | SiteKind::AddLo12);
-                if !one_past {
+                let section_len = section.size();
+                // A zero-byte section still has an aligned address. ADRP/ADD can form
+                // it just as they can form the end of a nonempty section. Reaching data
+                // elsewhere in the record does not make the zero-byte section loadable.
+                if (section_len == 0 || relro_at >= relro_len)
+                    && !(relro_at <= relro_len
+                        && u64::try_from(offset).ok() == Some(section_len)
+                        && matches!(kind, SiteKind::Page21 | SiteKind::AddLo12))
+                {
                     let mut section_name = FixedString::new();
                     section_name.try_push_str(section.name().unwrap_or("")).ok();
                     let mut symbol_name = FixedString::new();
@@ -454,7 +457,7 @@ fn instruction(file: &object::File<'_>, relocation: &object::Relocation, at: u64
                     }
                     return Err(ReadError::LocalRelroBounds {
                         at, kind, section: section_name, symbol: symbol_name, offset,
-                        section_len: section.size(), relro_at, relro_len,
+                        section_len, relro_at, relro_len,
                     });
                 }
             }
