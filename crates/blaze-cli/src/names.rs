@@ -1643,7 +1643,11 @@ fn make_world<'f>(
     for plan in plans.iter().filter(|plan| plan.id.consumer == Consumer::HostDependency) {
         let id = plan.id;
         let unit = &graph.units[id.unit.index()];
-        let module = plan_script_module(graph, lock, id.unit, None, home, heap);
+        let mut module = plan_script_module(graph, lock, id.unit, None, home, heap);
+        if id.side == Side::Macro && module.ran_as == crate::scripts::RanAs::Wasm && matches!(lock.package(unit.package).source, LockSource::Path) {
+            module.subject = crate::script_modules::producer_subject(module.subject);
+            module.checkout = crate::script_modules::CheckoutPolicy::ProducerRevision;
+        }
         let source = run_plan::dependency_source(graph, lock, paths, id.unit, id.side).ok_or_else(|| NamesError::World(std::format!(
             "the build script of {} {} has no host library to serve", unit.name.as_str(), unit.version.as_str()
         )))?;
@@ -1689,8 +1693,12 @@ fn plan_script_module(
     features.extend(script.features.iter().map(|feature| feature.as_str()));
     let (package, version) = (script.name.as_str(), script.version.as_str());
     let subject = crate::script_modules::subject(ran_as, package, version, &features);
-    let tracked = ran_as == crate::scripts::RanAs::Wasm && crate::script_modules::tracks_checkout(graph, lock, unit, heap);
-    crate::script_modules::ScriptModule { subject, crate_at, ran_as, package, version, package_id: script.package, root: script.root.as_str(), tracked, features }
+    let checkout = if ran_as == crate::scripts::RanAs::Wasm && crate::script_modules::tracks_checkout(graph, lock, unit, heap) {
+        crate::script_modules::CheckoutPolicy::CompilerReads
+    } else {
+        crate::script_modules::CheckoutPolicy::Untracked
+    };
+    crate::script_modules::ScriptModule { subject, crate_at, ran_as, package, version, package_id: script.package, root: script.root.as_str(), checkout, features }
 }
 
 /// Each crate (by world index, in order) made from a unit with a build script, with that

@@ -2,10 +2,11 @@
 //! here are transient. Only the admitted output receipt can enter a module identity.
 
 use std::io::Read as _;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
 use blaze_build_script::{
     Outputs,
-    instr::{Instr, Line, OutputLimits},
+    instr::{Instr, Line, OutputLimits, SearchKind},
     module_record::Digest,
     outputs::FileLimits,
     producer_outputs::{self, Observed, Receipt},
@@ -213,7 +214,7 @@ fn lay(entry: &Captured<'_>, alloc: blaze_own::Alloc<'_>) -> Result<PathBuf, Fai
     let root = PathBuf::from(format!("{}{}", producer_outputs::ROOT_PREFIX, entry.receipt.directory().text()));
     if !root.exists() {
         let stage = root.with_extension(std::process::id().to_string());
-        std::fs::create_dir(&stage).map_err(io(&stage))?;
+        std::fs::DirBuilder::new().mode(0o700).create(&stage).map_err(io(&stage))?;
         let built = (|| {
             for file in &entry.outputs.files {
                 let path = stage.join(file.name.as_str());
@@ -234,6 +235,9 @@ fn lay(entry: &Captured<'_>, alloc: blaze_own::Alloc<'_>) -> Result<PathBuf, Fai
     let tmp = std::fs::canonicalize("/tmp").map_err(io(Path::new("/tmp")))?;
     if real.parent() != Some(tmp.as_path()) || real.file_name() != root.file_name() {
         return Err(refuse(&root, "the admitted output directory is not at its content name"));
+    }
+    if std::fs::metadata(&real).map_err(io(&real))?.permissions().mode() & 0o077 != 0 {
+        return Err(refuse(&root, "the admitted output directory is not private to its owner"));
     }
     let mut held = Outputs::new_in("/", alloc);
     read_files(&real, &mut held, alloc)?;
@@ -261,7 +265,11 @@ pub(super) fn plan(producers: &[Captured<'_>], target: &Path, alloc: blaze_own::
             producer_outputs::Value::Scalar(_) => None,
             producer_outputs::Value::OutputPath(path) => Some(serde_json::json!([name.as_str(), path])),
         }).collect::<Vec<_>>();
-        inputs.push(serde_json::json!({ "name": producer.name, "version": producer.version, "root": root, "env": env, "path_cfgs": path_cfgs }));
+        let search = producer.outputs.link_search.iter().map(|(kind, path)| {
+            let relative = producer_outputs::under(path.as_str(), out).expect("the producer's search path was admitted");
+            serde_json::json!([*kind as u8, relative])
+        }).collect::<Vec<_>>();
+        inputs.push(serde_json::json!({ "name": producer.name, "version": producer.version, "root": root, "env": env, "path_cfgs": path_cfgs, "search": search }));
     }
     let plan = serde_json::json!({ "target": target.join("wasm32-wasip1/release/build"), "inputs": inputs }).to_string();
     if plan.len() > (48 << 10) {
@@ -277,6 +285,7 @@ pub(super) fn wrap(plan: &str, args: Vec<OsString>) -> ! {
     let builds = parsed.get("target").and_then(serde_json::Value::as_str).unwrap_or_else(|| fail("the plan names no WASI build directory"));
     let inputs = parsed.get("inputs").and_then(serde_json::Value::as_array).unwrap_or_else(|| fail("the plan has no producer inputs"));
     let mut command = toolchain_command(rustc);
+    command.env_remove(WRAPPER_PLAN);
     let mut arguments = args.to_vec();
     let wasi = args.windows(2).any(|pair| pair[0] == "--target" && pair[1] == "wasm32-wasip1");
     if wasi {
@@ -329,8 +338,10 @@ pub(super) fn wrap(plan: &str, args: Vec<OsString>) -> ! {
                     None => continue,
                 },
             };
-            if let Some(shown) = show_search(value, builds, inputs) {
-                arguments[index] = format!("{prefix}{shown}").into();
+            match show_search(value, builds, inputs) {
+                Ok(Some(shown)) => arguments[index] = format!("{prefix}{shown}").into(),
+                Ok(None) => {}
+                Err(why) => fail(&format!("{value}: {why}")),
             }
         }
     }
@@ -342,21 +353,55 @@ fn output_path(root: &str, path: &str) -> String {
     if path.is_empty() { root.to_owned() } else { format!("{root}/{path}") }
 }
 
-fn show_search(value: &str, builds: &str, inputs: &[serde_json::Value]) -> Option<String> {
-    let (kind, path) = value.split_once('=').map_or(("", value), |(kind, path)| (kind, path));
-    let relative = producer_outputs::under(path, builds)?;
-    let (folder, rest) = relative.split_once('/')?;
-    let (unit, _) = folder.rsplit_once('-')?;
-    let suffix = producer_outputs::under(rest, "out")?;
-    let root = inputs.iter().find(|input| input.get("name").and_then(serde_json::Value::as_str) == Some(unit))?
-        .get("root")?.as_str()?;
+fn show_search(value: &str, builds: &str, inputs: &[serde_json::Value]) -> Result<Option<String>, &'static str> {
+    let line = format!("cargo::rustc-link-search={value}");
+    let Line::Instr(_, Instr::LinkSearch { kind, path }) = blaze_build_script::parse(line.as_bytes()) else {
+        return Ok(None);
+    };
+    let Some(relative) = path.strip_prefix(builds).and_then(|rest| rest.strip_prefix('/')) else { return Ok(None) };
+    let Some((folder, rest)) = relative.split_once('/') else { return Ok(None) };
+    let Some((unit, _)) = folder.rsplit_once('-') else { return Ok(None) };
+    let mut candidates = inputs.iter().filter(|input| input.get("name").and_then(serde_json::Value::as_str) == Some(unit)).peekable();
+    if candidates.peek().is_none() {
+        return Ok(None);
+    }
+    let suffix = producer_outputs::under(rest, "out").ok_or("Cargo passed a search path outside the producer's confined OUT_DIR")?;
+    let mut roots = candidates.filter_map(|input| {
+        let search = input.get("search")?.as_array()?;
+        let planned = search.iter().any(|row| {
+            row.get(0).and_then(serde_json::Value::as_u64) == Some(kind as u64)
+                && row.get(1).and_then(serde_json::Value::as_str) == Some(suffix)
+        });
+        planned.then(|| input.get("root")?.as_str()).flatten()
+    });
+    let root = roots.next().ok_or("Cargo passed a producer search path absent from the output receipt")?;
+    if roots.any(|other| other != root) {
+        return Err("the producer search path does not uniquely identify the admitted output directory");
+    }
     let path = output_path(root, suffix);
-    Some(if kind.is_empty() { path } else { format!("{kind}={path}") })
+    Ok(Some(if kind == SearchKind::Unspecified { path } else { format!("{}={path}", value.split_once('=').expect("a written search kind has `=`").0) }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_admitted_producer_search_can_be_rewritten() {
+        const BUILDS: &str = "/work/wasm32-wasip1/release/build";
+        let inputs = [serde_json::json!({
+            "name": "a-dep",
+            "root": "/tmp/admitted",
+            "search": [[SearchKind::Native as u8, "found"], [SearchKind::Unspecified as u8, "found=exact"]],
+        })];
+        let search = |value: &str| show_search(value, BUILDS, &inputs);
+        assert_eq!(search(&format!("native={BUILDS}/a-dep-abcd/out/found")), Ok(Some("native=/tmp/admitted/found".to_owned())));
+        assert_eq!(search(&format!("{BUILDS}/a-dep-abcd/out/found=exact")), Ok(Some("/tmp/admitted/found=exact".to_owned())));
+        assert!(search(&format!("native={BUILDS}/a-dep-abcd/out/unplanned")).is_err());
+        assert!(search(&format!("native={BUILDS}/a-dep-abcd/out/../found")).is_err());
+        assert!(search(&format!("crate={BUILDS}/a-dep-abcd/out/found")).is_err());
+        assert_eq!(search(&format!("native={BUILDS}/another-abcd/out/found")), Ok(None));
+    }
 
     #[test]
     fn the_producer_receipt_uses_cargos_reached_library_and_real_outputs() {

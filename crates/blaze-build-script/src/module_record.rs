@@ -100,6 +100,14 @@ pub fn checkout_package(record: &str) -> Option<&str> {
     checkout_path(path).then_some(path)
 }
 
+/// The source digest written for a checkout package.
+pub fn checkout_files(record: &str) -> Option<Digest> {
+    if one(record, "checksum") != Ok(None) || one(record, "git") != Ok(None) {
+        return None;
+    }
+    Digest::parse(one(record, "files").ok()??)
+}
+
 /// The package and location a checkout receipt belongs to.
 pub fn checkout_owner(record: &str) -> Option<(&str, &str, &str)> {
     Some((one(record, "name").ok()??, one(record, "version").ok()??, checkout_package(record)?))
