@@ -491,9 +491,9 @@ fn a_frozen_head_carries_the_store_s_side_tables() {
                         consts += usize::from(r.consts.as_ref().is_some_and(|c| c.len() == 1));
                     }
                 }
-                head_record::Head::Adt { key, fieldless: f, life, static_defaults, .. } => {
+                head_record::Head::Adt { key, fieldless: count, life, static_defaults, .. } => {
                     assert!(life.is_some(), "ORACLE: {at:?}: an ADT's lifetime part is not in its record");
-                    fieldless += usize::from(*f == Some(2));
+                    fieldless += usize::from(*count == Some(2));
                     if names.name_of(*key) == Some("Defaulted") {
                         use crate::front2::types::StaticDefaultRegions;
                         assert_eq!(&static_defaults[..], &[StaticDefaultRegions { parameter: 1, slots: 1 }]);
