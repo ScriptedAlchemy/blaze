@@ -391,7 +391,9 @@ class ForkfixHarness(unittest.TestCase):
                     return {"returncode": 0, "timed_out": False}
                 value = env.get("FORKFIXES_CALLER_VALUE", "unset")
                 self.assertEqual(argv, [given.blaze, "run", "-p", "caller_environment_changes_and_becomes_unset",
-                                        "--bin", "caller_environment_changes_and_becomes_unset", "--workers", "2"])
+                                        "--bin", "caller_environment_changes_and_becomes_unset", "--build-env",
+                                        "FORKFIXES_CALLER_VALUE", "--workers", "2"])
+                self.assertNotIn(f"FORKFIXES_CALLER_VALUE={value}", argv)
                 observed.append(value)
                 return {"returncode": 0, "stdout": f"{value} {value}\n", "stderr": "", "timed_out": False}
             with patch.dict(os.environ, {"FORKFIXES_CALLER_VALUE": "ambient"}), \

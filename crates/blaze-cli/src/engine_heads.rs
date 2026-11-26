@@ -3706,6 +3706,7 @@ impl HeadsStage {
         let procs = names.stage().names.as_ref().and_then(|names| names.procs());
         let root = handles.root;
         let fs = &handles.env.fs;
+        let caller_env = handles.env.caller_env;
         let outlined = handles.outlined;
         let clock = handles.clock;
         let subjects = &subjects[..];
@@ -3891,7 +3892,7 @@ impl HeadsStage {
                         scope.may_overlap("engine heads", HEADS_FRAME, move |cx: &Cx| {
                             let began = clock.now();
                             let on_board = OnBoard { board, clock, shows };
-                            let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, &list, job, scope_records, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot, at_phase, workers));
+                            let made = work::unwinding(|| heads_of(cx, root, fs, outlined, packs, corrected, procs, &list, caller_env, job, scope_records, setup, tasks, subjects, view, expansion_reads, heap, once, listings, head_jobs.listings, on_board, snapshot, at_phase, workers));
                             Ok::<_, Infallible>((made, clock.now().since(began).map_or(0, crate::engine_times::ns), crate::engine_times::ns(began.since_start())))
                         }),
                     ));
@@ -4216,6 +4217,7 @@ impl core::fmt::Display for OpenScopeRefused {
 /// builds `row_env` on demand for any crate in the split's scope that has no build script.
 struct HeadEnvs<'n> {
     list: &'n blaze_world::crate_list::CrateList<'static>,
+    caller_env: blaze_build_script::env::CallerEnv<'n>,
     own: usize,
     rest: &'n [crate::front_load::Unopened],
     frame: &'n Frame,
@@ -4225,13 +4227,14 @@ struct HeadEnvs<'n> {
 impl<'n> HeadEnvs<'n> {
     fn new(
         list: &'n blaze_world::crate_list::CrateList<'static>,
+        caller_env: blaze_build_script::env::CallerEnv<'n>,
         own: usize,
         rest: &'n [crate::front_load::Unopened],
         frame: &'n Frame,
     ) -> HeadEnvs<'n> {
         let mut made = Vec::with_capacity_in(1 + rest.len(), frame);
         made.resize_with(1 + rest.len(), core::cell::OnceCell::new);
-        HeadEnvs { list, own, rest, frame, made }
+        HeadEnvs { list, caller_env, own, rest, frame, made }
     }
 }
 
@@ -4241,7 +4244,7 @@ impl<'n> crate::job_texts::EnvsByNeed<'n> for HeadEnvs<'n> {
         let world_at = if krate == 0 { self.own } else { self.rest.get(krate - 1)?.world_at };
         *slot.get_or_init(|| {
             if matches!(crate::body_types::owner_script(self.list, world_at), Ok(None)) {
-                crate::body_types::row_env(self.list, world_at, None, None, self.frame).ok()
+                crate::body_types::row_env(self.list, world_at, None, None, self.caller_env, self.frame).ok()
             } else {
                 None
             }
@@ -4421,6 +4424,7 @@ fn heads_of<'p>(
     corrected: &'static [(u32, &'static str, &'static str)],
     procs: Option<&'static crate::proc_runner::ProcRunner<'static>>,
     list: &blaze_world::crate_list::CrateList<'static>,
+    caller_env: blaze_build_script::env::CallerEnv<'_>,
     job: &ItemJob<'_, '_>,
     scope_records: &dyn crate::front_load::OpenByNeed,
     setup: &CrateSetup,
@@ -4440,7 +4444,7 @@ fn heads_of<'p>(
     let frame = cx.frame();
     let g = heap.alloc();
     let scope_crates = job.scope_crates(scope_records);
-    let head_envs = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(HeadEnvs::new(list, job.own.world_at, &job.rest, frame), frame));
+    let head_envs = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(HeadEnvs::new(list, caller_env, job.own.world_at, &job.rest, frame), frame));
     let envs = crate::run_names::Envs { owner: crate::job_texts::EnvsByNeed::env_of(head_envs, 0), rest: Some(head_envs) };
     let opened = open_scope_by_need(cx, root, fs, outlined, scope_crates, packs, corrected, procs, envs, frame, g, snapshot).map_err(OpenScopeRefused::message)?;
     let records = opened.records;

@@ -1677,6 +1677,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn observed_environment_answers_select_code_variants_and_revert() {
+        let builder = builder();
+        let producer = blaze_ids::producer::Producers::for_tests(b"environment code variants").get::<CodeBuilder>();
+        let key = |answer: u8| {
+            let reads = [Read { fact: [31; 32], digest: [answer; 32] }];
+            record_key(Symbol([4; 32]), &BodyId { key: ContentId([7; 32]), reads: &reads }, &[], &builder, &producer)
+        };
+        let absent = key(0);
+        let empty = key(1);
+        let first = key(2);
+        let changed = key(3);
+        assert_ne!(absent, empty);
+        assert_ne!(empty, first);
+        assert_ne!(first, changed);
+        assert_eq!(first, key(2), "restoring an observed answer restores the code key");
+    }
+
     /// One run of the model program over `store`: its counts and the maker's calls.
     fn run_once(ids: &Ids, store: &mut MemoryStore<'_>, alloc: blaze_own::Alloc<'_>) -> (Counts, usize) {
         let mut walk = Walk::new_in(alloc);

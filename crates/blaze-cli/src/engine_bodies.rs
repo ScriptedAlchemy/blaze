@@ -3047,6 +3047,7 @@ fn open_stretch_records<'n>(
     let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.into_bump_slice();
     let texts: &'n crate::job_texts::JobTexts<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
         crate::job_texts::JobTexts {
+            caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
             cx,
             root,
             frame,
@@ -5168,7 +5169,7 @@ impl<'f> BodiesStage<'f> {
             tally.parts.own_records_ns = tally.parts.own_records_ns.saturating_add(lap(handles.clock, &mut member_mark));
             // The member's environment, its script run's record handed by the Scripts stage:
             // made for every member in both arms (a refused one drops its row in both).
-            let env = crate::body_types::owner_env_by(cx, store, &|script| names.input_of(script), &list, member, handles.env.home, frame)?;
+            let env = crate::body_types::owner_env_by(cx, store, &|script| names.input_of(script), &list, member, handles.env.home, handles.env.caller_env, frame)?;
             let (env, script, env_refused) = match env {
                 Ok((env, script)) => (env, script.map(|(name, _)| name), None),
                 Err(why) => (None, None, Some(why)),
@@ -7931,6 +7932,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
         // Keep the include log until publication: a frame can fill after the last include
         // and before the row's reads have been copied out.
         let data_at = opened.sources.0.data.borrow().len();
+        let caller_at = opened.sources.0.caller_reads.borrow().len();
         // The reads of this body's calls that left its package inside the workspace (D111), told
         // to the texts while it is checked (job_texts.rs `left_package`): its warnings.
         let left_at = opened.sources.0.left.borrow().len();
@@ -8535,7 +8537,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
             Err(work::Panicked) => Err(frame_limit(mem.allocating, stretch_store.as_ref())),
         };
         let stopped = outcome.is_err();
-        let result = match outcome {
+        let mut result = match outcome {
             Ok(result) => {
                 tally.add(&body_tally);
                 result
@@ -8586,6 +8588,13 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
                 BodyResult { done, note: Some((said, None)), found: Vec::new_in(sc), locals: Vec::new_in(sc), typed: Vec::new_in(sc), untyped_clean: 0, checked: false, stands }
             }
         };
+        {
+            let reads = opened.sources.0.caller_reads.borrow();
+            result.done.reads.extend_from_slice(&reads[caller_at..]);
+            result.done.reads.sort_unstable_by_key(|read| read.0);
+            result.done.reads.dedup_by_key(|read| read.0);
+        }
+        opened.sources.0.caller_reads.borrow_mut().truncate(caller_at);
         opened.sources.0.data.borrow_mut().truncate(data_at);
         opened.sources.0.left.borrow_mut().truncate(left_at);
         let index = ran.len();

@@ -267,6 +267,7 @@ pub(crate) const CALL_SCRATCH: usize = 4 << 30;
 fn failed_scope(words: String, kept: blaze_own::SharedAlloc<'static>) -> Resolution {
     Resolution::Made {
         resolved: Resolved {
+            caller_reads: std::vec::Vec::new_in(Global),
             out: crate::work::failed_out(),
             payload: sections::write(0, [&[][..]; sections::SECTIONS]),
             files: std::vec::Vec::new(),
@@ -333,6 +334,7 @@ fn blocks_differential(
             let bump = erased.bump();
             let alloc = bump.alloc();
             let texts = JobTexts {
+                caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
                 cx: &span,
                 root,
                 frame: &own,
@@ -381,6 +383,7 @@ fn blocks_differential(
         let bump = erased.bump();
         let alloc = bump.alloc();
         let texts = JobTexts {
+            caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
             cx: &span,
             root,
             frame: &own,
@@ -432,6 +435,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     };
     let callers: &[(usize, usize, blaze_expand::Edition)] = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in([(job.at, job.at, job.input.edition)], frame));
     let texts = JobTexts {
+        caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
         cx: &cx,
         root,
         frame,
@@ -600,7 +604,8 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         }
         None => crate::work::failed_out(),
     };
-    Resolution::Made { resolved: Resolved { out, payload, files, absent, data, findings, left_package, failed, failed_calls, module_missing, test_marks, expansions }, ok, unresolved, oracle }
+    let caller_reads = texts.caller_reads.into_inner();
+    Resolution::Made { resolved: Resolved { out, payload, files, absent, data, findings, left_package, failed, failed_calls, module_missing, test_marks, expansions, caller_reads }, ok, unresolved, oracle }
 }
 
 /// The crate's comparison, owned on `kept`: its counts, and a line for each disagreement its
@@ -837,6 +842,7 @@ mod tests {
             module_missing: blaze_own::Vec::new_in(blaze_own::testing::heap().shared()),
             test_marks: blaze_own::Vec::new_in(Global),
             expansions: crate::work::Extras::none(),
+            caller_reads: std::vec::Vec::new_in(Global),
         };
         let frame = Frame::with_reserve(FRAME, Tag::Other).expect("a test frame");
         assert!(LEN > frame.reserved(), "the payload ({LEN} bytes) is larger than the frame ({} bytes)", frame.reserved());

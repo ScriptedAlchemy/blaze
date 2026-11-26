@@ -189,7 +189,26 @@ scripts parse). `CARGO_CFG_*` are the target unit's cfg atoms (multi-valued join
 `debug`, `OPT_LEVEL` `0`, `DEBUG` `true`, `RUSTC` `rustc`, `RUSTDOC`
 `rustdoc`, `CARGO` `cargo`, `CARGO_ENCODED_RUSTFLAGS` empty, the `CARGO_PKG_*` values from the
 manifest, `CARGO_MANIFEST_LINKS`, and `DEP_<links>_<key>` from the direct dependencies'
-records. No `PATH`, `HOME`, wrapper or user variable: a switch like `LIBC_CI` is unset.
+records. The default sandbox leaves caller variables such as `LIBC_CI` unset.
+
+`--build-env NAME` grants a workspace member's build script and its built-in `env!` and
+`option_env!` expansions one variable from this command. Repeat the flag for additional names.
+Blaze reads the named variables from the request.
+A missing variable stays absent. A present empty value stays empty. The flag accepts application
+variable names of up to 128 ASCII characters beginning with a letter, followed by letters,
+digits or underscores. Up to 64 distinct names may be granted. Runner and tool settings such
+as `HOME`, `PATH`, `OUT_DIR`, `CARGO_*` and loader variables are reserved. Dependencies and
+proc macros receive their existing sandbox environments. A script instruction such as
+`rerun-if-env-changed` grants no access.
+
+Each present caller fact in the engine is authenticated with a key created once at
+`$HOME/.blaze-build-env-key` (mode 0600). The engine records the variable's name and authentication tag.
+The script key includes the whole projection because a script can enumerate its environment.
+A Rust expansion reads the individual variable's fact. Changing or revoking a grant rechecks
+the existing checkout answer. A workspace script that prints `rustc-env` or writes a file,
+and a program that embeds a value with `env!`, can include that value in their private
+outputs. A deferred process tree or executor request must omit granted names from its child
+environment before blaze can record or dispatch the work.
 The job count is outside the key (a hint about the machine, `env::Env::for_run`): a wasm run is
 told `NUM_JOBS` `1`; a native run `NUM_JOBS` the command's workers and `CARGO_MAKEFLAGS` naming
 the command's jobserver fifo (`-j --jobserver-fds=fifo:P --jobserver-auth=fifo:P`, cargo's

@@ -466,6 +466,8 @@ pub struct Script {
     pub root: ScriptRoot,
     /// The environment, `(name, value)` sorted by name, paths in it virtual.
     pub env: Vec<(String, String)>,
+    /// Caller-granted names that may never enter a persisted process recipe or worker request.
+    pub private_env_names: Vec<String>,
     /// The target the script is run for, which a try-compile's key holds.
     pub target: String,
     /// The host, for `rustc -vV`.
@@ -531,6 +533,7 @@ pub enum Refusal {
 /// A spawn the sandbox does not answer.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SpawnRefusal {
+    PrivateEnv { name: String },
     /// A try-compile no row of the table answers: its key, arguments and snippet, so the row
     /// can be written (with its reason) from this, and the target its key was made for (a
     /// macro-side run asks for wasm32-wasip1: a row of another target never answers it).
@@ -625,6 +628,7 @@ impl std::fmt::Display for SpawnRefusal {
             SpawnRefusal::Program { program, args } => write!(f, "spawned `{program} {}`, a program a build script may not run", args.join(" ")),
             SpawnRefusal::Git { command, why } => write!(f, "asked `git {command}`, which blaze does not answer from the checkout: {why}"),
             SpawnRefusal::Malformed(why) => write!(f, "made a spawn request blaze cannot read: {why}"),
+            SpawnRefusal::PrivateEnv { name } => write!(f, "cannot persist caller variable {name} in a child process request; remove it from the child environment"),
             SpawnRefusal::NoSandbox { program, args, why } => write!(
                 f,
                 "spawned `{program} {}`, which runs only in the deterministic sandbox; the sandbox is off on this machine: {why} (D92). Not run natively (rule 3)",
@@ -1361,7 +1365,7 @@ impl ScriptSandbox {
                 // A process tree runs later with the folder and environment it was spawned
                 // with (outputs.rs `CTree`): `configure` reads CC, CFLAGS and the rest.
                 if blaze_build_script::c_tasks::is_tree(program) {
-                    let env = crate::spawn_route::child_env(&self.script.env, &spawned);
+                    let env = self.script.work_env(&spawned).map_err(|why| self.refuse(Refusal::Spawn(why)))?;
                     self.c_trees.push((self.c_requests.len() as u32, cwd, env));
                 }
                 self.c_requests.push((text, state));

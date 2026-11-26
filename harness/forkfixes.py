@@ -348,6 +348,8 @@ def choose_target(root: Path, case: dict, step: dict) -> tuple[str, str]:
 def target_args(root: Path, case: dict, step: dict) -> list[str]:
     package, binary = choose_target(root, case, step)
     args = ["-p", package, "--bin", binary]
+    for name in sorted(step.get("env", {})):
+        args.extend(["--build-env", name])
     raw = list(step.get("args", []))
     index = 0
     while index < len(raw):

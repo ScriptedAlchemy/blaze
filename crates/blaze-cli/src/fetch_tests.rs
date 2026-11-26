@@ -67,6 +67,7 @@ fn write(io: &Io, cx: &Cx, path: &str, bytes: &[u8]) {
 /// `CARGO_HOME=/c`, started in `/`, in the checkout `checkout`.
 fn env(io: &Io, checkout: &'static str) -> FetchEnv<'static> {
     FetchEnv {
+        caller_env: Default::default(),
         clock: io.need_clock().expect("a clock"),
         checkout,
         served: crate::engine_script_reads::Served::Simulated,
@@ -567,6 +568,7 @@ fn a_symlink_inside_cargos_git_db_is_refused_by_confined_reads() {
     let home_str = home_dir.to_str().expect("utf8 home");
     let cargo_str = cargo_dir.to_str().expect("utf8 cargo");
     let native_env = FetchEnv {
+        caller_env: Default::default(),
         clock: io.need_clock().expect("clock"),
         checkout: "",
         served: crate::engine_script_reads::Served::Simulated,

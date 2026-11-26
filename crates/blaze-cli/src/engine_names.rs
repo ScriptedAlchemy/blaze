@@ -2195,6 +2195,10 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
         record.reads.push((input.name, input.out));
         reads.push(input_cell(input, false));
     }
+    for &(cell, digest) in &resolved.caller_reads {
+        record.reads.push((cell.of, digest));
+        reads.push((cell, digest));
+    }
     reads.sort_unstable_by_key(|row| row.0);
     reads.dedup_by_key(|row| row.0);
     record.parts.push(Part { name: Name::links_of(name), locate: Locate::Source(blaze_ladder::native_links::table_digest(parts.links)), place: 0 });

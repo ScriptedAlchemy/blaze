@@ -123,7 +123,7 @@ use bstd::sync::CachePadded;
 use crate::CliError;
 use crate::engine_seeds::{DependencyFinder, HeadRecords, KEY_BYTES, Keyed};
 use crate::engine_head_consts::{HeadConsts, UnplacedIn, source_read, text_cell};
-use crate::engine_head_notes::{Cause, head_result, leak, published};
+use crate::engine_head_notes::{Cause, RootKind, head_result, leak, published};
 use crate::engine_heads::{HeadAt, MOST_HEAD_READS, Owners, Subjects, names_read};
 use crate::engine_tasks::WHOLE;
 
@@ -1124,7 +1124,7 @@ pub(crate) struct JobCx<'j, 't, 'n, 'v, 'w> {
     pub(crate) crate_scopes: &'j [ScopeCrate],
     /// Body expansion sources (`include_str!`, `include_bytes!`, `env!`) for head constant evaluation.
     pub(crate) sources: Option<&'n dyn blaze_ladder::front2::body_host::BodySources>,
-    /// Underlying `JobTexts` recording data-file reads made during head constant evaluation (rule 21).
+    /// Underlying `JobTexts` recording data files and caller inputs during constant evaluation.
     pub(crate) texts: &'n crate::job_texts::JobTexts<'n>,
 }
 
@@ -1167,24 +1167,26 @@ pub(crate) fn one_head<'n, 's: 'n>(
     }
     let mark = source.kept_len();
     let fail_mark = source.failed_len();
-    let data_mark = job.texts.data.borrow().len();
     // The task's own lookups (its item's text, `cell_of`) are its cell's.
     job.names.enter(want);
     job.evals.enter(want);
+    let data_mark = job.texts.data.borrow().len();
+    let caller_mark = job.texts.caller_reads.borrow().len();
     let made = head_task_with_key(job.shared, source, want, task.key, job.g);
     job.names.leave();
     job.evals.leave();
-    let data_cells = match data_read_cells(job, data_mark) {
-        Some(cells) => cells,
-        None => {
-            failed.get_or_insert(UNPLANNED_DATA_CELL);
-            Vec::new_in(job.g)
+    let const_cells = match constant_read_cells(job, data_mark, caller_mark, failed) {
+        Ok(cells) => cells,
+        Err(why) => {
+            job.engine_refusal.set(Some(why));
+            failed.get_or_insert(why);
+            return Err(Cause::new(RootKind::Engine, why));
         }
     };
-    for &id in data_cells.iter() {
+    for &id in const_cells.iter() {
         push(id);
     }
-    if let Err(why) = publish_since(job, owners, source, mark, fail_mark, &data_cells) {
+    if let Err(why) = publish_since(job, owners, source, mark, fail_mark, &const_cells) {
         failed.get_or_insert(why);
     }
     let result = head_result(job, source, want, made);
@@ -1216,6 +1218,31 @@ pub(crate) fn one_head<'n, 's: 'n>(
 
 const UNPLANNED_DATA_CELL: &str = "a data file read while evaluating a head's constant has no planned cell in this request (rule 21)";
 
+/// Bind the constant evaluation's observations to this request's view before publishing heads.
+fn constant_read_cells(job: &JobCx<'_, '_, '_, '_, '_>, data_mark: usize, caller_mark: usize, failed: &mut Option<&'static str>) -> Result<Vec<CellId, Alloc<'static>>, &'static str> {
+    let mut cells = match data_read_cells(job, data_mark) {
+        Some(cells) => cells,
+        None => {
+            failed.get_or_insert(UNPLANNED_DATA_CELL);
+            Vec::new_in(job.g)
+        }
+    };
+    let mut caller_reads = job.texts.caller_reads.borrow_mut();
+    let bound = (|| {
+        for &(cell, observed) in &caller_reads[caller_mark..] {
+            if job.view.cell(&cell) != observed {
+                return Err(leak(job.g, format_args!("caller environment cell {cell:?} read by a head's constant disagrees with this request (rule 21)")));
+            }
+            cells.push(cell);
+        }
+        cells.sort_unstable();
+        cells.dedup();
+        Ok(cells)
+    })();
+    caller_reads.truncate(caller_mark);
+    bound
+}
+
 /// Data-file cells read via `include_str!`/`include_bytes!` while evaluating a head's constant
 /// since `from` in `job.texts.data` (rule 21: every read file enters the cell's read list).
 fn data_read_cells<'n>(job: &JobCx<'_, '_, 'n, '_, '_>, from: usize) -> Option<Vec<CellId, Alloc<'static>>> {
@@ -1236,15 +1263,13 @@ fn data_read_cells<'n>(job: &JobCx<'_, '_, 'n, '_, '_>, from: usize) -> Option<V
         }
         return None;
     }
-    out.sort_unstable();
-    out.dedup();
     Some(out)
 }
 
 /// Every cell `source` froze itself from its kept index `mark` on, and every cell that failed in
 /// it from its failure mark `fail_mark` on (lane HF1), put into the table with its own reads
 /// (taken by owner from the job's recorders).
-fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, source: &mut SeededHeads<'n, '_, Tables<'_, 'n>>, mark: usize, fail_mark: usize, data_cells: &[CellId]) -> Result<(), &'static str> {
+fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, source: &mut SeededHeads<'n, '_, Tables<'_, 'n>>, mark: usize, fail_mark: usize, const_cells: &[CellId]) -> Result<(), &'static str> {
     let g = job.g;
     let mut gave_up: Vec<(Want, Cause, Option<Want>, Vec<Want, Alloc<'static>>), Alloc<'static>> = Vec::new_in(g);
     for (w, failure, heads) in source.failures_from(fail_mark) {
@@ -1255,8 +1280,8 @@ fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owner
     }
     for (want, cause, needs, heads) in gave_up.iter() {
         let mut reads = cell_reads(job, owners, *want, &[])?;
-        if !data_cells.is_empty() {
-            reads.extend_from_slice(data_cells);
+        if !const_cells.is_empty() {
+            reads.extend_from_slice(const_cells);
             reads.sort_unstable();
             reads.dedup();
         }
@@ -1274,8 +1299,8 @@ fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owner
             continue;
         }
         let mut reads = cell_reads(job, owners, w, read.consts)?;
-        if !data_cells.is_empty() {
-            reads.extend_from_slice(data_cells);
+        if !const_cells.is_empty() {
+            reads.extend_from_slice(const_cells);
             reads.sort_unstable();
             reads.dedup();
         }
@@ -1534,18 +1559,20 @@ fn alone<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
     let evaluated = Recorder::new(RecorderOpts { alloc: g });
     let bump = job.frame.alloc(blaze_own::Erased::new(job.frame)).bump();
     let mut consts = HeadConsts::new(job.base.reading_into(&evaluated), job.index, bump).with_sources(job.sources);
-    let data_mark = job.texts.data.borrow().len();
     job.once.alone.fetch_add(1, Ordering::Relaxed);
     let mut source = SeededHeads::new(SeededHeadsOpts { names, sized: job.sized, pointers: job.pointers, frame: job.frame, scratch: g, alloc: g, consts: Some(&mut consts as &mut dyn ConstValues<'_>), known: None, owners: None });
+    let data_mark = job.texts.data.borrow().len();
+    let caller_mark = job.texts.caller_reads.borrow().len();
     let made = head_task_with_key(names, &mut source, want, task.key, g);
-    match data_read_cells(job, data_mark) {
-        Some(cells) => {
+    match constant_read_cells(job, data_mark, caller_mark, failed) {
+        Ok(cells) => {
             for &id in cells.iter() {
                 push(id);
             }
         }
-        None => {
-            failed.get_or_insert(UNPLANNED_DATA_CELL);
+        Err(why) => {
+            failed.get_or_insert(why);
+            return Err(Cause::new(RootKind::Engine, why));
         }
     }
     let result = head_result(job, &source, want, made);

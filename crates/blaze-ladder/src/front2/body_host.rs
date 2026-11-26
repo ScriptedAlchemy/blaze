@@ -107,8 +107,7 @@ impl<'s, 'a: 's, S: SourceTexts<'a>> BodySources for Sourced<'s, S> {
     }
 
     fn env(&self, krate: usize, name: &str) -> Result<Option<&str>, HostError> {
-        let env = self.0.crate_env(krate).ok_or(refused(HostAsk::Env))?;
-        env.get(name).map_err(|_| refused(HostAsk::Env))
+        self.0.read_env(krate, name)
     }
 
     fn folder(&self, krate: usize) -> Option<&str> {

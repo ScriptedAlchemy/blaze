@@ -210,6 +210,7 @@ impl<'f> Lockfile<'f> {
 /// What the fetch needs of the command beyond the plan: its clock, for the machine's
 /// deadlines, and where the checkout is, for the records' driver.
 pub struct FetchEnv<'f> {
+    pub caller_env: blaze_build_script::env::CallerEnv<'f>,
     pub clock: bstd::clock::Clock,
     /// The checkout, relative to where blaze was started ("" for there).
     pub checkout: &'f str,

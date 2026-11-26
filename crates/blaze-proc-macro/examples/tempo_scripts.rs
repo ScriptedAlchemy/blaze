@@ -316,6 +316,7 @@ fn main() {
         Err(why) => println!("native: none ({why}): a script placed native is refused by name"),
     }
     let setting = Setting {
+        caller_env: Default::default(),
         store: &store,
         target: TARGET,
         host: TARGET,

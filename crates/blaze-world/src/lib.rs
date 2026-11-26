@@ -348,6 +348,13 @@ pub struct Texts<'w> {
 }
 
 impl<'w> Texts<'w> {
+    /// Command-local compiler grants; never part of the serialized crate list's facts.
+    pub fn grant_caller(&mut self, caller: blaze_build_script::env::CallerEnv<'_>, alloc: Alloc<'w>) {
+        for env in &mut self.envs {
+            env.grant_caller(caller, alloc);
+        }
+    }
+
     /// The trees after the checkout: the toolchain's packs, then the fetched packages'.
     pub fn packs(&self) -> &[PackView<'w>] {
         &self.packs

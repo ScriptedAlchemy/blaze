@@ -300,6 +300,7 @@ pub(crate) enum PhasesWhy {
     /// `Pointer::certifies_under`): the rows whose kind's producer moved are entered by their
     /// keys, which the wake (from moved files alone) does not find; the phase path plans them.
     ToolsMoved,
+    CallerMoved,
     /// The stored answer is another checkout's (engine_answer.rs `LATEST_ROOT`: this checkout
     /// had none): its leaves were all followed here and its journal places are not this
     /// checkout's, so no wake from changed files is proved; the phase path plans every file.
@@ -325,6 +326,7 @@ pub(crate) enum StoredBase {
     /// This checkout's own answer, written under other tools (engine_answer.rs
     /// `Pointer::certifies_under`).
     ToolsMoved,
+    CallerMoved,
     /// Another checkout's answer, the home's latest (engine_answer.rs `LATEST_ROOT`).
     OtherCheckout,
 }
@@ -340,6 +342,7 @@ impl PhasesWhy {
             PhasesWhy::ScriptRead => "a build script's read of the checkout moved (a `Given` cell and the `Script` tasks reading it, not on the ready path yet)",
             PhasesWhy::NothingMoved => "nothing moved",
             PhasesWhy::ToolsMoved => "a tool moved since the stored answer (its rows are entered by their keys)",
+            PhasesWhy::CallerMoved => "a caller build environment grant changed since the stored answer",
             PhasesWhy::OtherCheckout => "the stored answer is another checkout's (this one had none)",
             PhasesWhy::ReadyKind(kind) => match kind {
                 blaze_drive::Kind::Signature => "the edit enters a Signature task (not on the ready path yet)",
@@ -381,6 +384,7 @@ pub(crate) fn choose(driver: Driver, root: Option<&blaze_engine::pages::Root<'_>
     match base {
         StoredBase::Own => {}
         StoredBase::ToolsMoved => return refuse(PhasesWhy::ToolsMoved),
+        StoredBase::CallerMoved => return refuse(PhasesWhy::CallerMoved),
         StoredBase::OtherCheckout => return refuse(PhasesWhy::OtherCheckout),
     }
     if !root.owed_tasks.is_empty() || !root.owed_cells.is_empty() {
@@ -407,12 +411,14 @@ pub(crate) fn choose(driver: Driver, root: Option<&blaze_engine::pages::Root<'_>
 pub(crate) fn wakes_script(
     stored: &Stored<'_>,
     followed: &crate::sweep::Followed<'_>,
+    caller: blaze_build_script::env::CallerEnv<'_>,
     tools: &blaze_engine::Tools,
     alloc: blaze_own::SharedAlloc<'_>,
 ) -> Result<bool, CliError> {
-    let given_planned = crate::engine_script_reads::plan(&followed.now, alloc);
+    let given_planned = crate::engine_script_reads::plan(&followed.now, caller, alloc);
     let mut moved: SVec<'_, Moved> = SVec::new_in(alloc);
-    for (one, answer, _) in given_planned.iter() {
+    for input in given_planned.iter() {
+        let one = &input.planned;
         let name = one.name;
         let unchanged = stored
             .root
@@ -424,7 +430,7 @@ pub(crate) fn wakes_script(
         if unchanged {
             continue;
         }
-        let now = [(crate::engine_tasks::WHOLE, *answer)];
+        let now = [(crate::engine_tasks::WHOLE, input.answer)];
         if let Some(row) = page_for(stored, name, blaze_engine::Ask::Row)?.and_then(|page| page.row(name)) {
             moved_cells(name, row.defines(), &now, &mut moved);
         } else {
@@ -433,7 +439,7 @@ pub(crate) fn wakes_script(
     }
     for &file in stored.root.files.keys() {
         if file.kind == blaze_drive::Kind::Given
-            && given_planned.binary_search_by_key(&file, |(one, _, _)| one.name).is_err()
+            && given_planned.binary_search_by_key(&file, |input| input.planned.name).is_err()
             && let Some(row) = page_for(stored, file, blaze_engine::Ask::Row)?.and_then(|page| page.row(file))
         {
             moved_cells(file, row.defines(), &[], &mut moved);

@@ -58,6 +58,7 @@ pub(crate) fn script(c_mode: CMode, spawner: Option<Arc<dyn Executor + Send + Sy
         // `/workspace/gen.pl`).
         root: crate::script_sandbox::ScriptRoot::member("").expect("the root package"),
         env: vec![("OUT_DIR".to_owned(), "/out".to_owned())],
+        private_env_names: Vec::new(),
         target: "aarch64-apple-darwin".to_owned(),
         host: "aarch64-apple-darwin".to_owned(),
         c_mode,
@@ -242,6 +243,19 @@ fn child_env_follows_command_semantics() {
     assert_eq!(child_env(&parent, &decoded(true, &[(true, "Z", "1"), (false, "Z", ""), (true, "Y", "2")])), pairs(&[("Y", "2")]), "cleared first, then in order");
     assert_eq!(child_env(&parent, &decoded(false, &[(true, "X", "1"), (true, "X", "2")])), pairs(&[("A", "1"), ("B", "2"), ("X", "2")]), "the later set wins");
     assert_eq!(child_env(&parent, &decoded(false, &[(false, "Q", "")])), pairs(&[("A", "1"), ("B", "2")]), "unsetting an absent name is nothing");
+}
+
+#[test]
+fn a_private_script_value_is_not_disclosed_to_a_process_work_request() {
+    let mut script = script(CMode::Deferred, None, SpawnSetting::off());
+    let script = Arc::make_mut(&mut script);
+    script.env.push(("APP_SETTING".to_owned(), "private-test-marker".to_owned()));
+    script.private_env_names.push("APP_SETTING".to_owned());
+    let refused = script.work_env(&decoded(false, &[])).expect_err("a worker would inherit the grant");
+    assert!(matches!(&refused, SpawnRefusal::PrivateEnv { name } if name == "APP_SETTING"));
+    assert!(!format!("{refused:?} {script:?}").contains("private-test-marker"));
+    let cleared = script.work_env(&decoded(false, &[(false, "APP_SETTING", "")])).expect("grant removed");
+    assert_eq!(cleared, pairs(&[("OUT_DIR", "/out")]));
 }
 
 /// The oracle: `perl` in a build with no executor is refused, never deferred (a deferred

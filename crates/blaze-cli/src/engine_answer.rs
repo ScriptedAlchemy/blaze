@@ -30,10 +30,10 @@
 //! the root name   engine.<16 hex of H(checkout)>
 //! it names        the sealed pointer's key; `<it>.pages` reaches the root, lines and page
 //!                 indexes, with their payloads
-//! sealed pointer  seal.rs form: last = "BEL8" | answer root key [32] | lines key [32] |
+//! sealed pointer  seal.rs form: last = "BEL9" | answer root key [32] | lines key [32] |
 //!                 files u32 | printed u8 (bit 0 names checked, 1 bodies whole, 2 every
 //!                 printed line is in the lines record) | findings u32 | owed u32 (the
-//!                 certificate's facts) | tools digest [32] | headers u8 (0 current, 1
+//!                 certificate's facts) | tools digest [32] | caller grant identity [32] | headers u8 (0 current, 1
 //!                 absent) | since u64 | 128 x producer header shard key [32] (all zero when
 //!                 absent) | the journal's places; leaves = the BCL table
 //! ```
@@ -72,13 +72,16 @@ use crate::{CliError, seal};
 /// The pointer's form inside its seal.
 /// BEL8: a file's lint row is ONE (engine_lints.rs, sparse rows: its units' keys in its record,
 /// no row a unit); a BEL7 answer's unit rows are an old home's, reported and rebuilt.
-pub(crate) const POINTER_MAGIC: &[u8; 4] = b"BEL8";
+/// BEL9 carries the workspace caller environment identity for certificate replay.
+pub(crate) const POINTER_MAGIC: &[u8; 4] = b"BEL9";
 /// The magic, the answer's root, the lines record's key, then the [`Facts`]: files u32, printed
-/// u8, findings u32, owed u32; then the tools' digest ([`tools_digest`]). The header index's
+/// u8, findings u32, owed u32; then the tools' digest ([`tools_digest`]) and the caller grant
+/// identity. The header index's
 /// state ([`Headers`]) follows: its tag, its `since`, then every shard's key; then the
 /// journal's places, of their own length.
 const TOOLS_AT: usize = 4 + 32 + 32 + 4 + 1 + 4 + 4;
-const HEADERS_AT: usize = TOOLS_AT + 32;
+const CALLER_AT: usize = TOOLS_AT + 32;
+const HEADERS_AT: usize = CALLER_AT + 32;
 const SHARDS_AT: usize = HEADERS_AT + 1 + 8;
 const POINTER_BYTES: usize = SHARDS_AT + 32 * HeaderPages::COUNT;
 const HEADERS_CURRENT: u8 = 0;
@@ -708,7 +711,7 @@ pub(crate) enum Unreadable {
 impl fmt::Display for Unreadable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Unreadable::Older = self {
-            return write!(f, "the stored engine answer is an old home's answer (its pointer is of an older form than `BEL8`), rebuilt (rule 26)");
+            return write!(f, "the stored engine answer is an old home's answer (its pointer is of an older form than `BEL9`), rebuilt (rule 26)");
         }
         write!(f, "the stored engine answer is not read (engine_answer.rs `load`): ")?;
         match self {
@@ -775,6 +778,7 @@ pub(crate) struct Pointer<'m> {
     /// The digest of the tools that wrote the answer ([`tools_digest`]): the certificate stands
     /// only when today's are equal ([`Pointer::certifies_under`]).
     pub(crate) tools: ContentId,
+    pub(crate) caller: ContentId,
     pub(crate) leaves: Leaves<'m>,
     /// Where the journal of changes stood when the request that wrote it began its reads.
     pub(crate) journal: crate::journal_sweep::Stored<'m>,
@@ -1330,7 +1334,7 @@ pub(crate) fn load_pointer<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut Comma
 }
 
 /// The pointer record `first`, read in place (a root's one key, or a base's, [`load_base`]).
-fn pointer_at<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, first: Key) -> Result<Result<Pointer<'m>, Unreadable>, CliError> {
+pub(crate) fn pointer_at<'m, D: Driver, S: Sharing>(cx: &Cx, store: &mut CommandStore<'m, '_, D, S>, first: Key) -> Result<Result<Pointer<'m>, Unreadable>, CliError> {
     let Some(held) = store.get(cx, first)? else { return Ok(Err(Unreadable::Missing { key: first })) };
     decode_pointer_bytes(first, held.bytes)
 }
@@ -1367,7 +1371,7 @@ pub(crate) fn decode_pointer_bytes<'m>(first: Key, sealed: &'m [u8]) -> Result<R
         tag => return Ok(Err(Unreadable::Headers { tag })),
     };
     let tools = key_at(pointer, TOOLS_AT).0;
-    Ok(Ok(Pointer { key: first, root: key_at(pointer, 4), headers, lines: key_at(pointer, 36), facts, tools, leaves, journal }))
+    Ok(Ok(Pointer { key: first, root: key_at(pointer, 4), headers, lines: key_at(pointer, 36), facts, tools, caller: key_at(pointer, CALLER_AT).0, leaves, journal }))
 }
 
 /// The printed lines' record the pointer names, every entry checked (engine_lines.rs `decode`).
@@ -1545,7 +1549,7 @@ pub(crate) fn save_edit<'m, D: Driver, S: Sharing>(
     toolchain: blaze_toolchain::ToolchainId,
     tools: &Tools,
     kept: &Kept<'_>,
-    printed: Printed,
+    printed: (Printed, ContentId),
     lines: (Key, &[u8]),
     last: Option<&Stored<'_>>,
     rows: &Rows<'_>,
@@ -1579,7 +1583,7 @@ pub(crate) fn save_edit_rekeying_all<'m, D: Driver, S: Sharing>(
     frame: &Frame,
     last_root: Option<Key>,
 ) -> Result<Saved, CliError> {
-    save(cx, store, lent, name, toolchain, tools, kept, printed, lines, last, Writer::Phases, rows, journal, alloc, frame, &[], (last_root, Rekey::All), core::num::NonZeroU32::MIN, SaveBase::Keep)
+    save(cx, store, lent, name, toolchain, tools, kept, (printed, ContentId::default()), lines, last, Writer::Phases, rows, journal, alloc, frame, &[], (last_root, Rekey::All), core::num::NonZeroU32::MIN, SaveBase::Keep)
 }
 
 /// The `Ready` driver's commit of an edit (D187, engine_ready_check.rs): `kept`'s changed rows
@@ -1596,7 +1600,7 @@ pub(crate) fn save_changes<'m, D: Driver, S: Sharing>(
     toolchain: blaze_toolchain::ToolchainId,
     tools: &Tools,
     kept: &Kept<'_>,
-    printed: Printed,
+    printed: (Printed, ContentId),
     lines: (Key, &[u8]),
     last: &Stored<'_>,
     rows: &Rows<'_>,
@@ -1846,7 +1850,7 @@ fn save<'m, D: Driver, S: Sharing>(
     toolchain: blaze_toolchain::ToolchainId,
     tools: &Tools,
     kept: &Kept<'_>,
-    printed: Printed,
+    (printed, caller): (Printed, ContentId),
     lines: (Key, &[u8]),
     last: Option<&Stored<'_>>,
     writer: Writer,
@@ -1996,6 +2000,7 @@ fn save<'m, D: Driver, S: Sharing>(
     pointer.extend_from_slice(&facts.findings.to_le_bytes());
     pointer.extend_from_slice(&facts.owed.to_le_bytes());
     pointer.extend_from_slice(&tools_digest(tools).0);
+    pointer.extend_from_slice(&caller.0);
     match &headers {
         Headers::Current(keys) => {
             pointer.push(HEADERS_CURRENT);
@@ -2511,6 +2516,7 @@ pub(crate) fn adopt_certified<'m, D: Driver, S: Sharing>(
     ptr_bytes.extend_from_slice(&pointer.facts.findings.to_le_bytes());
     ptr_bytes.extend_from_slice(&pointer.facts.owed.to_le_bytes());
     ptr_bytes.extend_from_slice(&pointer.tools.0);
+    ptr_bytes.extend_from_slice(&pointer.caller.0);
     match &pointer.headers {
         Headers::Current(keys) => {
             ptr_bytes.push(HEADERS_CURRENT);
@@ -2972,6 +2978,7 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     pointer.extend_from_slice(&facts.findings.to_le_bytes());
     pointer.extend_from_slice(&facts.owed.to_le_bytes());
     pointer.extend_from_slice(&tools_digest(tools).0);
+    pointer.extend_from_slice(&blaze_drive::key::ABSENT.0);
     match &headers {
         Headers::Current(keys) => {
             pointer.push(HEADERS_CURRENT);
@@ -4132,7 +4139,7 @@ mod reach_shard_tests {
         let wt_b_root = root_name("/wt_b", frame);
         let saved = save_edit(
             &cx, &mut store, &lent, wt_a_root.as_str(), toolchain, &tools, &cold,
-            Printed { names: true, bodies_whole: true, replayable: true },
+            (Printed { names: true, bodies_whole: true, replayable: true }, ContentId::default()),
             (lines.0, &lines.1), None, &rows, &journal, alloc, frame, &[],
             (None, core::num::NonZeroU32::MIN), SaveBase::KeepWith(aux),
         ).expect("save wt_a");

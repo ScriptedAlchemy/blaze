@@ -169,6 +169,7 @@ MD5 and SHA-1 where a debug-info format asks; CRC32 for `.gnu_debuglink`
 - `test-suite-certificate`: `=blaze test suite cert`, `=blaze test closed crates digest`
 - `native-empty-memo`: `=blaze-cli engine native empty memo`
 - `workspace-run-ids-anchor`: `=blaze-cli run ids workspace anchor`
+- `workspace-caller-environment`: `=blaze-cli caller env name`, `=blaze workspace build environment projection`, `=blaze workspace caller environment`
 
 Each hash domain written in `crates/` outside tests, less its version number, under the cache
 it keys. `blaze v2 ` is left off; a name that starts otherwise is written with `=`. A literal

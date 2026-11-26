@@ -238,6 +238,19 @@ pub(crate) fn parts(keys: impl Iterator<Item = (ContentId, ContentId, RanAs)>, s
     parts
 }
 
+/// Plan script sources for this command, including the environment of member scripts.
+pub(crate) fn parts_for(names: &crate::names::Names<'_>, env: &FetchEnv<'_>) -> std::vec::Vec<(Name, ContentId), Global> {
+    let mut parts = parts(names.script_keys(), sdk_identity(env));
+    if env.caller_env.identity().is_some() {
+        for (name, source) in &mut parts {
+            if names.script_readers(*name).any(|at| names.list().member(at)) {
+                *source = env.caller_env.with_source(*source);
+            }
+        }
+    }
+    parts
+}
+
 /// The cfg `cfg` (a world row's, sorted, each once) as the atoms a script's environment is made
 /// from, in `alloc`, in the same order.
 pub(crate) fn side_atoms<'a>(cfg: &[(&str, Option<&str>)], alloc: Alloc<'a>) -> AVec<'a, CfgAtom<'a>> {
@@ -656,6 +669,7 @@ enum Files<'j> {
 
 /// One `Script` task's job: all of it `Sync`, so it runs on any worker.
 pub(crate) struct ScriptJob<'j> {
+    caller_env: blaze_build_script::env::CallerEnv<'j>,
     name: Name,
     shared: &'j Shared<'j>,
     script: UnitId,
@@ -979,7 +993,11 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(shared) => shared,
         Err(words) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true }),
     };
-    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole }))
+    let caller_env = match files {
+        Files::Member { .. } => crate::caller_env::hold(env.caller_env, jobs),
+        Files::Pack { .. } | Files::External { .. } => Default::default(),
+    };
+    Ok(Prepared::Ready(ScriptJob { caller_env, name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole }))
 }
 
 /// What a script's run gave on its worker, in `Global` (its task frame ends with it): the
@@ -1085,6 +1103,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         (Runner::Wasm, Err(_)) => None,
     };
     let setting = Setting {
+        caller_env: job.caller_env,
         store: &shared.store,
         // Its crates' side's target (ruling D115 (2)); native zero-Wasm macro scripts run for host.
         target: match (job.side, ran_as) {

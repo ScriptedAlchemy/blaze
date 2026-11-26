@@ -13,7 +13,7 @@ use std::{
 };
 
 use blaze_build_script::{
-    Env, Outputs, OutputsRef,
+    Outputs, OutputsRef,
     env::{DepMetadata, Given, PackageFacts},
     key::{CMode, RunLimits},
     native::Runner,
@@ -35,6 +35,8 @@ use crate::{
 
 /// What every script of one graph shares.
 pub struct Setting<'s> {
+    /// Caller grants for the workspace, restricted to a member at execution.
+    pub caller_env: blaze_build_script::env::CallerEnv<'s>,
     /// The store holding `build-script/modules` (the bootstrap's module records).
     pub store: &'s Path,
     pub target: &'s str,
@@ -57,10 +59,11 @@ pub struct Setting<'s> {
 }
 
 /// A script ready to run: its loaded module, its sandboxed inputs, its environment.
-pub struct Prepared<'a> {
+pub struct Prepared {
     pub loaded: LoadedScript,
     pub script: Arc<Script>,
-    pub env: Env<'a>,
+    /// The canonical script inputs and the MAC of the caller's projection.
+    pub base: blaze_ids::ContentId,
 }
 
 /// Why a unit's script gave no outputs.
@@ -282,7 +285,7 @@ pub fn prepare<'a>(
     root: ScriptRoot,
     deps: &[DepMetadata<'_>],
     alloc: Alloc<'a>,
-) -> Result<Prepared<'a>, UnitScriptError> {
+) -> Result<Prepared, UnitScriptError> {
     prepare_viewing(runtime, setting, graph, script, tree, root, deps, DepViews::none(), alloc)
 }
 
@@ -300,7 +303,7 @@ pub fn prepare_viewing<'a>(
     deps: &[DepMetadata<'_>],
     views: DepViews,
     alloc: Alloc<'a>,
-) -> Result<Prepared<'a>, UnitScriptError> {
+) -> Result<Prepared, UnitScriptError> {
     prepare_viewing_on(runtime, setting, graph, script, None, tree, root, deps, views, alloc)
 }
 
@@ -320,7 +323,7 @@ pub fn prepare_viewing_on<'a>(
     deps: &[DepMetadata<'_>],
     views: DepViews,
     alloc: Alloc<'a>,
-) -> Result<Prepared<'a>, UnitScriptError> {
+) -> Result<Prepared, UnitScriptError> {
     let unit = graph.units.get(script.index()).ok_or(UnitScriptError::NotAScript { unit: script })?;
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
@@ -349,11 +352,13 @@ pub fn prepare_viewing_on<'a>(
     };
     let given = Given { package: facts, seen: root.seen(), features: &unit.features, target_cfg, target: setting.target, host: setting.host, deps };
     let env = blaze_build_script::env(&given, alloc);
-    let script = Arc::new(Script {
+    let caller = setting.caller_env.for_root(root.seen());
+    let mut script = Script {
         package,
         tree,
         root,
-        env: owned_env(&env, alloc),
+        env: Vec::new(),
+        private_env_names: caller.iter().map(|(name, _)| name.to_owned()).collect(),
         target: setting.target.to_owned(),
         host: setting.host.to_owned(),
         c_mode: setting.c_mode,
@@ -364,8 +369,11 @@ pub fn prepare_viewing_on<'a>(
         step: blaze_ids::ContentId::default(),
         spawn_setting: Arc::clone(&setting.spawn_setting),
         deps: Arc::new(views),
-    });
-    Ok(Prepared { loaded, script, env })
+    };
+    let base = caller.with_source(runtime.base(&loaded, &script, &env));
+    script.step = base;
+    script.env = owned_env(&caller.serve(env, alloc), alloc);
+    Ok(Prepared { loaded, script: Arc::new(script), base })
 }
 
 /// `script`'s outputs, run as wasm, or native when [`placed`] says so for the setting's mode
@@ -390,7 +398,7 @@ pub fn outputs<'a>(
     match crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc) {
         Runner::Wasm => {
             let prepared = prepare(runtime, setting, graph, script, tree, root, deps, alloc)?;
-            runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
+            runtime.fresh(&prepared.loaded, prepared.script, prepared.base, alloc).map_err(UnitScriptError::Script)
         }
         Runner::Native { because } => {
             let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package(unit) })?;
@@ -446,7 +454,7 @@ pub fn outputs_viewing_on<'a>(
             let seen: Vec<DepMetadata<'_>> =
                 deps.iter().zip(viewed.values.iter()).map(|(dep, value)| DepMetadata { links: dep.links, key: dep.key, value: value.as_str() }).collect();
             let prepared = prepare_viewing_on(runtime, setting, graph, script, side_cfg, tree, root, &seen, viewed.views, alloc)?;
-            runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
+            runtime.fresh(&prepared.loaded, prepared.script, prepared.base, alloc).map_err(UnitScriptError::Script)
         }
         Runner::Native { .. } if side_cfg.is_some() && setting.target != setting.host => {
             Err(UnitScriptError::NativeOnSide { package: package(unit), target: setting.target.to_owned() })

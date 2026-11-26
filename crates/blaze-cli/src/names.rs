@@ -337,6 +337,7 @@ impl Records<'static> for Folder<'_> {
 
 /// One crate made this command: its payload, out, and the checkout files its resolution read.
 pub(crate) struct Resolved {
+    pub(crate) caller_reads: std::vec::Vec<(blaze_engine::CellId, ContentId), Global>,
     /// The record's payload ([`sections::write`]).
     payload: blaze_own::Vec<u8, Global>,
     /// The digest both check drivers publish for this resolution.
@@ -1584,7 +1585,7 @@ fn make_world<'f>(
             _ => NamesError::World(String::from(words.as_str())),
         }
     };
-    let (world, placed, lazy_trees) = if let Some(stored) = stored_list {
+    let (mut world, placed, lazy_trees) = if let Some(stored) = stored_list {
         let mut packages = CheckoutOnly { paths, lock: lock_whole, alloc: bump };
         let listed = {
             let _cx = cx.span("names: the crate list and toolchain manifest opened (lazy)");
@@ -1619,6 +1620,7 @@ fn make_world<'f>(
         };
         (world, packages.finish().leak_slice(), None)
     };
+    world.texts.grant_caller(env.caller_env, bump.alloc());
     let _cx = cx.span("names: the world's public crates and scripts");
     let from_archive = |unit: blaze_unit_graph::UnitId| {
         let package = lock.package(graph.units[unit.0 as usize].package);

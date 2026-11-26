@@ -722,6 +722,7 @@ fn edge_at<'l, R>(
     let target_rustflags_var = blaze_manifest::rustflags::target_variable(crate::graph::TRIPLE, heap.alloc());
     let max_store_bytes = crate::gc::budget_from_env(env)?;
     let place = Place {
+        caller_env: crate::caller_env::project(&flags.build_env, env, frame)?,
         checkout: served.root_text().unwrap_or(checkout_at),
         served,
         cert_file: var("SSL_CERT_FILE"),
@@ -1629,7 +1630,7 @@ fn preserve_standing_sibling_names<'a, 'f, 's, 'r>(
         crate_sources.insert(name, source);
     }
     let mut script_sources: SMap<'_, Name, blaze_ids::ContentId> = SMap::new_in(alloc);
-    for (name, source) in crate::scripts::parts(world.script_keys(), crate::scripts::sdk_identity(env)) {
+    for (name, source) in crate::scripts::parts_for(world, env) {
         script_sources.insert(name, source);
     }
     let mut module_sources: SMap<'_, Name, blaze_ids::ContentId> = SMap::new_in(alloc);
@@ -1646,8 +1647,8 @@ fn preserve_standing_sibling_names<'a, 'f, 's, 'r>(
     let mut changed_slots: SSet<'_, Name> = SSet::new_in(alloc);
     let has_followed = followed.is_some();
     if let Some(followed) = followed {
-        for (one, answer, _) in crate::engine_script_reads::plan(&followed.now, alloc).iter() {
-            given_answers.insert(one.name, *answer);
+        for input in crate::engine_script_reads::plan(&followed.now, env.caller_env, alloc).iter() {
+            given_answers.insert(input.planned.name, input.answer);
         }
         for (at, now) in followed.now.rows.iter().enumerate() {
             if followed.changed(at) && now.kind == sweep::LeafKind::Slot {
@@ -2170,16 +2171,10 @@ fn check_and_open<R>(
         let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
         let request_mem = crate::engine_phase_mem::RequestMem::new()?;
         let alloc = request_mem.shared();
-        let answer_root = if checked.used_whole_root {
-            crate::engine_answer::root_name_for(place.checkout, flags.feature_ask(), frame)
-        } else {
-            crate::engine_answer::scoped_root_name_for(place.checkout, check_scope, flags.feature_ask(), frame)
-        };
-        let pointer = match crate::engine_answer::load_pointer(cx, &mut store, &answer_root)? {
-            Some(Ok(pointer)) => Some(pointer),
-            Some(Err(why)) if require_graph => return Err(EngineCheckError::StartNoAnswer { why: Some(why) }.into()),
-            None if require_graph => return Err(EngineCheckError::StartNoAnswer { why: None }.into()),
-            _ => None,
+        let pointer = match crate::engine_answer::pointer_at(cx, &mut store, checked.pointer_key)? {
+            Ok(pointer) => Some(pointer),
+            Err(why) if require_graph => return Err(EngineCheckError::StartNoAnswer { why: Some(why) }.into()),
+            Err(_) => None,
         };
         let stood_root = match &pointer {
             Some(pointer) => match crate::engine_answer::open_root(cx, &mut store, pointer.root, alloc)? {
@@ -2305,6 +2300,7 @@ pub(crate) fn stats_line<'f>(checked: &Checked, in_main_ns: u64, frame: &'f Fram
 /// 75; main.rs `request`'s first argument). Copied, never re-read: `--fix`'s two checks take one.
 #[derive(Clone, Copy)]
 pub(crate) struct Place<'f> {
+    pub(crate) caller_env: blaze_build_script::env::CallerEnv<'f>,
     /// The checkout, relative to where blaze was started ("" for there).
     pub(crate) checkout: &'f str,
     /// The checkout's absolute root, resolved once at the edge (`Served::at_edge`).
@@ -2330,6 +2326,7 @@ impl<'f> Place<'f> {
     /// names readers' (engine_start.rs), made the one way.
     pub(crate) fn fetch_env(&self, clock: bstd::clock::Clock, toolchain: blaze_toolchain::ToolchainId, fs: bstd::fs::Fs, heap: &'static blaze_own::Heap) -> FetchEnv<'f> {
         FetchEnv {
+            caller_env: self.caller_env,
             clock,
             checkout: self.checkout,
             served: self.served,
@@ -2427,6 +2424,8 @@ pub(crate) const REQUEST_FRAME: usize = 64 << 30;
 
 /// What one [`check`] did: its exit status, and the engine's counts.
 pub(crate) struct Checked {
+    /// The answer that this command checked, even if another command advances the checkout.
+    pub(crate) pointer_key: blaze_drive::Key,
     pub(crate) status: Status,
     /// The tasks planned.
     pub(crate) tasks: u32,
@@ -2447,10 +2446,6 @@ pub(crate) struct Checked {
     pub(crate) times: std::vec::Vec<crate::engine_times::PhaseTime, std::alloc::Global>,
     /// The certificate stood: nothing the stored answer read moved, no task entered.
     pub(crate) certified: bool,
-    /// A scoped check certified directly against this checkout's own whole-workspace answer root
-    /// (`root_name`) rather than its disjoint scoped root (`scoped_root_name`), so callers that
-    /// open `Standing` read `root_name`.
-    pub(crate) used_whole_root: bool,
     /// Whether the request started from the stored answer, and why not when one was there.
     pub(crate) from_last: bool,
     pub(crate) unreadable: Option<crate::engine_answer::Unreadable>,
@@ -2758,6 +2753,7 @@ fn checking<'f, 's: 'f>(
     // Nothing moved, nothing owed and no findings kept: the certificate, from the pointer alone.
     let whole_root = crate::engine_answer::root_name_for(place.checkout, features, frame);
     let answer_root = crate::engine_answer::scoped_root_name_for(place.checkout, check_scope, features, frame);
+    let caller = place.caller_env.identity().unwrap_or_default();
     let view_slot = crate::engine_lines::ViewSlot::load(&opened.lent, answer_root.as_str(), fresh, shown, &tools, frame)?;
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum FallbackFrom {
@@ -2957,6 +2953,7 @@ fn checking<'f, 's: 'f>(
     let mut base = match &pointer {
         Some(_) if other_checkout => crate::engine_ready_edit::StoredBase::OtherCheckout,
         Some(pointer) if !pointer.certifies_under(&tools) => crate::engine_ready_edit::StoredBase::ToolsMoved,
+        Some(pointer) if pointer.caller != caller => crate::engine_ready_edit::StoredBase::CallerMoved,
         _ => crate::engine_ready_edit::StoredBase::Own,
     };
     *used_pointer = pointer.as_ref().map(|p| (p.key, other_checkout));
@@ -3014,7 +3011,7 @@ fn checking<'f, 's: 'f>(
         // Another checkout's leaves: every row looked at (its journal is not this checkout's).
         let marked = match base {
             crate::engine_ready_edit::StoredBase::OtherCheckout => None,
-            crate::engine_ready_edit::StoredBase::Own | crate::engine_ready_edit::StoredBase::ToolsMoved => journal.marked(&pointer.leaves, frame),
+            crate::engine_ready_edit::StoredBase::Own | crate::engine_ready_edit::StoredBase::ToolsMoved | crate::engine_ready_edit::StoredBase::CallerMoved => journal.marked(&pointer.leaves, frame),
         };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
@@ -3048,6 +3045,7 @@ fn checking<'f, 's: 'f>(
                 && lines.blocks().next().is_none());
         let own_certifies = base == crate::engine_ready_edit::StoredBase::Own;
         let other_certifies = base == crate::engine_ready_edit::StoredBase::OtherCheckout
+            && pointer.caller == caller
             && check_scope.is_whole()
             && !own_whole
             && unreadable.is_none()
@@ -3112,7 +3110,8 @@ fn checking<'f, 's: 'f>(
                 drop(store);
                 let cleanup = crate::store::after_answer_printed(cx, opened.lent, &opened.home, false, phases.clock(), err)?;
                 phases.mark_cx(cx, "store committed", frame);
-                return certificate_checked(cx, root, stood, sweep_counts, &journal_counts, &cleanup, phases, heap, frame, own_whole);
+                let pointer_key = adopted.unwrap_or(pointer.key);
+                return certificate_checked(cx, root, pointer_key, stood, sweep_counts, &journal_counts, &cleanup, phases, heap, frame);
             }
         }
     }
@@ -3126,6 +3125,7 @@ fn checking<'f, 's: 'f>(
         && (own_scoped_moved || base != crate::engine_ready_edit::StoredBase::Own)
         && let Some(Ok(whole_ptr)) = crate::engine_answer::load_pointer(cx, &mut store, whole_root.as_str())?
         && whole_ptr.certifies_under(&tools)
+        && whole_ptr.caller == caller
         && whole_ptr.facts.owed == 0
         && whole_ptr.facts.printed.replayable
         && let Ok(whole_lines) = crate::engine_answer::load_lines(cx, &mut store, whole_ptr.lines, request)?
@@ -3193,7 +3193,7 @@ fn checking<'f, 's: 'f>(
                 drop(store);
                 let cleanup = crate::store::after_answer_printed(cx, opened.lent, &opened.home, false, phases.clock(), err)?;
                 phases.mark_cx(cx, "store committed", frame);
-                return certificate_checked(cx, root, stood, whole_sweep_counts, &whole_journal_counts, &cleanup, phases, heap, frame, true);
+                return certificate_checked(cx, root, whole_ptr.key, stood, whole_sweep_counts, &whole_journal_counts, &cleanup, phases, heap, frame);
             }
             pointer = Some(whole_ptr);
             last_lines = Some(whole_lines);
@@ -3307,7 +3307,7 @@ fn checking<'f, 's: 'f>(
     if matches!(chosen, crate::engine_ready_edit::Chosen::Wake { .. })
         && has_script_leaf
         && let (Some(last_stored), Some(followed)) = (stored.as_ref(), followed_kept.as_ref())
-        && crate::engine_ready_edit::wakes_script(last_stored, followed, &tools, request)?
+        && crate::engine_ready_edit::wakes_script(last_stored, followed, place.caller_env, &tools, request)?
     {
         let why = crate::engine_ready_edit::PhasesWhy::ScriptRead;
         if driver == crate::engine_ready_edit::Driver::Auto {
@@ -3422,11 +3422,11 @@ fn checking<'f, 's: 'f>(
                 Err(CliError::EngineCheck(EngineCheckError::ReadyRefused(why))) => return Ok(Err(why)),
                 Err(error) => return Err(error),
             };
-            let given_planned = crate::engine_script_reads::plan(&followed.now, alloc);
+            let given_planned = crate::engine_script_reads::plan(&followed.now, env.caller_env, alloc);
             let mut given_answers: SVec<'_, (Name, blaze_ids::ContentId)> = SVec::with_capacity_in(given_planned.len(), alloc);
-            given_answers.extend(given_planned.iter().map(|(one, answer, _)| (one.name, *answer)));
+            given_answers.extend(given_planned.iter().map(|input| (input.planned.name, input.answer)));
             let mut planned: SVec<'_, Planned> = SVec::new_in(alloc);
-            planned.extend(given_planned.iter().map(|(one, _, _)| *one));
+            planned.extend(given_planned.iter().map(|input| input.planned));
             crate::engine_ready_edit::file_tasks(&outlined, &skipped.files, &skipped.external, names.is_some(), &linting.rules, reach, alloc, &mut planned);
             if scoped.is_some() && !skipped.files.is_empty() {
                 planned.retain(|one| !(matches!(one.name.kind, Kind::Signature | Kind::Lint) && skipped.files.binary_search(&one.file).is_ok()));
@@ -3587,7 +3587,7 @@ fn checking<'f, 's: 'f>(
                 let names_scoped = preserved_names.as_ref().or(scoped.as_ref());
                 planned.extend(scripts.plan(stage, &discovered, tools, &env, names_scoped, alloc, frame)?);
                 let no_reads = Rows::new_in(frame);
-                planned.extend(scripts.plan_reads(followed_kept.as_ref().map_or(&no_reads, |followed: &sweep::Followed<'_>| &followed.now), alloc));
+                planned.extend(scripts.plan_reads(followed_kept.as_ref().map_or(&no_reads, |followed: &sweep::Followed<'_>| &followed.now), env.caller_env, alloc));
                 planned.extend(stage.plan(names_scoped, alloc, frame)?);
                 planned.extend(crate::engine_heads::plan(stage, scoped.as_ref(), alloc)?);
             }
@@ -3788,8 +3788,8 @@ fn checking<'f, 's: 'f>(
         None => match (chosen, stored.as_ref()) {
             (crate::engine_ready_edit::Chosen::Wake { .. }, Some(last)) => {
                 if let Some(followed) = followed_kept.as_ref() {
-                    let planned_given = crate::engine_script_reads::plan(&followed.now, alloc);
-                    given_answers.extend(planned_given.iter().map(|(one, answer, _)| (one.name, *answer)));
+                    let planned_given = crate::engine_script_reads::plan(&followed.now, env.caller_env, alloc);
+                    given_answers.extend(planned_given.iter().map(|input| (input.planned.name, input.answer)));
                 }
                 let (mut woken, woke) = crate::engine_ready_edit::wake(cx, &mut store, last, &tools, &outlined, given_answers.as_slice(), &files, alloc)?;
                 expand_woken_views(bodies.reach(), &files, &mut woken);
@@ -4147,7 +4147,7 @@ fn checking<'f, 's: 'f>(
         // Whether every line printed beyond the closing one and its coverage is in the lines record,
         // or the next certificate cannot stand (it prints that record alone).
         let replayable = unprinted == 0 && bodies.ownerless == 0;
-        let printed = crate::engine_answer::Printed { names: names.is_some(), bodies_whole, replayable };
+        let printed = (crate::engine_answer::Printed { names: names.is_some(), bodies_whole, replayable }, caller);
         // The records the answer's root keeps beside its rows' own: each member's listing row and
         // each head listing, sorted, one each (a record the root does not name is collected and made
         // again by the next command: correct, but past the floor).
@@ -4272,6 +4272,7 @@ fn checking<'f, 's: 'f>(
             let from = match (read_from_last, own_whole, base) {
                 (false, _, _) => "started from no answer",
                 (true, true, crate::engine_ready_edit::StoredBase::Own) => "started from this checkout's whole-workspace stored answer",
+                (true, _, crate::engine_ready_edit::StoredBase::CallerMoved) => "started from the stored answer, whose caller environment changed",
                 (true, true, _) => "started from this checkout's whole-workspace stored answer, written under other tools",
                 (true, false, crate::engine_ready_edit::StoredBase::Own) => "started from the stored answer",
                 (true, false, crate::engine_ready_edit::StoredBase::ToolsMoved) => "started from the stored answer, written under other tools",
@@ -4317,6 +4318,7 @@ fn checking<'f, 's: 'f>(
         let mut kept = blaze_own::Vec::new_in(heap.alloc());
         kept.extend(because.iter().copied());
         Ok(blaze_own::Box::new_in(Checked {
+            pointer_key: saved.pointer_key,
             status,
             tasks: u32::try_from(planned.len()).unwrap_or(u32::MAX),
             entered: report.entered,
@@ -4327,7 +4329,6 @@ fn checking<'f, 's: 'f>(
             bodies: bodies.notes(&outlined, frame),
             times: phase_times,
             certified: false,
-            used_whole_root: false,
             from_last: read_from_last,
             unreadable,
             #[cfg(test)]
@@ -4897,6 +4898,7 @@ fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
 fn certificate_checked(
     cx: &Cx,
     root: &Dir<ReadWrite>,
+    pointer_key: blaze_drive::Key,
     (status, tally): (Status, crate::engine_lines::Tally),
     sweep_counts: crate::journal_sweep::SweepCounts,
     journal_counts: &crate::journal_checkpoint::Counts,
@@ -4904,7 +4906,6 @@ fn certificate_checked(
     phases: &Phases,
     heap: &'static blaze_own::Heap,
     frame: &Frame,
-    used_whole_root: bool,
 ) -> Result<BoxedChecked, CliError> {
     let tail = tally.tail.line(tally.listed, frame);
     let text = bstd::mem::format_in!(frame, "certificate stood: nothing the stored answer read moved; no task entered, no page read (the lines record alone), nothing written but the roots renewed (and the journal's checkpoint when due)\n{sweep_counts}\n{journal_counts}\n{cleanup}\n{tail}\n{phases}");
@@ -4915,6 +4916,7 @@ fn certificate_checked(
     // PHASE-MEM-DEBT(CHECKED): `Checked` outlives the request (main.rs prints it, the tests read
     // it) and has no lifetime, so its lists are on the process heap; boxed there ([`BoxedChecked`]).
     Ok(blaze_own::Box::new_in(Checked {
+        pointer_key,
         status,
         tasks: 0,
         entered: 0,
@@ -4925,7 +4927,6 @@ fn certificate_checked(
         bodies: (std::vec::Vec::new_in(std::alloc::Global), 0),
         times: std::vec::Vec::new_in(std::alloc::Global),
         certified: true,
-        used_whole_root,
         from_last: true,
         unreadable: None,
         #[cfg(test)]

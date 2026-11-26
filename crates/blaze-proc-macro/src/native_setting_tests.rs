@@ -140,6 +140,7 @@ fn unit(name: &str, kind: UnitKind<'static>, deps: &[u32], build_script: Option<
 /// A `build` command's setting over `store` with `native` (no spawns, no try-compile answers).
 fn setting<'s>(store: &'s Path, native: Option<NativeSetting<'s>>) -> Setting<'s> {
     Setting {
+        caller_env: Default::default(),
         store,
         target: HOST,
         host: HOST,

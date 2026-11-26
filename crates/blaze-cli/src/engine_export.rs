@@ -241,6 +241,9 @@ pub(crate) fn command(
     check_export_flags(&flags)?;
     let dist = crate::engine_dist::DistConfig::from_env(env, crate::graph::TRIPLE, heap)
         .map_err(|error| box_err(ExportCliError::Dist(error), heap))?;
+    if dist.is_some() && !flags.build_env.is_empty() {
+        return Err(CliError::Usage("--build-env grants are private to this home and cannot be used for a distributed export"));
+    }
     if flags.release && dist.is_some() {
         return Err(box_err(ExportCliError::Dist(crate::engine_dist::DistError::ReleaseBackendUnavailable), heap));
     }
