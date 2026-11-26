@@ -702,7 +702,7 @@ jobs:
         run: |
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
           scratch="$RUNNER_TEMP/blaze-fs/forkfixes"
-          timeout -k 30 3300 python3 harness/forkfixes.py "{\"blaze\":\"$RUNNER_TEMP/source-binaries/blaze\",\"scratch\":\"$scratch\",\"source\":\"$GITHUB_WORKSPACE\",\"timeout\":900,\"stall_bound\":300}" \
+          timeout -k 30 3300 python3 harness/forkfixes.py "{\"blaze\":\"$RUNNER_TEMP/source-binaries/blaze\",\"module_builder\":\"$BLAZE_SCRIPTS/proc_macro_modules\",\"scratch\":\"$scratch\",\"source\":\"$GITHUB_WORKSPACE\",\"timeout\":900,\"stall_bound\":300}" \
             2>&1 | tee "$RUNNER_TEMP/dist-evidence/forkfixes.log"
           python3 .github/scripts/forkfixes_acceptance.py "{\"scratch\":\"$scratch\"}"
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
