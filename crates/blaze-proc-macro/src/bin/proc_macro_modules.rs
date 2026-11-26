@@ -938,7 +938,8 @@ fn crate_name(name: &str) -> String {
 /// `[lib]` pointing at its unchanged source with `proc-macro` taken out, and its targets other
 /// than the library, its dev-dependencies and its file references dropped.
 fn member_manifest(original: &str, source: &Path, path: &Path, features: &[String], alloc: blaze_own::Alloc<'_>) -> Result<String, Failure> {
-    let filtered = member_dependencies::filtered_manifest(original, path, features, alloc)?;
+    let anchored = member_dependencies::anchor_path_dependencies(original, path, alloc)?;
+    let filtered = member_dependencies::filtered_manifest(anchored.as_str(), path, features, alloc)?;
     let original = filtered.as_str();
     let mut out = String::with_capacity(original.len() + 256);
     let mut section = String::new();
@@ -2245,6 +2246,22 @@ version = "1"
             assert!(!made.contains("dev-dependencies"), "{made}");
         }
         println!("render keeps the target alias and inline build dependency; both dev tables are omitted");
+    }
+
+    #[test]
+    fn member_manifest_anchors_direct_path_dependencies_before_copying() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n\n[dependencies]\ndep = { package = \"real-dep\", path = \"../dep\", version = \"0.1.0\", features = [\"extra\"], default-features = false }\n\n[build-dependencies]\nhostdep = { path = \"../hostdep\", features = [\"extra\"] }\n\n[target.'cfg(unix)'.build-dependencies.windep]\npath = \"../windep\"\nversion = \"0.1.0\"\n";
+        let made = generated_member(manifest, &[]);
+        for kept in [
+            "dep = { package = \"real-dep\", path = \"/dep\", version = \"0.1.0\", features = [\"extra\"], default-features = false }",
+            "hostdep = { path = \"/hostdep\", features = [\"extra\"] }",
+            "[target.'cfg(unix)'.build-dependencies.windep]\npath = \"/windep\"\nversion = \"0.1.0\"",
+        ] {
+            assert!(made.contains(kept), "missing {kept:?}:\n{made}");
+        }
+        for verbatim in ["path = \"../dep\"", "path = \"../hostdep\"", "path = \"../windep\""] {
+            assert!(!made.contains(verbatim), "{verbatim} remained:\n{made}");
+        }
     }
 
     /// A workspace in a fresh folder: `files` as (relative path, text).

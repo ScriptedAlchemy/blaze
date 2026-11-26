@@ -23,9 +23,9 @@
 
 #![feature(allocator_api)]
 // The bare crate (`default-features = false`: `layout` and `lock`, the shape every crate on the
-// rebuilt path takes) is sans-IO over text on blaze-own; only the `cargo` reader of the old
-// layer, which goes with that layer at the switch, is on `std`.
-#![cfg_attr(not(any(test, feature = "cargo")), no_std)]
+// rebuilt path takes) is sans-IO over text on blaze-own; `std` adds only the path helpers, and
+// the `cargo` reader of the old layer, which goes with that layer at the switch, is on `std`.
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 
 #[cfg(feature = "cargo")]
 pub mod config;
@@ -52,7 +52,7 @@ mod lock_ban_tests;
 pub mod manifest;
 #[cfg(feature = "cargo")]
 pub mod metadata;
-#[cfg(feature = "cargo")]
+#[cfg(feature = "std")]
 pub mod paths;
 #[cfg(feature = "cargo")]
 pub mod profiles;

@@ -81,7 +81,7 @@ tracing = { workspace = true, optional = true }
 blaze-unit-graph = { workspace = true, optional = true }
 # `module.rs`: a module key's lock closure walks the lock blaze-manifest's one reader read
 # (`lock::Lock`, sans-IO, on blaze-own; rule 30).
-blaze-manifest = { workspace = true, default-features = false }
+blaze-manifest = { workspace = true, default-features = false, features = ["std"] }
 # The source corrections (`blaze_fetch::correct`, D58): a corrected package's pin in a module's
 # closure names the row's digest, so the module key changes when the row does.
 blaze-fetch.workspace = true

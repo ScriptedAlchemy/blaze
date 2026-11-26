@@ -212,6 +212,8 @@ pub(super) fn script_manifest(
     features: &[String],
     alloc: blaze_own::Alloc<'_>,
 ) -> Result<String, Failure> {
+    let anchored = super::member_dependencies::anchor_path_dependencies(original, path, alloc)?;
+    let original = anchored.as_str();
     let doc = super::member_dependencies::parse(original, path, alloc)?;
     // Only the build-dependencies are in the script's manifest: an optional normal dependency's
     // implicit feature names nothing there, so it is declared empty (`cfg!(feature)` holds).
@@ -777,6 +779,30 @@ mod native_builder_tests {
         assert!(read_canary.as_ref().is_err_and(|e| e.contains("Operation not permitted")), "canary: {read_canary:?}");
         assert_eq!(old.as_deref(), Ok("canary"), "the planted control: the old profile reads the canary");
         _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    #[test]
+    fn script_manifest_anchors_relative_build_dependency_paths_before_copying() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nnormal = { path = \"../normal\" }\n\n[build-dependencies]\nhostdep = { package = \"real-hostdep\", path = \"../hostdep\", version = \"0.1.0\", features = [\"extra\"], default-features = false }\nabsolute = { path = \"/already/there\" }\n\n[target.'cfg(unix)'.build-dependencies.windep]\npath = \"../windep\"\nversion = \"0.1.0\"\n";
+        let alloc = blaze_own::testing::heap().alloc();
+        let made = script_manifest(manifest, std::path::Path::new("/checkout/app/Cargo.toml"), std::path::Path::new("/work/script.rs"), "app", "0.1.0", &[], alloc).unwrap_or_else(|failure| panic!("{failure}"));
+        super::super::member_dependencies::parse(&made, std::path::Path::new("/checkout/app/Cargo.toml"), alloc).unwrap_or_else(|failure| panic!("generated: {failure}\n{made}"));
+        for kept in [
+            "hostdep = { package = \"real-hostdep\", path = \"/checkout/hostdep\", version = \"0.1.0\", features = [\"extra\"], default-features = false }",
+            "absolute = { path = \"/already/there\" }",
+            "[target.'cfg(unix)'.dependencies.windep]\npath = \"/checkout/windep\"\nversion = \"0.1.0\"",
+        ] {
+            assert!(made.contains(kept), "missing {kept:?}:\n{made}");
+        }
+        assert!(!made.contains("normal ="), "a normal dependency entered the script manifest:\n{made}");
+        for verbatim in ["path = \"../hostdep\"", "path = \"../windep\""] {
+            assert!(!made.contains(verbatim), "{verbatim} remained:\n{made}");
+        }
     }
 }
 
