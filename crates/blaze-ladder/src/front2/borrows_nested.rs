@@ -20,7 +20,7 @@
 //! expression ([`Requirements`], closures and async blocks alike); any other is filed as a
 //! refusal by name, never as a finding.
 
-use blaze_flow::Flow;
+use blaze_flow::{Flow, Origin};
 use blaze_flow_lower::{
     AdtFacts, CallBounds, CalleeFacts, ClosureFlow, Facts, FieldRegion, ParamOrigin, Refusal, Requirement, Shape, lower, lower_async,
     lower_async_fn, lower_closure, lower_closure_external,
@@ -345,6 +345,14 @@ pub fn next_nested(view: &tc::BodyView<'_>, at: FlowOf) -> Option<FlowOf> {
     None
 }
 
+/// A lowered flow with the facts its borrow checker needs to report a finding.
+pub struct BodyFlow<'a> {
+    pub flow: Flow<Alloc<'a>>,
+    pub signature_origins: AVec<'a, (tc::regions::Region, Origin)>,
+    pub params: AVec<'a, ParamOrigin>,
+    pub coarse: Option<Refusal>,
+}
+
 /// Lowers flow `of` of the body: the owner's (an `async fn`'s with its suspensions), a closure's
 /// or an async block's.
 pub fn flow_of<'a>(
@@ -353,15 +361,19 @@ pub fn flow_of<'a>(
     done: &tc::Checked<'_>,
     facts: &NestedFacts<'_, '_>,
     alloc: Alloc<'a>,
-) -> Result<(Flow<Alloc<'a>>, AVec<'a, ParamOrigin>, Option<Refusal>), Refusal> {
+) -> Result<BodyFlow<'a>, Refusal> {
     // With each flow, its placeholders for the body's type parameters (blaze-flow-lower
     // param_outlives.rs): an `UnprovenOutlives` from one is E0310 or a refusal by name. An async
     // block's lowering makes none. And the first stricter relation it used
     // (blaze-flow-lower `Lowered::coarse`): the body is refused by it only on a finding.
-    match of {
-        FlowOf::Owner if view.coroutine.is_some() => lower_async_fn(view, done, facts, alloc).map(|l| (l.flow, l.params, l.coarse)),
-        FlowOf::Owner => lower(view, done, facts, alloc).map(|l| (l.flow, l.params, l.coarse)),
-        FlowOf::Closure(e) => lower_closure(view, done, e, facts, alloc).map(|l| (l.flow, l.params, l.coarse)),
-        FlowOf::AsyncBlock(e) => lower_async(view, done, e, facts, alloc).map(|l| (l.flow, AVec::new_in(alloc), l.coarse)),
-    }
+    let lowered = match of {
+        FlowOf::Owner if view.coroutine.is_some() => lower_async_fn(view, done, facts, alloc)?,
+        FlowOf::Owner => lower(view, done, facts, alloc)?,
+        FlowOf::Closure(e) => lower_closure(view, done, e, facts, alloc)?,
+        FlowOf::AsyncBlock(e) => {
+            let lowered = lower_async(view, done, e, facts, alloc)?;
+            return Ok(BodyFlow { flow: lowered.flow, signature_origins: lowered.signature_origins, params: AVec::new_in(alloc), coarse: lowered.coarse });
+        }
+    };
+    Ok(BodyFlow { flow: lowered.flow, signature_origins: lowered.signature_origins, params: lowered.params, coarse: lowered.coarse })
 }

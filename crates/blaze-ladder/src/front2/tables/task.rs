@@ -2104,6 +2104,9 @@ fn said_of<'n, 'a>(verdict: &BodyVerdict<'_>, borrows: &BorrowVerdict<'_>, names
     // the printer places them (blaze-cli engine_bodies.rs `found_of`).
     for d in borrows.findings.iter() {
         let mut words = text(d.text);
+        if let Some(bound) = d.outlives {
+            write!(words, " because {bound}").map_err(|_| TaskError::Write)?;
+        }
         if let Some((start, end)) = d.borrowed {
             write!(words, "; the borrow is taken at {start}..{end}").map_err(|_| TaskError::Write)?;
         }

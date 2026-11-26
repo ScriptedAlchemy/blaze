@@ -79,6 +79,8 @@ use crate::{At, AwaitUnrelated, BodyOut, External, Facts, Form, Lower, MOST_POSI
 /// An async block's body lowered as its own flow.
 pub struct LoweredAsync<A: Allocator + Copy> {
     pub flow: Flow<A>,
+    /// The signature regions retained by the block, as in [`crate::Lowered`].
+    pub signature_origins: Vec<(Region, blaze_flow::Origin), A>,
     /// Per local of `flow`, its type in `ck.types` (`PTy`).
     pub local_ty: Vec<PTy, A>,
     /// Per suspension, in statement order, the `Expr::Await` it came from.
@@ -198,7 +200,8 @@ pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call
     }
     let point_of = core::mem::replace(&mut l.points, Vec::new_in(alloc));
     let identity = core::mem::replace(&mut l.identity, Vec::new_in(alloc));
-    Ok(LoweredAsync { flow, local_ty, point_of, local_wrap, identity, range, externals, coarse: l.coarse.get() })
+    let signature_origins = core::mem::replace(&mut l.uni, Vec::new_in(alloc));
+    Ok(LoweredAsync { flow, signature_origins, local_ty, point_of, local_wrap, identity, range, externals, coarse: l.coarse.get() })
 }
 
 /// An async block's WITNESS (typeck.md "Witness records", W1): what its state stores, region-

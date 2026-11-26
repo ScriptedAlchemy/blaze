@@ -1056,6 +1056,8 @@ pub struct Stats {
 pub struct Lowered<A: Allocator + Copy> {
     pub flow: Flow<A>,
     pub stats: Stats,
+    /// The signature region each universal flow origin stands for.
+    pub signature_origins: Vec<(Region, Origin), A>,
     /// The placeholders standing for the body's type parameters (param_outlives.rs): an
     /// `UnprovenOutlives` from one is E0310 when `certain`, else `Form::ParamOutlivesUnread`.
     pub params: Vec<ParamOrigin, A>,
@@ -1207,7 +1209,8 @@ pub(crate) fn lower_with<A: Allocator + Copy, F: Facts, R: one_call::CallRule>(
     let flow = b.finish().map_err(|_| Refusal { form: Form::Builder, range: range_of(body, body.root) });
     let coarse = l.coarse.get();
     let params = core::mem::replace(&mut l.param_origs, Vec::new_in(alloc));
-    (flow.map(|flow| Lowered { flow, stats, params, coarse }), log)
+    let signature_origins = core::mem::replace(&mut l.uni, Vec::new_in(alloc));
+    (flow.map(|flow| Lowered { flow, stats, signature_origins, params, coarse }), log)
 }
 
 fn range_of(body: &BodyView<'_>, e: ExprId) -> Range {
