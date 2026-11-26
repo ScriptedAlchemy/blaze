@@ -1,9 +1,9 @@
-name: PR 81 nested WASI build dependency migration
+name: PR 81 source migration and protocol regressions
 on:
   workflow_dispatch:
     inputs:
       source:
-        description: Exact migration source commit
+        description: Exact compiler source commit
         type: string
         required: true
 permissions:
@@ -12,12 +12,14 @@ defaults:
   run:
     shell: bash
 env:
+  BLAZE_CORES: "2"
+  BLAZE_TESTS: verify
   CARGO_BUILD_JOBS: "2"
   RUST_BACKTRACE: "0"
 jobs:
   scripts-and-ladder:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 65
+    timeout-minutes: 115
     steps:
       - uses: actions/checkout@v7
         with:
@@ -27,7 +29,7 @@ jobs:
       - uses: ./.github/actions/reflink
       - uses: ./.github/actions/apt
         with:
-          packages: bubblewrap
+          packages: strace bubblewrap
       - name: Enable sandbox user namespaces
         run: |
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
@@ -50,17 +52,31 @@ jobs:
           timeout -k 30 2500 cargo +"$(cat pins/toolchain)" build --release --locked --bins -p blaze-cli -p blaze-launcher \
             2>&1 | tee "$evidence/build.log"
           sha256sum "$CARGO_TARGET_DIR"/release/{blaze,blaze-launcher,blaze-fact-shim} > "$evidence/binaries.txt"
+          timeout -k 10 90 cp -a "$HOME/.blaze/v2/toolchain" "$RUNNER_TEMP/protocol-shelf"
       - name: Install the pinned C toolchain for the native-archive fixture
         uses: ./.github/actions/linux-c-shelf
-      - name: Run the retained build-dependency fixture
+      - name: Run every retained compiler migration fixture
         run: |
           scratch="$RUNNER_TEMP/blaze-fs/selected-module-forkfixes"
           # shellcheck disable=SC2016
           input=$(timeout 10 jq -nc --arg blaze "$CARGO_TARGET_DIR/release/blaze" --arg scratch "$scratch" --arg source "$GITHUB_WORKSPACE" \
             --arg modules "$BLAZE_SCRIPTS/proc_macro_modules" \
-            '{blaze:$blaze,scratch:$scratch,source:$source,module_builder:$modules,timeout:600,workers:2,only:["a-script-searches-where-its-build-dependencys-script-said"]}')
-          timeout -k 20 1600 python3 harness/forkfixes.py "$input" 2>&1 | tee "$RUNNER_TEMP/selection-evidence/forkfixes.log"
-          grep -Fq 'fork migration: 1/1 cases passed' "$RUNNER_TEMP/selection-evidence/forkfixes.log"
+            '{blaze:$blaze,scratch:$scratch,source:$source,module_builder:$modules,timeout:900,workers:2}')
+          timeout -k 30 3300 python3 harness/forkfixes.py "$input" 2>&1 | tee "$RUNNER_TEMP/selection-evidence/forkfixes.log"
+          timeout 30 python3 .github/scripts/forkfixes_acceptance.py "{\"scratch\":\"$scratch\"}"
+      - name: Run the source protocol tests under execution observation
+        if: ${{ !cancelled() && steps.shelf.outcome == 'success' }}
+        run: |
+          evidence="$RUNNER_TEMP/selection-evidence"
+          # shellcheck disable=SC2016
+          timeout 15 jq -n --arg blaze "$CARGO_TARGET_DIR/release/blaze" --arg cwd "$GITHUB_WORKSPACE" \
+            --arg home "$RUNNER_TEMP/blaze-fs/protocol-home" --arg out "$evidence/exec" --arg shelf "$RUNNER_TEMP/protocol-shelf" \
+            '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:3300,commands:(["blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"] | map({name:.,args:["test","-p",.,"--view","json","--","--run-all","--format","json"]}))}' \
+            > "$evidence/exec-input.json"
+          status=0
+          timeout -k 30 3500 python3 harness/v2/exec_observer.py "$evidence/exec-input.json" || status=$?
+          timeout 30 sha256sum --check "$evidence/binaries.txt"
+          exit "$status"
       - name: Verify the generated-file and search-directory receipt
         if: ${{ !cancelled() && steps.shelf.outcome == 'success' }}
         run: |
@@ -92,6 +108,12 @@ jobs:
           timeout -k 30 1200 cargo +"$tc" test --release --locked -p scripts --bin proc_macro_modules \
             a_std_only_unit_does_not_remove_the_checkout_compile_receipt \
             2>&1 | tee "$evidence/std-dependency-graph.log" || status=1
+          timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-world --lib \
+            a_standalone_wasi_producer_and_its_edge_round_trip_in_the_crate_list \
+            2>&1 | tee "$evidence/wasi-crate-list.log" || status=1
+          timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-cli --bin blaze \
+            engine_check_scoped_skips_unrelated_sibling_and_preserves_whole_answer \
+            2>&1 | tee "$evidence/scoped-manifests.log" || status=1
           if timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-ladder \
             --test front2_body_scope_surface --no-run --message-format=json > "$evidence/body-scope-build.jsonl"; then
             binary=$(timeout 10 jq -er 'select(.target.name=="front2_body_scope_surface" and .executable!=null).executable' \
@@ -103,6 +125,8 @@ jobs:
           fi
           grep -Fq 'an_absent_member_is_observed_before_and_after_importing_its_trait ... ok' "$evidence/member-observation.log" || status=1
           grep -Fq 'a_std_only_unit_does_not_remove_the_checkout_compile_receipt ... ok' "$evidence/std-dependency-graph.log" || status=1
+          grep -Fq 'a_standalone_wasi_producer_and_its_edge_round_trip_in_the_crate_list ... ok' "$evidence/wasi-crate-list.log" || status=1
+          grep -Fq 'engine_check_scoped_skips_unrelated_sibling_and_preserves_whole_answer ... ok' "$evidence/scoped-manifests.log" || status=1
           exit "$status"
       - name: Preserve source, binary and runtime evidence
         if: always()
