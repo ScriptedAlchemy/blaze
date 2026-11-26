@@ -1717,6 +1717,8 @@ fn dispatch(shared: &Arc<Shared>, errand: Errand) {
         return;
     }
     drop(errands);
+    // Before the first worker can race a submitter for the queue, prepare its contention slot.
+    shared.errands.prewarm_contention();
     let pool = Arc::clone(shared); // clone: the state a thread more shares.
     // alloc: a thread more, for the most errands at once; kept for the next.
     let started =
