@@ -147,12 +147,17 @@ impl fmt::Display for RegError {
 impl core::error::Error for RegError {}
 
 /// Writes `record`'s unwind entry into `out` (cleared first) for the address `at` says, from the
-/// record's rows: blaze-code eh.rs's bytes, through `unwind::of_rows`, so every tier's record is
+/// record's rows and frame description, so every tier's record is
 /// unwound by the one entry writer. `out`'s bytes are then copied to `at.entry_at` by the placer.
 pub fn eh_bytes(record: &Emitted<'_>, at: Placed, out: &mut AVec<'_, u8>) -> Result<Made, RegError> {
     let len = record.code.len();
     let code_len = u32::try_from(len).map_err(|_| RegError::CodeTooLarge { len })?;
-    let rows = unwind::of_rows(record.unwind_frame, record.unwind.as_slice(), code_len).map_err(RegError::Rows)?;
+    let cfi = if record.machine_cfi.is_empty() {
+        None
+    } else {
+        Some(unwind::cfi::Cfi::read(&record.machine_cfi, code_len).map_err(|error| RegError::Rows(UnwindError::Cfi(error)))?)
+    };
+    let rows = unwind::with_cfi(record.unwind_frame, cfi, record.unwind.as_slice(), code_len).map_err(RegError::Rows)?;
     let entry = eh::entry(&rows, at, out).map_err(RegError::Eh)?;
     let eh_len = entry.lsda.unwrap_or(out.len()) as u64;
     Ok(Made { entry, eh_len })

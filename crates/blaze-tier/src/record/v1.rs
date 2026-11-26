@@ -55,12 +55,25 @@ pub fn from_v1<'a>(record: CodeRecord<'a>, alloc: Alloc<'a>) -> Result<Emitted<'
     }
     for i in 0..view.sites() {
         let site = view.site(i);
-        let (page, off, target, addend) = match site.kind {
-            SiteKind::Load | SiteKind::Call => (RelocKind::GotPage21, RelocKind::GotPageOff12, site.target, 0i64),
-            SiteKind::Relro => (RelocKind::Page21, RelocKind::PageOff12 { scale: 0 }, OWN_RELRO, i64::from(site.addend)),
+        let (first, second) = match site.kind {
+            SiteKind::Load | SiteKind::Call => (RelocKind::GotPage21, Some(RelocKind::GotPageOff12)),
+            SiteKind::Relro => (RelocKind::Page21, Some(RelocKind::PageOff12 { scale: 0 })),
+            SiteKind::Page21 => (RelocKind::Page21, None),
+            SiteKind::AddLo12 | SiteKind::LdstLo12_1 => (RelocKind::PageOff12 { scale: 0 }, None),
+            SiteKind::LdstLo12_2 => (RelocKind::PageOff12 { scale: 1 }, None),
+            SiteKind::LdstLo12_4 => (RelocKind::PageOff12 { scale: 2 }, None),
+            SiteKind::LdstLo12_8 => (RelocKind::PageOff12 { scale: 3 }, None),
+            SiteKind::LdstLo12_16 => (RelocKind::PageOff12 { scale: 4 }, None),
+            SiteKind::Branch26 => (RelocKind::Branch26, None),
+            SiteKind::GotPage21 => (RelocKind::ImportPage21, None),
+            SiteKind::GotLo12 => (RelocKind::ImportLo12, None),
         };
-        e.relocs.push(Reloc { at: site.at, in_relro: false, kind: page, target, addend });
-        e.relocs.push(Reloc { at: site.at + 4, in_relro: false, kind: off, target, addend });
+        let target = if site.kind == SiteKind::Relro { OWN_RELRO } else { site.target };
+        let reloc = Reloc { at: site.at, in_relro: false, kind: first, target, addend: i64::from(site.addend) };
+        e.relocs.push(reloc);
+        if let Some(kind) = second {
+            e.relocs.push(Reloc { at: site.at + 4, kind, ..reloc });
+        }
     }
     for i in 0..view.words() {
         e.words.push(view.word(i));
@@ -69,6 +82,9 @@ pub fn from_v1<'a>(record: CodeRecord<'a>, alloc: Alloc<'a>) -> Result<Emitted<'
         e.pads.push(view.pad(i));
     }
     e.unwind_frame = rows.frame();
+    if let Some(cfi) = rows.cfi() {
+        e.machine_cfi.extend_from_slice(cfi.bytes());
+    }
     for i in 0..rows.rows() {
         e.unwind.push(rows.row(i));
     }

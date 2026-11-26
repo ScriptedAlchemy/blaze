@@ -68,7 +68,7 @@ pub(super) fn span_of(placing: &Placing<'_>) -> Option<Span> {
     let eh_len = parts.lsda.unwrap_or(bytes.len()) as u64;
     Some(Span {
         code_lo: placing.code_at,
-        code_hi: placing.code_at + placing.code.len() as u64,
+        code_hi: placing.code_at + u64::from(parts.code_len),
         eh_at,
         eh_len,
         id: u64::from(placing.slot.0),

@@ -196,6 +196,8 @@ mod compose;
 mod enc;
 mod enc_probe;
 mod enc_tls;
+#[cfg(feature = "llvm")]
+pub mod llvm;
 mod pass;
 mod record;
 mod record_check;

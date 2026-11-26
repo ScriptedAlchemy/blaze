@@ -6,6 +6,7 @@
 
 use blaze_code::a64::{adrp_ldr_target, bl_target, read32};
 use blaze_code::record::{CodeRecord, CodeView, Site, SiteKind, Space, Symbol, Target};
+use blaze_code::unwind::cfi::{self, CfiInput};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_tier::record::{Declare, DeclaredKind, Declares, Emitted, LoopHeader, Poll, Reloc, RelocKind, declare, encode, read, seal};
 
@@ -30,6 +31,29 @@ const NOP: u32 = 0xD503_201F;
 const BL_0: u32 = 0x9400_0000;
 const LDR_XZR_X16: u32 = 0xF940_021F;
 const BR_X16: u32 = 0xD61F_0200;
+
+#[test]
+fn machine_cfi_participates_in_optimized_folding() {
+    let alloc = Alloc::global();
+    let record = |has_lsda| {
+        let mut rec = CodeRecord::new_in(alloc);
+        rec.code.extend_from_slice(&RET.to_le_bytes());
+        cfi::write(CfiInput { code_len: 4, code_align: 1, data_align: -8, has_lsda, initial: &[0x0c, 31, 0], instructions: &[] },
+            4, &mut rec.machine_cfi).unwrap();
+        let mut bytes = Vec::new_in(alloc);
+        rec.seal().unwrap().encode(&mut bytes);
+        v2(&bytes)
+    };
+    let plain = record(false);
+    let landing = record(true);
+    let members = [("main", &plain), ("same", &plain), ("with_lsda", &landing)].map(|(name, bytes)| Member02 {
+        symbol: sym(name), record: read(bytes).unwrap(), tier: Some(Tier::Optimized),
+    });
+    let laid = lay_out_records(&members, &[], sym("main"), None, macho::plan(), 0, alloc).unwrap();
+    let home = |name: &str| laid.placed.iter().find(|p| p.symbol == sym(name)).unwrap().at;
+    assert_eq!(home("main"), home("same"));
+    assert_ne!(home("main"), home("with_lsda"));
+}
 
 fn sym(name: &str) -> Symbol {
     Symbol::of_name(name)

@@ -24,10 +24,11 @@
 //!   (`UNWIND_SECOND_LEVEL_REGULAR`, 2) of (function offset, encoding).
 
 use blaze_code::record::{CodeRecord, CodeView, Site, SiteKind, Space, Symbol, Target};
+use blaze_code::unwind::cfi::{self, Cfi, CfiInput};
 use blaze_code::unwind::{self, Action, Frame, Row};
 use blaze_own::{AVec, Alloc, Vec};
 
-use super::{COMPACT_DWARF, COMPACT_FRAME, EhSections, ROOM_SLACK, TABLES_ALIGN, eh_room, eh_sections};
+use super::{COMPACT_DWARF, COMPACT_FRAME, Covered, EhSections, ROOM_SLACK, TABLES_ALIGN, eh_room, eh_sections, tables};
 use crate::error::ExportError;
 use crate::export::{Panics, export};
 use crate::input::{Entry, Function, Panic, Platform, ProgramIn, Tier};
@@ -52,6 +53,38 @@ const RET: u32 = 0xD65F_03C0;
 /// `main`'s one row: the call of `thrower` (its `adrp; ldr; blr` site, which the layout makes
 /// `nop; nop; bl`), landing at the `mov w0, #42` that leads to `exit(42)`.
 const MAIN_ROW: Row = Row { start: 8, len: 12, landing: 28, action: Action::Cleanup };
+
+#[test]
+fn export_machine_cfi_preserves_program_extent_and_shares_cie() {
+    let alloc = Alloc::global();
+    let mut payload = Vec::new_in(alloc);
+    // Non-padding FDE program from the pinned LLVM O3 AArch64 Mach-O cleanup probe.
+    let instructions = [0x44, 0x0e, 32, 0x44, 0x9e, 1, 0x9d, 2, 0x93, 3, 0x94, 4, 0x0a, 0x54, 0x0e, 0, 0xde, 0xdd, 0xd3, 0xd4, 0x44, 0x0b];
+    let input = CfiInput { code_len: 52, code_align: 1, data_align: -8, has_lsda: true, initial: &[0x0c, 31, 0], instructions: &instructions };
+    cfi::write(input, 68, &mut payload).unwrap();
+    let cfi = Cfi::read(&payload, 68).unwrap();
+    let rows = [Row { start: 12, len: 4, landing: 0, action: Action::Continue }];
+    let unwind = unwind::with_cfi(None, Some(cfi), &rows, 68).unwrap();
+    let covered = [Covered { symbol: sym("one"), at: 0x100, unwind }, Covered { symbol: sym("two"), at: 0x150, unwind }];
+    for platform in [Platform::MacosArm64, Platform::LinuxArm64] {
+        let sections = tables(&covered, Some(0x80), 0x200, platform, None, alloc).unwrap();
+        assert_eq!((sections.functions, sections.landing), (2, 2));
+        let b = &sections.eh_frame;
+        let plain_end = 4 + get32(b, 0) as usize;
+        let fde = plain_end + 4 + get32(b, plain_end) as usize;
+        assert_eq!(&b[plain_end + 9..plain_end + 17], b"zPLR\0\x01\x78\x1e");
+        let second = fde + 4 + get32(b, fde) as usize;
+        for (offset, placed) in [fde, second].into_iter().zip(covered) {
+            assert_eq!(offset + 4 - get32(b, offset + 4) as usize, plain_end);
+            assert_eq!(pcrel(b, offset + 8, sections.eh_frame_at), placed.at);
+            assert_eq!(get32(b, offset + 12), 52);
+            assert_eq!(&b[offset + 21..offset + 21 + instructions.len()], &instructions);
+            let lsda_at = pcrel(b, offset + 17, sections.eh_frame_at);
+            let rows = read_lsda(&sections.except_tab, (lsda_at - sections.except_tab_at) as usize);
+            assert_eq!(rows.as_slice(), &[(12, 4, 0, 0)]);
+        }
+    }
+}
 
 fn sym(name: &str) -> Symbol {
     Symbol::of_name(name)

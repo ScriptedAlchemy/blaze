@@ -1,0 +1,21 @@
+[package]
+name = "blaze-llvm-abi"
+description = "Owned narrow C ABI and pinned native linkage for blaze's LLVM emitter"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+native = []
+
+[[test]]
+name = "release"
+required-features = ["native"]
+
+[lints]
+workspace = true

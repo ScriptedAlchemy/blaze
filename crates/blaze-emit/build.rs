@@ -11,6 +11,47 @@ const TABLE: &[u8] = include_bytes!("table/arm64.bztab");
 const PIN: &str = include_str!("table/arm64.json");
 const KEY: &str = "\"blake3\": \"";
 
+/// The native release tier's implementation: the lowering (`src/llvm.rs` and its modules), the
+/// object reader (`src/llvm/object.rs`), and the pass pipeline the emitter runs
+/// (`vendor/llvm-sys/wrappers/passes.cpp`, which `LLVMBlazeRunPasses` builds), whose bytes are
+/// hashed into `BLAZE_EMIT_NATIVE_REVISION`. A record's bytes depend on every one of these, so
+/// the backend's identity (`llvm::emit::identity`) names this digest: a repair to any of them is
+/// different work, and a recipe keyed on the old identity is not reused for it. Test files are
+/// left out: a test changes what is proved, not what is made. Include the owned declarations
+/// and linkage because both participate in the native producer.
+const NATIVE: &[(&str, &str)] = &[
+    ("src/llvm.rs", include_str!("src/llvm.rs")),
+    ("src/llvm/abi.rs", include_str!("src/llvm/abi.rs")),
+    ("src/llvm/control.rs", include_str!("src/llvm/control.rs")),
+    ("src/llvm/emit.rs", include_str!("src/llvm/emit.rs")),
+    ("src/llvm/folding.rs", include_str!("src/llvm/folding.rs")),
+    ("src/llvm/instruction.rs", include_str!("src/llvm/instruction.rs")),
+    ("src/llvm/memory.rs", include_str!("src/llvm/memory.rs")),
+    ("src/llvm/object.rs", include_str!("src/llvm/object.rs")),
+    ("src/llvm/object_unwind.rs", include_str!("src/llvm/object_unwind.rs")),
+    ("src/llvm/tls.rs", include_str!("src/llvm/tls.rs")),
+    ("src/llvm/traps.rs", include_str!("src/llvm/traps.rs")),
+    ("src/pass/target.rs", include_str!("src/pass/target.rs")),
+    ("../blaze-code/src/record.rs", include_str!("../blaze-code/src/record.rs")),
+    ("../blaze-code/src/unwind.rs", include_str!("../blaze-code/src/unwind.rs")),
+    ("../blaze-code/src/unwind/cfi.rs", include_str!("../blaze-code/src/unwind/cfi.rs")),
+    ("../blaze-llvm-abi/abi.h", include_str!("../blaze-llvm-abi/abi.h")),
+    ("../blaze-llvm-abi/build.rs", include_str!("../blaze-llvm-abi/build.rs")),
+    ("../blaze-llvm-abi/src/lib.rs", include_str!("../blaze-llvm-abi/src/lib.rs")),
+    ("../../vendor/llvm-sys/pin.rs", include_str!("../../vendor/llvm-sys/pin.rs")),
+    ("../../vendor/llvm-sys/wrappers/passes.cpp", include_str!("../../vendor/llvm-sys/wrappers/passes.cpp")),
+];
+
+/// The BLAKE3 of the native implementation's files, each as its path then its bytes, in
+/// `NATIVE`'s order: a change to any file, a rename or a reorder changes the digest.
+fn native_revision() -> [u8; 32] {
+    let mut hash = blaze_blake3::Hasher::new();
+    for (path, bytes) in NATIVE {
+        hash.update(path.as_bytes()).update(&0u32.to_le_bytes()).update(bytes.as_bytes()).update(&0u32.to_le_bytes());
+    }
+    hash.finalize()
+}
+
 /// Why the table was refused: each names the file.
 enum PinError {
     /// The pin has no 64-hex-digit `blake3` value.
@@ -67,10 +108,21 @@ fn main() -> Result<(), PinError> {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=table/arm64.bztab");
     println!("cargo::rerun-if-changed=table/arm64.json");
+    for (path, _) in NATIVE {
+        println!("cargo::rerun-if-changed={path}");
+    }
     let pinned = pinned(PIN)?;
     let have = blaze_blake3::hash(TABLE);
     match have == pinned {
         true => Ok(()),
         false => Err(PinError::Digest { pinned, have }),
+    }?;
+    let revision = native_revision();
+    let mut spelled = String::with_capacity(64);
+    for byte in revision {
+        use core::fmt::Write;
+        write!(&mut spelled, "{byte:02x}").expect("a String holds 64 hex digits");
     }
+    println!("cargo::rustc-env=BLAZE_EMIT_NATIVE_REVISION={spelled}");
+    Ok(())
 }

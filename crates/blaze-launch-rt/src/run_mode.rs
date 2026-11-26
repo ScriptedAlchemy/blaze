@@ -1255,11 +1255,11 @@ impl<'a> RunMode<'a> {
         }
         let mut entry_bytes: AVec<'_, u8> = Vec::new_in(self.alloc);
         // The program's personality routine (its slot's entry thunk), once the parent named it;
-        // `None` before, and a record whose rows land is then `EhError::NoPersonality`.
+        // `None` before, and a record with an LSDA is then `EhError::NoPersonality`.
         let personality = self.personality_at(&*memory);
-        let entry = match unwind.frame() {
-            None => None,
-            Some(_) => {
+        let entry = match unwind.has_entry() {
+            false => None,
+            true => {
                 let eh = |why| RunModeError::Eh { record, why };
                 // Sized at address 0, then made at its own: an entry's length does not depend
                 // on its addresses (every one is an 8-byte absptr; TO VERIFY BY A TEST).

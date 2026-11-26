@@ -28,8 +28,6 @@ use super::{Reloc, RelocKind};
 const BLR_BASE: u32 = 0xD63F_0000;
 /// `b`/`bl`: bits 30..26 fixed, bit 31 the link.
 const B_OR_BL: (u32, u32) = (0x7C00_0000, 0x1400_0000);
-/// Load/store register, unsigned immediate offset: bits 29..27 `111`, 25..24 `01`.
-const LDST_UIMM: (u32, u32) = (0x3B00_0000, 0x3900_0000);
 
 /// [`place_resolved`] of a record with no source-position slot: one with any is refused naming
 /// its rows (`PlaceError::PositionBytes`), since only the run's answers fill them.
@@ -115,11 +113,18 @@ pub fn place_resolved(
             RelocKind::Branch26 => {
                 let inst = expect(code, off, B_OR_BL, symbol, "b or bl")?;
                 let to = address(view, words, at, r)?;
-                let delta = to as i64 - pc as i64;
-                if delta % 4 != 0 || !(-(1i64 << 27)..(1i64 << 27)).contains(&delta) {
-                    return Err(PlaceError::Site(ImageError::OutOfReach { symbol, at: off, what: "b/bl (128 MiB)" }));
+                write32(code, off, blaze_code::a64::branch26(inst, pc, to, symbol)?);
+            }
+            RelocKind::ImportPage21 | RelocKind::ImportLo12 => {
+                let word = words.word(view.target(r.target as usize), false)?;
+                if word % 8 != 0 {
+                    return Err(PlaceError::Misaligned { symbol, what: "a target's word", at: word, align: 8 });
                 }
-                write32(code, off, (inst & 0xFC00_0000) | (((delta >> 2) as u32) & 0x03FF_FFFF));
+                let kind = match r.kind {
+                    RelocKind::ImportPage21 => blaze_code::record::SiteKind::GotPage21,
+                    _ => blaze_code::record::SiteKind::GotLo12,
+                };
+                blaze_code::a64::single_site(code, off, pc, word, kind, symbol)?;
             }
             RelocKind::GotPage21 => {
                 let inst = expect(code, off, ADRP, symbol, "adrp")?;
@@ -182,12 +187,7 @@ fn address(view: &RecordView<'_>, words: &mut dyn Words, at: At, r: Reloc) -> Re
 /// Public for blaze-export optimized.rs, which completes `PageOff12` the same way.
 pub fn page_offset(inst: u32, scale: u8, to: u64, off: u64, symbol: Symbol) -> Result<u32, PlaceError> {
     let is_add = inst & ADD64.0 == ADD64.1;
-    let is_ldst = inst & LDST_UIMM.0 == LDST_UIMM.1;
-    let fits = match (is_add, is_ldst) {
-        (true, _) => scale == 0,
-        (false, true) => access_log2(inst) == u32::from(scale),
-        (false, false) => false,
-    };
+    let fits = (is_add && scale == 0) || blaze_code::a64::access_scale(inst) == Some(scale);
     if !fits {
         return Err(PlaceError::Site(ImageError::NotInstruction {
             symbol,
@@ -195,24 +195,7 @@ pub fn page_offset(inst: u32, scale: u8, to: u64, off: u64, symbol: Symbol) -> R
             want: "add, or load or store (unsigned offset) of the page offset's size",
         }));
     }
-    let lo = to & 0xFFF;
-    let align = 1u64 << scale;
-    if lo % align != 0 {
-        return Err(PlaceError::Misaligned { symbol, what: "a page offset's target", at: to, align });
-    }
-    Ok((inst & !(0xFFF << 10)) | (((lo >> scale) as u32) << 10))
-}
-
-/// The log2 of the bytes a load or store (unsigned offset) moves: `size`, or 4 for a 128-bit
-/// vector register (`V` set, `size` 0, `opc` bit 1 set).
-fn access_log2(inst: u32) -> u32 {
-    let size = inst >> 30;
-    let vector = (inst >> 26) & 1 == 1;
-    let opc_high = (inst >> 23) & 1 == 1;
-    match vector && size == 0 && opc_high {
-        true => 4,
-        false => size,
-    }
+    blaze_code::a64::lo12(inst, to, scale).ok_or(PlaceError::Misaligned { symbol, what: "a page offset's target", at: to, align: 1u64 << scale })
 }
 
 /// Whether the `ldr` at `ldr_at` loads x16 or x17 and the next instruction is `blr` of it.

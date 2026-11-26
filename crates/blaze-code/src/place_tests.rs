@@ -15,6 +15,42 @@ const ADRP_X0: u32 = 0x9000_0000;
 const ADD_X0: u32 = 0x9100_0000;
 const RET: u32 = 0xD65F_03C0;
 
+#[test]
+fn single_arm64_sites_keep_the_registers_neighbours_scale_and_branch_link() {
+    use crate::a64::{read32, single_site};
+    use SiteKind::{Branch26, LdstLo12_1, LdstLo12_2, LdstLo12_4, LdstLo12_8, LdstLo12_16};
+    let symbol = Symbol::of_name("relocated");
+    let mut code = [0xcc; 12];
+    for (kind, opcode, width) in [
+        (LdstLo12_1, 0x3940_0109u32, 1u32),
+        (LdstLo12_2, 0x7900_0109, 2),
+        (LdstLo12_4, 0xb940_0109, 4),
+        (LdstLo12_8, 0xfd00_0109, 8),
+        (LdstLo12_16, 0x3dc0_0109, 16),
+    ] {
+        code[4..8].copy_from_slice(&(opcode | (0xfff << 10)).to_le_bytes());
+        single_site(&mut code, 4, CODE + 4, TABLE + 0xfd0, kind, symbol).unwrap();
+        assert_eq!(read32(&code, 4), opcode | ((0xfd0 / width) << 10));
+        if width > 1 {
+            assert!(single_site(&mut code, 4, CODE + 4, TABLE + 1, kind, symbol).is_err());
+        }
+        assert_eq!((&code[..4], &code[8..]), (&[0xcc; 4][..], &[0xcc; 4][..]));
+    }
+    assert!(single_site(&mut code, 4, CODE + 4, TABLE, LdstLo12_1, symbol).is_err(), "a Q load cannot be patched as a byte load");
+    for opcode in [0x1400_0000u32, 0x9400_0000] {
+        for delta in [-(1i64 << 27), -4, 0, 4, (1 << 27) - 4] {
+            code[4..8].copy_from_slice(&opcode.to_le_bytes());
+            single_site(&mut code, 4, CODE, CODE.checked_add_signed(delta).unwrap(), Branch26, symbol).unwrap();
+            let inst = read32(&code, 4);
+            assert_eq!(inst & 0xfc00_0000, opcode);
+            assert_eq!(i64::from((inst << 6) as i32 >> 6) * 4, delta);
+        }
+        for bad in [CODE - (1 << 27) - 4, CODE + (1 << 27), CODE + 2, u64::MAX - 3] {
+            assert!(single_site(&mut code, 4, CODE, bad, Branch26, symbol).is_err());
+        }
+    }
+}
+
 /// The run's reservation in these tests: the slot words at `TABLE`, the thunk words 64 KiB after
 /// them, the code area 1 GiB on.
 const TABLE: u64 = 0x1_0000_0000;
