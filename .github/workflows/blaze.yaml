@@ -12,7 +12,7 @@ env:
 jobs:
   address:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 14
+    timeout-minutes: 18
     steps:
       - uses: actions/checkout@v7
         with:
@@ -37,7 +37,7 @@ jobs:
           timeout 30 tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries"
           timeout 30 tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$RUNNER_TEMP/source-shelf"
           timeout 90 python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-          timeout -k 15 480 python3 - <<'PY' | tee "$RUNNER_TEMP/address-evidence/result.log"
+          timeout -k 15 720 python3 - <<'PY' | tee "$RUNNER_TEMP/address-evidence/result.log"
           import ast
           import hashlib
           import os
@@ -73,6 +73,8 @@ jobs:
           shutil.copytree(project, other)
           modes = [("serial-a", "1", project), ("pooled", "4", project),
                    ("serial-b", "1", project), ("pooled-first", "4", other)]
+          modes.extend((f"serial-extra-{i:02}", "1", project) for i in range(10))
+          modes.extend((f"pooled-extra-{i:02}", "4", other) for i in range(6))
 
           def files(dir):
               return {str(p.relative_to(dir)): hashlib.sha256(p.read_bytes()).hexdigest()[:12]
