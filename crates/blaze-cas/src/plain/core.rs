@@ -2223,9 +2223,9 @@ pub struct Plain<A: Allocator + Clone> {
     /// next round carries forward ([`Plain::carry`]).
     carrying: Vec<(u64, ContentId), A>,
     carry_check: Option<CarryCheck<A>>,
-    /// Keys already copied into `segs` or tracked in `touches` after a carry. The eviction
-    /// check must not add their original segment again.
-    carried_in_commit: Option<blaze_own::Vec<ContentId, A>>,
+    /// Keys written by this commit or revalidated at a newer row. A concurrent root change
+    /// must not add their original segment again.
+    satisfied_in_commit: Option<blaze_own::Vec<ContentId, A>>,
     /// The rounds the commit in flight carried records forward: at most [`CARRY_ROUNDS`].
     carry_rounds: u32,
     /// Records carried forward by this process's commits, ever ([`Plain::carried`]).
@@ -2628,7 +2628,7 @@ impl<A: Allocator + Clone> Plain<A> {
             carry_check: None,
             touches: Vec::new_in(a()),
             carrying: Vec::new_in(a()),
-            carried_in_commit: None,
+            satisfied_in_commit: None,
             carry_rounds: 0,
             carried: 0,
             written_here: 0,
@@ -3864,9 +3864,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// non-renewal root edits walk existing roots in [`Plain::reused`] /
     /// [`Plain::missing_after_root_change`]).
     pub fn needs_whole_for_commit(&self) -> bool {
-        self.plant() == Plant::CommitMapsAll
-            || (self.cfg.liveness == Liveness::Reached
-                && self.roots_pending.iter().any(|edit| matches!(edit, RootEdit::Set { renew_only: false, .. })))
+        self.plant() == Plant::CommitMapsAll || self.checks_root_reach(&self.roots_pending)
     }
 
     /// Maps and verifies ONLY the unmapped/parked local segments whose Bloom filter matches at
@@ -4130,8 +4128,8 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         self.committing.clear();
         self.carrying.clear();
-        if let Some(carried) = &mut self.carried_in_commit {
-            carried.clear();
+        if let Some(satisfied) = &mut self.satisfied_in_commit {
+            satisfied.clear();
         }
         self.carry_rounds = 0;
         // The roots this commit's records were put with: one set after it started is the next's.
@@ -4156,6 +4154,12 @@ impl<A: Allocator + Clone> Plain<A> {
                 }
             },
         };
+        if self.checks_root_reach(&roots) {
+            self.note_written_pointers(&nexts);
+            if let Some(written) = &self.satisfied_in_commit {
+                self.touches.retain(|(_, key)| written.binary_search(key).is_err());
+            }
+        }
         self.replaced_index_hints.clear();
         for (digest, rec) in new_root_blooms {
             self.record_pending_bloom(digest, rec);
@@ -4184,6 +4188,31 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         Ok(())
+    }
+
+    fn checks_root_reach(&self, roots: &[RootEdit]) -> bool {
+        self.cfg.liveness == Liveness::Reached
+            && roots.iter().any(|edit| matches!(edit, RootEdit::Set { renew_only: false, .. }))
+    }
+
+    /// An explicitly written pointer is the publication's new value for that name, even if
+    /// an older row had the same name. Only use keys that made it into a staged segment.
+    fn note_written_pointers(&mut self, nexts: &[NextCommit<A>]) {
+        let mut keys = self.own_vec();
+        for next in nexts {
+            match next {
+                NextCommit::Laid(laid) if laid.namespace == Namespace::LOCAL => {
+                    keys.extend(laid.run.chunks_exact(ENTRY).map(Entry::read)
+                        .filter(|entry| ReservedTag::Pointer.is(entry.tag)).map(|entry| entry.key));
+                }
+                NextCommit::Planned(plan) if plan.sealed.described.namespace == Namespace::LOCAL => {
+                    keys.extend(plan.entries.iter()
+                        .filter(|entry| ReservedTag::Pointer.is(entry.tag)).map(|entry| entry.key));
+                }
+                _ => {}
+            }
+        }
+        self.note_satisfied(keys.into_iter());
     }
 
     /// Zero-copy twin of [`Plain::lay_out`]: sorts, deduplicates, checks `TwoValues`, computes
@@ -6094,7 +6123,7 @@ impl<A: Allocator + Clone> Plain<A> {
         for edit in edits {
             let RootEdit::Set { key: root, renew_only: false, .. } = edit else { continue };
             let mut check = |k: ContentId| {
-                if self.carried_in_commit.as_ref().is_some_and(|done| done.binary_search(&k).is_ok()) {
+                if self.satisfied_in_commit.as_ref().is_some_and(|done| done.binary_search(&k).is_ok()) {
                     return;
                 }
                 if let Some((at, _)) = self.find_in(&[Namespace::LOCAL], &Key(k))
@@ -6518,9 +6547,8 @@ impl<A: Allocator + Clone> Plain<A> {
                 present_segs.extend(m.segments.iter().map(|it| it.id));
                 present_segs.sort_unstable();
                 let old_protection_changed = base_gen != self.manifest.generation
-                    && self.cfg.liveness == Liveness::Reached
                     && self.plant() != Plant::CarrySkipped
-                    && !roots.is_empty()
+                    && self.checks_root_reach(roots)
                     && self.manifest.segments.iter().any(|s| s.local && present_segs.binary_search(&s.id).is_err())
                     && self.manifest.roots.iter().any(|old| {
                         old.expires_ns > *started_ns && !m.roots.iter().any(|current| {
@@ -7090,7 +7118,7 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         self.touches.retain(|it| carrying.binary_search(it).is_err());
-        self.note_carried(carrying.iter().map(|&(_, key)| key));
+        self.note_satisfied(carrying.iter().map(|&(_, key)| key));
         if out.entries.is_empty() {
             self.start_flip(Change::Commit { segs, started_ns, roots }, effects);
             return;
@@ -7105,15 +7133,15 @@ impl<A: Allocator + Clone> Plain<A> {
         }
     }
 
-    fn note_carried(&mut self, keys: impl Iterator<Item = ContentId>) {
-        if self.carried_in_commit.is_none() {
-            self.carried_in_commit = Some(self.own_vec());
+    fn note_satisfied(&mut self, keys: impl Iterator<Item = ContentId>) {
+        let mut keys = keys.peekable();
+        if keys.peek().is_none() {
+            return;
         }
-        if let Some(done) = &mut self.carried_in_commit {
-            done.extend(keys);
-            done.sort_unstable();
-            done.dedup();
-        }
+        let satisfied = self.satisfied_in_commit.get_or_insert_with(|| blaze_own::Vec::new_in(self.alloc.clone()));
+        satisfied.extend(keys);
+        satisfied.sort_unstable();
+        satisfied.dedup();
     }
 
     /// Check a mutable name against the manifest read at the failed flip. Keep any newly
@@ -7146,7 +7174,7 @@ impl<A: Allocator + Clone> Plain<A> {
         self.touches.extend(moved.iter().map(|&(_, new)| new));
         self.touches.sort_unstable();
         self.touches.dedup();
-        self.note_carried(moved.iter().map(|&(_, (_, key))| key));
+        self.note_satisfied(moved.iter().map(|&(_, (_, key))| key));
         Ok(())
     }
 
