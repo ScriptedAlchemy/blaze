@@ -1188,6 +1188,7 @@ mod tests {
             (Area::Cli, crate::names::UNRESOLVED_DOLLAR_CRATE),
             (Area::Cli, crate::names::UNRESOLVED_WRONG_MACRO_KIND),
             (Area::Cli, crate::names::UNRESOLVED_DERIVE_AFTER_ATTRIBUTE),
+            (Area::Cli, crate::names::DUPLICATE_IMPORT),
             (Area::Cli, crate::names::failed_call::FAILED_CALL),
             (Area::Cli, crate::names::include_outside::INCLUDE_OUTSIDE_PACKAGE),
             (Area::Cli, crate::names::test_marks::TEST_REFUSED),

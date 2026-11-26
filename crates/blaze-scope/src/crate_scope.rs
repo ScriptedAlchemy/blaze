@@ -609,7 +609,7 @@ fn clone_scope_error_in<'b, N: Copy>(
         ScopeError::Macro { call, ref path, segment, why } => ScopeError::Macro { call, path: clone_path_in(path, alloc), segment, why },
         ScopeError::ExternCrate { name } => ScopeError::ExternCrate { name },
         ScopeError::RestrictedNotAncestor { ref path } => ScopeError::RestrictedNotAncestor { path: clone_path_in(path, alloc) },
-        ScopeError::Duplicate { ns, name, first, second } => ScopeError::Duplicate { ns, name, first, second },
+        ScopeError::Duplicate { ns, name, first, second, import } => ScopeError::Duplicate { ns, name, first, second, import },
         ScopeError::WiderReexport { site, ns, name, def } => ScopeError::WiderReexport { site, ns, name, def },
         ScopeError::Ambiguous { site, ns, name, kind, first, second } => ScopeError::Ambiguous { site, ns, name, kind, first, second },
         ScopeError::Inconsistent { site, ns, name, early, last } => ScopeError::Inconsistent { site, ns, name, early, last },

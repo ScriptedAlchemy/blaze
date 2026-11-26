@@ -211,8 +211,9 @@ pub enum ScopeError<N, P> {
     ExternCrate { name: N },
     /// A `pub(in path)` whose path is not an ancestor of the module.
     RestrictedNotAncestor { path: P },
-    /// Two different non-glob bindings of one name (rustc E0252, E0254, E0255, E0428).
-    Duplicate { ns: Namespace, name: N, first: Def, second: Def },
+    /// Two non-glob bindings of one name. When both bindings are named imports (E0252),
+    /// `import` is the later import's site and the targets may agree. Older records carry no site.
+    Duplicate { ns: Namespace, name: N, first: Def, second: Def, import: Option<UseSite> },
     /// A `use` re-exports a binding wider than the binding itself is visible (E0364, E0365).
     WiderReexport { site: UseSite, ns: Namespace, name: N, def: Def },
     /// An early resolution (an import's or a macro path's first segment) that the final scope
@@ -237,7 +238,7 @@ impl<N, P> ScopeError<N, P> {
             E::Macro { call, path, segment, why } => E::Macro { call, path: f(path), segment, why },
             E::ExternCrate { name } => E::ExternCrate { name },
             E::RestrictedNotAncestor { path } => E::RestrictedNotAncestor { path: f(path) },
-            E::Duplicate { ns, name, first, second } => E::Duplicate { ns, name, first, second },
+            E::Duplicate { ns, name, first, second, import } => E::Duplicate { ns, name, first, second, import },
             E::WiderReexport { site, ns, name, def } => E::WiderReexport { site, ns, name, def },
             E::Ambiguous { site, ns, name, kind, first, second } => E::Ambiguous { site, ns, name, kind, first, second },
             E::Inconsistent { site, ns, name, early, last } => E::Inconsistent { site, ns, name, early, last },
@@ -354,7 +355,7 @@ impl<N, P> ScopeError<N, P> {
             E::Macro { call, segment, why, .. } => E::Macro { call: *call, path: (), segment: *segment, why: *why },
             E::ExternCrate { name } => E::ExternCrate { name },
             E::RestrictedNotAncestor { .. } => E::RestrictedNotAncestor { path: () },
-            E::Duplicate { ns, name, first, second } => E::Duplicate { ns: *ns, name, first: *first, second: *second },
+            E::Duplicate { ns, name, first, second, import } => E::Duplicate { ns: *ns, name, first: *first, second: *second, import: *import },
             E::WiderReexport { site, ns, name, def } => E::WiderReexport { site: *site, ns: *ns, name, def: *def },
             E::Ambiguous { site, ns, name, kind, first, second } => {
                 E::Ambiguous { site: *site, ns: *ns, name, kind: *kind, first: *first, second: *second }
@@ -738,8 +739,8 @@ fn error_row<N: AsRef<str>>(
         E::Macro { call, why, .. } => (ErrorTag::Macro, Some(Site::Call(*call)), None, Namespace::Types, Some(*why), None, None, None),
         E::ExternCrate { name } => (ErrorTag::ExternCrate, None, Some(name), Namespace::Types, None, None, None, None),
         E::RestrictedNotAncestor { .. } => (ErrorTag::RestrictedNotAncestor, None, None, Namespace::Types, None, None, None, None),
-        E::Duplicate { ns, name, first, second } => {
-            (ErrorTag::Duplicate, None, Some(name), *ns, None, None, Some(*first), Some(*second))
+        E::Duplicate { ns, name, first, second, import } => {
+            (ErrorTag::Duplicate, import.map(Site::Import), Some(name), *ns, None, None, Some(*first), Some(*second))
         }
         E::WiderReexport { site, ns, name, def } => {
             (ErrorTag::WiderReexport, Some(Site::Import(*site)), Some(name), *ns, None, None, Some(*def), None)
@@ -877,6 +878,9 @@ impl<'a> ScopeView<'a> {
         }
         for row in view.errors {
             check_text(strings, row.name, row, buffer)?;
+            if row.tag == ErrorTag::Duplicate && row.site == SiteTag::Call {
+                return Err(FormatError::Invalid { at: at_of_record(row, buffer), what: "a call site on a duplicate binding" });
+            }
             let has_path = matches!(row.tag, ErrorTag::Import | ErrorTag::Macro | ErrorTag::RestrictedNotAncestor);
             match has_path {
                 true => paths.check(row.path, false, row, buffer)?,
@@ -970,7 +974,13 @@ impl<'a> ScopeView<'a> {
                 ErrorTag::Macro => E::Macro { call: ItemKey(row.site_key), path: paths.get(row.path), segment: row.segment, why },
                 ErrorTag::ExternCrate => E::ExternCrate { name },
                 ErrorTag::RestrictedNotAncestor => E::RestrictedNotAncestor { path: paths.get(row.path) },
-                ErrorTag::Duplicate => E::Duplicate { ns: row.ns, name, first, second },
+                ErrorTag::Duplicate => E::Duplicate {
+                    ns: row.ns,
+                    name,
+                    first,
+                    second,
+                    import: (row.site == SiteTag::Import).then(|| use_site_of(row)),
+                },
                 ErrorTag::WiderReexport => E::WiderReexport { site: use_site_of(row), ns: row.ns, name, def: first },
                 ErrorTag::Ambiguous => E::Ambiguous { site, ns: row.ns, name, kind: row.ambiguity, first, second },
                 ErrorTag::Inconsistent => E::Inconsistent { site, ns: row.ns, name, early: first, last: second },

@@ -76,7 +76,8 @@ pub(crate) mod sections;
 // there only when what a name stands for changes. Source 18: D104 implicit `fn main` reads on
 // blaze-edition binary roots (engine_names.rs `finish`, rule 21) and expansion record keys in
 // `OUT_DOMAIN` 3. Source 19: `CrateScope` form 7 (32-byte `NameCell` rows + columnar `ItemsRecord` v14).
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 19";
+// Source 20 records the sites and findings of conflicting named imports.
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 20";
 /// The out: the names record, the crate's expansion record keys (`EXPANSIONS_OUT_DOMAIN`), AND
 /// the checkout files the crate holds ([`crate_out`]). "1" was the names record alone, but a
 /// body's check reads its crate's items record to find which crate owns its file (body_types.rs
@@ -646,6 +647,7 @@ pub(crate) const UNRESOLVED_SUPER_ABOVE_ROOT: u16 = 31;
 pub(crate) const UNRESOLVED_DOLLAR_CRATE: u16 = 32;
 pub(crate) const UNRESOLVED_WRONG_MACRO_KIND: u16 = 33;
 pub(crate) const UNRESOLVED_DERIVE_AFTER_ATTRIBUTE: u16 = 34;
+pub(crate) const DUPLICATE_IMPORT: u16 = 49;
 
 fn rule_of(why: blaze_surface::Unresolved) -> u16 {
     use blaze_surface::Unresolved as Reason;
@@ -667,7 +669,7 @@ pub(crate) fn placed(rule: u16) -> bool {
     matches!(rule,
         UNRESOLVED | UNRESOLVED_PRIVATE | UNRESOLVED_AMBIGUOUS | UNRESOLVED_NOT_A_MODULE |
         UNRESOLVED_SUPER_ABOVE_ROOT | UNRESOLVED_DOLLAR_CRATE | UNRESOLVED_WRONG_MACRO_KIND |
-        UNRESOLVED_DERIVE_AFTER_ATTRIBUTE | include_outside::INCLUDE_OUTSIDE_PACKAGE |
+        UNRESOLVED_DERIVE_AFTER_ATTRIBUTE | DUPLICATE_IMPORT | include_outside::INCLUDE_OUTSIDE_PACKAGE |
         failed_call::FAILED_CALL | test_marks::TEST_REFUSED | test_marks::TEST_DUPLICATED |
         blaze_drive::task::MODULE_FILE_MISSING_RULE | blaze_drive::task::PATH_FILE_MISSING_RULE
     )
@@ -716,7 +718,7 @@ fn find_word(text: &str, word: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// Every `use` and macro path of crate `c` that the resolver refused. The project's own (a
+/// Every unresolved path or conflicting import recorded by the resolver. The project's own (a
 /// checkout file, `/0/`) are findings in `own`, sorted; the number of the others (a fetched or
 /// toolchain crate's: not the project's to fix) is returned, counted in one note. A path that
 /// waits on a failed dependency (`waits`: written into it, or failing in a scope a glob or
@@ -724,16 +726,25 @@ fn find_word(text: &str, word: &str, from: usize) -> Option<usize> {
 /// reported once, at it (plan row A8, rule 19).
 fn unresolved<'a>(c: &blaze_scope::resolve::CrateNames<'a>, member: bool, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, own: &mut PathFindings) -> u32 {
     use blaze_surface::ScopeError;
+    enum Finding<'r, 'a> {
+        Path { path: &'r blaze_surface::Path<'a, &'a str>, segment: usize, why: blaze_surface::Unresolved },
+        DuplicateImport(&'a str),
+    }
     let project = member && c.files.iter().any(|file| file.path.starts_with("/0/"));
     let mut elsewhere = 0u32;
     for r in c.done.values() {
+        let use_location = |site: &blaze_surface::UseSite| {
+            let fragment = site.expansion.unwrap_or(r.scope.module);
+            c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(site.index as usize).copied())
+        };
         for error in r.scope.errors.iter() {
-            let (loc, path, segment, why) = match error {
-                ScopeError::Import { site, path, segment, why } => {
-                    let fragment = site.expansion.unwrap_or(r.scope.module);
-                    (c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(site.index as usize).copied()), path, *segment as usize, *why)
-                }
-                ScopeError::Macro { call, path, segment, why } => (c.tables.calls.get(call).map(|src| src.loc), path, *segment as usize, *why),
+            let (loc, finding) = match error {
+                ScopeError::Import { site, path, segment, why } => (use_location(site), Finding::Path { path, segment: *segment as usize, why: *why }),
+                ScopeError::Macro { call, path, segment, why } => (
+                    c.tables.calls.get(call).map(|src| src.loc),
+                    Finding::Path { path, segment: *segment as usize, why: *why },
+                ),
+                ScopeError::Duplicate { import: Some(site), name, .. } => (use_location(site), Finding::DuplicateImport(name)),
                 _ => continue,
             };
             let into_failed = waits.waits_on(r.scope.module, error).is_some();
@@ -748,14 +759,20 @@ fn unresolved<'a>(c: &blaze_scope::resolve::CrateNames<'a>, member: bool, waits:
                 Some((_, file, item)) => {
                     let text = file.text;
                     let entry = item.range.of(text);
-                    // The failing segment: the path's segments found in order in the item's text.
-                    let mut from = 0usize;
-                    let mut found = None;
-                    for seg in path.segments.iter().take(segment + 1) {
-                        found = find_word(entry, seg, from).map(|start| (start, start + seg.len()));
-                        from = found.map_or(from, |(_, end)| end);
-                    }
-                    at = found.map_or((0, 0), |(s, e)| (s as u32, e as u32));
+                    at = match finding {
+                        Finding::Path { path, segment, .. } => {
+                            // Find the failing segment in order in this item's text.
+                            let mut from = 0usize;
+                            let mut found = None;
+                            for seg in path.segments.iter().take(segment + 1) {
+                                found = find_word(entry, seg, from).map(|start| (start, start + seg.len()));
+                                from = found.map_or(from, |(_, end)| end);
+                            }
+                            found.map_or((0, 0), |(s, e)| (s as u32, e as u32))
+                        }
+                        // The resolver identified the receiving use item or the macro that wrote it.
+                        Finding::DuplicateImport(_) => (0, item.range.end - item.range.start),
+                    };
                     message.extend_from_slice(file.path.trim_start_matches("/0/").as_bytes());
                     message.push(0x1F);
                     let chain = crate::work::item_chain(&file.outline, item, text);
@@ -768,12 +785,23 @@ fn unresolved<'a>(c: &blaze_scope::resolve::CrateNames<'a>, member: bool, waits:
             message.push(0x1F);
             message.push(b'0' + c.edition.byte());
             message.push(0x1F);
-            unresolved_args(&mut message, why, path.kind, &path.segments, segment);
-            own.push((rule_of(why), PathFinding { at, message }));
+            let rule = match finding {
+                Finding::Path { path, segment, why } => {
+                    unresolved_args(&mut message, why, path.kind, &path.segments, segment);
+                    rule_of(why)
+                }
+                Finding::DuplicateImport(name) => {
+                    message.extend_from_slice(name.as_bytes());
+                    DUPLICATE_IMPORT
+                }
+            };
+            own.push((rule, PathFinding { at, message }));
         }
     }
     // The scopes are a map: its order reaches the record only sorted (rule 25).
     own.sort_unstable_by(|(ra, a), (rb, b)| (ra, &a.message[..], a.at).cmp(&(rb, &b.message[..], b.at)));
+    // One import of a constructor can conflict in both the type and value namespaces.
+    own.dedup_by(|(ra, a), (rb, b)| *ra == DUPLICATE_IMPORT && ra == rb && a.at == b.at && a.message == b.message);
     elsewhere
 }
 

@@ -460,6 +460,35 @@ fn a_name_that_does_not_exist_is_an_error() {
     std::println!("missing names: call E0425 x{}, use, method E0599", fresh.errors);
 }
 
+#[test]
+fn duplicate_import_is_drawn_at_the_second_use_in_its_namespace() {
+    let io = Io::simulated(SimWorld::new(106, Limits::USUAL));
+    write(&io, "Cargo.toml", MANIFEST);
+    // The later use conflicts whether or not the two uses resolve to the same function.
+    for module in ["b", "a"] {
+        let before = stdout(&io).len();
+        write(
+            &io,
+            "src/lib.rs",
+            &std::format!("mod a {{ pub fn x() {{}} }}\nmod b {{ pub fn x() {{}} }}\nuse a::r#x;\nuse {module}::x;\npub fn call() {{ x(); }}\n"),
+        );
+        let duplicate = check_view::<fix::Atomic>(&io, View::Json, None);
+        assert_eq!((duplicate.status, duplicate.failures), (Some(1), 0), "{:?}\n{}", duplicate.words, duplicate.profile);
+        let out = stdout(&io);
+        let drawn = &out[before..];
+        assert!(drawn.lines().any(|line| line.contains("\"code\":\"E0252\"") && line.contains("\"path\":\"src/lib.rs\",\"line\":4,\"col\":1")), "{drawn}");
+    }
+
+    // A type alias and a function of the same name occupy separate namespaces.
+    write(
+        &io,
+        "src/lib.rs",
+        "mod a { pub fn x() {} }\nmod b { pub type x = u8; }\nuse a::r#x;\nuse b::x;\npub fn call() -> x { x(); 0 }\n",
+    );
+    let separate = check_view::<fix::Atomic>(&io, View::Json, None);
+    assert_eq!((separate.errors, separate.failures), (0, 0), "{:?}\n{}", separate.words, separate.profile);
+}
+
 /// A TYPE THAT DOES NOT EXIST, WRITTEN IN A BODY: E0412 at the path, and the body checked for
 /// everything else (front2 type_miss.rs: the type converted as the error type). `h` writes
 /// `&[crate::a::T]` and a mismatch of its own (`let _x: u8 = true`, E0308). With `T` the
