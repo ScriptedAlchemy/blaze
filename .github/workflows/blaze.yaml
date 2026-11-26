@@ -50,6 +50,8 @@ jobs:
           ref: e49f8e395bfc16617c43a05fba4901e8fbdab2f6
       - uses: ./.github/actions/toolchain
       - name: exercise the CSR invariants
-        run: timeout -k 15 600 cargo +"$(cat pins/toolchain)" test --locked -p blaze-own --lib csr::tests::
+        run: |
+          timeout -k 15 600 cargo +"$(cat pins/toolchain)" test --locked -p blaze-own --lib csr::tests::
       - name: exercise reserve publication and crash recovery
-        run: timeout -k 15 1200 cargo +"$(cat pins/toolchain)" test --locked -p blaze-std --lib fs::reserve::tests::
+        run: |
+          timeout -k 15 1200 cargo +"$(cat pins/toolchain)" test --locked -p blaze-std --lib fs::reserve::tests::
