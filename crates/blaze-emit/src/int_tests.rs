@@ -111,12 +111,14 @@ fn overflow_flags_match_rusts_overflowing_ops() {
 /// made in `x12`, the register `overflow` holds its flag in, so storing the result wrote the
 /// cell's address over the flag: every checked `+ - *` past value 2048 read as overflowed
 /// (tempo's 61 failing tests, 2026-11-21: serde_json's `remaining_depth -= 1`, sha2's
-/// `K64[t + 6]`, `len - 128` after a `len >= 128` guard). Padded by unused constants to put the
-/// operation on each side of the boundary; each case against Rust's own `overflowing_*`. The
-/// control (rule 23): with `FAR` set back to `X12` the non-overflowing cases at 2048 and on fail
-/// with flag 1 and those below it pass.
+/// `K64[t + 6]`, `len - 128` after a `len >= 128` guard). Live 16-byte values put the result pair
+/// on each side of the boundary in the lifetime-colored frame. Every case checks the pair's
+/// actual frame offset and Rust's own `overflowing_*` result.
 #[test]
 fn far_cells_keep_overflow_flags() {
+    use blaze_lir::{builder::MemAttrs, func::SlotKind};
+    use blaze_own::Alloc;
+
     use crate::tests::{emitted, run};
 
     // (op, ty, a, b, wrapped result, overflowed): non-overflowing cases first, by Rust's ops.
@@ -155,13 +157,22 @@ fn far_cells_keep_overflow_flags() {
     for pad in [2040u32, 2045, 2046, 2047, 2048, 2100, 4200] {
         for &(op, ty, a, b, (result, flag)) in &cases {
             for (k, ret, want) in [(0, ty, result), (1, Ty::I1, u64::from(flag))] {
+                let mut overflow = None;
                 let func = one(&[ty, ty], ret, |bb, v| {
-                    for n in 0..pad {
-                        let _ = bb.iconst(Ty::I64, u128::from(n));
-                    }
+                    // The stores after the overflow keep every padding cell live across it.
+                    let live: Vec<_> = (0..pad).map(|n| bb.iconst(Ty::I128, u128::from(n))).collect();
                     let pair = bb.overflow(op, v[0], v[1]);
+                    overflow = Some(pair);
+                    let slot = bb.slot(16, 4, SlotKind::Temp);
+                    let address = bb.slot_addr(slot);
+                    for value in live {
+                        bb.store(Flags::NONE, value, address, 0, MemAttrs::aligned(4));
+                    }
                     bb.project(pair, k)
                 });
+                let cells = crate::pass::frame::layout_cells(func.view(), Alloc::global()).expect("lays out cells");
+                let offset = cells.cell_at[overflow.expect("the checked pair was built").index()];
+                assert_eq!(offset >= 32 * 1024, pad >= 2048, "{op:?} {ty:?} after {pad} live values used cell {offset}");
                 let code = emitted(func.view(), &[]).expect("emits");
                 let exec = run::place(&code, |_| unreachable!());
                 let got = run::call(&exec, [a, b, 0, 0]) & crate::tests::mask(ret.bits(64));
