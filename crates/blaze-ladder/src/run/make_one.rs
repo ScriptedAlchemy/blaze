@@ -972,8 +972,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
     let Some(i) = state.ensure(program, typing, tabled, checks)? else {
         return Err(RunError::OneBody { key: tabled, why: "the record walk reached an instance of a fn the front end holds no checked body for" });
     };
-    let (item, args) = decode_instance(name, &mut state.work.ground, alloc).map_err(|e| RunError::CodeRecord { function: program.function(i).named(), error: CodeRecordError::Symbol(e) })?;
-    let instance = Instance { item, args };
+    let instance = instance_from_name(program, state, i, name)?;
     // Each fn whose check another fact of this instance's ARGUMENTS is in: a closure's or an
     // async block's owner (its capture facts are in its body: `LayoutFacts::closure`, which
     // lay_states.rs `roots_of_instance` reads before the build), and an `impl Trait`'s
@@ -981,13 +980,13 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
     // checked body's types. Read from the ground tree, not by the program's rows: a lazy front
     // end has no row for an owner until it is checked (front2/program/lazy `fn_index`), so a
     // filter by row skipped `rand::rngs::thread::rng` for `LocalKey::try_with` at its closure.
-    let Held { owners, items, objects } = held_owners(&*program, state.work.ground.view(), args, tabled, alloc)?;
+    let held = held_owners(&*program, state.work.ground.view(), instance.args, tabled, alloc)?;
     // Each `dyn` principal the arguments hold: its object table asked by name BEFORE the build
     // (D194, D197): core's `<&mut F as FnMut>::call_mut` at `F = dyn FnMut(..)` reads the table
     // of a trait no body of this instance names, which before came only from the check of the
     // caller that coerced to the object (on another worker, or found in the store). `false` is
     // a front end that makes none here: the build's `NoTrait` then names it.
-    for &principal in objects.iter() {
+    for &principal in held.objects.iter() {
         program.object_table(principal)?;
     }
     // The heads the body's `#[track_caller]` sites count from, asked BEFORE the build (D194):
@@ -995,9 +994,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
     // came only from a check of the enclosing body this maker happened to make. One the ask
     // could not serve stays the build's typed `SiteGap::NoEnclosingRow`.
     program.site_heads(tabled)?;
-    for &owner in owners.iter() {
-        state.ensure(program, typing, owner, checks)?;
-    }
+    make_held_owners(program, typing, state, checks, &held.owners)?;
     // Each fn item whose TYPE the arguments hold: its row from its head, its body not checked
     // (this instance reads none of it; its own instance is the walk's, found or made). The
     // Reference, "Function item types": "When referred to, a function item, or the
@@ -1009,7 +1006,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>>(
     // this run, so no check made that head (t1530, 36 tests: "the build's `Adts` gave no ABI
     // for it" at `Result::map` with `NonZero::<u64>::new`, `Option::map` with `Into::into`,
     // fastrand's `try_with_rng(Rng::fork)`, a fn handed to `OnceLock::get_or_init`).
-    for &item in items.iter() {
+    for &item in held.items.iter() {
         program.head_row(item)?;
     }
     // A test report shim calls `Termination::report` (the trait method, which `name_ref` then
@@ -1434,6 +1431,20 @@ struct Held<'a> {
     objects: AVec<'a, ItemKey>,
 }
 
+fn instance_from_name<P: FrontEnd>(program: &P, state: &mut MakerState, row: usize, name: &[u8]) -> Result<Instance, RunError> {
+    let (item, args) = decode_instance(name, &mut state.work.ground, state.work.alloc)
+        .map_err(|error| RunError::CodeRecord { function: program.function(row).named(), error: CodeRecordError::Symbol(error) })?;
+    Ok(Instance { item, args })
+}
+
+/// Load the captures or hidden types supplied by the checked bodies of ground arguments' owners.
+fn make_held_owners<P: FrontEnd, T: Typing<P>>(program: &mut P, typing: &mut T, state: &mut MakerState, checks: &mut CheckCount, owners: &[ItemKey]) -> Result<(), RunError> {
+    for &owner in owners {
+        state.ensure(program, typing, owner, checks)?;
+    }
+    Ok(())
+}
+
 /// Result of [`pull_constants`]: either every constant need was pulled, or a coroutine held by
 /// one of the constant needs' arguments requires its owner fn to be checked first.
 enum PullStep {
@@ -1812,15 +1823,45 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     state: &mut MakerState,
     checks: &mut CheckCount,
     tabled: ItemKey,
+    name: &[u8],
     entry: &[u8],
 ) -> Result<Verdict, RunError> {
     let first = verify_ready(program, typing, state, checks, tabled, entry)?;
-    if first == Verdict::Holds || state.asked.binary_search_by_key(&tabled, |r| r.0).is_ok() {
+    if first == Verdict::Holds {
         return Ok(first);
     }
-    // The referring body's checked columns can supply body-local heads and closure
-    // captures. Compare the same reads after loading them, before emitting code again.
-    if state.ensure(program, typing, tabled, checks)?.is_none() {
+    // The referring body supplies body-local heads. Its instance and stored questions can
+    // also name a closure or an opaque type owned by a different body, such as a cached caller.
+    let Some(i) = state.ensure(program, typing, tabled, checks)? else {
+        return Ok(first);
+    };
+    let instance = instance_from_name(program, state, i, name)?;
+    let alloc = state.work.alloc;
+    let held = held_owners(program, state.work.ground.view(), instance.args, tabled, alloc)?;
+    for &principal in held.objects.iter() {
+        program.object_table(principal)?;
+    }
+    make_held_owners(program, typing, state, checks, &held.owners)?;
+    for &item in held.items.iter() {
+        program.head_row(item)?;
+    }
+    let refused = |program: &RecordsProgram<'n>, error| RunError::CodeRecord { function: program.function(i).named(), error };
+    let view = EntryView::read(entry).map_err(|error| refused(program, CodeRecordError::Entry(error)))?;
+    let ground = &mut state.work.ground;
+    let mut roots: AVec<'_, PTy> = blaze_own::Vec::new_in(alloc);
+    let malformed = || refused(program, CodeRecordError::Reads(ReadsError::Question));
+    for row in view.reads() {
+        let (question, _) = row.map_err(|error| refused(program, CodeRecordError::Entry(error)))?;
+        let (_, _, _, args) = reads::question(question, ground, alloc).map_err(|error| refused(program, CodeRecordError::Reads(error)))?;
+        roots.extend_from_slice(ground.view().list(args).map_err(|_| malformed())?);
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    let roots = ground.intern_list(&roots).map_err(|_| malformed())?;
+    let held = held_owners(program, ground.view(), roots, tabled, alloc)?;
+    // An old question may name an owner that today's program removed. Its failed read
+    // makes the entry stale, and the new build determines whether the owner is still needed.
+    if make_held_owners(program, typing, state, checks, &held.owners).is_err() {
         return Ok(first);
     }
     verify_ready(program, typing, state, checks, tabled, entry)
@@ -3493,7 +3534,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Make for Maker<'n, G, T> {
 
     /// A found entry asked again ([`verify_instance`]) over the program, made here as on a
     /// first miss; as `make`, a verdict over an unanswered question is void.
-    fn verify(&mut self, tabled: ItemKey, _name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, RunError> {
+    fn verify(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, RunError> {
         if let Some(void) = self.void(tabled) {
             return Err(void);
         }
@@ -3501,7 +3542,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Make for Maker<'n, G, T> {
         let Some((program, state)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::verify`)" });
         };
-        let verdict = verify_instance(program, &mut self.typing, state, &mut self.checks, tabled, entry);
+        let verdict = verify_instance(program, &mut self.typing, state, &mut self.checks, tabled, name, entry);
         if let Some(void) = self.void(tabled) {
             return Err(void);
         }
