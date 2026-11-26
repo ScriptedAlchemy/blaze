@@ -218,6 +218,13 @@ class AcceptanceGateTests(unittest.TestCase):
             " harness/blaze_cli.py) printf '%s\\n' \"${SMOKE_SAYS:-source CLI: every check passed}\"; exit \"${SMOKE_EXIT:-0}\" ;;\n"
             f" *) exec {shlex.quote(sys.executable)} \"$@\" ;;\nesac\n")
         python.chmod(0o700)
+        uv = commands / "uv"
+        uv.write_text(
+            '#!/bin/sh\n'
+            '[ "$1" = run ] && [ "$2" = --frozen ] && [ "$3" = --no-dev ] && [ "$4" = python ] || exit 97\n'
+            'shift 4\n'
+            'exec python3 "$@"\n')
+        uv.chmod(0o700)
         (root / "dist-evidence").mkdir()
         (root / "source-evidence").mkdir()
         return {"RUNNER_TEMP":str(root), "GITHUB_OUTPUT":str(root / "output"),

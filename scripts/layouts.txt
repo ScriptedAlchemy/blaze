@@ -24,6 +24,7 @@ crates/blaze-build-script/src/facts.rs	PKG_CONFIG_VERSION	none
 crates/blaze-build-script/src/git.rs	MOST_FORMAT	none
 crates/blaze-build-script/src/git.rs	VERSION	none
 crates/blaze-build-script/src/metadata_ask.rs	FORMAT_VERSION	none
+crates/blaze-build-script/src/module_record.rs	FORMAT	none
 crates/blaze-build-script/src/outputs.rs	LAYOUT	none
 crates/blaze-cad-field/src/tape.rs	MAGIC	none
 crates/blaze-cad-field/src/tape.rs	SCHEMA	none
@@ -84,6 +85,7 @@ crates/blaze-cli/src/unused_deps.rs	FILE_REFS_MAGIC	none
 crates/blaze-cli/src/test_cache.rs	VERIFIED_MAGIC	none
 crates/blaze-cli/src/test_cache.rs	VERIFIED_VERSION	test decode_verified_refuses_previous_v1_layout
 crates/blaze-code/src/datum.rs	DATUM_MAGIC	none
+crates/blaze-code/src/record.rs	CFI_MAGIC	none
 crates/blaze-code/src/record.rs	MAGIC	none
 crates/blaze-cunit/src/index.rs	INDEX_MAGIC	none
 crates/blaze-dist-local/src/protocol.rs	TRANSPORT_VERSION	not persisted: the local carrier's hello/welcome negotiation for live in-memory sessions
@@ -138,6 +140,7 @@ crates/blaze-keyed/src/kind.rs	LAYOUT	none
 crates/blaze-keyed/src/kind.rs	VERSION	none
 crates/blaze-keyed/src/store.rs	FORMAT	none
 crates/blaze-keyed/src/store.rs	MAGIC	none
+crates/blaze-ladder/src/backend_plan/execute.rs	RECEIPT_MAGIC	none
 crates/blaze-ladder/src/code_records.rs	ENTRY_MAGIC	none
 crates/blaze-ladder/src/front2/adt_facts.rs	ADT_FACTS_VERSION	none
 crates/blaze-ladder/src/front2/buckets/records.rs	FRAMED_MAGIC	none
@@ -318,6 +321,7 @@ crates/blaze-test-reach/src/persist.rs	MAGIC	none
 crates/blaze-test-reach/src/persist.rs	VERSION	none
 crates/blaze-test-reach/src/record.rs	MAGIC	none
 crates/blaze-test-reach/src/record.rs	VERSION	none
+crates/blaze-tier/src/record/form.rs	CFI_MAGIC	none
 crates/blaze-tier/src/record/form.rs	MAGIC	none
 crates/blaze-tier/src/table.rs	TABLE_MAGIC	none
 crates/blaze-tokens/src/form.rs	TOKENS_SCHEMA	none
