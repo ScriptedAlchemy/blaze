@@ -30,3 +30,4 @@ jobs:
           tc=$(timeout 10 cat pins/toolchain)
           timeout -k 15 800 cargo +"$tc" test --locked -p blaze-cas --lib \
             plain::tests::publication_keeps_a_reused_key_after_the_old_root_is_retargeted -- --exact --nocapture
+          timeout -k 15 800 cargo +"$tc" test --locked -p blaze-cas --lib

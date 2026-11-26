@@ -3862,7 +3862,7 @@ impl<A: Allocator + Clone> Plain<A> {
 
     /// Whether a commit on this store requires the whole manifest mapped (because `Liveness::Reached`
     /// non-renewal root edits walk existing roots in [`Plain::reused`] /
-    /// [`Plain::missing_from_eviction`]).
+    /// [`Plain::missing_after_root_change`]).
     pub fn needs_whole_for_commit(&self) -> bool {
         self.plant() == Plant::CommitMapsAll
             || (self.cfg.liveness == Liveness::Reached
@@ -6086,12 +6086,9 @@ impl<A: Allocator + Clone> Plain<A> {
     }
 
     /// Keys named by `edits` (new/updated roots) whose committed segment in `self.maps` is no
-    /// longer in `m.segments`, used when a concurrent command LRU-evicted a root and swept its
-    /// segment between this process's open and its commit flip.
-    fn missing_from_eviction(&self, edits: &[RootEdit], m: &Manifest) -> Result<Vec<(u64, ContentId), A>, StoreError> {
-        let mut present: Vec<u64, &A> = Vec::with_capacity_in(m.segments.len(), &self.alloc);
-        present.extend(m.segments.iter().map(|it| it.id));
-        present.sort_unstable();
+    /// longer among `present`, used when a concurrent root change allowed a sweep between this
+    /// process's open and its commit flip.
+    fn missing_after_root_change(&self, edits: &[RootEdit], present: &[u64]) -> Result<Vec<(u64, ContentId), A>, StoreError> {
         let mut seen_indexes: Map<[u8; 32], (), BuildKeyHasher, &A> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: &self.alloc, capacity: None });
         let mut out = self.alloc_vec();
         for edit in edits {
@@ -6517,13 +6514,21 @@ impl<A: Allocator + Clone> Plain<A> {
         let mut early = self.alloc_vec();
         match &mut flip.change {
             Change::Commit { segs, started_ns, roots } => {
-                let evicted_under = self.cfg.liveness == Liveness::Reached
+                let mut present_segs: Vec<u64, &A> = Vec::with_capacity_in(m.segments.len(), &self.alloc);
+                present_segs.extend(m.segments.iter().map(|it| it.id));
+                present_segs.sort_unstable();
+                let old_protection_changed = base_gen != self.manifest.generation
+                    && self.cfg.liveness == Liveness::Reached
                     && self.plant() != Plant::CarrySkipped
                     && !roots.is_empty()
-                    && self.manifest.roots.iter().any(|r| r.expires_ns > now_ns && !m.roots.iter().any(|cur| cur.name == r.name))
-                    && self.manifest.segments.iter().any(|s| s.local && !m.segments.iter().any(|cur| cur.id == s.id));
-                let extra_carry = if evicted_under {
-                    match self.missing_from_eviction(roots, &m) {
+                    && self.manifest.segments.iter().any(|s| s.local && present_segs.binary_search(&s.id).is_err())
+                    && self.manifest.roots.iter().any(|old| {
+                        old.expires_ns > *started_ns && !m.roots.iter().any(|current| {
+                            current.name == old.name && current.key == old.key && current.expires_ns > now_ns
+                        })
+                    });
+                let extra_carry = if old_protection_changed {
+                    match self.missing_after_root_change(roots, &present_segs) {
                         Ok(list) => list,
                         Err(why) => {
                             refused = Some(why);
@@ -6533,9 +6538,6 @@ impl<A: Allocator + Clone> Plain<A> {
                 } else {
                     self.alloc_vec()
                 };
-                let mut present_segs: Vec<u64, &A> = Vec::with_capacity_in(m.segments.len(), &self.alloc);
-                present_segs.extend(m.segments.iter().map(|it| it.id));
-                present_segs.sort_unstable();
                 // A segment covered by this process's own still-live lease in `m` can only have
                 // been replaced by a lossless tiered merge (which keeps 100% of leased segments'
                 // records and preserves lease generation), never swept — unless any segment loss
@@ -6568,7 +6570,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     && self.plant() != Plant::CarrySkipped
                 {
                     // A record this commit's roots name, dead in its view (or whose protecting
-                    // root was concurrently LRU-evicted), was in a segment a slice replaced
+                    // root changed concurrently), was in a segment a slice replaced
                     // since: the slice may have let it go. The command still holds its bytes
                     // (its mapping of the retired file stays valid: the unlink rule below keeps
                     // the file while this process's lease, opened before the retirement, lives,

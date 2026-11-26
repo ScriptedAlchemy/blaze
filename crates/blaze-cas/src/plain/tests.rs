@@ -490,19 +490,14 @@ fn publication_keeps_a_reused_key_after_the_old_root_is_retargeted() {
     writer.store.put(fresh, Namespace::LOCAL, TAG, b"fresh record").expect("put fresh record");
     let answer = writer.store.root("answer", &[old, fresh]).expect("stage answer root");
     writer.store.release_lease();
-    let published = writer.store.commit(&[], sim.wall_ns(), &mut writer.effects).and_then(|()| {
-        settle(&mut sim, core::slice::from_mut(&mut writer));
-        writer.store.take_committed().expect("publication verdict")
-    });
+    writer.store.commit(&[], sim.wall_ns(), &mut writer.effects).expect("start publication");
+    settle(&mut sim, core::slice::from_mut(&mut writer));
+    writer.store.take_committed().expect("publication verdict").expect("publish after retarget and sweep");
 
     let mut reader = Actor::new(reached(4), &root, Plant::None);
     settle(&mut sim, core::slice::from_mut(&mut reader));
-    if published.is_ok() {
-        assert_eq!(reader.store.root_named("answer"), Some(answer));
-        assert_eq!(reader.store.get(&old).map(|record| record.bytes), Some(old_bytes.as_slice()), "published root lost its reused record after retarget and sweep");
-    } else {
-        assert_eq!(reader.store.root_named("answer"), None, "refused publication installed its root");
-    }
+    assert_eq!(reader.store.root_named("answer"), Some(answer));
+    assert_eq!(reader.store.get(&old).map(|record| record.bytes), Some(old_bytes.as_slice()), "published root lost its reused record after retarget and sweep");
 }
 
 /// One effect of the test's own, run to its completion.
