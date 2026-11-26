@@ -574,7 +574,10 @@ fn the_inventory_oracle_catches_one_unit_and_display_path_identity() {
     assert!(!listed_each_unit(&by_display_path, Some(0)));
 }
 
-const REFUSED: &str = "a `ref` binding or a binding with a subpattern";
+#[cfg(target_arch = "x86_64")]
+const REFUSED: &str = "inline assembly for x86-64";
+#[cfg(not(target_arch = "x86_64"))]
+const REFUSED: &str = "an assembler directive";
 const REFUSED_SUMMARY: &str = "test result: FAILED. ran 1: 1 passed, 0 failed, 1 not run (code not built)";
 
 fn only_dependent_test_refused(stdout: &str, code: Option<i32>) -> bool {
@@ -591,9 +594,9 @@ fn only_dependent_test_refused(stdout: &str, code: Option<i32>) -> bool {
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn refused_first_call_does_not_hide_the_next_test() {
-    // A `let` binding with an `@` subpattern is refused in walk.rs `plain_binding` with
-    // `REFUSED`. Keep it in the *callee* so the launcher first enters a successfully built test.
-    let lib = "fn refused_callee() { let _word @ _ = 7u8; }\n\
+    // The baseline assembler refuses directives. Put one in the callee so the launcher
+    // first enters a successfully built test.
+    let lib = "fn refused_callee() { unsafe { core::arch::asm!(\".p2align 0\"); } }\n\
                #[test] fn a_needs_callee() { refused_callee(); }\n\
                #[test] fn b_returns() {}\n";
     let said = fixture("test_command_refused_call", &[("Cargo.toml", MANIFEST), ("src/lib.rs", lib)], |dir, home| {
@@ -988,8 +991,8 @@ fn collect_bzth_and_bztr(store_root: &Path) -> (blaze_own::AVec<'static, blaze_o
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn copy_dir_files(src: &Path, dst: &Path) {
-    let status = Command::new("/bin/cp").arg("-R").arg(src).arg(dst).status().expect("cp -R store");
-    assert!(status.success(), "cp -R store failed");
+    let status = Command::new("/bin/cp").arg("-R").arg(src).arg(dst).status().expect("copy toolchain shelf");
+    assert!(status.success(), "copying the toolchain shelf failed");
 }
 
 /// Regression for parallel `Codes::Pooled` + `SuiteCache` + lock-free `SyncTypedFrom`:
@@ -1046,14 +1049,17 @@ fn impure_clock() {
         let expect_cold = "test result: ok. ran 5: 5 passed, 0 failed; 0 reused from kept results; 1 not kept (1 read the real clock); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
         let expect_warm = "test result: ok. ran 1: 1 passed, 0 failed; 4 reused from kept results; 1 not kept (1 read the real clock); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
 
-        // 0. Warm `blaze check` once via `--list` and snapshot the checked store (empty code store)
-        //    so both `--workers 1` (`Codes::Serial`) and `--workers 4` (`Codes::Pooled`) compile
-        //    cold code records over the exact same check records.
-        let listed = run(dir, home, &["--", "--list"]);
-        assert_eq!(listed.code, Some(0), "{}", evidence("warm check via --list", &listed));
+        // 0. Give each worker mode its own home and warm checking via `--list`. Both modes
+        //    then start with cold code, and a detached GC can keep using the serial home.
+        let pooled_home = home.with_file_name("pooled-home");
+        let pooled_v2 = pooled_home.join(".blaze/v2");
+        std::fs::create_dir_all(&pooled_v2).expect("create the pooled home's shelf directory");
+        copy_dir_files(&home.join(".blaze/v2/toolchain"), &pooled_v2.join("toolchain"));
+        for test_home in [home, pooled_home.as_path()] {
+            let listed = run(dir, test_home, &["--", "--list"]);
+            assert_eq!(listed.code, Some(0), "{}", evidence("warm check via --list", &listed));
+        }
         let store_dir = home.join(".blaze/v2/store");
-        let checked_snapshot = home.join("store_checked_snapshot");
-        copy_dir_files(&store_dir, &checked_snapshot);
 
         // 1. Cold serial (`--workers 1`).
         let serial_cold = run(dir, home, &["--workers", "1", "--", "--deadline", "20s"]);
@@ -1068,11 +1074,8 @@ fn impure_clock() {
         assert_eq!(pooled_on_serial.code, Some(0), "{}", evidence("pooled reuses serial cache", &pooled_on_serial));
         assert!(pooled_on_serial.stdout.ends_with(expect_warm), "{}", evidence(expect_warm, &pooled_on_serial));
 
-        // 3. Restore the warm-checked / empty-code-store snapshot and run cold pooled (`--workers 4`).
-        let rm_ok = Command::new("/bin/rm").arg("-rf").arg(&store_dir).status().expect("rm -rf store");
-        assert!(rm_ok.success(), "rm -rf store failed");
-        copy_dir_files(&checked_snapshot, &store_dir);
-        let pooled_cold = run(dir, home, &["--workers", "4", "--", "--deadline", "20s"]);
+        // 3. Cold pooled (`--workers 4`), with the independently checked store.
+        let pooled_cold = run(dir, &pooled_home, &["--workers", "4", "--", "--deadline", "20s"]);
         assert_eq!(pooled_cold.code, Some(0), "{}", evidence("pooled cold passes", &pooled_cold));
         assert!(pooled_cold.stdout.ends_with(expect_cold), "{}", evidence(expect_cold, &pooled_cold));
 
@@ -1080,7 +1083,7 @@ fn impure_clock() {
         //    32-byte `BZTR` address, asks table, and read table) and kept `BZTR` pass count must
         //    be byte-for-byte identical between `--workers 1` (`Codes::Serial`) and `--workers 4`
         //    (`Codes::Pooled`).
-        let (pooled_heads, pooled_passes) = collect_bzth_and_bztr(&store_dir);
+        let (pooled_heads, pooled_passes) = collect_bzth_and_bztr(&pooled_v2.join("store"));
         assert_eq!(pooled_passes, 4, "pooled run must keep exactly the 4 pure tests (got {pooled_passes})");
         assert_eq!(
             serial_heads, pooled_heads,
@@ -1088,12 +1091,12 @@ fn impure_clock() {
         );
 
         // 5. Warm pooled (`--workers 4`): reuses all 4 pure tests, reruns only impure_clock.
-        let pooled_warm = run(dir, home, &["--workers", "4", "--", "--deadline", "20s"]);
+        let pooled_warm = run(dir, &pooled_home, &["--workers", "4", "--", "--deadline", "20s"]);
         assert_eq!(pooled_warm.code, Some(0), "{}", evidence("pooled warm passes", &pooled_warm));
         assert!(pooled_warm.stdout.ends_with(expect_warm), "{}", evidence(expect_warm, &pooled_warm));
 
         // 6. Cross-mode reuse (Pooled -> Serial): `--workers 1` reuses all 4 pooled-kept passes.
-        let serial_on_pooled = run(dir, home, &["--workers", "1", "--", "--deadline", "20s"]);
+        let serial_on_pooled = run(dir, &pooled_home, &["--workers", "1", "--", "--deadline", "20s"]);
         assert_eq!(serial_on_pooled.code, Some(0), "{}", evidence("serial reuses pooled cache", &serial_on_pooled));
         assert!(serial_on_pooled.stdout.ends_with(expect_warm), "{}", evidence(expect_warm, &serial_on_pooled));
     });
