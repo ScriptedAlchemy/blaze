@@ -74,7 +74,7 @@ pub(crate) fn part_source(graph_source: ContentId, subject: ContentId) -> Conten
 /// of the command with the names world). Made in names.rs `world`.
 pub(crate) struct ScriptModule {
     pub subject: ContentId,
-    pub crate_at: usize,
+    pub crate_at: Option<usize>,
     pub ran_as: RanAs,
     pub package: &'static str,
     pub version: &'static str,

@@ -57,7 +57,7 @@ use blaze_own::{AVec, Alloc, Erased};
 use blaze_proc_macro::native_unit::{NativeSetting, placed};
 use blaze_proc_macro::script::ScriptRuntime;
 use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree_with_submodules};
-use blaze_proc_macro::script_unit::{self, Setting, links_closure};
+use blaze_proc_macro::script_unit::{self, Consumer, Setting};
 use blaze_proc_macro::spawn_route::SpawnSetting;
 use blaze_unit_graph::{CfgAtom, Records, StoreSources, Unit, UnitGraph, UnitId, UnitKind};
 use blaze_world::Side;
@@ -74,6 +74,7 @@ use crate::work::Record;
 #[cfg(test)]
 #[path = "scripts_tests.rs"]
 mod tests;
+pub(crate) mod plan;
 const SOURCE_DOMAIN: &str = "blaze-cli script unit source 1";
 /// The out: the outputs record's bytes ("1": `bzbsout4`, blaze-build-script's form).
 const OUT_DOMAIN: &str = "blaze-cli script outputs out 1";
@@ -93,6 +94,14 @@ pub(crate) enum RanAs {
 }
 
 impl RanAs {
+    pub(crate) fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Wasm),
+            2 => Some(Self::Native),
+            _ => None,
+        }
+    }
+
     /// How a script placed on `runner` runs: the one map from D112's choice point.
     pub(crate) fn of(runner: &Runner) -> RanAs {
         match runner {
@@ -127,11 +136,7 @@ pub(crate) fn placement(home: Option<&str>, graph: &UnitGraph<'_>, script: UnitI
 /// byte).
 pub(crate) fn payload_parts(payload: &[u8]) -> Option<(RanAs, &[u8])> {
     let (&first, record) = payload.split_first()?;
-    let ran_as = match first {
-        1 => RanAs::Wasm,
-        2 => RanAs::Native,
-        _ => return None,
-    };
+    let ran_as = RanAs::from_byte(first)?;
     Some((ran_as, record))
 }
 
@@ -243,7 +248,7 @@ pub(crate) fn parts_for<A: core::alloc::Allocator>(names: &crate::names::Names<'
     let mut parts = parts(names.script_keys(), sdk_identity(env), alloc);
     if env.caller_env.identity().is_some() {
         for (name, source) in &mut parts {
-            if names.script_readers(*name).any(|at| names.list().member(at)) {
+            if names.script_run(name.subject).is_some_and(|run| run.inputs.member) {
                 *source = env.caller_env.with_source(*source);
             }
         }
@@ -311,9 +316,6 @@ pub(crate) struct Scripts<'f> {
     graph: &'f UnitGraph<'f>,
     /// Lightweight toolchain + script-cfg world when `Names` has not built the full world yet.
     script_world: Option<&'f blaze_world::ScriptWorld<'f>>,
-    /// (subject, script unit, side), sorted: each run a crate of the world reads, by the world's
-    /// own subject (names.rs `Names::script_runs`): the runs a `Script` part can name.
-    by_subject: blaze_own::Vec<(ContentId, UnitId, Side), &'f Frame>,
     sources: StoreSources<'f, 'f, 'f, SourcesDir<'f>>,
     lock: &'f Lock<'f>,
     /// Each checkout path package's lock entry, folder (checkout-relative), and kind (member vs
@@ -462,11 +464,7 @@ impl<'f> Scripts<'f> {
         members: Option<&[crate::graph::CheckoutDir]>,
         frame: &'f Frame,
     ) -> Result<Scripts<'f>, SetupError<'f>> {
-        let by_subject = {
-            let _cx = cx.span("scripts: the world's runs by subject");
-            names.script_runs(frame)
-        };
-        Self::finish_open(cx, env, names.graph(), None, by_subject, graph_record, lock, members, frame)
+        Self::finish_open(cx, env, names.graph(), None, graph_record, lock, members, frame)
     }
 
     /// Lightweight scripts setup when no `Names` task has built the full world yet: decodes the
@@ -475,7 +473,6 @@ impl<'f> Scripts<'f> {
     pub(crate) fn open_light(
         cx: &Cx,
         env: &FetchEnv<'_>,
-        names: &crate::names::Names<'f>,
         graph_record: &'f [u8],
         lock: Option<&'f Lock<'static>>,
         members: Option<&[crate::graph::CheckoutDir]>,
@@ -512,8 +509,7 @@ impl<'f> Scripts<'f> {
             blaze_world::script_world(graph, listed, &NO_CHECKOUT, bump).map_err(|e| SetupError::Setting(said(frame, format_args!("script world: {e}"))))?
         };
         let sw: &'f blaze_world::ScriptWorld<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(sw, frame));
-        let by_subject = names.script_runs(frame);
-        Self::finish_open(cx, env, graph, Some(sw), by_subject, graph_record, lock, members, frame)
+        Self::finish_open(cx, env, graph, Some(sw), graph_record, lock, members, frame)
     }
 
     #[expect(clippy::too_many_arguments, reason = "shared Scripts constructor")]
@@ -522,7 +518,6 @@ impl<'f> Scripts<'f> {
         env: &FetchEnv<'_>,
         graph: &'f UnitGraph<'f>,
         script_world: Option<&'f blaze_world::ScriptWorld<'f>>,
-        by_subject: blaze_own::Vec<(ContentId, UnitId, Side), &'f Frame>,
         graph_record: &'f [u8],
         lock: Option<&'f Lock<'static>>,
         members: Option<&[crate::graph::CheckoutDir]>,
@@ -543,7 +538,7 @@ impl<'f> Scripts<'f> {
         let folder = crate::fetch::sources_native(env, frame).ok_or(SetupError::NoHome)?;
         let dir = SourcesDir { folder: crate::work::held_str(folder.as_str(), frame), frame };
         let sources = StoreSources::new(lock, dir, blaze_fetch::pack::PackView::open_source_put, alloc).map_err(|error| SetupError::Sources(said(frame, format_args!("{error}"))))?;
-        Ok(Scripts { shared: None, graph_record, graph, script_world, by_subject, sources, lock, members, files: std::vec::Vec::new_in(Global), setups_opened: 0 })
+        Ok(Scripts { shared: None, graph_record, graph, script_world, sources, lock, members, files: std::vec::Vec::new_in(Global), setups_opened: 0 })
     }
 
     /// The shared setups opened this command: 1 once a job was made ready to run, else 0.
@@ -628,9 +623,6 @@ impl<'f> Scripts<'f> {
         Ok(shared)
     }
 
-    fn unit_of(&self, name: Name) -> Option<(UnitId, Side)> {
-        self.by_subject.binary_search_by_key(&name.subject, |(subject, _, _)| *subject).ok().map(|at| (self.by_subject[at].1, self.by_subject[at].2))
-    }
 }
 
 impl Drop for Scripts<'_> {
@@ -675,12 +667,15 @@ pub(crate) struct ScriptJob<'j> {
     script: UnitId,
     /// The side of the crates that read it: a macro-side run has TARGET [`MACRO_TARGET`].
     side: Side,
+    consumer: Consumer,
     /// The cfg of the crate of the list that reads this run (its world row's, sorted): a
     /// macro-side run's `CARGO_CFG_*` (wasm32-wasip1's atoms, the profile's, its features).
     cfg: &'j [(&'j str, Option<&'j str>)],
     files: Files<'j>,
     /// Each script of its `links` closure ([`links_closure`]), sorted by unit, each once.
     producers: &'j [Producer<'j>],
+    /// The admitted outputs of this run's producers, keyed by their task names.
+    producer_reads: &'j [(Name, ContentId)],
     /// What a member's run that read the checkout gives ([`CheckoutReads`]): a hole unless its
     /// caller keeps the reads as cells.
     pub(crate) checkout: CheckoutReads,
@@ -704,9 +699,8 @@ struct Producer<'j> {
     script: UnitId,
     /// The `links` of the unit it serves.
     links: &'j str,
-    /// Its `Script` name and the out its record had: a read of the reader.
+    /// Its `Script` name.
     name: Name,
-    out: ContentId,
     /// Its outputs record, as handed.
     bytes: &'j [u8],
     /// Where its package's files are: the tree it was served, which a path under it names.
@@ -887,7 +881,7 @@ pub(crate) fn job<'f: 'j, 'j>(
             // unit graph for script execution.
             let opened = match listed.made().filter(|made| made.has_open_packs()) {
                 Some(made) => Scripts::open(&cx, env, made, bytes, lock, members, frame),
-                None => Scripts::open_light(&cx, env, listed, bytes, lock, members, frame),
+                None => Scripts::open_light(&cx, env, bytes, lock, members, frame),
             };
             match opened {
                 Ok(opened) => *scripts = Some(Ok(opened)),
@@ -901,12 +895,17 @@ pub(crate) fn job<'f: 'j, 'j>(
         }
     }
     let Some(Ok(scripts)) = scripts.as_mut() else { return Err(CliError::Text { what: "the command's scripts, opened above, are not there" }) };
-    let Some((script, side)) = scripts.unit_of(task.name) else {
+    let Some(names) = names.as_ref() else { return Err(CliError::Text { what: "the names world, made above, is gone" }) };
+    let Some(run) = names.script_run(task.name.subject) else {
         return Ok(Prepared::Said { what: "a `Script` part names no build script of this command's graph", words: "a `Script` part names no build-script unit of this command's graph", hole: false });
     };
-    // The crate of the list that reads this run: its cfg is the run's side's.
+    let (script, side) = (UnitId(run.unit), run.side);
+    let consumer = if run.inputs.host_dependency { Consumer::HostDependency } else { Consumer::Checked };
+    // A checked crate's run takes its crate's cfg. A standalone producer's worker
+    // takes the resolved host configuration directly from the graph.
     let script_world = scripts.script_world;
-    let (world, raw_cfg): (&blaze_world::World<'_>, &[(&str, Option<&str>)]) = match names.as_ref().and_then(|n| n.made()).filter(|made| made.has_open_packs()) {
+    let (world, raw_cfg): (&blaze_world::World<'_>, &[(&str, Option<&str>)]) = match names.made().filter(|made| made.has_open_packs()) {
+        Some(made) if run.inputs.host_dependency => (made.world(), &[]),
         Some(made) => {
             let world = made.world();
             let wanted = blaze_world::Script::Read { subject: task.name.subject };
@@ -921,6 +920,12 @@ pub(crate) fn job<'f: 'j, 'j>(
                 });
             }
             (world, row.input.cfg)
+        }
+        None if run.inputs.host_dependency => {
+            let Some(sw) = script_world else {
+                return Err(CliError::Text { what: "the standalone build-script producer has no script world" });
+            };
+            (&sw.world, &[])
         }
         None => {
             let Some(sw) = script_world else {
@@ -947,41 +952,47 @@ pub(crate) fn job<'f: 'j, 'j>(
     // Copied out of `scripts`, which the sources' lookup below borrows mutably.
     let (graph, members, lock) = (scripts.graph, scripts.members, scripts.lock);
     let unit = &graph.units[script.index()];
-    // The links closure: each producing script's record (direct and upstream), asked for until
-    // handed, and where its package's files are (a path in its metadata may name them).
-    let closure = links_closure(graph, script);
     let mut wants = std::vec::Vec::new_in(Global);
-    // Its module, looked up by its own task (script_modules.rs, ruling D115 (c)): read, so a
-    // rebuilt module reruns this run alone and an equal one moves nothing.
-    let Some(module) = names.as_ref().and_then(|n| n.script_readers(task.name).next().and_then(|at| n.script_module_of(at))) else {
-        return Ok(Prepared::Said { what: "a build script with no module lookup", words: "the build script read here has no unit in the graph to name its module by", hole: false });
-    };
-    let module = crate::script_modules::name(module.subject);
+    let module = crate::script_modules::name(ContentId(run.inputs.module));
     if !task.inputs.iter().any(|input: &Input| input.name == module) {
         wants.push(Want { name: module, home: Name::unit_graph() });
     }
-    let mut producers: blaze_own::Vec<Producer<'j>, &'j Frame> = blaze_own::Vec::with_capacity_in(closure.len(), jobs);
-    for (input, links, direct) in closure.iter() {
-        // A producer of a reader on one side is that side's run (its `links` crate is a crate
-        // of the same side's list).
-        let erased = Erased::new(jobs);
-        let Some(dep) = name_of(graph, *input, side, erased.handle()) else {
-            return Ok(Prepared::Said { what: "a `links` input that serves no unit", words: said(jobs, format_args!("the build script of {} {} reads the `links` metadata of a script that serves no unit", unit.name.as_str(), unit.version.as_str())), hole: false });
-        };
-        match task.inputs.iter().find(|handed: &&Input| handed.name == dep) {
-            None => wants.push(Want { name: dep, home: Name::unit_graph() }),
-            Some(handed) => {
-                let bytes = held_bytes(crate::work::payload(&cx, store, handed, jobs)?.payload(), jobs);
-                let files = match files_of(&mut scripts.sources, &mut scripts.files, members, lock, &graph.units[input.index()], frame, jobs) {
-                    Ok(files) => files,
-                    Err(refused) => return Ok(refused),
-                };
-                producers.push(Producer { script: *input, links: crate::work::held_str(links, jobs), name: dep, out: handed.out, bytes, files, direct: *direct });
-            }
+    let mut producer_reads = blaze_own::Vec::new_in(jobs);
+    for producer in run.producers() {
+        let name = Name::new(Kind::Script, ContentId(producer));
+        match task.inputs.iter().find(|input| input.name == name) {
+            Some(input) => producer_reads.push((name, input.out)),
+            None => wants.push(Want { name, home: Name::unit_graph() }),
         }
     }
     if !wants.is_empty() {
         return Ok(Prepared::Need(wants));
+    }
+    // Only the original metadata closure is served as DEP_* and mounted through links.
+    let closure = script_unit::links_closure_for(graph, script, consumer);
+    let mut producers: blaze_own::Vec<Producer<'j>, &'j Frame> = blaze_own::Vec::with_capacity_in(closure.len(), jobs);
+    for (input, links, direct) in closure.iter() {
+        let dep = if run.inputs.host_dependency {
+            plan::host_source(graph, lock, members, *input).map(plan::host_name)
+        } else {
+            name_of(graph, *input, side, Erased::new(jobs).handle())
+        };
+        let Some(dep) = dep else {
+            return Ok(Prepared::Said { what: "a `links` input that serves no unit", words: said(jobs, format_args!("the build script of {} {} reads the `links` metadata of a script that serves no unit", unit.name.as_str(), unit.version.as_str())), hole: false });
+        };
+        let Some(handed) = task.inputs.iter().find(|handed| handed.name == dep) else {
+            return Ok(Prepared::Said {
+                what: "a planned run lacks its links producer",
+                words: said(jobs, format_args!("the build script of {} {} needs the `links` metadata of {dep:?} ({links:?}), which its run plan did not hand it", unit.name.as_str(), unit.version.as_str())),
+                hole: false,
+            });
+        };
+        let bytes = held_bytes(crate::work::payload(&cx, store, handed, jobs)?.payload(), jobs);
+        let files = match files_of(&mut scripts.sources, &mut scripts.files, members, lock, &graph.units[input.index()], frame, jobs) {
+            Ok(files) => files,
+            Err(refused) => return Ok(refused),
+        };
+        producers.push(Producer { script: *input, links: crate::work::held_str(links, jobs), name: dep, bytes, files, direct: *direct });
     }
     let files = match files_of(&mut scripts.sources, &mut scripts.files, members, lock, unit, frame, jobs) {
         Ok(files) => files,
@@ -997,7 +1008,10 @@ pub(crate) fn job<'f: 'j, 'j>(
         Files::Member { .. } => crate::caller_env::hold(env.caller_env, jobs),
         Files::Pack { .. } | Files::External { .. } => Default::default(),
     };
-    Ok(Prepared::Ready(ScriptJob { caller_env, name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole }))
+    Ok(Prepared::Ready(ScriptJob {
+        caller_env, name: task.name, shared, script, side, consumer, cfg, files,
+        producers: producers.into_bump_slice(), producer_reads: producer_reads.into_bump_slice(), checkout: CheckoutReads::Hole,
+    }))
 }
 
 /// What a script's run gave on its worker, in `Global` (its task frame ends with it): the
@@ -1140,7 +1154,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     // alone would keep it failed past the edit that fixes it (rule 21). Under
     // [`CheckoutReads::Hole`] its failure is filed.
     let failed_hole = is_checkout && matches!(job.checkout, CheckoutReads::Kept { .. });
-    let ran = match script_unit::outputs_given(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &given, alloc) {
+    let ran = match script_unit::outputs_given_for(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &given, job.consumer, alloc) {
         Ok(ran) => ran,
         Err(error) => return failed("a build script failed", format_args!("the build script of {package} failed: {error}"), failed_hole),
     };
@@ -1148,7 +1162,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         return failed("a build script printed `cargo::error`", format_args!("the build script of {package} failed: cargo::error={}", error.as_str()), failed_hole);
     }
     // The record's reads, in the run's frame until the record is made.
-    let mut reads: blaze_own::Vec<(Name, ContentId), &Frame> = blaze_own::Vec::with_capacity_in(ran.reads.len() + job.producers.len(), scratch);
+    let mut reads: blaze_own::Vec<(Name, ContentId), &Frame> = blaze_own::Vec::with_capacity_in(ran.reads.len() + job.producer_reads.len(), scratch);
     // A member's tree is the checkout: what it read there is a read of today's file. A fetched
     // package's tree is its record, pinned by the lock in the graph's source: its reads (files,
     // listings, git facts from the lock's commit) are functions of that pin.
@@ -1179,11 +1193,9 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
             }
         }
     }
-    // Every producer of the closure, by its out (dep_paths.rs: per producer mounted, its outputs
-    // record's id; a fetched tree is under the graph's source, a member tree has checkout reads).
-    for producer in job.producers.iter() {
-        reads.push((producer.name, producer.out));
-    }
+    // A producer output is a task read. Metadata lookup and file mounts still use the
+    // original links projection, which admits only the packages named by that contract.
+    reads.extend_from_slice(job.producer_reads);
     outputs_record(job.name, &reads[..], ran_as, &ran.outputs, &package)
 }
 

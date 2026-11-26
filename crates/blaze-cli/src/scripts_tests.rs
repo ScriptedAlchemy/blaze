@@ -10,7 +10,9 @@ use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKin
 use blaze_world::Side;
 use edition::PackageEdition;
 
-use super::{MACRO_TARGET, links_closure, side_atoms};
+use blaze_proc_macro::script_unit::{Consumer, links_closure, links_closure_for, served_for};
+
+use super::{MACRO_TARGET, plan, side_atoms};
 
 /// A side's pinned rows and ships facts as the shared setup makes them (blaze-world
 /// `script_setting::pinned_table`, which `probe_table` sorts with the feature listings), sorted.
@@ -95,6 +97,36 @@ fn scripts_a_runs_links_closure_holds_its_inputs_and_whats_upstream_of_them() {
     let of_b: std::vec::Vec<u32> = links_closure(&both, UnitId(2)).iter().map(|(unit, _, _)| unit.0).collect();
     assert_eq!(of_b, [1], "b's script reads c's run");
     assert!(links_closure(&both, UnitId(1)).is_empty(), "c's script reads no run");
+}
+
+/// The graph shares tool's script between its target and host library units. Only app has a
+/// checked run. App's build dependency still has a producer row and reads the host metadata.
+#[test]
+fn scripts_plan_a_host_only_producer_without_a_checked_crate() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut units = AVec::new_in(alloc);
+    units.push(unit(0, "app", UnitKind::BuildScript, &[3], None, None));
+    units.push(unit(0, "app", UnitKind::Lib, &[], Some(0), None));
+    units.push(unit(1, "tool", UnitKind::Lib, &[], Some(5), None));
+    units.push(unit(1, "tool", UnitKind::Lib, &[4], Some(5), None));
+    units.push(unit(2, "helper", UnitKind::Lib, &[], Some(6), Some("helper")));
+    units.push(unit(1, "tool", UnitKind::BuildScript, &[], None, None));
+    units.push(unit(2, "helper", UnitKind::BuildScript, &[], None, None));
+    for index in [0, 3, 4, 5, 6] {
+        units[index].for_host = true;
+    }
+    let graph = UnitGraph { units, resolver: Resolver::V1, meta: AVec::new_in(alloc), left_out: AVec::new_in(alloc) };
+    let root = plan::RunId { unit: UnitId(0), side: Side::Target, consumer: Consumer::Checked };
+    let host = |unit| plan::RunId { unit: UnitId(unit), side: Side::Target, consumer: Consumer::HostDependency };
+    let plans = plan::runs(&graph, core::iter::once(root), alloc);
+    let row = |id| plans.iter().find(|plan| plan.id == id).expect("the reachable script has a plan");
+    assert_eq!(plans.len(), 3);
+    assert_eq!(row(root).inputs.as_slice(), &[host(5), host(6)]);
+    assert_eq!(row(host(5)).inputs.as_slice(), &[host(6)]);
+    assert!(row(host(6)).inputs.is_empty());
+    assert_eq!(served_for(&graph, UnitId(5), Consumer::HostDependency), Some(UnitId(3)));
+    assert_eq!(links_closure_for(&graph, UnitId(5), Consumer::HostDependency), [(UnitId(6), "helper", true)]);
+    assert!(links_closure(&graph, UnitId(0)).is_empty(), "build-dependency runs alone grant no DEP_* metadata");
 }
 
 /// The runtime keys a try-compile by its `--target` (blaze-proc-macro script_sandbox.rs,

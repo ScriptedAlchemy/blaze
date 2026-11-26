@@ -310,12 +310,25 @@ pub fn read_selected_module(store: &Path, selected: Selected) -> Result<Vec<u8>,
     read_verified_module(&record, selected.executable(), selected.digest())
 }
 
+/// The configuration to serve with a build-script run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Consumer {
+    Checked,
+    HostDependency,
+}
+
 /// The unit build-script unit `script` serves: the library (or proc macro) whose
 /// `build_script` it is, else the first such unit.
 pub fn served(graph: &UnitGraph<'_>, script: UnitId) -> Option<UnitId> {
+    served_for(graph, script, Consumer::Checked)
+}
+
+/// A standalone producer serves the host unit even if resolver 1 shares its script with a
+/// target unit.
+pub fn served_for(graph: &UnitGraph<'_>, script: UnitId, consumer: Consumer) -> Option<UnitId> {
     let mut first = None;
     for (at, unit) in graph.units.iter().enumerate() {
-        if unit.build_script != Some(script) {
+        if unit.build_script != Some(script) || (consumer == Consumer::HostDependency && !unit.for_host) {
             continue;
         }
         let id = UnitId(at as u32);
@@ -386,12 +399,29 @@ pub fn prepare_viewing_on<'a>(
     views: DepViews,
     alloc: Alloc<'a>,
 ) -> Result<Prepared, UnitScriptError> {
+    prepare_viewing_for(runtime, setting, graph, script, side_cfg, tree, root, deps, views, Consumer::Checked, alloc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_viewing_for<'a>(
+    runtime: &ScriptRuntime,
+    setting: &Setting<'_>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    side_cfg: Option<&[CfgAtom<'_>]>,
+    tree: Tree,
+    root: ScriptRoot,
+    deps: &[DepMetadata<'_>],
+    views: DepViews,
+    consumer: Consumer,
+    alloc: Alloc<'a>,
+) -> Result<Prepared, UnitScriptError> {
     let unit = graph.units.get(script.index()).ok_or(UnitScriptError::NotAScript { unit: script })?;
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
     let package = package(unit);
-    let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package.clone() })?;
+    let serves = served_for(graph, script, consumer).ok_or_else(|| UnitScriptError::ServesNothing { package: package.clone() })?;
     let serves = &graph.units[serves.index()];
     let features: Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
     let module = module_of(setting.store, unit.name.as_str(), unit.version.as_str(), &features).map_err(UnitScriptError::Lookup)?.ok_or_else(|| UnitScriptError::NoModule {
@@ -505,6 +535,23 @@ pub fn outputs_viewing_on<'a>(
     producers: &[(&str, &DepProducer)],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, UnitScriptError> {
+    outputs_viewing_for(runtime, setting, graph, script, side_cfg, tree, root, deps, producers, Consumer::Checked, alloc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn outputs_viewing_for<'a>(
+    runtime: &ScriptRuntime,
+    setting: &Setting<'_>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    side_cfg: Option<&[CfgAtom<'_>]>,
+    tree: Tree,
+    root: ScriptRoot,
+    deps: &[DepMetadata<'_>],
+    producers: &[(&str, &DepProducer)],
+    consumer: Consumer,
+    alloc: Alloc<'a>,
+) -> Result<ScriptRun<'a>, UnitScriptError> {
     let unit = graph.units.get(script.index()).ok_or(UnitScriptError::NotAScript { unit: script })?;
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
@@ -514,14 +561,14 @@ pub fn outputs_viewing_on<'a>(
             let viewed = dep_mount::view(&tree, producers, deps, alloc).map_err(|why| UnitScriptError::DepView { package: package(unit), why })?;
             let seen: Vec<DepMetadata<'_>> =
                 deps.iter().zip(viewed.values.iter()).map(|(dep, value)| DepMetadata { links: dep.links, key: dep.key, value: value.as_str() }).collect();
-            let prepared = prepare_viewing_on(runtime, setting, graph, script, side_cfg, tree, root, &seen, viewed.views, alloc)?;
+            let prepared = prepare_viewing_for(runtime, setting, graph, script, side_cfg, tree, root, &seen, viewed.views, consumer, alloc)?;
             runtime.fresh(&prepared.loaded, prepared.script, prepared.base, alloc).map_err(UnitScriptError::Script)
         }
         Runner::Native { .. } if side_cfg.is_some() && setting.target != setting.host => {
             Err(UnitScriptError::NativeOnSide { package: package(unit), target: setting.target.to_owned() })
         }
         Runner::Native { because } => {
-            let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package(unit) })?;
+            let serves = served_for(graph, script, consumer).ok_or_else(|| UnitScriptError::ServesNothing { package: package(unit) })?;
             native_outputs(setting, graph, script, serves, because, tree, root, deps, producers, alloc).map_err(UnitScriptError::Native)
         }
     }
@@ -558,14 +605,19 @@ pub struct ServedLinks<'g> {
 /// the `links` each serves and whether it is a direct input. A work list, no recursion; sorted
 /// by unit, each once (a script reached directly and upstream is direct).
 pub fn links_closure<'g>(graph: &'g UnitGraph<'_>, script: UnitId) -> Vec<(UnitId, &'g str, bool)> {
+    links_closure_for(graph, script, Consumer::Checked)
+}
+
+/// The metadata closure of the resolved configuration the run serves.
+pub fn links_closure_for<'g>(graph: &'g UnitGraph<'_>, script: UnitId, consumer: Consumer) -> Vec<(UnitId, &'g str, bool)> {
     let mut found: Vec<(UnitId, &'g str, bool)> = Vec::new();
-    let mut stack: Vec<(UnitId, &'g str, bool)> = links_inputs(graph, script).into_iter().map(|(unit, links)| (unit, links, true)).collect();
+    let mut stack: Vec<(UnitId, &'g str, bool)> = links_inputs_for(graph, script, consumer).into_iter().map(|(unit, links)| (unit, links, true)).collect();
     while let Some((unit, links, direct)) = stack.pop() {
         match found.iter_mut().find(|(seen, _, _)| *seen == unit) {
             Some(seen) => seen.2 |= direct,
             None => {
                 found.push((unit, links, direct));
-                stack.extend(links_inputs(graph, unit).into_iter().map(|(up, links)| (up, links, false)));
+                stack.extend(links_inputs_for(graph, unit, consumer).into_iter().map(|(up, links)| (up, links, false)));
             }
         }
     }
@@ -580,8 +632,12 @@ pub fn links_closure<'g>(graph: &'g UnitGraph<'_>, script: UnitId) -> Vec<(UnitI
 /// `given` lacks is refused naming it ([`UnitScriptError::Dependency`]): a script is never run
 /// without a `DEP_<LINKS>_*` cargo gives it (rule 3).
 pub fn served_links<'g, 'r: 'g>(graph: &UnitGraph<'_>, script: UnitId, given: &'g [GivenRun<'r>]) -> Result<ServedLinks<'g>, UnitScriptError> {
+    served_links_for(graph, script, given, Consumer::Checked)
+}
+
+fn served_links_for<'g, 'r: 'g>(graph: &UnitGraph<'_>, script: UnitId, given: &'g [GivenRun<'r>], consumer: Consumer) -> Result<ServedLinks<'g>, UnitScriptError> {
     let unit = graph.units.get(script.index()).ok_or(UnitScriptError::NotAScript { unit: script })?;
-    for (input, links) in links_inputs(graph, script) {
+    for (input, links) in links_inputs_for(graph, script, consumer) {
         if !given.iter().any(|run| run.script == input && run.direct) {
             return Err(UnitScriptError::Dependency { package: package(unit), dependency: package(&graph.units[input.index()]), links: links.to_owned() });
         }
@@ -589,7 +645,7 @@ pub fn served_links<'g, 'r: 'g>(graph: &UnitGraph<'_>, script: UnitId, given: &'
     let mut ids: Vec<UnitId> = given.iter().map(|run| run.script).collect();
     ids.sort_unstable();
     ids.dedup();
-    let inputs: Vec<Vec<UnitId>> = ids.iter().map(|id| links_inputs(graph, *id).into_iter().map(|(up, _)| up).collect()).collect();
+    let inputs: Vec<Vec<UnitId>> = ids.iter().map(|id| links_inputs_for(graph, *id, consumer).into_iter().map(|(up, _)| up).collect()).collect();
     let order = order_after(&ids, &inputs).map_err(|_| UnitScriptError::LinksCycle { package: package(unit) })?;
     let mut deps: Vec<DepMetadata<'g>> = Vec::new();
     let mut made: Vec<(UnitId, DepProducer)> = Vec::with_capacity(order.len());
@@ -599,7 +655,7 @@ pub fn served_links<'g, 'r: 'g>(graph: &UnitGraph<'_>, script: UnitId, given: &'
             deps.extend(run.outputs.metadata().map(|(key, value)| DepMetadata { links: run.links, key, value }));
         }
         let ups: Vec<(&str, &DepProducer)> =
-            links_inputs(graph, id).into_iter().filter_map(|(up, links)| made.iter().find(|(s, _)| *s == up).map(|(_, producer)| (links, producer))).collect();
+            links_inputs_for(graph, id, consumer).into_iter().filter_map(|(up, links)| made.iter().find(|(s, _)| *s == up).map(|(_, producer)| (links, producer))).collect();
         let upstream = DepProducer::closure(&ups);
         made.push((id, DepProducer::of_record(blaze_own::Share::share(&run.tree), blaze_own::Share::share(&run.root), &run.outputs).with_upstream(upstream)));
     }
@@ -627,9 +683,26 @@ pub fn outputs_given<'a>(
     given: &[GivenRun<'_>],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, UnitScriptError> {
-    let served = served_links(graph, script, given)?;
+    outputs_given_for(runtime, setting, graph, script, side_cfg, tree, root, given, Consumer::Checked, alloc)
+}
+
+/// The same task with a separately planned host producer as its consumer.
+#[allow(clippy::too_many_arguments)]
+pub fn outputs_given_for<'a>(
+    runtime: &ScriptRuntime,
+    setting: &Setting<'_>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    side_cfg: Option<&[CfgAtom<'_>]>,
+    tree: Tree,
+    root: ScriptRoot,
+    given: &[GivenRun<'_>],
+    consumer: Consumer,
+    alloc: Alloc<'a>,
+) -> Result<ScriptRun<'a>, UnitScriptError> {
+    let served = served_links_for(graph, script, given, consumer)?;
     let producers: Vec<(&str, &DepProducer)> = served.producers.iter().map(|(links, producer)| (*links, producer)).collect();
-    outputs_viewing_on(runtime, setting, graph, script, side_cfg, tree, root, &served.deps, &producers, alloc)
+    outputs_viewing_for(runtime, setting, graph, script, side_cfg, tree, root, &served.deps, &producers, consumer, alloc)
 }
 
 /// The build-script units whose metadata `script` is given: for each direct dependency of the
@@ -637,7 +710,11 @@ pub fn outputs_given<'a>(
 /// `links` (cargo: a package's `cargo::metadata` reaches the scripts of the packages that
 /// depend on it directly, as `DEP_<LINKS>_<KEY>`). Sorted by unit, each once.
 pub fn links_inputs<'g>(graph: &'g UnitGraph<'_>, script: UnitId) -> Vec<(UnitId, &'g str)> {
-    let Some(serves) = served(graph, script) else { return Vec::new() };
+    links_inputs_for(graph, script, Consumer::Checked)
+}
+
+fn links_inputs_for<'g>(graph: &'g UnitGraph<'_>, script: UnitId, consumer: Consumer) -> Vec<(UnitId, &'g str)> {
+    let Some(serves) = served_for(graph, script, consumer) else { return Vec::new() };
     let mut inputs: Vec<(UnitId, &'g str)> = graph.units[serves.index()]
         .deps
         .iter()
