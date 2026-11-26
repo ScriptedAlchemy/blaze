@@ -170,7 +170,10 @@ impl<D: Driver> CodeStore for HomeCodeStore<'_, D> {
                 Ok(Some(CodeKey(target.0)))
             }
             Ok(None) => Ok(None),
-            Err(LentError::TargetGone { .. }) => Ok(None),
+            Err(LentError::TargetGone { target, .. }) => {
+                std::eprintln!("code replay target-gone code={:x} previous={:x}", key.0, target.0);
+                Ok(None)
+            }
             // A code key that holds a plain entry, no pointer (the thread-local getter's and
             // ender's, put under their code keys by `RecordRun::getter`/`ender`): no target, as
             // `MemoryStore::pointed` answers; `entry_of` then reads the entry under the key.

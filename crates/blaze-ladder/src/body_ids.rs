@@ -1290,6 +1290,7 @@ impl<'a> Walk<'a> {
         // Found: through the key's pointer to its content key (a key of an older walk may hold
         // its entry itself), and taken only when its read list holds today (the module doc,
         // "The read list"). A list that moved: made again, as a missing entry is.
+        let mut rejected = None;
         if let Ok(key) = keyed
             && let Some((under, bytes)) = Walk::found(&*store, key).map_err(WalkError::Store)?
         {
@@ -1307,6 +1308,7 @@ impl<'a> Walk<'a> {
                     Some(moved @ (Verdict::Stale { .. } | Verdict::Needs { .. })) => {
                         self.stale_reads += 1;
                         self.first_moved.get_or_insert((tabled, moved));
+                        rejected = Some((under, moved));
                         false
                     }
                 },
@@ -1316,6 +1318,29 @@ impl<'a> Walk<'a> {
                 let stepped = Stepped::Found(under);
                 self.reach_declared(row, stepped, most, declared)?;
                 return Ok(Began::Stepped(stepped));
+            }
+        }
+        if let Ok(key) = keyed {
+            let digest = |domain, reads: &[Read]| {
+                let mut hash = Hasher::new(domain);
+                for read in reads {
+                    hash.update(&read.fact).update(&read.digest);
+                }
+                hash.finish()
+            };
+            let body_reads = digest("replay trace body reads", body.reads);
+            let instance_facts = digest("replay trace instance facts", facts.as_slice());
+            let symbol = ContentId(self.symbols[row].0);
+            let code = key.0;
+            match rejected {
+                Some((under, verdict)) => std::eprintln!(
+                    "code replay verify-failed kind={:?} tabled={tabled:?} symbol={symbol:x} code={code:x} previous={:x} body={:x} body-reads={body_reads:x} instance-facts={instance_facts:x} verdict={verdict:?}",
+                    self.kinds[row], under.0, body.key,
+                ),
+                None => std::eprintln!(
+                    "code replay absent kind={:?} tabled={tabled:?} symbol={symbol:x} code={code:x} body={:x} body-reads={body_reads:x} instance-facts={instance_facts:x}",
+                    self.kinds[row], body.key,
+                ),
             }
         }
         // The toolchain's when every item of its name is (`items` is the name's, filled when it
@@ -1338,6 +1363,9 @@ impl<'a> Walk<'a> {
         // because its read list moved has other bytes under the same instance key, which a put
         // under that key would refuse as two values (rule 21).
         let content = crate::code_records::content_key(made);
+        if let Ok(key) = keyed {
+            std::eprintln!("code replay made code={:x} content={:x}", key.0, content.0);
+        }
         let done = form
             .declared(made, declared)
             .map_err(|why| WalkError::Entry { tabled, found: false, why })

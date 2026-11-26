@@ -1200,6 +1200,10 @@ pub fn verify_today(
         if let Some(today) = known.get(question) {
             out.known += 1;
             if today != answer {
+                if out.verdict == Verdict::Holds {
+                    let read = ContentId::of("replay trace question", question);
+                    std::eprintln!("code replay read-moved cached=true kind={kind:?} extra={extra} read={read:x} expected={answer:x} observed={today:x}");
+                }
                 stale(ItemKey(0), &mut out);
                 if !each {
                     return Ok(out);
@@ -1342,6 +1346,10 @@ pub fn verify_today(
         if today == answer {
             held.push((question, today));
         } else {
+            if out.verdict == Verdict::Holds {
+                let read = ContentId::of("replay trace question", question);
+                std::eprintln!("code replay read-moved cached=false kind={kind:?} item={item:?} extra={extra} read={read:x} expected={answer:x} observed={today:x}");
+            }
             stale(item, &mut out);
             if !each {
                 return Ok(out);
