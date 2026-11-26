@@ -129,12 +129,8 @@ pub fn plan_for(native_libraries: Option<&[AString<'_>]>) -> Plan {
 /// (`ExportError::HeaderRoom`).
 pub fn command_room(native_libraries: Option<&[AString<'_>]>) -> u64 {
     // __PAGEZERO, __TEXT, __DATA_CONST, __DATA and __LINKEDIT; the native image's two.
-    let mut room = commands::HEADER
-        + segment_size(0)
-        + segment_size(TEXT_SECTIONS as u64)
-        + segment_size(DATA_CONST_SECTIONS as u64)
-        + segment_size(DATA_SECTIONS as u64)
-        + segment_size(0);
+    let mut room =
+        commands::HEADER + segment_size(0) + segment_size(TEXT_SECTIONS as u64) + segment_size(DATA_CONST_SECTIONS as u64) + segment_size(DATA_SECTIONS as u64) + segment_size(0);
     if native_libraries.is_some() {
         room += segment_size(native_merge::CODE_SECTIONS as u64) + segment_size(native_merge::DATA_SECTIONS as u64);
     }
@@ -176,6 +172,25 @@ fn tail<'n>(t: &Tail, libraries: &'n [AString<'_>], mut push: impl FnMut(Command
     }
     push(Command::LinkeditData { cmd: LC_FUNCTION_STARTS, off: t.starts.0, size: t.starts.1 });
     push(Command::LinkeditData { cmd: LC_CODE_SIGNATURE, off: t.signature.0, size: t.signature.1 });
+}
+
+/// Library command room includes its install name and export trie, but never LC_MAIN.
+pub fn plan_library_for(libraries: Option<&[AString<'_>]>, name: &str) -> Plan {
+    // Executable room is a safe bound for all segments; include variable LC_ID_DYLIB.
+    let id = Command::Dylib { cmd: 0xD, name, timestamp: 1, current: DYLIB_VERSION, compat: DYLIB_VERSION };
+    Plan { page: PAGE, text_at: up(command_room(libraries) + id.size() + 16, 16), const_head: 0 }
+}
+
+fn library_tail<'n>(t: &Tail, libraries: &'n [AString<'_>], name: &'n str, trie: (u64, u64), defined: u64, mut push: impl FnMut(Command<'n>)) {
+    push(Command::Dylib { cmd: 0xD, name, timestamp: 1, current: DYLIB_VERSION, compat: DYLIB_VERSION });
+    push(Command::LinkeditData { cmd: 0x8000_0033, off: trie.0, size: trie.1 });
+    tail(t, libraries, |cmd| match cmd {
+        Command::Main { .. } | Command::Dylinker { .. } => {}
+        Command::Dysymtab { .. } => {
+            push(Command::Dysymtab { fields: [0, 0, 0, defined, defined, t.symtab.1 - defined, 0, 0, 0, 0, 0, 0, t.indirect_at, t.symtab.1 - defined, 0, 0, 0, 0] })
+        }
+        other => push(other),
+    });
 }
 
 fn up(n: u64, to: u64) -> u64 {
@@ -415,14 +430,17 @@ pub(crate) fn chained_fixups<'a, 'n, F>(
 /// The chained fixups blob, and each fixup slot's encoded value by image offset: the
 /// program's imports are libSystem's (ordinal 1), named with the platform's `_`; a native
 /// image's (native_merge.rs) follow, by flat lookup, with their addends (`Addend64` rows then).
-fn chained<'a>(laid: &Laid<'_, '_>, native: Option<&Merged<'_, '_>>, segs: &[Seg], alloc: Alloc<'a>) -> Result<(AVec<'a, u8>, AVec<'a, (u64, u64)>), ExportError> {
+fn chained<'a>(laid: &Laid<'_, '_>, native: Option<&Merged<'_, '_>>, library: bool, segs: &[Seg], alloc: Alloc<'a>) -> Result<(AVec<'a, u8>, AVec<'a, (u64, u64)>), ExportError> {
     let mut chain_segs: AVec<'a, ChainSeg> = Vec::with_capacity_in(segs.len(), alloc);
     for seg in segs {
         chain_segs.push(ChainSeg { vm: seg.vm, vm_size: seg.vm_size, fixups: seg.fixups });
     }
     // A program import the image defines is a rebase to it (`Merged::direct`); the rows left
     // keep their order (`kept`, and each import's new row in `row_of`).
-    let direct = |import: u32| native.and_then(|m| m.direct.binary_search_by_key(&import, |&(row, _)| row).ok().map(|i| m.direct[i].1));
+    let direct = |import: u32| {
+        if library && laid.imports[import as usize].name == "__dso_handle" { return Some(0); }
+        native.and_then(|m| m.direct.binary_search_by_key(&import, |&(row, _)| row).ok().map(|i| m.direct[i].1))
+    };
     let mut kept: AVec<'a, u32> = Vec::with_capacity_in(laid.imports.len(), alloc);
     let mut row_of: AVec<'a, u32> = Vec::with_capacity_in(laid.imports.len(), alloc);
     for k in 0..laid.imports.len() as u32 {
@@ -463,19 +481,18 @@ fn chained<'a>(laid: &Laid<'_, '_>, native: Option<&Merged<'_, '_>>, segs: &[Seg
         None => (ImportRows::Plain, program),
         Some(m) => (ImportRows::Addend64, program + m.imports.len()),
     };
-    chained_fixups(&all, |c: &(u64, Chain)| *c, &chain_segs, rows, count, import, alloc)
-        .map_err(|e| ExportError::TooLarge { what: e.what, len: e.len })
+    chained_fixups(&all, |c: &(u64, Chain)| *c, &chain_segs, rows, count, import, alloc).map_err(|e| ExportError::TooLarge { what: e.what, len: e.len })
 }
 
 /// A segment's command: at its image offset past `__PAGEZERO`, which is at 0.
-fn segment(seg: &Seg) -> Segment<'static> {
-    let vmaddr = if seg.name == "__PAGEZERO" { 0 } else { BASE + seg.vm };
+fn segment(seg: &Seg, base: u64) -> Segment<'static> {
+    let vmaddr = if seg.name == "__PAGEZERO" { 0 } else { base + seg.vm };
     Segment { name: seg.name, vmaddr, vm_size: seg.vm_size, file: seg.file, file_size: seg.file_size, prot: seg.prot, flags: seg.flags }
 }
 
 /// `section_64`: `addr` an image offset, `offset` its file offset (0 for zero fill).
-fn section(name: &'static str, seg: &'static str, addr: u64, size: u64, offset: u64, align: u32, flags: u32) -> Section<'static> {
-    Section { name, seg, addr: BASE + addr, size, offset, align, flags, reserved1: 0 }
+fn section(name: &'static str, seg: &'static str, addr: u64, size: u64, offset: u64, align: u32, flags: u32, base: u64) -> Section<'static> {
+    Section { name, seg, addr: base + addr, size, offset, align, flags, reserved1: 0 }
 }
 
 /// Writes `laid` as a Mach-O executable into `out` (its contents replaced): the file, whole,
@@ -500,6 +517,37 @@ pub fn write_native<'a>(
     out: &mut AVec<'a, u8>,
     alloc: Alloc<'a>,
 ) -> Result<[u8; 16], ExportError> {
+    write_form(laid, eh, native, None, identifier, seed, out, alloc)
+}
+
+/// Writes reached Rust records as a genuine MH_DYLIB, without any process entry.
+#[allow(clippy::too_many_arguments)]
+pub fn write_library_native<'a>(
+    laid: &Laid<'_, '_>,
+    eh: &EhSections<'_>,
+    native: Option<&Merged<'_, '_>>,
+    exports: &[crate::CExport<'_>],
+    identifier: &str,
+    seed: &[u8; 32],
+    out: &mut AVec<'a, u8>,
+    alloc: Alloc<'a>,
+) -> Result<[u8; 16], ExportError> {
+    write_form(laid, eh, native, Some(exports), identifier, seed, out, alloc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_form<'a>(
+    laid: &Laid<'_, '_>,
+    eh: &EhSections<'_>,
+    native: Option<&Merged<'_, '_>>,
+    exports: Option<&[crate::CExport<'_>]>,
+    identifier: &str,
+    seed: &[u8; 32],
+    out: &mut AVec<'a, u8>,
+    alloc: Alloc<'a>,
+) -> Result<[u8; 16], ExportError> {
+    let library = exports.is_some();
+    let base = if library { 0 } else { BASE };
     let has_const = !laid.konst.is_empty();
     let has_data = !laid.data.is_empty() || laid.zero_len > 0;
     // `__TEXT` holds the code and, after it, the unwind tables (eh_out.rs).
@@ -509,7 +557,9 @@ pub fn write_native<'a>(
     let mut file_end = text_size;
     let mut segs: AVec<'_, Seg> = Vec::new_in(alloc);
     let none = 0;
-    segs.push(Seg { name: "__PAGEZERO", vm: 0, vm_size: BASE, file: 0, file_size: 0, prot: none, flags: 0, fixups: false });
+    if !library {
+        segs.push(Seg { name: "__PAGEZERO", vm: 0, vm_size: BASE, file: 0, file_size: 0, prot: none, flags: 0, fixups: false });
+    }
     segs.push(Seg { name: "__TEXT", vm: 0, vm_size: text_size, file: 0, file_size: text_size, prot: VM_PROT_READ | VM_PROT_EXECUTE, flags: 0, fixups: false });
     if has_const {
         segs.push(Seg {
@@ -529,16 +579,7 @@ pub fn write_native<'a>(
             true => (0, 0),
             false => (laid.data_at, data_file),
         };
-        segs.push(Seg {
-            name: "__DATA",
-            vm: laid.data_at,
-            vm_size: laid.end - laid.data_at,
-            file,
-            file_size,
-            prot: VM_PROT_READ | VM_PROT_WRITE,
-            flags: 0,
-            fixups: true,
-        });
+        segs.push(Seg { name: "__DATA", vm: laid.data_at, vm_size: laid.end - laid.data_at, file, file_size, prot: VM_PROT_READ | VM_PROT_WRITE, flags: 0, fixups: true });
         if file_size > 0 {
             file_end = laid.data_at + data_file;
         }
@@ -550,16 +591,7 @@ pub fn write_native<'a>(
     if let Some(m) = native {
         native_file = up(file_end, PAGE);
         let code = m.data_at - m.text_at;
-        segs.push(Seg {
-            name: NATIVE_TEXT,
-            vm: m.text_at,
-            vm_size: code,
-            file: native_file,
-            file_size: code,
-            prot: VM_PROT_READ | VM_PROT_EXECUTE,
-            flags: 0,
-            fixups: false,
-        });
+        segs.push(Seg { name: NATIVE_TEXT, vm: m.text_at, vm_size: code, file: native_file, file_size: code, prot: VM_PROT_READ | VM_PROT_EXECUTE, flags: 0, fixups: false });
         let data_file = up(m.file_end.max(m.data_at) - m.data_at, PAGE);
         segs.push(Seg {
             name: NATIVE_DATA,
@@ -575,12 +607,44 @@ pub fn write_native<'a>(
         vm_end = m.end;
     }
     // `__LINKEDIT`'s pieces, at offsets from its start.
-    let (fixups_blob, slots) = chained(laid, native, &segs_with_linkedit(&segs, vm_end, alloc), alloc)?;
+    let (fixups_blob, slots) = chained(laid, native, library, &segs_with_linkedit(&segs, vm_end, alloc), alloc)?;
     let mut link: AVec<'_, u8> = Vec::new_in(alloc);
     let link_off = file_end;
     let fixups_at = link.len() as u64;
     link.extend_from_slice(&fixups_blob);
     bytes::pad(&mut link, 8);
+    let mut export_names: AVec<'_, AVec<'_, u8>> = Vec::new_in(alloc);
+    let mut export_homes: AVec<'_, u64> = Vec::new_in(alloc);
+    if let Some(exports) = exports {
+        let mut previous: Option<&[u8]> = None;
+        for e in exports {
+            if e.name.is_empty() || e.name.contains(&0) || previous.is_some_and(|p| p >= e.name) {
+                return Err(ExportError::ExportName { symbol: e.symbol });
+            }
+            previous = Some(e.name);
+            let home = laid.placed.iter().find(|p| p.symbol == e.symbol).ok_or(ExportError::ExportNotPlaced { symbol: e.symbol })?.at;
+            let mut name = Vec::new_in(alloc);
+            name.push(b'_');
+            name.extend_from_slice(e.name);
+            export_names.push(name);
+            export_homes.push(home);
+        }
+    }
+    let mut rows = Vec::new_in(alloc);
+    for (name, &home) in export_names.iter().zip(export_homes.iter()) {
+        rows.push((&name[..], 0, home));
+    }
+    let trie = if library {
+        crate::native_dylib::export_trie_rows(&rows, alloc).map_err(|e| match e {
+            crate::native_dylib::DylibError::TooLarge { what, len } => ExportError::TooLarge { what, len },
+            _ => ExportError::Remeasured { what: "the C export trie", measured: rows.len() as u64, written: 0 },
+        })?
+    } else { Vec::new_in(alloc) };
+    let trie_at = link.len() as u64;
+    if library {
+        link.extend_from_slice(&trie);
+        bytes::pad(&mut link, 8);
+    }
     let starts_at = link.len() as u64;
     let mut homes: AVec<'_, u64> = Vec::with_capacity_in(laid.placed.len(), alloc);
     for p in laid.placed.iter() {
@@ -599,6 +663,14 @@ pub fn write_native<'a>(
     let symtab_at = link.len() as u64;
     let n = laid.imports.len();
     let mut strx = 2u32;
+    for (name, &home) in export_names.iter().zip(export_homes.iter()) {
+        bytes::u32(&mut link, strx);
+        bytes::u8(&mut link, 0x0f); // N_SECT | N_EXT
+        bytes::u8(&mut link, 1); // __TEXT,__text
+        bytes::u16(&mut link, 0);
+        bytes::u64(&mut link, home);
+        strx += name.len() as u32 + 1;
+    }
     for import in laid.imports.iter() {
         // `nlist_64`: n_strx, n_type, n_sect, n_desc, n_value.
         bytes::u32(&mut link, strx);
@@ -610,10 +682,14 @@ pub fn write_native<'a>(
     }
     let indirect_at = link.len() as u64;
     for k in 0..n {
-        bytes::u32(&mut link, k as u32);
+        bytes::u32(&mut link, (k + export_names.len()) as u32);
     }
     let strtab_at = link.len() as u64;
     link.extend_from_slice(b" \0");
+    for name in export_names.iter() {
+        link.extend_from_slice(name);
+        link.push(0);
+    }
     for import in laid.imports.iter() {
         link.push(b'_');
         link.extend_from_slice(import.name.as_bytes());
@@ -625,16 +701,7 @@ pub fn write_native<'a>(
     let code_limit = link_off + link.len() as u64;
     let sig_len = sign::len(identifier, code_limit);
     let link_len = link.len() as u64 + sig_len;
-    let link_seg = Seg {
-        name: "__LINKEDIT",
-        vm: vm_end,
-        vm_size: up(link_len, PAGE),
-        file: link_off,
-        file_size: link_len,
-        prot: VM_PROT_READ,
-        flags: 0,
-        fixups: false,
-    };
+    let link_seg = Seg { name: "__LINKEDIT", vm: vm_end, vm_size: up(link_len, PAGE), file: link_off, file_size: link_len, prot: VM_PROT_READ, flags: 0, fixups: false };
     segs.push(link_seg);
 
     // The header and load commands, built first as a list (commands.rs): `ncmds` and
@@ -647,35 +714,35 @@ pub fn write_native<'a>(
         match seg.name {
             "__TEXT" => {
                 let sections: [Section<'_>; TEXT_SECTIONS] = [
-                    section("__text", "__TEXT", laid.text_at, laid.text.len() as u64, laid.text_at, 4, S_CODE),
-                    section("__eh_frame", "__TEXT", eh.eh_frame_at, eh.eh_frame.len() as u64, eh.eh_frame_at, 3, S_EH_FRAME),
-                    section("__gcc_except_tab", "__TEXT", eh.except_tab_at, eh.except_tab.len() as u64, eh.except_tab_at, 2, S_REGULAR),
-                    section("__unwind_info", "__TEXT", eh.unwind_info_at, eh.unwind_info.len() as u64, eh.unwind_info_at, 2, S_REGULAR),
+                    section("__text", "__TEXT", laid.text_at, laid.text.len() as u64, laid.text_at, 4, S_CODE, base),
+                    section("__eh_frame", "__TEXT", eh.eh_frame_at, eh.eh_frame.len() as u64, eh.eh_frame_at, 3, S_EH_FRAME, base),
+                    section("__gcc_except_tab", "__TEXT", eh.except_tab_at, eh.except_tab.len() as u64, eh.except_tab_at, 2, S_REGULAR, base),
+                    section("__unwind_info", "__TEXT", eh.unwind_info_at, eh.unwind_info.len() as u64, eh.unwind_info_at, 2, S_REGULAR, base),
                 ];
-                cmds.segment(segment(seg), sections);
+                cmds.segment(segment(seg, base), sections);
             }
             "__DATA_CONST" => {
                 let mut cursor = laid.got_at + got_size;
                 let mod_init = laid.mod_init_at.map(|at| {
                     cursor = at + 8;
-                    section("__mod_init_func", "__DATA_CONST", at, 8, at, 3, S_MOD_INIT_FUNC_POINTERS)
+                    section("__mod_init_func", "__DATA_CONST", at, 8, at, 3, S_MOD_INIT_FUNC_POINTERS, base)
                 });
                 let const_start = up(cursor, 16);
                 let rest = laid.const_end().saturating_sub(const_start);
                 let sections: [Option<Section<'_>>; DATA_CONST_SECTIONS] = [
-                    (n > 0).then(|| section("__got", "__DATA_CONST", laid.got_at, got_size, laid.got_at, 3, S_NON_LAZY_SYMBOL_POINTERS)),
+                    (n > 0).then(|| section("__got", "__DATA_CONST", laid.got_at, got_size, laid.got_at, 3, S_NON_LAZY_SYMBOL_POINTERS, base)),
                     mod_init,
-                    (rest > 0).then(|| section("__const", "__DATA_CONST", const_start, rest, const_start, 4, S_REGULAR)),
+                    (rest > 0).then(|| section("__const", "__DATA_CONST", const_start, rest, const_start, 4, S_REGULAR, base)),
                 ];
-                cmds.segment(segment(seg), sections.into_iter().flatten());
+                cmds.segment(segment(seg, base), sections.into_iter().flatten());
             }
             "__DATA" => {
                 let data = laid.data.len() as u64;
                 let sections: [Option<Section<'_>>; DATA_SECTIONS] = [
-                    (data > 0).then(|| section("__data", "__DATA", laid.data_at, data, laid.data_at, 4, S_REGULAR)),
-                    (laid.zero_len > 0).then(|| section("__bss", "__DATA", laid.zero_at, laid.zero_len, 0, 4, S_ZEROFILL)),
+                    (data > 0).then(|| section("__data", "__DATA", laid.data_at, data, laid.data_at, 4, S_REGULAR, base)),
+                    (laid.zero_len > 0).then(|| section("__bss", "__DATA", laid.zero_at, laid.zero_len, 0, 4, S_ZEROFILL, base)),
                 ];
-                cmds.segment(segment(seg), sections.into_iter().flatten());
+                cmds.segment(segment(seg, base), sections.into_iter().flatten());
             }
             NATIVE_TEXT | NATIVE_DATA => {
                 let sects: &[Sect] = match native {
@@ -685,16 +752,16 @@ pub fn write_native<'a>(
                 };
                 let sections = sects.iter().map(|s| {
                     let offset = if s.zero { 0 } else { s.at - seg.vm + seg.file };
-                    section(s.name, seg.name, s.at, s.len, offset, s.align_log2, s.flags)
+                    section(s.name, seg.name, s.at, s.len, offset, s.align_log2, s.flags, base)
                 });
-                cmds.segment(segment(seg), sections);
+                cmds.segment(segment(seg, base), sections);
             }
-            _ => cmds.segment(segment(seg), []),
+            _ => cmds.segment(segment(seg, base), []),
         }
     }
     let t = Tail {
         fixups: (link_off + fixups_at, fixups_blob.len() as u64),
-        symtab: (link_off + symtab_at, n as u64),
+        symtab: (link_off + symtab_at, (n + export_names.len()) as u64),
         strtab: (link_off + strtab_at, strtab_len),
         indirect_at: link_off + indirect_at,
         entry: laid.entry,
@@ -705,13 +772,22 @@ pub fn write_native<'a>(
         Some(m) => &m.libraries,
         None => &[],
     };
-    tail(&t, libraries, |command| cmds.push(command));
+    if library {
+        library_tail(&t, libraries, identifier, (link_off + trie_at, trie.len() as u64), export_names.len() as u64, |command| cmds.push(command));
+    } else {
+        tail(&t, libraries, |command| cmds.push(command));
+    }
     out.clear();
-    let header = Header { filetype: MH_EXECUTE, flags: MH_FLAGS | native.map_or(0, |m| m.header_flags()) };
+    let header =
+        Header { filetype: if library { 6 } else { MH_EXECUTE }, flags: (if library { 0x4 | 0x80 | 0x10_0000 } else { MH_FLAGS }) | native.map_or(0, |m| m.header_flags()) };
     let uuid_at = match cmds.write(out, header, laid.text_at) {
         Ok(written) => written.uuid_at,
-        Err(CommandsError::Room { need, room }) => return Err(ExportError::HeaderRoom { what: "the executable", need, room }),
-        Err(CommandsError::Field { what, value }) => return Err(ExportError::TooLarge { what, len: value }),
+        Err(CommandsError::Room { need, room }) => {
+            return Err(ExportError::HeaderRoom { what: "the executable", need, room });
+        }
+        Err(CommandsError::Field { what, value }) => {
+            return Err(ExportError::TooLarge { what, len: value });
+        }
     };
 
     // The regions at their offsets, the fixups' slots in them.
@@ -762,7 +838,7 @@ pub fn write_native<'a>(
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&digest[..16]);
     out[uuid_at..uuid_at + 16].copy_from_slice(&uuid);
-    sign::sign(out, identifier, text_size, true);
+    sign::sign(out, identifier, text_size, !library);
     if late {
         let (at, value) = slots[slots.len() - 1];
         bytes::set64(out, file_of(at) as usize, value);

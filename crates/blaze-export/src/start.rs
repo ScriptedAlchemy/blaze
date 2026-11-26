@@ -68,12 +68,12 @@ const BRK_0: u32 = 0xD420_0000; // brk #0: `__libc_start_main` never returns
 pub struct Start<'a> {
     /// Each made record's symbol and encoded bytes, read with [`CodeView::read`].
     pub records: AVec<'a, (Symbol, AVec<'a, u8>)>,
-    /// What the file's entry is: a made record's symbol, or the program's `main` itself.
-    pub entry: Symbol,
+    /// Executable entry: a made record or `main`; libraries have none.
+    pub entry: Option<Symbol>,
     /// On macOS, when the program uses Rust thread-locals, the `__mod_init_func` initializer
     /// symbol (`tls_init`) that creates the pthread key and writes `DESC.root` before `main` and
-    /// before any native static constructors. `None` when there is no TLS or on Linux (where the
-    /// start wrapper calls `tls_init` directly).
+    /// before any native static constructors. Linux libraries also use it as DT_INIT;
+    /// Linux executables call it from their start wrapper.
     pub tls_init: Option<Symbol>,
 }
 
@@ -123,7 +123,7 @@ fn static_target(symbol: Symbol) -> Target {
 /// The thread-local startup initializer: calls `pthread_key_create(&DESC.key, ender)`, traps on
 /// failure (`KEY_CREATE_FAILED`), and on macOS writes `DESC.root = DESC.key * 8` (on Linux,
 /// `DESC.root` is statically initialized to the `PT_TLS` root offset with `ROOT_OWN` set).
-fn tls_init_record<'a>(tls: TlsRuntime, platform: Platform, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ExportError> {
+fn tls_init_record<'a>(tls: TlsRuntime, platform: Platform, library: bool, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ExportError> {
     let desc = static_target(tls.descriptor);
     let ender = func(tls.ender);
     match platform {
@@ -150,6 +150,31 @@ fn tls_init_record<'a>(tls: TlsRuntime, platform: Platform, alloc: Alloc<'a>) ->
             ];
             let sites = [(8, SiteKind::Load, desc), (16, SiteKind::Load, ender), (44, SiteKind::Load, desc)];
             made(&code, &sites, Some((24, "pthread_key_create")), alloc)
+        }
+        Platform::LinuxArm64 if library => {
+            // ld.so has relocated DESC.root to this module's TP-relative ROOT slot.
+            // Mark it owned only after the pthread destructor key exists.
+            let code = [
+                STP_FP_LR,
+                MOV_FP_SP,
+                ADRP_X0,
+                LDR_X0,
+                ADRP_X1,
+                LDR_X1,
+                ADRP_X16,
+                LDR_X16,
+                BLR_X16,
+                CBZ_W0_8,
+                BRK_KEY_CREATE_FAILED,
+                ADRP_X0,
+                LDR_X0,
+                0xF940_0401, // ldr x1,[x0,#8]
+                0xB241_0021, // orr x1,x1,#0x8000000000000000
+                STR_X1_X0_8,
+                LDP_FP_LR,
+                RET,
+            ];
+            made(&code, &[(8, SiteKind::Load, desc), (16, SiteKind::Load, ender), (44, SiteKind::Load, desc)], Some((24, "pthread_key_create")), alloc)
         }
         Platform::LinuxArm64 => {
             let code = [
@@ -178,6 +203,7 @@ fn tls_init_record<'a>(tls: TlsRuntime, platform: Platform, alloc: Alloc<'a>) ->
 /// one; `None` for `CMain` with no `init` call, whose `main` is that already.
 fn wrapper<'a>(entry: Entry, init: Option<Symbol>, alloc: Alloc<'a>) -> Result<Option<AVec<'a, u8>>, ExportError> {
     match (entry, init) {
+        (Entry::Cdylib, _) => Ok(None),
         (Entry::CMain { .. }, None) => Ok(None),
         (Entry::CMain { main }, Some(init)) => {
             let code = [
@@ -222,9 +248,7 @@ fn wrapper<'a>(entry: Entry, init: Option<Symbol>, alloc: Alloc<'a>) -> Result<O
             made(&code, &sites, None, alloc).map(Some)
         }
         (Entry::LangStart { lang_start, main }, None) => {
-            let code = [
-                STP_FP_LR, MOV_FP_SP, MOV_X2_X1, SXTW_X1_W0, ADRP_X0, LDR_X0, MOV_W3_0, ADRP_X16, LDR_X16, BLR_X16, LDP_FP_LR, RET,
-            ];
+            let code = [STP_FP_LR, MOV_FP_SP, MOV_X2_X1, SXTW_X1_W0, ADRP_X0, LDR_X0, MOV_W3_0, ADRP_X16, LDR_X16, BLR_X16, LDP_FP_LR, RET];
             let sites = [(16, SiteKind::Load, func(main)), (28, SiteKind::Call, func(lang_start))];
             made(&code, &sites, None, alloc).map(Some)
         }
@@ -254,10 +278,11 @@ fn wrapper<'a>(entry: Entry, init: Option<Symbol>, alloc: Alloc<'a>) -> Result<O
 }
 
 /// The program's `main`, by entry form.
-pub fn main_of(entry: Entry) -> Symbol {
+pub fn main_of(entry: Entry) -> Option<Symbol> {
     match entry {
-        Entry::RustMain { main } | Entry::CMain { main } | Entry::LangStart { main, .. } => main,
-        Entry::Hosted { start } => start,
+        Entry::RustMain { main } | Entry::CMain { main } | Entry::LangStart { main, .. } => Some(main),
+        Entry::Hosted { start } => Some(start),
+        Entry::Cdylib => None,
     }
 }
 
@@ -268,12 +293,17 @@ pub fn start<'a>(entry: Entry, tls: Option<TlsRuntime>, platform: Platform, allo
     let mut wrapper_init = None;
     if let Some(tls) = tls {
         let init_sym = start_symbol("tls_init");
-        records.push((init_sym, tls_init_record(tls, platform, alloc)?));
+        records.push((init_sym, tls_init_record(tls, platform, entry == Entry::Cdylib, alloc)?));
         match platform {
             Platform::MacosArm64 => tls_init_mod = Some(init_sym),
+            Platform::LinuxArm64 if entry == Entry::Cdylib => tls_init_mod = Some(init_sym),
             Platform::LinuxArm64 => wrapper_init = Some(init_sym),
             Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
         }
+    }
+    if entry == Entry::Cdylib {
+        // `entry` is unused by library layout; no entry record is manufactured.
+        return Ok(Start { records, entry: None, tls_init: tls_init_mod });
     }
     let wrapper_symbol = start_symbol("wrapper");
     let c_main = match wrapper(entry, wrapper_init, alloc)? {
@@ -281,15 +311,12 @@ pub fn start<'a>(entry: Entry, tls: Option<TlsRuntime>, platform: Platform, allo
             records.push((wrapper_symbol, bytes));
             wrapper_symbol
         }
-        None => main_of(entry),
+        None => main_of(entry).expect("executable has an entry"),
     };
     let entry = match platform {
         Platform::MacosArm64 => c_main,
         Platform::LinuxArm64 => {
-            let code = [
-                MOV_X29_0, MOV_X30_0, MOV_X5_X0, LDR_X1_SP, ADD_X2_SP_8, MOV_X6_SP, ADRP_X0, LDR_X0, MOV_X3_0, MOV_X4_0, ADRP_X16,
-                LDR_X16, BLR_X16, BRK_0,
-            ];
+            let code = [MOV_X29_0, MOV_X30_0, MOV_X5_X0, LDR_X1_SP, ADD_X2_SP_8, MOV_X6_SP, ADRP_X0, LDR_X0, MOV_X3_0, MOV_X4_0, ADRP_X16, LDR_X16, BLR_X16, BRK_0];
             let bytes = made(&code, &[(24, SiteKind::Load, func(c_main))], Some((40, "__libc_start_main")), alloc)?;
             let symbol = start_symbol("_start");
             records.push((symbol, bytes));
@@ -297,5 +324,5 @@ pub fn start<'a>(entry: Entry, tls: Option<TlsRuntime>, platform: Platform, allo
         }
         Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
-    Ok(Start { records, entry, tls_init: tls_init_mod })
+    Ok(Start { records, entry: Some(entry), tls_init: tls_init_mod })
 }

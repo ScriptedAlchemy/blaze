@@ -12,7 +12,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::eh_out::{Outside, eh_room_with, eh_sections_with};
 use crate::error::ExportError;
 use crate::input::{Entry, Panic, Platform, ProgramIn, Tier};
-use crate::layout::{Member, TlsPlan, lay_out_with_tls};
+use crate::layout::{Member, TlsPlan, lay_out_library_with_tls, lay_out_with_tls};
 use crate::native_merge::{self, MergeError};
 use crate::start::{main_of, start};
 use crate::{elf, macho};
@@ -59,19 +59,16 @@ impl Exported {
         match (self.fast, self.optimized) {
             (fast, 0) => writeln!(f, "exported at the fast tier: {fast} functions; the optimized tier is not built yet")?,
             (0, optimized) => writeln!(f, "exported at the optimized tier: {optimized} functions")?,
-            (fast, optimized) => writeln!(
-                f,
-                "exported: {optimized} functions at the optimized tier, {fast} at the fast tier (the optimized tier is not built yet for those {fast})"
-            )?,
+            (fast, optimized) => {
+                writeln!(f, "exported: {optimized} functions at the optimized tier, {fast} at the fast tier (the optimized tier is not built yet for those {fast})")?
+            }
         }
         if self.folded > 0 {
             writeln!(f, "folded: {} functions share an equal function's code", self.folded)?;
         }
         match self.panics {
             Panics::Unwind { functions } => writeln!(f, "panics: unwind tables for {functions} functions")?,
-            Panics::Abort { functions } => {
-                writeln!(f, "panics: abort (the profile's `panic = \"abort\"`); unwind tables for {functions} functions, for backtraces")?
-            }
+            Panics::Abort { functions } => writeln!(f, "panics: abort (the profile's `panic = \"abort\"`); unwind tables for {functions} functions, for backtraces")?,
         }
         match self.profile {
             None => writeln!(f, "profile: none; functions in call-graph order from the entry")?,
@@ -105,9 +102,13 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
     if platform == Platform::Wasm64 {
         return Err(ExportError::Wasm64RequiresWasmProgram);
     }
-    let has =|symbol: Symbol| program.functions.iter().any(|f| f.symbol == symbol);
+    let library = program.entry == Entry::Cdylib;
+    let has = |symbol: Symbol| program.functions.iter().any(|f| f.symbol == symbol);
     let main = main_of(program.entry);
-    if !matches!(program.entry, Entry::Hosted { .. }) && !has(main) {
+    if let Some(main) = main
+        && !matches!(program.entry, Entry::Hosted { .. })
+        && !has(main)
+    {
         return Err(ExportError::NoEntry { symbol: main });
     }
     if let Entry::LangStart { lang_start, .. } = program.entry
@@ -146,18 +147,29 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
         }
     };
     let (plan, initial_root) = match platform {
-        Platform::MacosArm64 => (macho::plan_for(natives.as_ref().map(|(_, libraries)| &libraries[..])), 0u64),
+        Platform::MacosArm64 => (
+            if library {
+                macho::plan_library_for(natives.as_ref().map(|(_, libraries)| &libraries[..]), program.name)
+            } else {
+                macho::plan_for(natives.as_ref().map(|(_, libraries)| &libraries[..]))
+            },
+            0u64,
+        ),
         Platform::LinuxArm64 => {
             let libs = natives.as_ref().map(|(_, libraries)| &libraries[..]);
-            let has_inits = natives.as_ref().is_some_and(|(image, _)| image.region(NativeRegion::Inits).is_some_and(|r| r.len > 0));
+            let has_inits = (library && program.tls.is_some()) || natives.as_ref().is_some_and(|(image, _)| image.region(NativeRegion::Inits).is_some_and(|r| r.len > 0));
             let root_off = elf::tls_root_offset(natives.as_ref().map(|(image, _)| *image)).map_err(ExportError::Native)?;
-            (elf::plan_for(libs, has_inits), root_off | blaze_code::tls::ROOT_OWN)
+            (if library { elf::plan_library_for(libs, has_inits) } else { elf::plan_for(libs, has_inits) }, if library { 0 } else { root_off | blaze_code::tls::ROOT_OWN })
         }
         Platform::Wasm64 => return Err(ExportError::Wasm64RequiresWasmProgram),
     };
     let tls_plan = program.tls.map(|t| TlsPlan { descriptor: t.descriptor, mod_init_fn: start.tls_init, initial_root });
     let room = eh_room_with(&members, program.personality, platform, program.natives, alloc)?;
-    let laid = lay_out_with_tls(&members, program.data, start.entry, program.profile, plan, room, tls_plan, alloc)?;
+    let laid = if library {
+        lay_out_library_with_tls(&members, program.data, program.exports, program.profile, plan, room, tls_plan, alloc)?
+    } else {
+        lay_out_with_tls(&members, program.data, start.entry.expect("executable has an entry"), program.profile, plan, room, tls_plan, alloc)?
+    };
     let seed = program.profile.map_or([0u8; 32], |p| p.digest);
     let (eh, identity, bound) = match platform {
         Platform::MacosArm64 => {
@@ -170,7 +182,11 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
                 _ => None,
             };
             let eh = eh_sections_with(&laid, &members, program.personality, platform, outside.as_ref(), alloc)?;
-            let identity = macho::write_native(&laid, &eh, merged.as_ref(), program.name, &seed, out, alloc)?;
+            let identity = if library {
+                macho::write_library_native(&laid, &eh, merged.as_ref(), program.exports, program.name, &seed, out, alloc)?
+            } else {
+                macho::write_native(&laid, &eh, merged.as_ref(), program.name, &seed, out, alloc)?
+            };
             let bound = merged.as_ref().map_or(laid.imports.len(), |m| m.bound(laid.imports.len()));
             (eh, identity, bound)
         }
@@ -184,7 +200,11 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
                 _ => None,
             };
             let eh = eh_sections_with(&laid, &members, program.personality, platform, outside.as_ref(), alloc)?;
-            let identity = elf::write_native(&laid, &eh, merged.as_ref(), &seed, out, alloc)?;
+            let identity = if library {
+                elf::write_library_native(&laid, &eh, merged.as_ref(), program.exports, program.name, &seed, out, alloc)?
+            } else {
+                elf::write_native(&laid, &eh, merged.as_ref(), &seed, out, alloc)?
+            };
             let synthetic_dso = usize::from(laid.imports.iter().any(|imp| imp.name == "__dso_handle"));
             let bound = merged.as_ref().map_or(laid.imports.len(), |m| m.bound(laid.imports.len())).saturating_sub(synthetic_dso);
             (eh, identity, bound)
@@ -206,17 +226,5 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
             }
         }
     }
-    Ok(Exported {
-        platform,
-        functions,
-        folded,
-        fast,
-        optimized,
-        made,
-        imports: bound as u32,
-        len: out.len() as u64,
-        identity,
-        profile: program.profile.map(|p| p.digest),
-        panics,
-    })
+    Ok(Exported { platform, functions, folded, fast, optimized, made, imports: bound as u32, len: out.len() as u64, identity, profile: program.profile.map(|p| p.digest), panics })
 }
