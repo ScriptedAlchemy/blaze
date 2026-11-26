@@ -3,29 +3,31 @@
 //! command's path writes with `blaze_report::outln!`, `out!`, `errln!` and `err!`, which end
 //! the process quietly then. This holds each crate to the number of std's macros it has left
 //! (`prints.txt`): a crate's number may fall, and its row is then lowered in the same change;
-//! it never rises, and a crate with no row has none. It reads the sources as text; a ban in
+//! it never rises, and a crate with no row has none. It reads the sources as Rust tokens; a ban in
 //! `.clippy.toml` (`disallowed-macros`) takes its place once every row is 0.
 
 use std::{collections::BTreeMap, fs, path::Path};
 
-/// How many of std's print macros `line` calls.
-fn count(line: &str) -> u32 {
+use blaze_lex::{Cpu, FrontmatterAllowed, TokenKind, tokenize};
+
+/// How many of std's print macros `source` calls.
+fn count(source: &str) -> u32 {
     let mut found = 0;
-    let mut from = 0;
-    while let Some(at) = line[from..].find("print") {
-        let at = from + at;
-        from = at + 5;
-        let after = &line[from..];
-        if !(after.starts_with("!(") || after.starts_with("ln!(")) {
+    let mut offset = 0;
+    let mut named = false;
+    let mut bang = false;
+    for token in tokenize(source, FrontmatterAllowed::Yes, Cpu::BASELINE) {
+        let start = offset;
+        offset += token.len as usize;
+        if matches!(token.kind, TokenKind::Whitespace | TokenKind::LineComment { .. } | TokenKind::BlockComment { .. }) {
             continue;
         }
-        // `print` or `eprint`, and before it nothing of a longer name.
-        let before = &line[..at];
-        let before = before.strip_suffix('e').unwrap_or(before);
-        if before.chars().next_back().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
-            continue;
+        if bang && matches!(token.kind, TokenKind::OpenParen | TokenKind::OpenBrace | TokenKind::OpenBracket) {
+            found += 1;
         }
-        found += 1;
+        bang = named && token.kind == TokenKind::Bang;
+        named = matches!(token.kind, TokenKind::Ident | TokenKind::RawIdent)
+            && matches!(source[start..offset].trim_start_matches("r#"), "print" | "println" | "eprint" | "eprintln");
     }
     found
 }
@@ -41,7 +43,7 @@ fn walk(dir: &Path, total: &mut u32) {
             }
         } else if path.extension().is_some_and(|it| it == "rs") && name != "tests.rs" {
             let text = fs::read(&path).map(|it| String::from_utf8_lossy(&it).into_owned()).unwrap_or_default();
-            *total += text.lines().filter(|it| !it.trim_start().starts_with("//")).map(count).sum::<u32>();
+            *total += count(&text);
         }
     }
 }
@@ -52,6 +54,8 @@ fn the_matcher_finds_stds_print_macros_and_nothing_else() {
     assert_eq!(count(r#"std::println!("a")"#), 1);
     assert_eq!(count(r#"blaze_report::outln!("a"); my_print!("b"); sprintln!("c"); fingerprint!(x)"#), 0);
     assert_eq!(count("let print = 1; print(x)"), 0);
+    assert_eq!(count(r##"let generated = "println!(value)"; let raw = r#"println!(value)"#; /* println!(comment); */"##), 0);
+    assert_eq!(count("println /* comment */ !\n{ \"real\" }"), 1);
 }
 
 /// The control: a crate that gains one of std's print macros is over its row.

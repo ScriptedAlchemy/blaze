@@ -34,10 +34,10 @@ blaze-impls 1
 blaze-json 1
 blaze-keyed 2
 blaze-kit 11
-blaze-ladder 355
+blaze-ladder 379
 blaze-launch 21
 blaze-launch-rt 30
-blaze-launcher 3
+blaze-launcher 7
 blaze-lint-defs 9
 blaze-lir 11
 blaze-lower 18
@@ -52,7 +52,7 @@ blaze-new 34
 blaze-own 6
 blaze-parquet 5
 blaze-pg 4
-blaze-proc-macro 83
+blaze-proc-macro 96
 blaze-producers 6
 blaze-profile 80
 blaze-rel 11
@@ -61,7 +61,8 @@ blaze-resolve 125
 blaze-run 2
 blaze-scope 87
 blaze-script 21
-blaze-serde-derive 12
+blaze-sh 6
+blaze-shell 42
 blaze-sim 81
 blaze-solve 11
 blaze-source 10
