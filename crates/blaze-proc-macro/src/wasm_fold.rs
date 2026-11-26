@@ -221,7 +221,7 @@ fn append<'a>(raw: &[u8], suffix: &[u8], extra: usize, alloc: Alloc<'a>) -> Resu
     let total = old.checked_add(count(extra)?).ok_or(Error::Limit("section entries"))?;
     let mut out = AVec::new_in(alloc);
     out.put_uleb(u64::from(total));
-    out.put_bytes(reader.remaining_buffer());
+    out.put_bytes(reader.read_bytes(reader.bytes_remaining())?);
     out.put_bytes(suffix);
     Ok(out)
 }
