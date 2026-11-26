@@ -1,7 +1,7 @@
 //! A build script's compiled module, looked up by a `MacroModule` task (piece 2c; the
 //! coordinator's ruling D115 (c), 2026-11-16 21:1x): ONE mechanism with the proc-macro modules
 //! (macros.rs, rule 30). The kind and the record are the same: a lookup whose out is the
-//! module's wasm digest and whose payload is empty. Only the subject differs: a build script's
+//! module's executable digest and whose payload names its selected record. The subject differs: a build script's
 //! module is named by its package, version and the script unit's features (what the bootstrap
 //! builder's identity names: blaze-proc-macro script_unit.rs `module_of`), in a domain of its
 //! own, so no proc-macro crate's subject can equal it.
@@ -22,6 +22,7 @@
 //! Interim (D110): the store is scanned on the filesystem as the runtime scans it; one scan a
 //! lookup, cached by the lookup's record.
 
+use blaze_build_script::module_record::{Executable, Selected};
 use blaze_drive::{Kind, Name, Task, TaskFailure, Why};
 use blaze_ids::ContentId;
 use bstd::cx::Cx;
@@ -36,7 +37,8 @@ use crate::scripts::RanAs;
 // reth-mdbx-sys and librocksdb-sys, placed native, were looked up as wasm modules and refused
 // while their native records stood in the store).
 const SUBJECT_DOMAIN: &str = "blaze-cli build-script module subject 2";
-const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 1";
+// Module rows in version 1 did not include the selected executable record.
+const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 2";
 const OUT_DOMAIN: &str = "blaze-cli build-script module out 2";
 
 /// The rule a lookup's failure names.
@@ -67,6 +69,10 @@ pub(crate) fn part_source(graph_source: ContentId, subject: ContentId) -> Conten
     source[..32].copy_from_slice(&graph_source.0);
     source[32..].copy_from_slice(&subject.0);
     ContentId::of(SOURCE_DOMAIN, &source)
+}
+
+pub(crate) fn selected_out(selected: Selected) -> ContentId {
+    ContentId::of(OUT_DOMAIN, selected.digest().as_bytes())
 }
 
 /// A module lookup a crate's script reads: its subject, the world index of the crate reading
@@ -105,9 +111,9 @@ pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Ta
     let store = std::path::Path::new(home).join(".blaze/v2");
     let Wanted { ran_as, package, version, features } = wanted;
     let host = crate::graph::TRIPLE;
-    let (found, digest_file) = match ran_as {
-        RanAs::Wasm => (blaze_proc_macro::script_unit::module_of(&store, package, version, features), "wasm-sha256"),
-        RanAs::Native => (blaze_proc_macro::script_unit::module_of_native(&store, package, version, features, host), "bin-sha256"),
+    let (found, executable) = match ran_as {
+        RanAs::Wasm => (blaze_proc_macro::script_unit::module_of(&store, package, version, features), Executable::Wasm),
+        RanAs::Native => (blaze_proc_macro::script_unit::module_of_native(&store, package, version, features, host), Executable::Native),
     };
     let unread = |error: &blaze_proc_macro::script_unit::ModuleLookupError| {
         let words = bstd::mem::format_in!(held, "the build script of {package} {version}: {error}");
@@ -150,16 +156,13 @@ pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Ta
         // module comes or goes.
         return Ok(Did::FailedSaying(refused("a build-script module the store lacks"), held_str(words.as_str(), held)));
     };
-    let digest_at = record.join(digest_file);
-    let digest = match std::fs::read_to_string(&digest_at) {
-        Ok(digest) => digest,
-        Err(error) => {
-            let words = bstd::mem::format_in!(held, "the build script of {package} {version}: its module's digest {}: {error}", digest_at.display());
-            return Ok(Did::Hole(refused("the module store could not be read"), held_str(words.as_str(), held)));
-        }
+    let selected = match blaze_proc_macro::script_unit::select_record(&record, executable) {
+        Ok(selected) => selected,
+        Err(error) => return Ok(unread(&error)),
     };
     let mut made = Made::new_in(name, held);
-    made.out = ContentId::of(OUT_DOMAIN, digest.trim().as_bytes());
+    made.out = selected_out(selected);
+    made.payload.extend_from_slice(&selected.encode());
     Ok(Did::Done(made))
 }
 

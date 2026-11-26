@@ -35,7 +35,7 @@ use crate::{
         NOT_A_FILE, Read, Tree, TreeRead, answer_now,
         dep_mount::{self, DepProducer, native::LayError},
     },
-    script_unit::module_of_native,
+    script_unit::{module_of_native, read_verified_module},
 };
 
 /// The deployment target every native script compiles for: its one home is blaze-build-script
@@ -374,17 +374,25 @@ pub fn native_outputs<'a>(
     };
 
     // The host binary the interim builder made with exactly the unit's features.
-    let features: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-    let module = module_of_native(setting.store, name, version, &features, setting.host).map_err(NativeUnitError::Lookup)?.ok_or_else(|| NativeUnitError::NoModule {
-        package: pkg(),
-        features: features.iter().map(|f| (*f).to_owned()).collect(),
-        store: setting.store.display().to_string(),
-    })?;
+    let module = match setting.selected {
+        Some(module) => setting.store.join("build-script/modules").join(module.key()),
+        None => {
+            let features: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
+            module_of_native(setting.store, name, version, &features, setting.host).map_err(NativeUnitError::Lookup)?.ok_or_else(|| NativeUnitError::NoModule {
+                package: pkg(),
+                features: features.iter().map(|f| (*f).to_owned()).collect(),
+                store: setting.store.display().to_string(),
+            })?
+        }
+    };
     // Seatbelt matches resolved paths: the store may be named through a link.
     let module = std::fs::canonicalize(&module).map_err(|e| NativeUnitError::Read { path: module.display().to_string(), why: e.to_string() })?;
     let module = module.to_str().ok_or_else(|| NativeUnitError::Read { path: module.display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
     let program = format!("{module}/script.bin");
-    let module_digest = blaze_sha256::digest(&read_file(&module, "script.bin")?);
+    let module_digest = blaze_sha256::digest(&match setting.selected {
+        Some(selected) => read_verified_module(Path::new(&module), selected.executable(), selected.digest()).map_err(NativeUnitError::Lookup)?,
+        None => read_file(&module, "script.bin")?,
+    });
 
     // The same environment as the wasm path: the unit's features, the served unit's cfg.
     let serves_unit = &graph.units[serves.index()];

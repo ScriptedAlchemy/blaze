@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blaze_build_script::key::CMode;
+use blaze_build_script::module_record::{Executable, Selected};
 use blaze_build_script::native::Runner;
 use blaze_build_script::outputs::OutputsRef;
 use blaze_build_script::probe::Row;
@@ -665,6 +666,7 @@ pub(crate) struct ScriptJob<'j> {
     name: Name,
     shared: &'j Shared<'j>,
     script: UnitId,
+    selected: Selected,
     /// The side of the crates that read it: a macro-side run has TARGET [`MACRO_TARGET`].
     side: Side,
     consumer: Consumer,
@@ -953,10 +955,32 @@ pub(crate) fn job<'f: 'j, 'j>(
     let (graph, members, lock) = (scripts.graph, scripts.members, scripts.lock);
     let unit = &graph.units[script.index()];
     let mut wants = std::vec::Vec::new_in(Global);
-    let module = crate::script_modules::name(ContentId(run.inputs.module));
-    if !task.inputs.iter().any(|input: &Input| input.name == module) {
-        wants.push(Want { name: module, home: Name::unit_graph() });
-    }
+    // The module lookup's executable digest is a read. Run the record that produced that out.
+    let module_name = crate::script_modules::name(ContentId(run.inputs.module));
+    let selected = match task.inputs.iter().find(|input: &&Input| input.name == module_name) {
+        Some(input) => {
+            let read = crate::work::payload(&cx, store, input, jobs)?;
+            let selected = Selected::decode(read.payload()).filter(|selected| {
+                let runner = match selected.executable() {
+                    Executable::Wasm => RanAs::Wasm,
+                    Executable::Native => RanAs::Native,
+                };
+                runner as u8 == run.inputs.ran_as && crate::script_modules::selected_out(*selected) == input.out
+            });
+            let Some(selected) = selected else {
+                return Ok(Prepared::Said {
+                    what: "a build-script module with an invalid selection proof",
+                    words: said(jobs, format_args!("the build script of {} {}: its module proof disagrees with the planned runner or executable digest", unit.name.as_str(), unit.version.as_str())),
+                    hole: false,
+                });
+            };
+            Some(selected)
+        }
+        None => {
+            wants.push(Want { name: module_name, home: Name::unit_graph() });
+            None
+        }
+    };
     let mut producer_reads = blaze_own::Vec::new_in(jobs);
     for producer in run.producers() {
         let name = Name::new(Kind::Script, ContentId(producer));
@@ -968,6 +992,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     if !wants.is_empty() {
         return Ok(Prepared::Need(wants));
     }
+    let selected = selected.expect("the script's module was handed");
     // Only the original metadata closure is served as DEP_* and mounted through links.
     let closure = script_unit::links_closure_for(graph, script, consumer);
     let mut producers: blaze_own::Vec<Producer<'j>, &'j Frame> = blaze_own::Vec::with_capacity_in(closure.len(), jobs);
@@ -1009,7 +1034,7 @@ pub(crate) fn job<'f: 'j, 'j>(
         Files::Pack { .. } | Files::External { .. } => Default::default(),
     };
     Ok(Prepared::Ready(ScriptJob {
-        caller_env, name: task.name, shared, script, side, consumer, cfg, files,
+        caller_env, name: task.name, shared, script, selected, side, consumer, cfg, files,
         producers: producers.into_bump_slice(), producer_reads: producer_reads.into_bump_slice(), checkout: CheckoutReads::Hole,
     }))
 }
@@ -1106,7 +1131,10 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     };
     // The one choice point (D112 / D175 zero-Wasm), before anything runs: a script placed native
     // needs the command's native setting, or fails naming why it has none.
-    let runner = blaze_proc_macro::native_unit::placed_in_store(&shared.store, graph, job.script, MODE, crate::graph::TRIPLE, alloc);
+    let runner = match job.selected.executable() {
+        Executable::Wasm => Runner::Wasm,
+        Executable::Native => Runner::Native { because: job.script },
+    };
     let ran_as = RanAs::of(&runner);
     let native = match (runner, &shared.native) {
         // No SDK: a function of the run's key, which holds "no SDK" ([`Shared::no_sdk`]), so
@@ -1117,6 +1145,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         (Runner::Wasm, Err(_)) => None,
     };
     let setting = Setting {
+        selected: Some(job.selected),
         caller_env: job.caller_env,
         store: &shared.store,
         // Its crates' side's target (ruling D115 (2)); native zero-Wasm macro scripts run for host.

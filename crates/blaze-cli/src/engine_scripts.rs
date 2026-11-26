@@ -133,7 +133,7 @@ struct MacroInputs<'a> {
 }
 
 enum ModuleAnswer {
-    Found(ContentId),
+    Found { out: ContentId, selected: Option<blaze_build_script::module_record::Selected> },
     Failed(TaskFailure, Option<blaze_own::String<SharedAlloc<'static>>>, bool),
 }
 
@@ -188,7 +188,7 @@ impl ModuleJob<'_> {
         let (did, crates) = match self {
             Self::Build { wanted, home } => (crate::script_modules::run(cx, home, wanted, &drive(Vec::new_in(alloc)), frame)?, None),
             #[cfg(test)]
-            Self::Fixture => return Ok(WorkerOutput::Module(ModuleAnswer::Found(name.subject), None)),
+            Self::Fixture => return Ok(WorkerOutput::Module(ModuleAnswer::Found { out: name.subject, selected: None }, None)),
             Self::Proc { mut crates, home, checkout, graph, initial } => {
                 let mut handed = LookupStore { name, graph: initial.zip(graph).map(|(input, graph)| (graph.at, input.graph)) };
                 let mut inputs = Vec::new_in(alloc);
@@ -218,7 +218,14 @@ impl ModuleJob<'_> {
             }
         };
         let answer = match did {
-            Did::Done(made) => ModuleAnswer::Found(made.out),
+            Did::Done(made) => {
+                let selected = if made.payload.is_empty() {
+                    None
+                } else {
+                    Some(blaze_build_script::module_record::Selected::decode(&made.payload).ok_or(CliError::Text { what: "the build-script module lookup produced a malformed selection proof" })?)
+                };
+                ModuleAnswer::Found { out: made.out, selected }
+            }
             Did::Failed(failed) => ModuleAnswer::Failed(failed, None, false),
             Did::FailedSaying(failed, words) => ModuleAnswer::Failed(failed, Some(blaze_own::String::from_str_in(words, heap.shared())), false),
             Did::Hole(failed, words) => ModuleAnswer::Failed(failed, Some(blaze_own::String::from_str_in(words, heap.shared())), true),
@@ -1204,9 +1211,12 @@ impl<'f> ScriptsStage<'f> {
             WorkerOutput::Module(answer, crates) => {
                 if lane == ScriptLane::ProcLookup { self.macros = crates; }
                 let did = match answer {
-                    ModuleAnswer::Found(out) => {
+                    ModuleAnswer::Found { out, selected } => {
                         let mut made = work::Made::new_in(name, frame);
                         made.out = out;
+                        if let Some(module) = selected {
+                            made.payload.extend_from_slice(&module.encode());
+                        }
                         Did::Done(made)
                     }
                     ModuleAnswer::Failed(failed, Some(words), hole) => {

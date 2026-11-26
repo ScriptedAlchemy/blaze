@@ -40,6 +40,8 @@ pub struct Setting<'s> {
     pub caller_env: blaze_build_script::env::CallerEnv<'s>,
     /// The store holding `build-script/modules` (the bootstrap's module records).
     pub store: &'s Path,
+    /// The command's proven module. Standalone runs which own module lookup supply none.
+    pub selected: Option<Selected>,
     pub target: &'s str,
     pub host: &'s str,
     /// The probe table's rows (`probe::pinned_rows`).
@@ -57,6 +59,16 @@ pub struct Setting<'s> {
     /// What the command's setting says about spawns, chosen once per command
     /// (`crate::fact_pins::command_spawn_setting`): every script of the graph gets it.
     pub spawn_setting: Arc<crate::spawn_route::SpawnSetting>,
+}
+
+impl Setting<'_> {
+    pub fn runner(&self, graph: &UnitGraph<'_>, script: UnitId, alloc: Alloc<'_>) -> Runner {
+        match self.selected.map(|module| module.executable()) {
+            Some(Executable::Wasm) => Runner::Wasm,
+            Some(Executable::Native) => Runner::Native { because: script },
+            None => crate::native_unit::placed_in_store(self.store, graph, script, self.mode, self.host, alloc),
+        }
+    }
 }
 
 /// A script ready to run: its loaded module, its sandboxed inputs, its environment.
@@ -158,6 +170,8 @@ pub enum ModuleLookupError {
     RecordKey { folder: PathBuf, expected: String },
     /// The producer's executable digest is not a SHA-256.
     InvalidDigest { path: PathBuf },
+    /// A module is not stored in a digest-named directory.
+    InvalidKey { folder: PathBuf },
     /// Two records answer the same request.
     Ambiguous { first: PathBuf, second: PathBuf },
 }
@@ -171,6 +185,7 @@ impl std::fmt::Display for ModuleLookupError {
             ModuleLookupError::Digest { path, expected, actual } => write!(f, "{}: the build-script module names SHA-256 {expected}, but its bytes have SHA-256 {actual}", path.display()),
             ModuleLookupError::RecordKey { folder, expected } => write!(f, "{}: the build-script module identity has SHA-256 {expected}", folder.display()),
             ModuleLookupError::InvalidDigest { path } => write!(f, "{}: the build-script module digest is not a lower-case SHA-256", path.display()),
+            ModuleLookupError::InvalidKey { folder } => write!(f, "{}: the build-script module folder name is not a lower-case SHA-256", folder.display()),
             ModuleLookupError::Ambiguous { first, second } => write!(
                 f,
                 "{} and {}: two build-script module records answer the same request",
@@ -274,7 +289,7 @@ fn read_verified_wasm(record: &Path) -> Result<Vec<u8>, ModuleLookupError> {
     read_verified_module(record, Executable::Wasm, expected.trim())
 }
 
-fn read_verified_module(record: &Path, executable: Executable, expected: &str) -> Result<Vec<u8>, ModuleLookupError> {
+pub(crate) fn read_verified_module(record: &Path, executable: Executable, expected: &str) -> Result<Vec<u8>, ModuleLookupError> {
     let path = record.join(executable.filename());
     let bytes = std::fs::read(&path).map_err(|error| ModuleLookupError::ReadModule { path: path.clone(), error })?;
     let actual = crate::module::sha256_hex(&bytes);
@@ -296,12 +311,17 @@ pub fn module_for(store: &Path, request: &Request<'_>) -> Result<Option<Selected
     if let Some((second, _)) = matching.next() {
         return Err(ModuleLookupError::Ambiguous { first: folder, second });
     }
-    let key = Digest::parse(&expected).expect("sha256_hex writes lower-case SHA-256");
-    let executable = request.executable();
+    select_record(&folder, request.executable()).map(Some)
+}
+
+/// Preserve the identity and named executable digest of a record selected by the module lookup.
+pub fn select_record(folder: &Path, executable: Executable) -> Result<Selected, ModuleLookupError> {
+    let key = folder.file_name().and_then(|name| name.to_str()).and_then(Digest::parse)
+        .ok_or_else(|| ModuleLookupError::InvalidKey { folder: folder.to_owned() })?;
     let path = folder.join(executable.digest_filename());
     let digest = std::fs::read_to_string(&path).map_err(|error| ModuleLookupError::ReadModule { path: path.clone(), error })?;
     let bytes = Digest::parse(digest.trim()).ok_or(ModuleLookupError::InvalidDigest { path })?;
-    Ok(Some(Selected::from_lookup(key, executable, bytes)))
+    Ok(Selected::from_lookup(key, executable, bytes))
 }
 
 /// Return the proven executable bytes from the selected record for the script runner.
@@ -423,13 +443,18 @@ fn prepare_viewing_for<'a>(
     let package = package(unit);
     let serves = served_for(graph, script, consumer).ok_or_else(|| UnitScriptError::ServesNothing { package: package.clone() })?;
     let serves = &graph.units[serves.index()];
-    let features: Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
-    let module = module_of(setting.store, unit.name.as_str(), unit.version.as_str(), &features).map_err(UnitScriptError::Lookup)?.ok_or_else(|| UnitScriptError::NoModule {
-        package: package.clone(),
-        features: features.iter().map(|f| (*f).to_owned()).collect(),
-        store: setting.store.to_owned(),
-    })?;
-    let wasm = read_verified_wasm(&module).map_err(UnitScriptError::Lookup)?;
+    let wasm = match setting.selected {
+        Some(module) => read_selected_module(setting.store, module).map_err(UnitScriptError::Lookup)?,
+        None => {
+            let features: Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
+            let module = module_of(setting.store, unit.name.as_str(), unit.version.as_str(), &features).map_err(UnitScriptError::Lookup)?.ok_or_else(|| UnitScriptError::NoModule {
+                package: package.clone(),
+                features: features.iter().map(|f| (*f).to_owned()).collect(),
+                store: setting.store.to_owned(),
+            })?;
+            read_verified_wasm(&module).map_err(UnitScriptError::Lookup)?
+        }
+    };
     let loaded = runtime.load(&package, &wasm).map_err(UnitScriptError::Script)?;
     let facts = PackageFacts {
         name: unit.name.as_str(),
@@ -486,7 +511,7 @@ pub fn outputs<'a>(
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
-    match crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc) {
+    match setting.runner(graph, script, alloc) {
         Runner::Wasm => {
             let prepared = prepare(runtime, setting, graph, script, tree, root, deps, alloc)?;
             runtime.fresh(&prepared.loaded, prepared.script, prepared.base, alloc).map_err(UnitScriptError::Script)
@@ -556,7 +581,7 @@ fn outputs_viewing_for<'a>(
     if unit.kind != UnitKind::BuildScript {
         return Err(UnitScriptError::NotAScript { unit: script });
     }
-    match crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc) {
+    match setting.runner(graph, script, alloc) {
         Runner::Wasm => {
             let viewed = dep_mount::view(&tree, producers, deps, alloc).map_err(|why| UnitScriptError::DepView { package: package(unit), why })?;
             let seen: Vec<DepMetadata<'_>> =
