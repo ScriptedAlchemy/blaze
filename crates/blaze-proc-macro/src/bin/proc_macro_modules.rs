@@ -1817,6 +1817,7 @@ impl Plan<'_> {
         if let Origin::Path { dir, .. } = origin {
             flags.push(format!("--remap-path-prefix={}=/build/path/{}-{}", dir.display(), wanted.name, wanted.version));
         }
+        flags.push(format!("--remap-path-prefix={}=/build/checkout", self.args.checkout.display()));
         env.push(("CARGO_ENCODED_RUSTFLAGS".to_owned(), flags.join("\u{1f}").into()));
         env.push(("CARGO_TARGET_DIR".to_owned(), self.work.join("target").into_os_string()));
         env.push(("RUSTC_WRAPPER".to_owned(), self.me.clone()));
