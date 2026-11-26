@@ -30,7 +30,7 @@ jobs:
       - uses: ./.github/actions/reflink
       - uses: ./.github/actions/apt
         with:
-          packages: strace bubblewrap
+          packages: strace bubblewrap clang
       - name: Enable sandbox user namespaces
         run: |
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
@@ -102,7 +102,7 @@ jobs:
         if: ${{ !cancelled() && env.LLVM_SYS_231_PREFIX != '' }}
         run: |
           prefix="$LLVM_SYS_231_PREFIX"
-          input=$(timeout 10 jq -nc --arg prefix "$prefix" --arg clang "$prefix/bin/clang" '{prefix:$prefix,clang:$clang,check:true}')
+          input=$(timeout 10 jq -nc --arg prefix "$prefix" --arg clang "$(command -v clang)" '{prefix:$prefix,clang:$clang,check:true}')
           timeout -k 20 1200 cargo +"$(cat pins/toolchain)" run --release --locked -p scripts --bin llvm_abi -- "$input" \
             2>&1 | tee "$RUNNER_TEMP/plan-evidence/llvm-generator.log"
       - name: Verify focused compiler regressions
