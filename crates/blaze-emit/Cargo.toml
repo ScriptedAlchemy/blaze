@@ -13,6 +13,9 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[features]
+llvm = ["dep:blaze-ids", "dep:blaze-llvm-abi", "dep:blaze-pins", "dep:object"]
+
 [dependencies]
 # The input: one function's columns (`View`), its ops, types and signatures.
 blaze-lir.workspace = true
@@ -25,6 +28,10 @@ blaze-own.workspace = true
 blaze-tier.workspace = true
 # The template table's digest (`TableHead::digest`): BLAKE3 of its bytes.
 blaze-blake3.workspace = true
+blaze-ids = { workspace = true, optional = true }
+blaze-llvm-abi = { workspace = true, features = ["native"], optional = true }
+blaze-pins = { workspace = true, optional = true }
+object = { workspace = true, optional = true }
 
 [build-dependencies]
 # build.rs: the committed table's BLAKE3, against table/arm64.json.

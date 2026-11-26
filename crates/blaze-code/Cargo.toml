@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-int.workspace = true
 # `Vec`, `BTreeMap` and `Alloc`: every table, in the allocator the caller names (no `alloc`).
 blaze-own.workspace = true
 # The domain-separated BLAKE3 `Hasher`: an outside name's symbol, a record's fold digest. By

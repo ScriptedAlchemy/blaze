@@ -31,6 +31,7 @@ use blaze_code::a64::{ADD64, ADRP, BLR, LDR64, NOP, add_lo12, adrp, bl, expect, 
 use blaze_code::record::{CodeView, NO_TARGET, OWN_CODE, OWN_RELRO, SiteKind, Space, Symbol, Target, Word};
 use blaze_code::tls::{CAP as TLS_CAP, DESC_VARS, ROW_BYTES as TLS_ROW_BYTES, ROW_INIT, descriptor as tls_descriptor, var_row as tls_var_row};
 use blaze_ids::Hasher;
+use blaze_int::{Int, idx};
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::error::ExportError;
@@ -158,6 +159,7 @@ pub(crate) trait LayoutMember {
     fn symbol(&self) -> Symbol;
     fn code(&self) -> &[u8];
     fn relro(&self) -> &[u8];
+    fn relro_align(&self) -> u8;
     fn words(&self) -> usize;
     fn word(&self, i: usize) -> Word;
     fn target(&self, i: usize) -> Target;
@@ -183,6 +185,9 @@ impl LayoutMember for Member<'_> {
     }
     fn relro(&self) -> &[u8] {
         self.record.relro()
+    }
+    fn relro_align(&self) -> u8 {
+        self.record.relro_align()
     }
     fn words(&self) -> usize {
         self.record.words()
@@ -308,6 +313,7 @@ pub(crate) struct ConstAndData<'a> {
     pub(crate) const_at: u64,
     pub(crate) konst: AVec<'a, u8>,
     pub(crate) got_at: u64,
+    pub(crate) bound_got_at: u64,
     pub(crate) mod_init_at: Option<u64>,
     pub(crate) tls_indices_at: u64,
     pub(crate) tls_rows_at: u64,
@@ -326,6 +332,23 @@ pub(crate) struct ConstAndData<'a> {
 }
 
 impl ConstAndData<'_> {
+    /// A single-instruction GOT reference always names a word, including a bound symbol.
+    pub(crate) fn import_word(&self, target: Target, from: Symbol, imports: &[Import<'_>], bound: &[Target]) -> Result<u64, ExportError> {
+        match target.space {
+            Space::Tls => self.tls_index_of(target.symbol).map(|i| self.tls_indices_at + 8 * u64::from(i)),
+            Space::Outside => imports.binary_search_by_key(&target.symbol, |i| i.symbol).ok().map(|i| self.got_at + 8 * i.widen_to::<u64>()),
+            _ => bound.binary_search(&target).ok().map(|i| self.bound_got_at + 8 * i.widen_to::<u64>()),
+        }.ok_or(ExportError::OutOfReach { from, target })
+    }
+
+    /// Bound GOT words are relative pointer fixups in read-only data.
+    pub(crate) fn fix_bound_words(&self, bound: &[Target], home: impl Fn(Target) -> Option<u64>, fixups: &mut AVec<'_, Fixup>) -> Result<(), ExportError> {
+        for (i, &target) in bound.iter().enumerate() {
+            let to = home(target).ok_or(ExportError::OutOfReach { from: target.symbol, target })?;
+            fixups.push(Fixup { at: self.bound_got_at + 8 * i.widen_to::<u64>(), to: FixTo::Rebase { target: to } });
+        }
+        Ok(())
+    }
     /// Returns the 0-based index of thread-local `symbol`, or `None` if no `Space::Tls` datum
     /// places it.
     pub(crate) fn tls_index_of(&self, symbol: Symbol) -> Option<u32> {
@@ -358,6 +381,7 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     data: &[Data<'_>],
     by_target: &[u32],
     imports_len: usize,
+    bound_got_words: usize,
     tls_plan: Option<TlsPlan>,
     text_end: u64,
     plan: Plan,
@@ -398,9 +422,11 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
     // Keep `__const` (everything after `__got` and optional `__mod_init_func`) 16-byte aligned
     // when non-empty so Mach-O's `__const` section header (`align = 4`) matches its start address.
     let post_tables = konst.len();
-    if !tls_targets.is_empty() {
+    if bound_got_words != 0 || !tls_targets.is_empty() {
         pad_to(&mut konst, const_at, 16);
     }
+    let bound_got_at = const_at + konst.len().widen_to::<u64>();
+    konst.resize(konst.len() + 8 * bound_got_words, 0);
     let tls_indices_at = const_at + u64::try_from(konst.len()).unwrap_or(u64::MAX);
     for k in 0..tls_count {
         konst.extend_from_slice(&k.to_le_bytes());
@@ -416,11 +442,12 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
             relro_at[i as usize] = relro_at[order[r] as usize];
             continue;
         }
-        let relro = members[i as usize].relro();
+        let member = &members[idx(i)];
+        let relro = member.relro();
         if relro.is_empty() {
             continue;
         }
-        pad_to(&mut konst, const_at, 16);
+        pad_to(&mut konst, const_at, (1u64 << member.relro_align()).max(16));
         relro_at[i as usize] = const_at + konst.len() as u64;
         konst.extend_from_slice(relro);
     }
@@ -507,6 +534,7 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
         const_at,
         konst,
         got_at,
+        bound_got_at,
         mod_init_at,
         tls_indices_at,
         tls_rows_at,
@@ -549,6 +577,7 @@ impl<'a> ConstAndData<'a> {
             const_at,
             mut konst,
             got_at,
+            bound_got_at: _,
             mod_init_at,
             tls_indices_at: _,
             tls_rows_at,
@@ -1560,7 +1589,7 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
         if folded {
             home[i as usize] = home[order[r] as usize];
         } else {
-            pad_to(&mut text, plan.text_at, 16);
+            pad_to(&mut text, plan.text_at, 1u64 << m.record.code_align());
             home[i as usize] = plan.text_at + text.len() as u64;
             text.extend_from_slice(m.record.code());
         }
@@ -1571,11 +1600,21 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
 
     // Every target a placed record names: C names gathered, thread-locals checked for runtime.
     let mut imports: AVec<'a, Import<'r>> = Vec::new_in(alloc);
+    let mut bound_got = Vec::new_in(alloc);
     for (pos, &i) in order.iter().enumerate() {
         if rep[pos] as usize != pos {
             continue;
         }
         let m = &members[i as usize];
+        for s in 0..m.record.sites() {
+            let site = m.record.site(s);
+            if matches!(site.kind, SiteKind::GotPage21 | SiteKind::GotLo12) {
+                let target = m.record.target(idx(site.target));
+                if matches!(target.space, Space::Func | Space::Static | Space::Vtable) {
+                    bound_got.push(target);
+                }
+            }
+        }
         for k in 0..m.record.targets() {
             let t = m.record.target(k);
             match t.space {
@@ -1614,7 +1653,9 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
     imports.dedup_by(|a, b| a.symbol == b.symbol);
     let import_of = |symbol: Symbol| imports.binary_search_by(|it| it.symbol.cmp(&symbol)).ok();
 
-    let regions = lay_out_const_and_data(members, &order, &rep, data, &by_target, imports.len(), tls_plan, text_end, plan, tail, alloc)?;
+    bound_got.sort_unstable();
+    bound_got.dedup();
+    let regions = lay_out_const_and_data(members, &order, &rep, data, &by_target, imports.len(), bound_got.len(), tls_plan, text_end, plan, tail, alloc)?;
     let home_of = |t: Target| target_home(members, &by_symbol, &home, data, &by_target, &regions.data_home, regions.tls_desc, t);
 
     // Complete every placed record's sites.
@@ -1624,13 +1665,21 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
         }
         let m = &members[i as usize];
         let symbol = m.symbol;
-        let at_home = home[i as usize];
+        let at = blaze_code::place::At { code: home[idx(i)], relro: regions.relro_at[idx(i)] };
         for s in 0..m.record.sites() {
             let site = m.record.site(s);
-            let pc = at_home + u64::from(site.at);
+            let pc = at.code + u64::from(site.at);
             let x = pc - plan.text_at;
+            if site.kind.len() == 4 {
+                let to = match at.own(site) {
+                    Some(local) => local,
+                    None => regions.import_word(m.record.target(idx(site.target)), symbol, &imports, &bound_got)?,
+                };
+                blaze_code::a64::single_site(&mut text, x, pc, to, site.kind, symbol)?;
+                continue;
+            }
             if site.kind == SiteKind::Relro {
-                let to = regions.relro_at[i as usize] + u64::from(site.addend);
+                let to = at.relro + u64::from(site.addend);
                 let first = expect(&text, x, ADRP, symbol, "adrp")?;
                 let second = expect(&text, x + 4, ADD64, symbol, "add")?;
                 write32(&mut text, x, adrp(first, pc, to, symbol)?);
@@ -1688,6 +1737,7 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
 
     // Every word the loader fixes: the GOT's, the relro parts', the data's.
     let mut fixups: AVec<'a, Fixup> = Vec::new_in(alloc);
+    regions.fix_bound_words(&bound_got, home_of, &mut fixups)?;
     for k in 0..imports.len() {
         fixups.push(Fixup { at: regions.got_at + 8 * k as u64, to: FixTo::Bind { import: k as u32 } });
     }

@@ -77,7 +77,7 @@ lock = "required"
 [workspace.metadata.blaze.native.llvm]
 pin = "pins/llvm.json"
 env = "LLVM_SYS_231_PREFIX"
-packages = ["llvm-sys", "blaze-stencil/llvm-stencils"]
+packages = ["llvm-sys", "blaze-llvm-abi/native", "blaze-stencil/llvm-stencils"]
 
 [workspace.package]
 version = "0.0.0"
@@ -435,6 +435,7 @@ blaze-build = { path = "crates/blaze-build" } # A type-checked body to LIR (crat
 blaze-body-build = { path = "crates/blaze-body-build" }
 blaze-consteval = { path = "crates/blaze-consteval" } # The constant evaluator (docs/v2/plan/design/consteval.md).
 blaze-emit = { path = "crates/blaze-emit" } # The baseline tier: LIR to AArch64 machine code.
+blaze-llvm-abi = { path = "crates/blaze-llvm-abi" } # The release emitter's pinned LLVM C ABI.
 blaze-tier = { path = "crates/blaze-tier" } # Piece 0 of the tiers (backend-next.md D99): the seam, the record rows, the template table's form, register descriptions, samples, keys.
 blaze-ladder = { path = "crates/blaze-ladder" } # The `blaze run` walking skeleton's straight line.
 blaze-world = { path = "crates/blaze-world" } # One world for run and check: the unit graph made into the names library's inputs.

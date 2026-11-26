@@ -29,14 +29,14 @@ use blaze_own::{AVec, Alloc, Vec};
 /// table ([`TrapRow`]), `bzcode05` its held values ([`Held`]) and subjects ([`Subject`]),
 /// `bzcode06` the alignment each part asks of its placement ([`CodeRecord::code_align`],
 /// [`CodeRecord::relro_align`]: data aligned past 16, as `vzipq_u8`'s 64-aligned table).
-/// `bzcode07` adds item-relative source positions ([`PositionRow`]). `02`
+/// `bzcode09` adds independent AArch64 relocation sites; `07` added item-relative source positions ([`PositionRow`]). `02`
 /// and `03` are blaze-tier's own forms (record/form.rs), so this form skips them and a record
 /// of one form is never read as another's. A record of an older form of this one is refused
 /// naming its form ([`DecodeError::Older`]) and rebuilt, never read (rule 26).
-pub const MAGIC: [u8; 8] = *b"bzcode07";
+pub const MAGIC: [u8; 8] = *b"bzcode09";
 
 /// The forms before [`MAGIC`] that were this record's: refused by name, never read.
-const OLDER: [[u8; 8]; 3] = [*b"bzcode04", *b"bzcode05", *b"bzcode06"];
+const OLDER: [[u8; 8]; 4] = [*b"bzcode04", *b"bzcode05", *b"bzcode06", *b"bzcode07"];
 
 /// The least alignment, as log2, of a record's code: 16 bytes, what every placement gives
 /// (image.rs `lay_out`, blaze-launch-rt run_mode.rs) and what a 16-aligned data row of the code
@@ -126,10 +126,31 @@ pub enum SiteKind {
     /// `adrp xN, r@PAGE` at `at`, `add xN, xN, r@PAGEOFF` at `at + 4`: the address of byte
     /// `addend` of this record's relro part. Its target is [`NO_TARGET`].
     Relro = 2,
+    /// One ADRP of an own-code or own-relro address, independent of its users.
+    Page21 = 3,
+    /// One ADD-immediate of an own address's low twelve bits.
+    AddLo12 = 4,
+    /// One unsigned-offset load/store, in units of the indicated byte width.
+    LdstLo12_1 = 5,
+    LdstLo12_2 = 6,
+    LdstLo12_4 = 7,
+    LdstLo12_8 = 8,
+    LdstLo12_16 = 9,
+    /// One B or BL to own code. Placement preserves the instruction's link bit.
+    Branch26 = 10,
+    /// One ADRP of a target's import word (not of the target's address).
+    GotPage21 = 11,
+    /// One LDR64 of a target's import word's low twelve bits.
+    GotLo12 = 12,
 }
 
 impl SiteKind {
-    const ALL: [SiteKind; 3] = [SiteKind::Load, SiteKind::Call, SiteKind::Relro];
+    const ALL: [SiteKind; 13] = [Self::Load, Self::Call, Self::Relro, Self::Page21, Self::AddLo12, Self::LdstLo12_1, Self::LdstLo12_2, Self::LdstLo12_4, Self::LdstLo12_8, Self::LdstLo12_16, Self::Branch26, Self::GotPage21, Self::GotLo12];
+
+    /// A single instruction addressing this record's code or relro, not an import.
+    pub fn own(self) -> bool {
+        matches!(self, Self::Page21 | Self::AddLo12 | Self::LdstLo12_1 | Self::LdstLo12_2 | Self::LdstLo12_4 | Self::LdstLo12_8 | Self::LdstLo12_16 | Self::Branch26)
+    }
 
     fn from_byte(byte: u8) -> Option<SiteKind> {
         SiteKind::ALL.get(usize::from(byte)).copied()
@@ -140,6 +161,7 @@ impl SiteKind {
         match self {
             SiteKind::Load | SiteKind::Relro => 8,
             SiteKind::Call => 12,
+            _ => 4,
         }
     }
 }
@@ -150,9 +172,11 @@ pub struct Site {
     /// The first instruction's offset from the code's first byte (4-aligned).
     pub at: u32,
     pub kind: SiteKind,
-    /// The target's index in the record's targets, or [`NO_TARGET`] for [`SiteKind::Relro`].
+    /// The target's index for imports, [`NO_TARGET`] for [`SiteKind::Relro`], or
+    /// [`OWN_CODE`]/[`OWN_RELRO`] for a single own-address instruction.
     pub target: u32,
-    /// For [`SiteKind::Relro`], the relro byte addressed; 0 otherwise.
+    /// The byte within an own-address site's code/relro part (also for `Relro`); zero for
+    /// import sites. Signed external pointer addends live in [`Word`].
     pub addend: u32,
 }
 
@@ -420,6 +444,8 @@ pub enum RecordError {
     SitesOverlap { at: u32 },
     /// A relro site at `at` addresses relro byte `addend`, past the relro part's `relro` bytes.
     RelroOutside { at: u32, addend: u32, relro: u32 },
+    /// Import slots name one exact pointer; their instructions cannot encode an addend.
+    ImportAddend { at: u32, addend: u32 },
     /// A word at `at` is not inside the relro part (`relro` bytes).
     WordOutside { at: u32, relro: u32 },
     /// A word at `at` is not 8-aligned.
@@ -460,6 +486,7 @@ impl fmt::Display for RecordError {
             RecordError::SiteMisaligned { at } => write!(f, "a code record's site at {at} is not on an instruction (4-aligned)"),
             RecordError::SitesOverlap { at } => write!(f, "a code record's site at {at} overlaps the site before it"),
             RecordError::RelroOutside { at, addend, relro } => write!(f, "a code record's site at {at} addresses relro byte {addend}, past its {relro} relro bytes"),
+            RecordError::ImportAddend { at, addend } => write!(f, "a code record's import site at {at} has unsupported addend {addend}"),
             RecordError::WordOutside { at, relro } => write!(f, "a code record's relro word at {at} is past its {relro} relro bytes"),
             RecordError::WordMisaligned { at } => write!(f, "a code record's relro word at {at} is not 8-aligned"),
             RecordError::WordsOverlap { at } => write!(f, "a code record has two relro words at {at}"),
@@ -581,6 +608,9 @@ impl<'a> CodeRecord<'a> {
         let code_len = code.len() as u32;
         let relro_len = relro.len() as u32;
         for site in sites.iter_mut() {
+            if site.kind != SiteKind::Relro && !site.kind.own() && site.addend != 0 {
+                return Err(RecordError::ImportAddend { at: site.at, addend: site.addend });
+            }
             match site.kind {
                 SiteKind::Relro => {
                     if site.target != NO_TARGET {
@@ -590,7 +620,17 @@ impl<'a> CodeRecord<'a> {
                         return Err(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: relro_len });
                     }
                 }
-                SiteKind::Load | SiteKind::Call => match renumber.get(site.target as usize) {
+                kind if kind.own() => {
+                    let len = match site.target {
+                        OWN_CODE => code_len,
+                        OWN_RELRO if kind != SiteKind::Branch26 => relro_len,
+                        _ => return Err(RecordError::NoSuchTarget { at: site.at, target: site.target }),
+                    };
+                    if site.addend >= len {
+                        return Err(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: len });
+                    }
+                }
+                _ => match renumber.get(blaze_int::idx(site.target)) {
                     Some(&new) => site.target = new,
                     None => return Err(RecordError::NoSuchTarget { at: site.at, target: site.target }),
                 },
@@ -883,6 +923,8 @@ pub enum DecodeError {
     PositionByte { row: u32, what: &'static str, byte: u8 },
     /// The decoded position would violate the same slot contract as builder input.
     Position(RecordError),
+    /// A decoded relocation violates the same bounds and target contract as a sealed site.
+    Site(RecordError),
     /// The word after the header counts is reserved and must be zero.
     Reserved { value: u32 },
     /// The bytes are a record of an older form of this one (`form` its eight-byte head, e.g.
@@ -896,10 +938,10 @@ pub enum DecodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode07` head"),
+            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode09` head"),
             DecodeError::Older { form } => write!(
                 f,
-                "the bytes are a code record of the older form `{}`, which held no source-position table: rebuilt, never read (rule 26)",
+                "the bytes are a code record of the older form `{}`: rebuilt, never read (rule 26)",
                 core::str::from_utf8(&form).unwrap_or("bzcode0?")
             ),
             DecodeError::Align { part, align } => write!(
@@ -910,7 +952,7 @@ impl fmt::Display for DecodeError {
             DecodeError::Held { row } => write!(f, "a code record's trap row {row} has a malformed held value (an unknown tag or a register past x30)"),
             DecodeError::Subject { row } => write!(f, "a code record's subject row {row} is not the subject of one of its trap rows"),
             DecodeError::PositionByte { row, what, byte } => write!(f, "a code record's source-position row {row} has invalid {what} byte {byte}"),
-            DecodeError::Position(error) => fmt::Display::fmt(&error, f),
+            DecodeError::Position(error) | DecodeError::Site(error) => fmt::Display::fmt(&error, f),
             DecodeError::Reserved { value } => write!(f, "a code record's reserved word after the header counts is {value}, expected zero"),
             DecodeError::Length { need, have } => write!(f, "a code record's head counts {need} bytes; it has {have}"),
             DecodeError::Space { row, byte } => write!(f, "a code record's target {row} has the unknown space {byte}"),
@@ -1101,6 +1143,34 @@ impl<'b> CodeView<'b> {
             }
         }
         let view = CodeView { bytes, frame, code_align, relro_align, code, relro, targets, sites, words, pads, traps, subjects, positions, names, text };
+        let code_len = get32(bytes, 16);
+        let relro_len = get32(bytes, 20);
+        let mut end = 0u64;
+        for i in 0..view.sites() {
+            let site = view.site(i);
+            if site.kind == SiteKind::Relro && site.target != NO_TARGET {
+                return Err(DecodeError::Site(RecordError::NoSuchTarget { at: site.at, target: site.target }));
+            }
+            if site.kind != SiteKind::Relro && !site.kind.own() && site.addend != 0 {
+                return Err(DecodeError::Site(RecordError::ImportAddend { at: site.at, addend: site.addend }));
+            }
+            if site.at % 4 != 0 { return Err(DecodeError::Site(RecordError::SiteMisaligned { at: site.at })); }
+            if u64::from(site.at) < end { return Err(DecodeError::Site(RecordError::SitesOverlap { at: site.at })); }
+            end = u64::from(site.at) + u64::from(site.kind.len());
+            if end > u64::from(code_len) { return Err(DecodeError::Site(RecordError::SiteOutside { at: site.at, len: site.kind.len(), code: code_len })); }
+            let own = if site.kind == SiteKind::Relro { Some(relro_len) } else if site.kind.own() {
+                match site.target {
+                    OWN_CODE => Some(code_len),
+                    OWN_RELRO if site.kind != SiteKind::Branch26 => Some(relro_len),
+                    _ => return Err(DecodeError::Site(RecordError::NoSuchTarget { at: site.at, target: site.target })),
+                }
+            } else { None };
+            if let Some(len) = own {
+                if site.addend >= len { return Err(DecodeError::Site(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: len })); }
+            } else if blaze_int::idx(site.target) >= view.targets() {
+                return Err(DecodeError::Site(RecordError::NoSuchTarget { at: site.at, target: site.target }));
+            }
+        }
         check_position_references(
             positions,
             |row| (row[24], get32(row, 20)),

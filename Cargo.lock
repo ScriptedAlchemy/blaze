@@ -710,6 +710,7 @@ name = "blaze-code"
 version = "0.0.0"
 dependencies = [
  "blaze-ids",
+ "blaze-int",
  "blaze-own",
 ]
 
@@ -913,12 +914,16 @@ version = "0.0.0"
 dependencies = [
  "blaze-blake3",
  "blaze-code",
+ "blaze-ids",
  "blaze-inproc",
  "blaze-lir",
+ "blaze-llvm-abi",
  "blaze-own",
+ "blaze-pins",
  "blaze-sim",
  "blaze-std",
  "blaze-tier",
+ "object 0.40.0",
 ]
 
 [[package]]
@@ -957,6 +962,7 @@ dependencies = [
  "blaze-code",
  "blaze-hash",
  "blaze-ids",
+ "blaze-int",
  "blaze-mem",
  "blaze-native",
  "blaze-own",
@@ -1482,6 +1488,10 @@ dependencies = [
  "blaze-own",
  "blaze-sim",
 ]
+
+[[package]]
+name = "blaze-llvm-abi"
+version = "0.0.0"
 
 [[package]]
 name = "blaze-lower"

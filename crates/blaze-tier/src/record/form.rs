@@ -66,7 +66,7 @@
 //! | source-position slot (32) | `item: u128`, `site: u32`, `at: u32`, part `u8` (0 code, 1 relro), field `u8` (0 line, 1 column), 6 zero |
 //!
 //! Relocation kinds by byte: Page21 0, PageOff12 1, Branch26 2, GotPage21 3, GotPageOff12 4, Abs64
-//! 5, Pc32 6, GotPc32 7 (piece 0's discriminants).
+//! 5, Pc32 6, GotPc32 7, ImportPage21 8, ImportLo12 9.
 
 use core::fmt;
 
@@ -862,6 +862,8 @@ pub(super) fn kind_byte(kind: RelocKind) -> (u8, u8) {
         RelocKind::Abs64 => (5, 0),
         RelocKind::Pc32 => (6, 0),
         RelocKind::GotPc32 => (7, 0),
+        RelocKind::ImportPage21 => (8, 0),
+        RelocKind::ImportLo12 => (9, 0),
     }
 }
 
@@ -877,6 +879,8 @@ fn kind_of(kind: u8, scale: u8) -> Option<RelocKind> {
         5 => RelocKind::Abs64,
         6 => RelocKind::Pc32,
         7 => RelocKind::GotPc32,
+        8 => RelocKind::ImportPage21,
+        9 => RelocKind::ImportLo12,
         _ => return None,
     };
     (scale == 0).then_some(kind)
@@ -903,7 +907,7 @@ pub(super) fn field_len(kind: RelocKind) -> u32 {
 
 /// Whether the kind completes an import word (a GOT entry) rather than an address.
 pub(super) fn is_import(kind: RelocKind) -> bool {
-    matches!(kind, RelocKind::GotPage21 | RelocKind::GotPageOff12 | RelocKind::GotPc32)
+    matches!(kind, RelocKind::GotPage21 | RelocKind::GotPageOff12 | RelocKind::GotPc32 | RelocKind::ImportPage21 | RelocKind::ImportLo12)
 }
 
 /// An encoded record read in place ([`read`]): every tag and every rule checked once, so the
