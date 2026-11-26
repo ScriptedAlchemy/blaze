@@ -372,6 +372,25 @@ impl<'a> Lower<'a, '_> {
                 typed(o.value()),
                 o.imm()
             ),
+            Op::Bitmask => {
+                let vector = o.value();
+                let from = view.ty(vector);
+                if from.form() == Form::Scalable {
+                    return Err(self.error("a scalable bitmask has no fixed integer width"));
+                }
+                // LLVM packs lane 0 into the least significant bit on our little-endian
+                // targets. Verified LIR supplies i1 lanes and a sufficiently wide integer.
+                let lanes = from.lanes();
+                if lanes == ty.bits(view.head.ptr_bits) {
+                    format_into!(out, "  %v{i} = bitcast {} to {t}", typed(vector));
+                } else {
+                    format_into!(
+                        out,
+                        "  %bits{i} = bitcast {} to i{lanes}\n  %v{i} = zext i{lanes} %bits{i} to {t}",
+                        typed(vector)
+                    );
+                }
+            }
             Op::Assume => return Ok(()),
             Op::TargetIntrinsic => return self.system_intrinsic(i),
             Op::TlsAddr => return self.tls(i, o.reference()),

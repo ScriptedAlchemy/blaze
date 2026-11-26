@@ -395,6 +395,65 @@ fn release_record_stores_a_splat_to_every_lane() {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn release_record_packs_bitmask_lanes_low_to_high() {
+    use blaze_code::{image::ImageError, place::{At, Words, place}};
+    use blaze_inproc::exec::Executable;
+    use blaze_lir::{IntCond, Op, Scalar, builder::MemAttrs};
+
+    struct NoImports;
+    impl Words for NoImports {
+        fn word(&mut self, target: Target, _: bool) -> Result<u64, ImageError> {
+            Err(ImageError::Unbound { target })
+        }
+        fn value(&mut self, target: Target) -> Result<u64, ImageError> {
+            Err(ImageError::Unbound { target })
+        }
+    }
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut b = Builder::<_, Full>::new_in(64, alloc);
+    let pointer = Param::of(Ty::PTR);
+    let sig = b.sig(Conv::C, Variadic::No, &[pointer, pointer], &[]);
+    b.set_signature(sig);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    let input = b.param(Ty::PTR);
+    let output = b.param(Ty::PTR);
+    let bytes = Ty::vector(Scalar::I8, 4).unwrap();
+    let values = b.load(bytes, Flags::NONE, input, 0, MemAttrs::aligned(0));
+    let zero = b.iconst(Ty::I8, 0);
+    let zeros = b.convert(Op::Splat, Flags::NONE, bytes, zero);
+    let lanes = b.icmp(IntCond::Ne, values, zeros);
+    let widened = b.convert(Op::Bitmask, Flags::NONE, Ty::I128, lanes);
+    b.store(Flags::NONE, widened, output, 0, MemAttrs::aligned(0));
+    let bits = Ty::vector(Scalar::I1, 128).unwrap();
+    let lanes = b.load(bits, Flags::NONE, input, 4, MemAttrs::aligned(0));
+    let exact = b.convert(Op::Bitmask, Flags::NONE, Ty::I128, lanes);
+    b.store(Flags::NONE, exact, output, 16, MemAttrs::aligned(0));
+    b.ret(&[]);
+    let func = b.finish_verified().unwrap();
+    let symbol = Symbol([16; 32]);
+    let module = prepare(symbol, func.verified(), &ByPlace, alloc).unwrap();
+    let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, alloc).unwrap();
+    let view = CodeView::read(&emission.record).unwrap();
+    assert_eq!(view.targets(), 0);
+    let code = Executable::written(view.code().len(), view.relro().len(), |code, data| {
+        let at = At { code: code.as_ptr().addr().try_into().unwrap(), relro: data.as_ptr().addr().try_into().unwrap() };
+        place(&view, symbol, at, &mut NoImports, code, data).expect("the leaf and its own data place");
+    }).expect("the code maps");
+    // SAFETY: the placed leaf has the declared C ABI.
+    let pack: unsafe extern "C" fn(*const u8, *mut u8) = unsafe { code.as_fn() };
+    let mut input = [0xd5; 20];
+    input[..4].copy_from_slice(&[0xff, 0, 0xff, 0xff]);
+    let mut output = [0xee; 32];
+    // SAFETY: the source provides 20 readable bytes, and the destination provides 32 writable bytes.
+    unsafe { pack(input.as_ptr(), output.as_mut_ptr()) };
+    assert_eq!(output[..16], 0x0du128.to_le_bytes());
+    assert_eq!(output[16..], input[4..]);
+}
+
 fn object_fixture(ir: &str) -> super::LlvmModule<'static> {
     let func = control();
     let mut module = prepare(Symbol([3; 32]), func.verified(), &ByPlace, Alloc::global()).unwrap();
