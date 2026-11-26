@@ -351,6 +351,19 @@ impl TcpClient {
     fn fd(&self) -> Fd {
         self.fd.fd()
     }
+
+    fn finish_request(&self) -> Result<(), Errno> {
+        #[cfg(target_os = "linux")]
+        {
+            blaze_sys::linux::shutdown(self.fd(), blaze_sys::linux::Shutdown::Write)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: `shutdown` reads no memory, and 1 is `SHUT_WR`.
+            let rc = unsafe { blaze_sys::posix::net::c::shutdown(self.fd().raw(), 1) };
+            if rc < 0 { Err(blaze_sys::posix::signal::errno()) } else { Ok(()) }
+        }
+    }
 }
 
 trait ByteSource {
@@ -446,7 +459,7 @@ impl Answer {
             }
         }
 
-        let length = if method == "HEAD" || matches!(status, 204 | 304) {
+        let length = if method == "HEAD" || matches!(status, 100..=199 | 204 | 304) {
             0usize
         } else {
             let cl = headers
@@ -716,25 +729,29 @@ fn an_aborted_put_removes_its_staged_pack() {
     let served = Served::start("aborted-put", alloc.clone());
     let packs = format_in!(alloc.clone(), "{}/packs", served.dir());
     let mut client = TcpClient::connect(served.port).unwrap_or_else(|e| panic!("connect: {}", e.what()));
-    let request = b"PUT /v1/blob/packs/0101010101010101010101010101010101010101010101010101010101010101.pack HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\nx";
-    assert!(client.write_all(request).is_ok());
-    let wait_for_stage = |present: bool| {
-        for _ in 0..200 {
-            let entries = list_names(packs.as_str(), alloc.clone());
-            if match entries.as_slice() {
-                [] => !present,
-                [entry] if entry.name.as_str().ends_with(".tmp") => present,
-                _ => panic!("unexpected file in {}", packs.as_str()),
-            } {
-                return;
-            }
-            sleep_ms(10);
-        }
-        panic!("timed out waiting for staged pack presence {present} in {}", packs.as_str());
-    };
-    wait_for_stage(true);
-    drop(client);
-    wait_for_stage(false);
+    let request = b"PUT /v1/blob/packs/0101010101010101010101010101010101010101010101010101010101010101.pack HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\nExpect: 100-continue\r\n\r\n";
+    client.write_all(request).unwrap_or_else(|e| panic!("write pack headers: {}", e.what()));
+
+    // The server opens the staging file before acknowledging the headers.
+    let accepted = Answer::read(&mut client, "PUT", alloc.clone())
+        .unwrap_or_else(|e| panic!("read pack upload acknowledgement: {}", e.what()));
+    assert_eq!(accepted.status, 100);
+    let staged = list_names(packs.as_str(), alloc.clone());
+    assert!(
+        matches!(staged.as_slice(), [entry] if entry.name.as_str().ends_with(".tmp")),
+        "expected one staged pack in {}",
+        packs.as_str(),
+    );
+
+    client.write_all(&blaze_wire::DIST_PACK_MAGIC)
+        .unwrap_or_else(|e| panic!("write partial pack body: {}", e.what()));
+    client.finish_request().unwrap_or_else(|e| panic!("end partial pack body: {}", e.what()));
+    // EOF drops the staged file before the server writes the error response.
+    let refused = Answer::read(&mut client, "PUT", alloc.clone())
+        .unwrap_or_else(|e| panic!("read aborted pack response: {}", e.what()));
+    assert_eq!(refused.status, 400);
+    assert_eq!(refused.error().message.as_str(), "unexpected EOF inside pack upload body");
+    assert!(list_names(packs.as_str(), alloc).is_empty(), "staged pack left behind in {}", packs.as_str());
 }
 
 #[test]
