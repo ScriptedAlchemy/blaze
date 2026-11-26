@@ -434,8 +434,8 @@ path = "keep/relative"
 "#;
         let alloc = blaze_own::testing::heap().alloc();
         let path = Path::new("/checkout/app/Cargo.toml");
-        let made = anchor_paths(SOURCE, path, alloc).unwrap();
-        let doc = parse(made.as_str(), path, alloc).unwrap();
+        let made = anchor_paths(SOURCE, path, alloc).unwrap_or_else(|failure| panic!("{failure}"));
+        let doc = parse(made.as_str(), path, alloc).unwrap_or_else(|failure| panic!("{failure}"));
         let root = doc.root();
         let dependencies = root.get("dependencies").unwrap();
         let alias = dependencies.get("alias").unwrap();

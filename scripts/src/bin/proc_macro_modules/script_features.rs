@@ -162,7 +162,8 @@ native = [\"cc?/parallel\", \"dep:cc\", \"extra?/x\", \"dep:extra\"]\n";
         let manifest_path = Path::new("/checkout/app/Cargo.toml");
         let script = Path::new("/checkout/app/build.rs");
         let alloc = blaze_own::testing::heap().alloc();
-        let rendered = script_manifest(SOURCE, manifest_path, script, "app", "0.1.0", &[], alloc).unwrap();
+        let rendered = script_manifest(SOURCE, manifest_path, script, "app", "0.1.0", &[], alloc)
+            .unwrap_or_else(|failure| panic!("{failure}"));
         assert!(rendered.contains("[dependencies.hostdep]\npath = \"/checkout/app/../hostdep\"\nfeatures = [\"extra\"]"), "{rendered}");
         assert!(!rendered.contains("normal ="), "{rendered}");
     }
