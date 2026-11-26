@@ -1916,10 +1916,10 @@ static TEMPORARY: AtomicU64 = AtomicU64::new(1 << 63);
 impl Uring {
     /// A driver whose files are under `root`, or why this kernel has no ring for it.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Uring> {
-        Self::open(Arc::from(root.into()), Instant::now(), crate::boot::system())
+        Self::open_ring(&root.into(), Instant::now(), crate::boot::system())
     }
 
-    fn open(root: Arc<Path>, start: Instant, boot: Result<crate::Boot, crate::NoBoot>) -> io::Result<Uring> {
+    fn open_ring(root: &Path, start: Instant, boot: Result<crate::Boot, crate::NoBoot>) -> io::Result<Uring> {
         let ring = Ring::new(ENTRIES, COMPLETIONS)?;
         let offload = Offload::new()?;
         let table = Table::new(&ring.fd)?;
@@ -1928,6 +1928,7 @@ impl Uring {
             Slab::new(max, MemTag::Io).map_err(io::Error::other)
         }
         let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
+        let root: Arc<Path> = Arc::from(root);
         Ok(Uring {
             start,
             boot,
@@ -3084,7 +3085,7 @@ impl Driver for Uring {
     }
 
     fn confined_files(&self) -> Option<crate::fs::ConfinedFiles> {
-        Some(crate::fs::ConfinedFiles::new(Arc::clone(&self.root)))
+        Some(crate::fs::ConfinedFiles::new(&self.root))
     }
 }
 

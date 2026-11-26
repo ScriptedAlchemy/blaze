@@ -1,5 +1,6 @@
 //! The Linux program world's driver. A world that submits no effects never starts SQPOLL.
 
+use std::alloc::Global;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,9 +42,9 @@ impl Driver for DeferredUring {
             return;
         }
         if matches!(self.state, State::Idle) {
-            self.state = match Uring::open(Arc::clone(&self.root), self.start, self.boot.clone()) {
-                Ok(ring) => State::Active(Box::new(ring)), // alloc: once at the world's first queued effect.
-                Err(error) => State::Refused { why: IoError(error.to_string()), ready: Vec::new() }, // alloc: error path.
+            self.state = match Uring::open_ring(&self.root, self.start, self.boot.clone()) {
+                Ok(ring) => State::Active(Box::new_in(ring, Global)),
+                Err(error) => State::Refused { why: IoError(error.to_string()), ready: Vec::new_in(Global) },
             };
         }
         match &mut self.state {
@@ -89,6 +90,6 @@ impl Driver for DeferredUring {
     }
 
     fn confined_files(&self) -> Option<crate::fs::ConfinedFiles> {
-        Some(crate::fs::ConfinedFiles::new(Arc::clone(&self.root)))
+        Some(crate::fs::ConfinedFiles::new(&self.root))
     }
 }

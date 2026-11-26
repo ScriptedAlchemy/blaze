@@ -4,6 +4,7 @@
 
 use core::{alloc::Allocator, mem::MaybeUninit};
 use std::{
+    alloc::Global,
     fs::{self, File},
     io,
     path::Path,
@@ -36,10 +37,9 @@ pub enum ConfinedEntries {
 }
 
 impl ConfinedFiles {
-    pub(crate) fn new(root: Arc<Path>) -> Self {
-        // alloc: one cached root directory descriptor, shared by this world's handles.
-        let dir = Arc::new(RootDir::open(&root));
-        Self { root, dir }
+    pub(crate) fn new(root: &Path) -> Self {
+        let dir = Arc::new_in(RootDir::open(root), Global);
+        Self { root: Arc::from(root), dir }
     }
 
     /// Reads the regular file under `file` without following symlinks. A range limits the
@@ -51,7 +51,6 @@ impl ConfinedFiles {
         match done {
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::IsADirectory => LentRead::IsADirectory,
-            // alloc: an error's message.
             Err(error) => LentRead::Failed(IoError(error.to_string())),
         }
     }
@@ -63,7 +62,6 @@ impl ConfinedFiles {
             Err(error) if error.kind() == io::ErrorKind::NotFound => ConfinedEntries::NotFound,
             Err(error) if error.kind() == io::ErrorKind::NotADirectory => ConfinedEntries::NotADirectory,
             Err(error) if error.kind() == io::ErrorKind::OutOfMemory => ConfinedEntries::OutOfMemory,
-            // alloc: an error's message.
             Err(error) => ConfinedEntries::Failed(IoError(error.to_string())),
         }
     }
