@@ -805,6 +805,8 @@ fn release_record_names_synthesized_libcalls_and_requires_metadata_for_input_ext
 
     let copy = object_fixture("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)\n\
         define void @entry(ptr %dst, ptr %src, i64 %len) uwtable {\n\
+          %thread = call i64 asm sideeffect \"mrs $0, tpidrro_el0\", \"=r\"()\n\
+          call void asm sideeffect \"yield\", \"\"()\n\
           call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %src, i64 %len, i1 false)\n\
           ret void\n\
         }\n");
@@ -832,7 +834,28 @@ fn release_record_names_synthesized_libcalls_and_requires_metadata_for_input_ext
 
         let error = emit(&input).err().expect("input extern has no metadata");
         assert!(matches!(error, EmitError::Read(ReadError::UnknownSymbol { name }) if name.as_str() == "memcmp"), "{os:?}");
+
+        // The assembler makes a real branch relocation with no corresponding LLVM global.
+        let asm_symbol = if os == blaze_tier::Os::MacOs { "_memcmp" } else { "memcmp" };
+        let raw = blaze_own::format_in!(alloc, "define void @entry() uwtable {{\n\
+          call void asm sideeffect \"b {asm_symbol}\", \"\"()\n\
+          ret void\n\
+        }}\n");
+        let raw = object_fixture(&raw);
+        let error = emit_release(ReleaseTask { module: &raw, imports: &[], opt: 2, machine }, alloc)
+            .err()
+            .expect("assembly target has no metadata");
+        assert!(matches!(error, EmitError::Read(ReadError::UnknownSymbol { name }) if name.as_str() == "memcmp"), "{os:?}");
     }
+
+    let remainder = object_fixture("define fp128 @entry(fp128 %left, fp128 %right) uwtable {\n\
+          %result = frem fp128 %left, %right\n\
+          ret fp128 %result\n\
+        }\n");
+    let machine = blaze_tier::Machine { os: blaze_tier::Os::Linux, ..machine() };
+    let error = emit_release(ReleaseTask { module: &remainder, imports: &[], opt: 2, machine }, alloc)
+        .err().expect("libm is outside the synthesized system ABI");
+    assert!(matches!(error, EmitError::Read(ReadError::UnknownSymbol { name }) if matches!(name.as_str(), "fmodl" | "fmodf128")));
 }
 
 #[cfg(target_arch = "aarch64")]

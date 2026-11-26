@@ -315,7 +315,10 @@ fn destination<'o>(file: &object::File<'o>, relocation: &object::Relocation, at:
                 Ok(Destination::Section { index, offset })
             } else {
                 target_of(references, name, || {
-                    symbol.is_undefined() && branch_relocation(relocation.flags()) && is_libcall(name)
+                    symbol.is_undefined()
+                        && matches!(symbol.kind(), object::SymbolKind::Text | object::SymbolKind::Unknown)
+                        && branch_relocation(relocation.flags())
+                        && is_libcall(name)
                 }).map(Destination::Named)
             }
         }
