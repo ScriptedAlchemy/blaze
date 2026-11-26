@@ -22,6 +22,7 @@
 //! | [`CloneIn`], [`Share`], [`DefaultIn`], [`FromIn`], [`IntoIn`], [`FromStrIn`] | std's `Clone`, `Default`, `From`, `Into` and `FromStr` with the allocator named; `Share` the copy that is another handle ([`make`]) |
 //! | [`Cow`] | borrowed or owned, copied into the allocator the caller names when it must own |
 //! | [`Soa`], [`soa!`] | a struct-of-arrays vector: one packed column per field in one allocation; the macro names its rows and columns |
+//! | [`Csr`] | a zero-unsafe Compressed Sparse Row container: flat `offsets: Vec<u32, A>` (`[0, ..]`) + `values: Vec<T, A>` |
 //! | [`String`], [`format_in!`], [`format_into!`] | UTF-8 text over [`Vec<u8, A>`](Vec); `blaze_mem` re-exports it, keeping only `OsString` and `PathBuf` |
 //! | [`FixedVec`] | up to `N` values inline, no allocator; a push past `N` is refused with [`Full`], the value handed back |
 //! | [`Packed`], [`Pack`] | values of different sizes end to end in one byte buffer, each its own size; iterated, not indexed, with an optional checkpoint every `K` values for seeking |
@@ -113,6 +114,7 @@ pub mod boxed;
 pub mod btree;
 pub mod byte_cursor;
 pub mod cow;
+pub mod csr;
 pub mod deque;
 mod error;
 pub mod fixed;
@@ -120,6 +122,7 @@ pub mod fixed;
 pub mod found;
 pub mod heap4;
 pub mod lists;
+pub mod lz77;
 pub mod make;
 pub mod packed;
 pub mod paths;
@@ -129,6 +132,7 @@ pub mod planted;
 /// conversions — `#![no_std]`, zero dependencies, zero `transmute`.
 #[macro_use]
 pub mod pod;
+pub mod pow2_table;
 pub mod raw;
 pub mod rc;
 pub mod segs;
@@ -143,6 +147,7 @@ pub mod texts;
 pub mod thin_arc;
 pub mod thin_vec;
 pub mod vec;
+mod xxhash;
 
 // A test-only switch that plants a known bug, for the oracles' controls (rule 53).
 #[cfg(test)]
@@ -159,11 +164,20 @@ pub use lists::Lists;
 pub use paths::{DirId, PathId, PathsView, Paths, SealedPaths};
 pub use segs::{Appender, Segs, SharedSegs};
 pub use texts::{SortedTexts, Texts};
+pub use blaze_memchr::blaze_int::{self, Idx, Int};
 pub use arc::Arc;
 pub use boxed::{Box, CallOnce};
 pub use btree::{BTreeMap, BTreeSet};
-pub use byte_cursor::{ByteCursor, RevBitCursor, SeqOp, SliceWriter, common_prefix_len};
+pub use byte_cursor::{
+    ByteCursor, RevBitCursor, SeqExecCtx, SeqLeafResult, SeqOp, SliceWriter, common_prefix_len,
+};
+pub use lz77::{
+    FseSeqEncTables, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, count_seq_symbols_fast,
+    fse_pack_sequences_fast, huff_encode_stream_checked_raw, huff_encode_stream_raw,
+    lz77_preload_default, lz77_preload_fast, lz77_scan_default, lz77_scan_fast,
+};
 pub use cow::{Cow, ToOwnedIn};
+pub use csr::Csr;
 pub use deque::VecDeque;
 pub use error::AllocFailure;
 pub use fixed::{FixedString, FixedVec, Full, Inline, Overflow};
@@ -171,6 +185,7 @@ pub use heap4::{Heap4, Heap4Plant};
 pub use make::{CloneIn, DefaultIn, FromIn, FromStrIn, IntoIn, LocalShare, ParseIn, Share};
 pub use packed::{Pack, Packed};
 pub use pod::{AnyBitPattern, CastError, CheckedBitPattern, NoUninit, Pod, TransparentWrapper, Zeroable};
+pub use pow2_table::{FixedTable, Pow2Array, Pow2Table, SlackSlice, low_u32, top_bits};
 pub use raw::RawBuf;
 pub use rc::Rc;
 pub use soa::Soa;
@@ -179,6 +194,7 @@ pub use text::{FromUtf8Error, String};
 pub use thin_arc::{ThinArc, ThinArcSlice, ThinStr};
 pub use thin_vec::ThinVec;
 pub use vec::{CollectIn, Refused, Vec};
+pub use xxhash::{xxhash64_slice, xxhash64_stripes};
 
 #[cfg(test)]
 mod tests;

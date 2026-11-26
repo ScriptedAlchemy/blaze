@@ -96,13 +96,11 @@ mod journal_checkpoint;
 // The checkout's journal helper: a command's ask (journal_ask.rs) and the helper (journal_helper.rs).
 mod journal_ask;
 mod journal_helper;
-// Wave 7 resident per-checkout daemon: synchronous kernel vnode watcher, server, and pre-runtime client.
-mod daemon_client;
-mod daemon_server;
-mod daemon_watch;
+// Resident daemon removed; cold-process commands use the lightweight `journal-helper`.
 mod graph;
 mod graph_payload;
 mod test_args;
+mod test_bins;
 mod test_cache;
 mod test_drive;
 mod test_loop;
@@ -600,15 +598,9 @@ fn choice(word: &str) -> Result<Choice, CliError> {
 static HEAP: blaze_mem::counted::Counted = blaze_mem::counted::Counted;
 
 fn main() -> bstd::entry::Exit {
-    // Wave 7: try the resident per-checkout daemon BEFORE initializing `bstd::rt` so warm
-    // `blaze check` commands skip the runtime, worker pool, and driver startup/teardown tax.
-    let spawn_daemon = match daemon_client::try_run() {
-        daemon_client::ClientOutcome::Exit(status) => return bstd::entry::Exit(status),
-        daemon_client::ClientOutcome::Fallthrough { spawn_daemon } => spawn_daemon,
-    };
     // The process's heap is a grant bstd's entry hands `main` (D102, D120), never reached for
     // here or below: every allocator under the command is its handle, a frame, or an arena.
-    bstd::entry::run_with_heap_at(bstd::entry::Os::process(), telemetry_level, |cx, io, heap| run(cx, io, heap, spawn_daemon))
+    bstd::entry::run_with_heap_at(bstd::entry::Os::process(), telemetry_level, |cx, io, heap| run(cx, io, heap))
 }
 
 /// The run's telemetry level, chosen before the runtime starts (D178): `--stats` among the
@@ -623,7 +615,7 @@ fn telemetry_level(args: &bstd::args::Args) -> bstd::telemetry::Level {
 }
 
 /// The status: 0 for a check that passed; `blaze run`'s, the status its program's `main` ended with.
-fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap, spawn_daemon: bool) -> Result<Status, Error> {
+fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap) -> Result<Status, Error> {
     let heap = heap.root();
     let clock = io.need_clock()?;
     let mut phases = Phases::new(clock.clone());
@@ -647,7 +639,7 @@ fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap, spawn_daemon: bool) -> Result<Sta
     // (A `Ran` holding `RunError::Trapped` was matched here: no constructor ever made one, as
     // `Ran` is made only from `Program`, whose every constructor is a manifest refusal; a trap
     // in the program's own process is the run loop's words, run_loop.rs `LoopError`.)
-    match command(cx, &args, &fs, env.as_ref(), net.as_ref(), &host, clock, &mut rng, &out, &err, &mut phases, heap, spawn_daemon) {
+    match command(cx, &args, &fs, env.as_ref(), net.as_ref(), &host, clock, &mut rng, &out, &err, &mut phases, heap) {
         // D86 and the ladder's L6: any failure of `run` or `test` before the program starts
         // (manifest, check, build, start, or a stub that stopped it) exits `program::NOT_RUN`,
         // never 1, which a program's `main` returning `Err` also exits with (std's
@@ -673,6 +665,87 @@ fn words<'o>(command: Command, out: &'o Out, err: &'o Out) -> &'o Out {
 /// What `blaze build` is told: the two commands that do what it would.
 const NO_BUILD: &str = "`blaze run` compiles what the program reaches and runs it; `blaze export` writes the program as a standalone executable";
 
+/// Help text for `blaze --help`, `blaze -h`, `blaze help [cmd]`, and bare `blaze`.
+const HELP_TEXT: &str = "\
+blaze — incremental Rust compiler, runner, tester, and exporter
+
+USAGE
+  blaze <command> [options] [dir]
+
+COMMANDS
+  check           Check and lint a workspace incrementally
+  run             Compile what is reached and run a binary
+  test            Run workspace tests incrementally
+  export          Export a standalone PGO-optimized native binary
+  ci              Run CI checks with structured reporting
+  inspect         Inspect lowered MIR/types for a file or function
+  why             Explain why a file or item was rechecked
+  explain         Explain a diagnostic or lint code
+  clean           Remove checkout state (and --store for home store)
+  gc              Compact store and evict stale records
+  peer            Serve crate records to LAN peers
+  toolchain       Print the pinned Rust toolchain
+  warm-toolchain  Pre-warm toolchain records into the store
+  version         Print blaze and toolchain versions
+  help            Show this help message
+
+COMMON OPTIONS
+  -p, --package <name>   Select package in workspace
+      --bin <name>       Select binary target
+  -o, --output <path>    Output path for `blaze export`
+      --view <mode>      Output view: person, agent, or json
+      --color <when>     Color output: auto, always, or never
+      --fix [sel...]     Apply automatic fixes (`blaze check`)
+      --workers <N>      Limit concurrent worker threads
+      --stats            Print telemetry summary at exit
+  -h, --help             Show help for blaze or a command
+  -V, --version          Print version information
+
+EXAMPLES
+  blaze check
+  blaze run -- --arg
+  blaze test
+  blaze export -p app -o ./app";
+
+fn command_help(sub: &str) -> Option<&'static str> {
+    match sub {
+        "check" | "engine-check" => Some(
+            "blaze check [dir] [options]\n\nCheck and lint a workspace incrementally.\n\nOPTIONS\n  --color auto|always|never   Colorize diagnostics\n  --view person|agent|json    Diagnostic output format\n  --fix [selector...]         Apply fixes (id, code, path, or all)\n  --each                      Report each body individually\n  --workers <N>               Maximum concurrent workers\n  --status-every <secs>       Emit periodic progress lines\n  --stats                     Print telemetry report at exit",
+        ),
+        "run" => Some(
+            "blaze run [dir] [options] [-- <program args>...]\n\nCompile only what is reached and execute a binary.\n\nOPTIONS\n  -p, --package <name>        Package to run\n      --bin <name>            Binary target to run\n      --grant <k=v>           Grant an environment/host capability\n      --open                  Open Explore viewer in browser\n      --workers <N>           Maximum concurrent workers\n      --stats                 Print telemetry report at exit",
+        ),
+        "test" => Some(
+            "blaze test [dir] [options] [-- <test args>...]\n\nRun workspace tests incrementally.\n\nOPTIONS\n  -p, --package <name>        Package to test\n      --workers <N>           Maximum concurrent workers\n      --stats                 Print telemetry report at exit",
+        ),
+        "export" => Some(
+            "blaze export [dir] [options]\n\nExport a standalone native executable (PGO-optimized by default).\n\nOPTIONS\n  -p, --package <name>        Package to export\n      --bin <name>            Binary target to export\n  -o, --output <path>         Destination executable path\n      --workers <N>           Maximum concurrent workers\n      --stats                 Print telemetry report at exit",
+        ),
+        "ci" => Some(
+            "blaze ci [dir] [options]\n\nRun workspace CI checks.\n\nOPTIONS\n  --format <fmt>              Output format\n  --todo <mode>               TODO handling policy\n  --workers <N>               Maximum concurrent workers",
+        ),
+        "inspect" => Some(
+            "blaze inspect <file.rs[::fn]> [options]\n\nInspect lowered types and expressions for a file or function.\n\nOPTIONS\n  --json                      Emit JSON output\n  --all-exprs                 Include all sub-expressions\n  --edition <ed>              Override Rust edition (2015..2024, blaze-2026.11)",
+        ),
+        "clean" => Some(
+            "blaze clean [dir] [--store]\n\nRemove checkout build state (and home store with --store).",
+        ),
+        "gc" => Some(
+            "blaze gc [dir] [--background]\n\nCompact store segments and evict stale entries.",
+        ),
+        "explain" => Some(
+            "blaze explain <code>\n\nExplain a blaze diagnostic or lint code.",
+        ),
+        _ => None,
+    }
+}
+
+fn print_help(cx: &Cx, sub: Option<&str>, out: &Out) -> Result<Status, CliError> {
+    let text = sub.and_then(command_help).unwrap_or(HELP_TEXT);
+    out.line(cx, format_args!("{text}"))?;
+    Ok(Status::OK)
+}
+
 #[expect(clippy::too_many_arguments, reason = "top-level command dispatcher: each argument one specific capability extracted at main")]
 fn command(
     cx: &Cx,
@@ -687,13 +760,20 @@ fn command(
     err: &Out,
     phases: &mut Phases,
     heap: &'static blaze_own::Heap,
-    spawn_daemon: bool,
 ) -> Result<Status, CliError> {
+    if let Some(sub) = args.get(1)
+        && !matches!(sub, "help" | "-h" | "--help" | "warm-toolchain")
+        && args.each().skip(2).take_while(|a| *a != "--").any(|a| matches!(a, "-h" | "--help"))
+    {
+        return print_help(cx, Some(sub), out);
+    }
     match args.get(1) {
+        Some("--help" | "-h") | None => print_help(cx, None, out),
+        Some("help") => print_help(cx, args.get(2), out),
         // `check` IS the execution engine (check_command.rs over engine_check.rs): one checker
         // (rule 30). `engine-check` is its old name, an alias until the scripts that type it
         // are moved.
-        Some("check" | "engine-check") => check_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap, spawn_daemon),
+        Some("check" | "engine-check") => check_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         Some("ci") => ci_command::run(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         Some("inspect") => inspect_command::run(cx, args, fs, out, err, heap),
         Some("why") => engine_check::why(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
@@ -710,14 +790,12 @@ fn command(
         Some("export") => engine_export::command(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         Some("explain") => explain(cx, args.get(2), out),
         // The checkout's state, and with `--store` the home's store, removed (clean.rs).
-        Some("clean") => clean::run(cx, fs, env, args, out),
+        Some("clean") => clean::run(cx, fs, env, args, host, rng, out, heap),
         // Bounded store compaction, root-LRU budget eviction, and stale old-format cleanup (gc.rs).
         Some("gc") => gc::run(cx, args, fs, env, host, &clock, rng, out, err, heap),
         // Hidden: the checkout's journal helper, run by hand until a command starts one
         // (journal_ask.rs `HelperStart`): one stream held open, asks answered on its socket.
         Some("journal-helper") => journal_helper::run(cx, fs, &clock, host, rng, env, args, out),
-        // Hidden: resident per-checkout daemon (Wave 7, daemon_server.rs).
-        Some("daemon") => daemon_server::run(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap),
         Some("--version" | "-V" | "version") => {
             let ver = option_env!("BLAZE_RELEASE").unwrap_or(env!("CARGO_PKG_VERSION"));
             let tc = include_str!("../../../pins/toolchain").trim();
@@ -742,7 +820,7 @@ fn command(
         Some("warm-toolchain") => engine_check::warm_toolchain(cx, args, fs, env, net, host, &clock, rng, out, err, phases, heap),
         Some("store") => store::publish_command::run(cx, args, fs, env, &clock, host, rng, out, err, heap),
         Some("peer") => peer::run(cx, args, fs, env, net, &clock, rng, out),
-        Some(_) | None => Err(CliError::Usage("the command is check, ci, inspect, run, test, export, peer, clean, gc, warm-toolchain or explain")),
+        Some(_) => Err(CliError::Usage("the command is check, ci, inspect, run, test, export, peer, clean, gc, warm-toolchain or explain")),
     }
 }
 

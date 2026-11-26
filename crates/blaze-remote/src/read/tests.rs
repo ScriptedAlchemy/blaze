@@ -144,7 +144,7 @@ fn run(tape: &Tape, reader: &mut Reader<'_>, world: &World, keys: &[ContentId], 
                 Object::Manifest(_) => 2,
                 Object::Summary(_) => 3,
                 Object::Index(_) => 4,
-                Object::Segment(_) => 5,
+                Object::Segment(_) | Object::SegmentWire(_) => 5,
             };
             if let Mood::Hostile(target) = mood
                 && (target == 0 || target == kind)
@@ -488,7 +488,7 @@ fn a_summary_whose_lengths_disagree_is_refused() {
     form::encode_summary(ContentId([5; 32]), &keys, 8, &digests, &mut bytes);
     let mut bad = bytes.as_slice().to_vec();
     bad[52..56].copy_from_slice(&u32::MAX.to_le_bytes());
-    let row = Row { segment: ContentId([5; 32]), len: 0, index_at: 0, count: 20, pages: 3, page_entries: 8, summary: ContentId::of(form::SUMMARY_DOMAIN, &bad), summary_len: bad.len() as u64 };
+    let row = Row { segment: ContentId([5; 32]), len: 0, index_at: 0, count: 20, pages: 3, page_entries: 8, summary: ContentId::of(form::SUMMARY_DOMAIN, &bad), summary_len: bad.len() as u64, wire_len: 0 };
     assert!(matches!(Summary::decode(&bad, &row, alloc), Err(Refused::Malformed { .. })));
     let row = Row { summary: ContentId::of(form::SUMMARY_DOMAIN, &bytes), summary_len: bytes.len() as u64, ..row };
     let summary = Summary::decode(&bytes, &row, alloc).expect("the honest summary");
@@ -507,8 +507,46 @@ fn an_entry_placing_its_payload_outside_the_payloads_is_refused() {
     let mut page = std::vec::Vec::new();
     entry.encode_into(&mut page);
     page.extend_from_slice(&[0; 32]);
-    let row = Row { segment: ContentId([6; 32]), len: 0, index_at: 4096, count: 1, pages: 1, page_entries: 1, summary: ContentId([0; 32]), summary_len: 0 };
+    let row = Row { segment: ContentId([6; 32]), len: 0, index_at: 4096, count: 1, pages: 1, page_entries: 1, summary: ContentId([0; 32]), summary_len: 0, wire_len: 0 };
     assert!(matches!(form::lookup(&page, &row, 0, &k), Err(Refused::Malformed { what: "an entry places its payload outside the segment's payloads", .. })));
+}
+
+/// Format 1 objects (heads, manifests, summaries) are refused with `Refused::Format` (rule 26).
+#[test]
+fn previous_format_is_refused() {
+    let signer = Signer::from_seed(&[3; 32]);
+    let keys = [signer.public()];
+    let check = Ed25519Keys { namespace: NS, keys: &keys };
+    let head = Head { namespace: NS, generation: 1, manifest: ContentId([9; 32]), manifest_len: form::MANIFEST_HEADER as u64, signer: signer.public() };
+    let mut head_v1 = head.encode(|domain, body| signer.sign(domain, body));
+    head_v1[4..8].copy_from_slice(&1u32.to_le_bytes());
+    assert!(matches!(Head::decode(&head_v1, NS, &check), Err(Refused::Format { found: 1, wanted: form::FORMAT, .. })));
+
+    let arena = blaze_own::Inline::<65536>::new();
+    let erased = Erased::new(&arena);
+    let alloc = erased.handle();
+    let mut manifest_v1 = OwnVec::new_in(alloc);
+    form::encode_manifest(NS, 1, &[], &mut manifest_v1);
+    manifest_v1.as_mut_slice()[4..8].copy_from_slice(&1u32.to_le_bytes());
+    let mhead = Head { namespace: NS, generation: 1, manifest: ContentId::of(form::MANIFEST_DOMAIN, manifest_v1.as_slice()), manifest_len: manifest_v1.len() as u64, signer: signer.public() };
+    let mut rows = OwnVec::new_in(alloc);
+    assert!(matches!(form::decode_manifest(manifest_v1.as_slice(), &mhead, &mut rows), Err(Refused::Format { found: 1, wanted: form::FORMAT, .. })));
+
+    let mut summary_v1 = OwnVec::new_in(alloc);
+    form::encode_summary(ContentId([5; 32]), &[], 8, &[], &mut summary_v1);
+    summary_v1.as_mut_slice()[4..8].copy_from_slice(&1u32.to_le_bytes());
+    let row = Row {
+        segment: ContentId([5; 32]),
+        len: 176,
+        index_at: 128,
+        count: 0,
+        pages: 0,
+        page_entries: 8,
+        summary: ContentId::of(form::SUMMARY_DOMAIN, summary_v1.as_slice()),
+        summary_len: summary_v1.len() as u64,
+        wire_len: crate::wire_segment::WIRE_MIN_LEN,
+    };
+    assert!(matches!(Summary::decode(summary_v1.as_slice(), &row, alloc), Err(Refused::Format { found: 1, wanted: form::FORMAT, .. })));
 }
 
 /// No name built for any digest holds anything but `[a-z0-9-]`: nothing fetched can steer a
@@ -517,7 +555,7 @@ fn an_entry_placing_its_payload_outside_the_payloads_is_refused() {
 fn every_object_name_stays_inside_its_namespace() {
     blaze_sim::check(Config::cases(200), |tape| {
         let id = key(tape);
-        for object in [Object::Head, Object::Manifest(id), Object::Segment(id), Object::Summary(id), Object::Index(id)] {
+        for object in [Object::Head, Object::Manifest(id), Object::Segment(id), Object::SegmentWire(id), Object::Summary(id), Object::Index(id)] {
             let name = object.name();
             assert!(name.as_str().bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'), "{}", name.as_str());
             assert!(!name.as_str().is_empty() && name.as_str().len() <= 73);
@@ -595,5 +633,66 @@ fn a_batch_of_adjacent_payloads_is_few_ranges() {
     assert_eq!(r.payload_asks, 1, "300 small adjacent payloads are one range");
     for (i, k) in all.iter().enumerate() {
         assert_eq!(reader.found(i), Some(truth[k].as_slice()));
+    }
+}
+
+struct ParallelBatchOrigin<'o> {
+    inner: MapOrigin<'o>,
+    batch_calls: usize,
+    max_batch: usize,
+}
+
+impl super::Origin for ParallelBatchOrigin<'_> {
+    fn read(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
+        self.inner.read(object, at, into, deadline_ns)
+    }
+
+    fn read_batch(
+        &mut self,
+        reads: &mut [super::BatchRead<'_>],
+        clock: &mut dyn FnMut() -> u64,
+        outcomes: &mut [super::BatchOutcome],
+    ) {
+        self.batch_calls += 1;
+        self.max_batch = self.max_batch.max(reads.len());
+        for (req, out) in reads.iter_mut().zip(outcomes.iter_mut()) {
+            let result = self.read(&req.object, req.at, req.into, req.deadline_ns);
+            *out = super::BatchOutcome { result, at_ns: clock() };
+        }
+    }
+}
+
+/// Multi-ask waves (index pages, payload ranges) are dispatched together via `Origin::read_batch`
+/// and produce byte-identical answers to serial `Origin::read`.
+#[test]
+fn fetch_dispatches_multi_ask_waves_through_read_batch() {
+    let (signer, objects, truth) = trusted_world(9, 200);
+    let alloc = blaze_own::testing::heap().alloc();
+    let keys = [signer.public()];
+    let check = Ed25519Keys { namespace: NS, keys: &keys };
+    let mut all = blaze_own::Vec::with_capacity_in(truth.len(), alloc);
+    for &k in truth.keys() {
+        all.push(k);
+    }
+
+    // Use tight gap/range limits so payload fetches split into multiple ranged asks in one wave.
+    let limits = Limits { gap_most: 0, range_most: 256, ..Limits::DEFAULT };
+
+    let mut serial_reader = Reader::new_in(NS, &check, limits, alloc);
+    let mut serial_origin = MapOrigin { objects: &objects };
+    let mut c1 = 0u64;
+    fetch(&mut serial_reader, &mut serial_origin, &mut || { c1 += 1; c1 }, &all, alloc).expect("serial fetch");
+
+    let mut par_reader = Reader::new_in(NS, &check, limits, alloc);
+    let mut par_origin = ParallelBatchOrigin { inner: MapOrigin { objects: &objects }, batch_calls: 0, max_batch: 0 };
+    let mut c2 = 0u64;
+    fetch(&mut par_reader, &mut par_origin, &mut || { c2 += 1; c2 }, &all, alloc).expect("parallel fetch");
+
+    assert!(par_origin.batch_calls >= 1, "expected multi-ask wave to dispatch through read_batch");
+    assert!(par_origin.max_batch >= 2, "expected batch size >= 2, got {}", par_origin.max_batch);
+    assert_eq!(par_reader.report().found, all.len() as u32);
+    for (i, k) in all.iter().enumerate() {
+        assert_eq!(par_reader.found(i), serial_reader.found(i), "key {i} differs between serial and batch");
+        assert_eq!(par_reader.found(i), Some(truth[k].as_slice()));
     }
 }

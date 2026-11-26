@@ -91,7 +91,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// notes the clause: there the instance still holds inference variables (`need(&n)`'s `T`
     /// is a variable until the argument is typed), here it is resolved, and the notes are a
     /// tuple each while the export and the selection are the cost.
-    pub(super) fn selected_rows(&mut self, ex: &mut Export<'a>, closures: &Closures<'a>) -> Result<Vec<Projected, Alloc<'a>>, CheckError> {
+    pub(super) fn selected_rows(&mut self, ex: &mut Export<'a>, closures: &Closures<'a>, expr_ty: &[PTy]) -> Result<Vec<Projected, Alloc<'a>>, CheckError> {
         let alloc = self.alloc;
         if self.projected.len() > MOST_PROJECTED {
             return Err(CheckError::Limit(Limit::Solver));
@@ -108,6 +108,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             kinds: closures.column::<1>(),
             sigs: closures.column::<2>(),
             upvars: closures.column::<3>(),
+            expr_ty,
         };
         let inert = self.inert()?;
         let env = self.call_env(inert)?;
@@ -138,8 +139,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.diags.truncate(n);
                 continue;
             }
-            if name.is_none() && !may_relate(ex.out.view(), &ps, alloc)? {
+            if name.is_none() && !may_relate(ex.out.view(), &ps, alloc)? && !self.trait_has_lifetimes(trait_)? {
+                if self.reads.stopped() {
+                    return Ok(out);
+                }
                 continue;
+            }
+            if self.reads.stopped() {
+                return Ok(out);
             }
             let list = ex.out.intern_list(&ps)?;
             if seen.insert((e, trait_, name, list), ()).is_some() && name.is_none() {
@@ -182,6 +189,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let alloc = self.alloc;
         // `(row, depth)`: a row selected `Impl` whose impl's clauses and nested assoc aliases are still to file.
         let mut nest: Vec<(usize, u32), Alloc<'a>> = Vec::new_in(alloc);
+        let initial_len = out.len();
         for (i, r) in out.iter().enumerate() {
             if matches!(r.selected, Selected::Impl { .. }) {
                 nest.push((i, 0));
@@ -189,6 +197,48 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let mut iargs: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
         let mut ps: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+        // Normalize any concrete or caller-bound aliases inside initial call rows (e.g.
+        // `<N as FullNodeTypes>::Types: NodeTypes` under `where N: FullNodeTypes<Types = TempoNode>`,
+        // or `<Self::ReturnTuple<'_> as SolType>::abi_decode_sequence`) and file the normalized
+        // selection row alongside the original.
+        for i in 0..initial_len {
+            let Some(&Projected { expr: e, trait_, name: cname, args: rargs, .. }) = out.get(i) else { continue };
+            if !holds_alias(ex.out.view(), rargs, alloc)? {
+                continue;
+            }
+            iargs.clear();
+            iargs.extend_from_slice(ex.out.view().list(rargs)?);
+            ps.clear();
+            let mut changed = false;
+            for &t in &iargs {
+                let norm = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, 0, t, 0)?;
+                if self.reads.stopped() {
+                    return Ok(());
+                }
+                if norm != t {
+                    changed = true;
+                }
+                ps.push(norm);
+            }
+            if !changed {
+                continue;
+            }
+            let list = ex.out.intern_list(&ps)?;
+            if seen.insert((e, trait_, cname, list), ()).is_some() {
+                continue;
+            }
+            if out.len() >= MOST_PROJECTED {
+                return Err(CheckError::Limit(Limit::Solver));
+            }
+            let selected = self.select_row(ex, rows, inert, &ps, (trait_, list, cname), e)?;
+            if self.reads.stopped() {
+                return Ok(());
+            }
+            out.push(Projected { expr: e, at: 0, trait_, name: cname, args: list, global_env: rows.env.global, selected });
+            if matches!(selected, Selected::Impl { .. }) {
+                nest.push((out.len() - 1, 0));
+            }
+        }
         let mut next = 0usize;
         while next < nest.len() {
             let (row, depth) = nest[next];
@@ -239,7 +289,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         }
                         ps.clear();
                         for &t in formal_list {
-                            ps.push(subst_into(h.types, t, &iargs, &mut ex.out, alloc)?);
+                            let sub = subst_into(h.types, t, &iargs, &mut ex.out, alloc)?;
+                            let norm = self.normalize_portable(ex, rows, inert, seen, out, &mut nest, e, depth, sub, 0)?;
+                            if self.reads.stopped() {
+                                return Ok(());
+                            }
+                            ps.push(norm);
                         }
                         let list = ex.out.intern_list(&ps)?;
                         if seen.insert((e, nt, Some(nn), list), ()).is_some() {
@@ -290,8 +345,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                     ps.push(norm);
                 }
-                if cname.is_none() && !may_relate(ex.out.view(), &ps, alloc)? {
+                if cname.is_none() && !may_relate(ex.out.view(), &ps, alloc)? && !self.trait_has_lifetimes(trait_)? {
+                    if self.reads.stopped() {
+                        return Ok(())
+                    }
                     continue;
+                }
+                if self.reads.stopped() {
+                    return Ok(());
                 }
                 let list = ex.out.intern_list(&ps)?;
                 if seen.insert((e, trait_, cname, list), ()).is_some() {
@@ -335,101 +396,163 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         norm_depth: u32,
     ) -> Result<PTy, CheckError> {
         struct NormFrame<'a> {
-            orig_ty: PTy,
+            orig: PTy,
             node: PNode,
             kids: Vec<PTy, Alloc<'a>>,
-            next_kid: usize,
+            next: usize,
             changed: bool,
-            depth: u32,
+            norm_depth: u32,
         }
         let alloc = self.alloc;
         let mut stack: Vec<NormFrame<'a>, Alloc<'a>> = Vec::new_in(alloc);
         let mut cur_ty = ty;
         let mut cur_depth = norm_depth;
-        'eval: loop {
-            let mut result = cur_ty;
-            if cur_depth < 8 {
+        loop {
+            // Descend into `cur_ty` at `cur_depth`.
+            let mut res = if cur_depth >= 8 {
+                cur_ty
+            } else {
                 let node = ex.out.view().node(cur_ty)?;
                 let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
                 ex.out.view().children_of(node, &mut kids)?;
-                if let Some(&first) = kids.first() {
+                if let Some(&first_kid) = kids.first() {
                     let next_depth = cur_depth + 1;
-                    stack.push(NormFrame {
-                        orig_ty: cur_ty,
-                        node,
-                        kids,
-                        next_kid: 0,
-                        changed: false,
-                        depth: cur_depth,
-                    });
-                    cur_ty = first;
+                    stack.push(NormFrame { orig: cur_ty, node, kids, next: 0, changed: false, norm_depth: cur_depth });
+                    cur_ty = first_kid;
                     cur_depth = next_depth;
-                    continue 'eval;
+                    continue;
                 }
-            }
-            'finish: loop {
-                if cur_depth < 8
-                    && let PNode::Alias { trait_: at, name: an, args: al } = ex.out.view().node(result)?
-                {
-                    let mut aps: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
-                    aps.extend_from_slice(ex.out.view().list(al)?);
-                    let selected = self.select_row(ex, rows, inert, &aps, (at, al, Some(an)), e)?;
-                    if self.reads.stopped() {
-                        return Ok(ty);
-                    }
-                    if seen.insert((e, at, Some(an), al), ()).is_none() {
-                        if out.len() >= MOST_PROJECTED {
-                            return Err(CheckError::Limit(Limit::Solver));
-                        }
-                        out.push(Projected { expr: e, at: 0, trait_: at, name: Some(an), args: al, global_env: rows.env.global, selected });
-                        if matches!(selected, Selected::Impl { .. }) && depth < MOST_ROW_NESTING {
-                            nest.push((out.len() - 1, depth + 1));
-                        }
-                    }
-                    if let Selected::Impl { imp, args: imp_args } = selected {
-                        let hdr = match self.reads.impl_header(imp) {
-                            Ok(h) => h,
-                            Err(Stop::Need(_)) if self.reads.stopped() => return Ok(ty),
-                            Err(Stop::Need(_)) => None,
-                            Err(Stop::Error(err)) => return Err(err),
-                        };
-                        if let Some(h) = hdr
-                            && let Some(&(_, val_ty)) = h.assoc_types.iter().find(|&&(n, _)| n == an)
-                        {
-                            let mut ia: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
-                            ia.extend_from_slice(ex.out.view().list(imp_args)?);
-                            if let Ok(ia_len) = u32::try_from(ia.len())
-                                && params_in_bounds(h.types, &[val_ty], ia_len, alloc)?
-                            {
-                                cur_ty = subst_into(h.types, val_ty, &ia, &mut ex.out, alloc)?;
-                                cur_depth += 1;
-                                continue 'eval;
-                            }
-                        }
-                    }
+                if let Some(sub) = self.normalize_portable_alias(ex, rows, inert, seen, out, nest, e, depth, cur_ty)? {
+                    cur_ty = sub;
+                    cur_depth += 1;
+                    continue;
                 }
-                let Some(mut frame) = stack.pop() else {
-                    return Ok(result);
-                };
-                if let Some(slot) = frame.kids.get_mut(frame.next_kid)
-                    && result != *slot
+                if self.reads.stopped() {
+                    return Ok(cur_ty);
+                }
+                cur_ty
+            };
+
+            // Ascend with `res` until either a sibling needs descending, an alias expands, or
+            // the stack empties.
+            let mut descend: Option<(PTy, u32)> = None;
+            while let Some(mut frame) = stack.pop() {
+                if let Some(slot) = frame.kids.get_mut(frame.next)
+                    && *slot != res
                 {
-                    *slot = result;
+                    *slot = res;
                     frame.changed = true;
                 }
-                frame.next_kid += 1;
-                if let Some(&next) = frame.kids.get(frame.next_kid) {
-                    let next_depth = frame.depth + 1;
+                frame.next += 1;
+                if let Some(&next_kid) = frame.kids.get(frame.next) {
+                    let next_depth = frame.norm_depth + 1;
                     stack.push(frame);
-                    cur_ty = next;
-                    cur_depth = next_depth;
-                    continue 'eval;
+                    descend = Some((next_kid, next_depth));
+                    break;
                 }
-                result = if frame.changed { rebuild_in(&mut ex.out, frame.node, &frame.kids)? } else { frame.orig_ty };
-                cur_depth = frame.depth;
-                continue 'finish;
+                let rebuilt = if frame.changed { rebuild_in(&mut ex.out, frame.node, &frame.kids)? } else { frame.orig };
+                if let Some(sub) = self.normalize_portable_alias(ex, rows, inert, seen, out, nest, e, depth, rebuilt)? {
+                    descend = Some((sub, frame.norm_depth + 1));
+                    break;
+                }
+                if self.reads.stopped() {
+                    return Ok(rebuilt);
+                }
+                res = rebuilt;
+            }
+            if let Some((next_ty, next_depth)) = descend {
+                cur_ty = next_ty;
+                cur_depth = next_depth;
+            } else {
+                return Ok(res);
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn normalize_portable_alias(
+        &mut self,
+        ex: &mut Export<'a>,
+        rows: &mut Rows<'_, 'a>,
+        inert: Inert,
+        seen: &mut HashMap<(ExprId, ItemKey, Option<Name>, List), (), Alloc<'a>>,
+        out: &mut Vec<Projected, Alloc<'a>>,
+        nest: &mut Vec<(usize, u32), Alloc<'a>>,
+        e: ExprId,
+        depth: u32,
+        cur: PTy,
+    ) -> Result<Option<PTy>, CheckError> {
+        let alloc = self.alloc;
+        let PNode::Alias { trait_: at, name: an, args: al } = ex.out.view().node(cur)? else {
+            return Ok(None);
+        };
+        let mut aps: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+        aps.extend_from_slice(ex.out.view().list(al)?);
+        let selected = self.select_row(ex, rows, inert, &aps, (at, al, Some(an)), e)?;
+        if self.reads.stopped() {
+            return Ok(None);
+        }
+        if seen.insert((e, at, Some(an), al), ()).is_none() {
+            if out.len() >= MOST_PROJECTED {
+                return Err(CheckError::Limit(Limit::Solver));
+            }
+            out.push(Projected { expr: e, at: 0, trait_: at, name: Some(an), args: al, global_env: rows.env.global, selected });
+            if matches!(selected, Selected::Impl { .. }) && depth < MOST_ROW_NESTING {
+                nest.push((out.len() - 1, depth + 1));
+            }
+        }
+        let Selected::Impl { imp, args: imp_args } = selected else {
+            // Also normalize through the caller's own `where`-clause projection equalities
+            // (e.g. `where N: FullNodeTypes<Types = TempoNode>` -> `N::Types` normalizes to
+            // `TempoNode`), so downstream impls on `N::Types` or `<N::Types as NodeTypes>::Primitives`
+            // are selected at writeback.
+            let own = match self.reads.predicates(self.body.owner) {
+                Ok(own) => own,
+                Err(Stop::Need(_)) => return Ok(None),
+                Err(Stop::Error(err)) => return Err(err),
+            };
+            for c in own.clauses {
+                if let PClause::Projection { trait_: pt, name: pn, args: pargs, term } = *c
+                    && pt == at
+                    && pn == an
+                    && let Ok(plist) = own.types.list(pargs)
+                    && plist.len() == aps.len()
+                {
+                    let mut all_eq = true;
+                    for (&pa, &aa) in plist.iter().zip(aps.iter()) {
+                        if !exact_equal(own.types, pa, ex.out.view(), aa, alloc)? {
+                            all_eq = false;
+                            break;
+                        }
+                    }
+                    if all_eq {
+                        let copied = copy_into(own.types, term, &mut ex.out, alloc)?;
+                        return Ok(Some(copied));
+                    }
+                }
+            }
+            return Ok(None);
+        };
+        let hdr = match self.reads.impl_header(imp) {
+            Ok(h) => h,
+            Err(Stop::Need(_)) if self.reads.stopped() => return Ok(None),
+            Err(Stop::Need(_)) => None,
+            Err(Stop::Error(err)) => return Err(err),
+        };
+        let Some(h) = hdr else { return Ok(None) };
+        let Some(&(_, val_ty)) = h.assoc_types.iter().find(|&&(n, _)| n == an) else {
+            return Ok(None);
+        };
+        let mut ia: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
+        ia.extend_from_slice(ex.out.view().list(imp_args)?);
+        let Ok(ia_len) = u32::try_from(ia.len()) else {
+            return Ok(None);
+        };
+        if !params_in_bounds(h.types, &[val_ty], ia_len, alloc)? {
+            return Ok(None);
+        }
+        let sub = subst_into(h.types, val_ty, &ia, &mut ex.out, alloc)?;
+        Ok(Some(sub))
     }
 
     /// How the row `key` (`(trait, [Self, trait args..], name)`, its arguments `ps` in
@@ -441,21 +564,31 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let (trait_, _, name) = key;
         let alloc = self.alloc;
-        let selected = if !ground(ex.out.view(), ps, name.is_none(), alloc)? {
-            // Even when `ps` contains the body's own type parameters (e.g. `RChunksMut<'a, T>:
+        // Projection rows for GATs with type params or generic RPITITs carry `[Self, trait_args..,
+        // assoc_or_fn_args..]`; impl selection matches only the trait's own `generics` arguments.
+        let trait_arity = if name.is_some() { self.trait_generics(trait_)? } else { None };
+        if self.reads.stopped() {
+            return Ok(Selected::Unanswered);
+        }
+        let sel_ps = match trait_arity.and_then(|n| usize::try_from(n).ok()) {
+            Some(n) if n > 0 && n < ps.len() => ps.get(..n).unwrap_or(ps),
+            _ => ps,
+        };
+        let selected = if !ground(ex.out.view(), sel_ps, name.is_none(), alloc)? {
+            // Even when `sel_ps` contains the body's own type parameters (e.g. `RChunksMut<'a, T>:
             // ExactSizeIterator`, `(A, B): Default`, `Foo<E>: DiscriminantKind`, `E: ToString`
             // via blanket impl), select the owning impl or builtin rule whenever no caller
-            // where-clause can match `ps`.
-            let self_node = ps.first().and_then(|&s| ex.out.view().node(s).ok());
+            // where-clause can match `sel_ps`.
+            let self_node = sel_ps.first().and_then(|&s| ex.out.view().node(s).ok());
             let try_impl = self_node.is_some_and(|n| !matches!(n, PNode::Infer | PNode::Error));
             let self_is_abstract = matches!(
                 self_node,
                 Some(PNode::Param(_) | PNode::ConstParam(_) | PNode::Opaque(..) | PNode::Dynamic(_) | PNode::Alias { .. })
             );
             let mut decided = None;
-            if try_impl && !self.any_clause_may_match(ex.out.view(), ps, trait_, inert)? {
+            if try_impl && !self.any_clause_may_match(ex.out.view(), sel_ps, trait_, inert)? {
                 let mut cx = InferCtx::analysis_in(alloc);
-                match crate::instance::select_owning_owner(&mut cx, &mut self.reads, self.body.owner, Some(rows.own), trait_, ps, &mut ex.out) {
+                match crate::instance::select_owning_owner(&mut cx, &mut self.reads, self.body.owner, Some(rows.own), trait_, sel_ps, &mut ex.out) {
                     Ok(Some((imp, iargs))) => decided = Some(Selected::Impl { imp, args: iargs }),
                     Ok(None) | Err(ResolveError::NoImpl { .. }) if !self_is_abstract => {
                         decided = Some(Selected::Builtin);
@@ -465,16 +598,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             match decided {
                 Some(s) => s,
-                None => self.source_not_ground(ex.out.view(), ps, trait_, name)?,
+                None => self.source_not_ground(ex.out.view(), sel_ps, trait_, name)?,
             }
         } else {
             // A where-clause of the caller may be the candidate that applies (`CallEnv`).
             let env = rows.env.all
-                || rows.env.traits.contains(&trait_)
-                || (rows.env.exact.contains(&trait_) && self.ground_clause_may_equal(ex.out.view(), ps, trait_)?);
+                || rows.env.traits.scan_for(&trait_).is_some()
+                || (rows.env.exact.scan_for(&trait_).is_some() && self.ground_clause_may_equal(ex.out.view(), sel_ps, trait_, inert)?);
             // Part of the body's own check, recorded for its borrow check: analysis.
             let mut cx = InferCtx::analysis_in(alloc);
-            match crate::instance::select_owning(&mut cx, &mut self.reads, Some(rows.own), trait_, ps, &mut ex.out) {
+            match crate::instance::select_owning(&mut cx, &mut self.reads, Some(rows.own), trait_, sel_ps, &mut ex.out) {
                 Ok(Some((imp, iargs))) if !env => Selected::Impl { imp, args: iargs },
                 // An impl holds, and so may the caller's clause, which rustc prefers: which
                 // one applies is not decided here (its lifetimes are erased).
@@ -496,6 +629,29 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         rows.memo.insert(key, selected);
         Ok(selected)
+    }
+
+    /// How many generic arguments `trait_` declares (`Self` included), when its def is readable.
+    fn trait_generics(&mut self, trait_: ItemKey) -> Result<Option<u32>, CheckError> {
+        match self.reads.trait_def(trait_) {
+            Ok(Some(def)) => Ok(Some(def.generics)),
+            Ok(None) => Ok(None),
+            Err(Stop::Need(_)) => Ok(None),
+            Err(Stop::Error(err)) => Err(err),
+        }
+    }
+
+    /// Whether `trait_` declares lifetime parameters (`TraitFlags::LIFETIME_PARAMS`): a trait
+    /// like `Deserialize<'de>` or `Arbitrary<'a>` carries region slots even when `Self` is a
+    /// primitive (`usize`, `bool`, `u64`) whose erased type holds no region.
+    fn trait_has_lifetimes(&mut self, trait_: ItemKey) -> Result<bool, CheckError> {
+        match self.reads.trait_def(trait_) {
+            Ok(Some(def)) => Ok(def.flags.has(crate::world::TraitFlags::LIFETIME_PARAMS)),
+            Ok(None) => Ok(false),
+            Err(Stop::Need(_)) if self.reads.stopped() => Ok(false),
+            Err(Stop::Need(_)) => Ok(true),
+            Err(Stop::Error(err)) => Err(err),
+        }
     }
 
     /// The four relates-nothing traits of this world ([`Inert`]).
@@ -545,16 +701,28 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 env.exact.push(trait_);
             }
         }
-        // The supertraits of every parameter-free clause's trait, each answerable at any row.
-        let mut work: Vec<ItemKey, Alloc<'a>> = Vec::new_in(alloc);
-        work.extend_from_slice(&env.traits);
-        work.extend(env.exact.iter().copied().filter(|t| !env.traits.contains(t)));
+        // Supertraits of parameter-free clauses:
+        // - From an alias-bearing clause (`env.traits`), or any non-`Self` supertrait predicate
+        //   (`Self::Assoc: St`), the supertrait goes into `env.traits` (may match any ground row).
+        // - From a plain ground clause (`env.exact`, e.g. `Signed<TxLegacy>: DeserializeOwned`)
+        //   through a `Self: Super` chain (`DeserializeOwned: for<'de> Deserialize<'de>`), the
+        //   supertrait stays in `env.exact` so `ground_clause_may_equal` matches it ONLY against
+        //   rows whose `Self` may equal `Signed<TxLegacy>` (never shadowing `u32: Deserialize` or
+        //   `Value: Deserialize`).
+        let mut work: Vec<(ItemKey, bool), Alloc<'a>> = Vec::new_in(alloc);
+        for &t in env.traits.iter() {
+            work.push((t, false));
+        }
+        for &t in env.exact.iter() {
+            if env.traits.scan_for(&t).is_none() {
+                work.push((t, true));
+            }
+        }
         let mut next = 0usize;
-        while next < work.len() {
-            if work.len() > MOST_ENV_TRAITS {
+        while let Some(&(t, exact_self)) = work.get(next) {
+            if work.len() > MOST_ENV_TRAITS * 2 {
                 return Err(CheckError::Limit(Limit::Solver));
             }
-            let t = work[next];
             next += 1;
             let def = match self.reads.trait_def(t) {
                 Ok(Some(def)) => def,
@@ -566,53 +734,117 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Err(Stop::Error(err)) => return Err(err),
             };
             for s in def.supertraits {
-                let (PClause::Trait { trait_: st, .. } | PClause::Projection { trait_: st, .. }) = *s else { continue };
+                let (PClause::Trait { trait_: st, args: sargs } | PClause::Projection { trait_: st, args: sargs, .. }) = *s else { continue };
                 if inert.has(st) {
                     continue;
                 }
-                if !env.traits.contains(&st) {
+                let self_is_param0 = def
+                    .types
+                    .list(sargs)
+                    .ok()
+                    .and_then(|l| l.first())
+                    .and_then(|&a| def.types.node(a).ok())
+                    .is_some_and(|n| matches!(n, PNode::Param(0)));
+                let st_exact = exact_self && self_is_param0;
+                if st_exact {
+                    if env.traits.scan_for(&st).is_none() && env.exact.scan_for(&st).is_none() {
+                        env.exact.push(st);
+                    }
+                } else if env.traits.scan_for(&st).is_none() {
                     env.traits.push(st);
                 }
-                if !work.contains(&st) {
-                    work.push(st);
+                if work.scan_for(&(st, st_exact)).is_none() {
+                    work.push((st, st_exact));
                 }
             }
         }
         Ok(env)
     }
 
-    /// Whether a ground clause of the caller of `trait_` ([`CallEnv::exact`]) may equal the
-    /// ground row `ps` (types of `tys`) up to regions, so may be the candidate rustc prefers.
+    /// Whether a ground clause of the caller of `trait_` (or a subtrait whose `Self`-supertrait
+    /// chain reaches `trait_`, [`CallEnv::exact`]) may equal the ground row `ps` (types of `tys`)
+    /// up to regions, so may be the candidate rustc prefers.
     /// The caller's predicates were read by `call_env`; one not answered now may answer
     /// (never a wait at writeback).
-    fn ground_clause_may_equal(&mut self, tys: PTys<'_>, ps: &[PTy], trait_: ItemKey) -> Result<bool, CheckError> {
+    fn ground_clause_may_equal(&mut self, tys: PTys<'_>, ps: &[PTy], trait_: ItemKey, inert: Inert) -> Result<bool, CheckError> {
         let alloc = self.alloc;
         let own = match self.reads.predicates(self.body.owner) {
             Ok(own) => own,
             Err(Stop::Need(_)) => return Ok(true),
             Err(Stop::Error(err)) => return Err(err),
         };
+        let Some(&ps0) = ps.first() else { return Ok(true) };
         for c in own.clauses {
             let (t, args) = match *c {
                 PClause::Trait { trait_, args } | PClause::Projection { trait_, args, .. } => (trait_, args),
                 _ => continue,
             };
-            if t != trait_ || names_param(own.types, args, alloc)? || holds_alias(own.types, args, alloc)? {
+            if names_param(own.types, args, alloc)? || holds_alias(own.types, args, alloc)? {
                 continue;
             }
             let l = own.types.list(args)?;
-            if l.len() != ps.len() {
-                continue;
-            }
-            let mut equal = true;
-            for (&a, &b) in l.iter().zip(ps) {
-                if !may_equal(own.types, a, tys, b, alloc)? {
-                    equal = false;
-                    break;
+            if t == trait_ {
+                if l.len() != ps.len() {
+                    continue;
                 }
-            }
-            if equal {
+                let mut equal = true;
+                for (&a, &b) in l.iter().zip(ps) {
+                    if !may_equal(own.types, a, tys, b, alloc)? {
+                        equal = false;
+                        break;
+                    }
+                }
+                if equal {
+                    return Ok(true);
+                }
+            } else if let Some(&a0) = l.first()
+                && may_equal(own.types, a0, tys, ps0, alloc)?
+                && self.trait_has_self_super(t, trait_, inert)?
+            {
                 return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `target` is reachable from `start` via `Self: Super` (`Param(0)`) supertrait edges.
+    fn trait_has_self_super(&mut self, start: ItemKey, target: ItemKey, inert: Inert) -> Result<bool, CheckError> {
+        let alloc = self.alloc;
+        let mut work: Vec<ItemKey, Alloc<'a>> = Vec::new_in(alloc);
+        work.push(start);
+        let mut next = 0usize;
+        while let Some(&t) = work.get(next) {
+            if work.len() > MOST_ENV_TRAITS {
+                return Err(CheckError::Limit(Limit::Solver));
+            }
+            next += 1;
+            let def = match self.reads.trait_def(t) {
+                Ok(Some(def)) => def,
+                Ok(None) => continue,
+                Err(Stop::Need(_)) => return Ok(true),
+                Err(Stop::Error(err)) => return Err(err),
+            };
+            for s in def.supertraits {
+                let (PClause::Trait { trait_: st, args: sargs } | PClause::Projection { trait_: st, args: sargs, .. }) = *s else { continue };
+                if inert.has(st) {
+                    continue;
+                }
+                let self_is_param0 = def
+                    .types
+                    .list(sargs)
+                    .ok()
+                    .and_then(|l| l.first())
+                    .and_then(|&a| def.types.node(a).ok())
+                    .is_some_and(|n| matches!(n, PNode::Param(0)));
+                if !self_is_param0 {
+                    continue;
+                }
+                if st == target {
+                    return Ok(true);
+                }
+                if work.scan_for(&st).is_none() {
+                    work.push(st);
+                }
             }
         }
         Ok(false)
@@ -630,6 +862,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         let Some(&ps0) = ps.first() else { return Ok(true) };
         let ps0_node = tys.node(ps0)?;
+        // Whether `own.clauses` carries any projection equality `<.. as at>::an = term` (which
+        // could normalize a rigid alias to another type in this body's param-env).
+        let has_proj_eq = |at: ItemKey, an: Name| -> bool {
+            own.clauses.iter().any(|cl| matches!(*cl, PClause::Projection { trait_: pt, name: pn, .. } if pt == at && pn == an))
+        };
+        let ps0_is_concrete = !matches!(
+            ps0_node,
+            PNode::Param(_) | PNode::ConstParam(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Dynamic(_) | PNode::Infer | PNode::Error
+        );
         for c in own.clauses {
             let (ct, args) = match *c {
                 PClause::Trait { trait_: ct, args } | PClause::Projection { trait_: ct, args, .. } => (ct, args),
@@ -647,13 +888,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let a0_node = own.types.node(a0)?;
             let self_matches = match (a0_node, ps0_node) {
                 (PNode::Param(q), PNode::Param(p)) => q == p,
-                (PNode::Param(_), PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error) => true,
+                (PNode::Param(_), PNode::Alias { trait_: at, name: an, args: p_args }) => {
+                    // A clause `P: Tr` cannot match a rigid alias `<Q as Foo>::Assoc` (e.g.
+                    // `I: IntoIterator` vs `I::IntoIter: IntoIterator` in `for x in iter.into_iter()`)
+                    // unless a projection equality in `own.clauses` can equate that alias.
+                    let rigid_param = tys.list(p_args).ok().and_then(|al| al.first()).and_then(|&s| tys.node(s).ok()).is_some_and(|n| matches!(n, PNode::Param(_)));
+                    !rigid_param || has_proj_eq(at, an)
+                }
+                (PNode::Param(_), PNode::Opaque(..) | PNode::Infer | PNode::Error) => true,
                 (PNode::Param(_), _) => false,
-                (PNode::Alias { args: a_args, .. }, PNode::Adt(..)) => {
-                    // A rigid alias `<P as Tr>::Assoc` on a type parameter cannot shadow a
-                    // nominal ADT's own impl (e.g. `P::Searcher<'a>: Clone` vs `MatchIndicesInternal<'a, P>: Clone`).
+                (PNode::Alias { trait_: at, name: an, args: a_args }, _) if ps0_is_concrete => {
+                    // A rigid alias `<P as Tr>::Assoc` on a type parameter cannot shadow a concrete
+                    // type constructor's impl (e.g. `O::Len: PartialEq` vs `&O: PartialEq` or
+                    // `P::Searcher<'a>: Clone` vs `MatchIndicesInternal<'a, P>: Clone`) unless a
+                    // projection equality in `own.clauses` can equate that alias.
                     let rigid_param = own.types.list(a_args).ok().and_then(|al| al.first()).and_then(|&s| own.types.node(s).ok()).is_some_and(|n| matches!(n, PNode::Param(_)));
-                    !rigid_param
+                    !rigid_param || has_proj_eq(at, an)
                 }
                 (PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error, _) => true,
                 _ => may_equal(own.types, a0, tys, ps0, alloc)?,
@@ -685,11 +935,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut work: Vec<ItemKey, Alloc<'a>> = Vec::new_in(alloc);
         work.push(start);
         let mut next = 0usize;
-        while next < work.len() {
+        while let Some(&t) = work.get(next) {
             if work.len() > MOST_ENV_TRAITS {
                 return Err(CheckError::Limit(Limit::Solver));
             }
-            let t = work[next];
             next += 1;
             let def = match self.reads.trait_def(t) {
                 Ok(Some(def)) => def,
@@ -980,4 +1229,83 @@ fn rebuild_in(out: &mut PortableTys<'_>, node: PNode, kids: &[PTy]) -> Result<PT
         | PNode::Foreign(_) => node,
     };
     out.intern(node)
+}
+
+/// Exact structural equality of two erased portable types across two tables (including `Param`,
+/// `ConstParam`, `Opaque`, `Alias`; never equating `Infer`/`Error`). Bounded by `MOST_NODES`.
+fn exact_equal(at: PTys<'_>, a: PTy, bt: PTys<'_>, b: PTy, alloc: Alloc<'_>) -> Result<bool, CheckError> {
+    let mut stack: Vec<(PTy, PTy), Alloc<'_>> = Vec::new_in(alloc);
+    let mut ka: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
+    let mut kb: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
+    stack.push((a, b));
+    let mut steps = 0u32;
+    while let Some((x, y)) = stack.pop() {
+        steps += 1;
+        if steps > MOST_NODES {
+            return Err(CheckError::Limit(Limit::Solver));
+        }
+        let (nx, ny) = (at.node(x)?, bt.node(y)?);
+        let same_head = match (nx, ny) {
+            (PNode::Infer | PNode::Error, _) | (_, PNode::Infer | PNode::Error) => false,
+            (PNode::Param(p), PNode::Param(q)) => p == q,
+            (PNode::ConstParam(p), PNode::ConstParam(q)) => p == q,
+            (PNode::Opaque(p, _), PNode::Opaque(q, _)) => p == q,
+            (PNode::Alias { trait_: t1, name: n1, .. }, PNode::Alias { trait_: t2, name: n2, .. }) => t1 == t2 && n1 == n2,
+            (PNode::Dynamic(_), PNode::Dynamic(_)) => true,
+            (PNode::ExTrait(t1, _), PNode::ExTrait(t2, _)) => t1 == t2,
+            (PNode::ExProj { trait_: t1, name: n1, .. }, PNode::ExProj { trait_: t2, name: n2, .. }) => t1 == t2 && n1 == n2,
+            (PNode::ExAuto(t1), PNode::ExAuto(t2)) => t1 == t2,
+            _ => matches!((head(nx), head(ny)), (Some(hx), Some(hy)) if hx == hy),
+        };
+        if !same_head {
+            return Ok(false);
+        }
+        ka.clear();
+        kb.clear();
+        at.children_of(nx, &mut ka)?;
+        bt.children_of(ny, &mut kb)?;
+        if ka.len() != kb.len() {
+            return Ok(false);
+        }
+        stack.extend(ka.iter().copied().zip(kb.iter().copied()));
+    }
+    Ok(true)
+}
+
+/// Copy `root` from `src` into `out` preserving `Param` and `ConstParam` indices unchanged.
+fn copy_into(src: PTys<'_>, root: PTy, out: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Result<PTy, CheckError> {
+    let order = |node: PTy, child: PTy| CheckError::Malformed(Malformed::TypeOrder { node: node.0, child: child.0 });
+    let mut mapped: HashMap<PTy, PTy, Alloc<'_>> = HashMap::new_in(alloc);
+    let mut stack: Vec<(PTy, bool), Alloc<'_>> = Vec::new_in(alloc);
+    let mut kids: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
+    let mut steps = 0u32;
+    stack.push((root, false));
+    while let Some((at, expanded)) = stack.pop() {
+        if mapped.contains_key(&at) {
+            continue;
+        }
+        steps += 1;
+        if steps > MOST_NODES {
+            return Err(CheckError::Limit(Limit::Solver));
+        }
+        let node = src.node(at)?;
+        kids.clear();
+        src.children_of(node, &mut kids)?;
+        if !expanded && !kids.is_empty() {
+            stack.push((at, true));
+            for &child in kids.iter().rev() {
+                if child.0 >= at.0 {
+                    return Err(order(at, child));
+                }
+                stack.push((child, false));
+            }
+            continue;
+        }
+        for child in kids.iter_mut() {
+            *child = *mapped.get(&*child).ok_or(order(at, *child))?;
+        }
+        let made = rebuild_in(out, node, &kids)?;
+        mapped.insert(at, made);
+    }
+    mapped.get(&root).copied().ok_or(order(root, root))
 }

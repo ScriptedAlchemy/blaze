@@ -89,6 +89,7 @@ try {
   mkdirSync(base);
   cpSync(action, join(base, ".github/actions/script"), { recursive: true });
   const fixture = {
+    ".github/blaze-cli-version": "0.test.cli\n",
     ".github/blaze-version": "0.test.1\n",
     "pins/toolchain": "nightly-test\n",
     "pins/llvm.json": '{"revision":"fixture-one"}\n',
@@ -207,6 +208,7 @@ version = "1.0.0"
   }
   changes("whole root workspace manifest", () => replace("Cargo.toml", 'registry-pkg = "1.0.0"', 'registry-pkg = "=1.0.0"'));
   changes("blaze lock input", () => write("blaze.lock", "version = 2\n"));
+  changes("published CLI version", () => write(".github/blaze-cli-version", "0.test.other\n"));
   changes("pinned Cargo toolchain", () => write("pins/toolchain", "nightly-other\n"));
   changes("pinned LLVM recipe", () => write("pins/llvm.json", '{"revision":"fixture-two"}\n'));
   changes("selected package manifest", () => write("crates/shared/Cargo.toml", read("crates/shared/Cargo.toml") + "# package input\n"));

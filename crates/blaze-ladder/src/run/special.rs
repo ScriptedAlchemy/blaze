@@ -213,6 +213,33 @@ pub enum MakerStart {
     Direct(blaze_id::ItemKey),
 }
 
+/// Which start class a [`crate::run::make_one::Maker`] serves (rule 76):
+/// - [`MakerKind::ByRule`]: starts by THE start rule (`MakerStart::ByRule`), which runs
+///   `start_of` and (for a Rust start) mutates the program's head store via `rust_start` for a
+///   specific `entry` (`main`). Must never be conflated with another `ByRule` entry or with
+///   [`MakerKind::Direct`].
+/// - [`MakerKind::Direct`]: starts directly at a test fn (`MakerStart::Direct(_)`).
+///   `LazyProgram::decide_start(MakerStart::Direct(_))` mutates no head store, `rust_start()`
+///   is always `None`, `locate_local` never takes the `Hosted`/`CMain` start-chain branch, and
+///   `make_one` never reads `FrontEnd::entry()`. Every `Direct(_)` test in one suite therefore
+///   shares ONE `Maker` (`RecordsProgram` + `MakerState`), updating its direct entry via
+///   [`crate::run::make_one::Maker::set_direct_entry`] without rebuilding cached state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MakerKind {
+    ByRule(Option<ItemKey>),
+    Direct,
+}
+
+impl MakerKind {
+    /// The start class for `(entry, start)`.
+    pub const fn of(entry: Option<ItemKey>, start: MakerStart) -> MakerKind {
+        match start {
+            MakerStart::ByRule => MakerKind::ByRule(entry),
+            MakerStart::Direct(_) => MakerKind::Direct,
+        }
+    }
+}
+
 /// The run's roots ([`roots`]; the module doc's table).
 pub struct Roots<'a> {
     /// What the start rule answered.
@@ -379,10 +406,16 @@ impl<'a> RootTable<'a> {
     /// The instance `item` at `args` (ground in `ground`) as the next row: its symbol. `what`
     /// names it in a refusal.
     fn push(&mut self, what: &'static str, item: ItemKey, args: List, ground: PTys<'_>) -> Result<Symbol, RootsError> {
+        self.push_as(what, item, item, args, ground)
+    }
+
+    /// The instance `item` at `args` (ground in `ground`), tabled under `tabled`, as the next
+    /// row: its symbol. Used for synthetic shim roots such as the test report shim.
+    fn push_as(&mut self, what: &'static str, tabled: ItemKey, item: ItemKey, args: List, ground: PTys<'_>) -> Result<Symbol, RootsError> {
         self.name.clear();
         encode_instance(item, args, ground, self.alloc, &mut self.name).map_err(|error| RootsError::Symbol { what, error })?;
         let symbol = fn_symbol_of_name(&self.name);
-        self.rows.push(item, &self.name);
+        self.rows.push(tabled, &self.name);
         self.symbols.push(symbol);
         Ok(symbol)
     }

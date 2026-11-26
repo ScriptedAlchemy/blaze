@@ -139,7 +139,7 @@ pub(super) fn select_once<'n, S: NamesSource<'n>>(
     let spell = Spelling::fixed();
     // An empty block list (no block's `use` is in a trait's own scope); `BlockTraits::module`
     // takes an `Alloc<'static>`, which the caller's `alloc` is not: the store's is.
-    let blocks = BlockTraits::module(store.tys.alloc());
+    let blocks = BlockTraits::module(store.work_alloc());
     let self_ = SelfTy::None;
     let world = BodyWorld {
         names,
@@ -204,5 +204,5 @@ pub(super) fn select_made<'n, S: NamesSource<'n>>(
             }
         }
     }
-    Err(ConstFail::Check { item: constant, error: super::check::rounds_fail(r, constant, "selecting a trait's constant", made, Vec::new_in(Global)) })
+    Err(ConstFail::Check { item: constant, error: super::check::rounds_fail(r, constant, "selecting a trait's constant", made, MOST_ROUNDS, Vec::new_in(Global)) })
 }

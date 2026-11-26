@@ -10,36 +10,33 @@
 //! rule's width is the terminal's, 80 when not a terminal):
 //!
 //! ```text
-//! FAILED fails after <t> s: ended by signal 6
+//! FAILED fails after <t> s: panicked: assertion `left == right` failed
+//!   left: 1
+//!  right: 2
 //! ---- fails output: <n> bytes ----
 //! thread '...' (...) panicked at src/lib.rs:6:5:
 //! assertion `left == right` failed
 //! ...
 //! --------------------------------------------------------------------------------
-//! FAILED fails: ended by signal 6
-//! not kept passes: was not traced
-//! test result: FAILED. ran 2: 1 passed, 1 failed; 0 reused from kept results; 1 not kept (1 was not traced); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky
+//! FAILED fails: panicked
+//! test result: FAILED. ran 2: 1 passed, 1 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky
 //! ```
 //!
 //! and its status is not 0. The case `a_pass_alone` (`passes` only) prints
 //!
 //! ```text
-//! not kept passes: was not traced
-//! test result: ok. ran 1: 1 passed, 0 failed; 0 reused from kept results; 1 not kept (1 was not traced); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky
+//! test result: ok. ran 1: 1 passed, 0 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky
 //! ```
 //!
-//! and its status is 0. "ended by signal 6": a panic in a test unwinds out of the launcher's
-//! entry, which no frame catches, and the runtime aborts (SIGABRT); the descriptor-3 report that
-//! carries the panic's message is test.md piece 10. "not kept ... was not traced" (`NotKept::Untraced`): no tracer
-//! saw what the pass entered, so its pass is not kept for reuse (the same piece).
+//! and its status is 0. "panicked": a harnessed test's panic unwinds into the launcher's
+//! catch-all frame (`End::Return`), writes its unwind marker and exits 101, so `blaze test`
+//! reports `panicked` with the message extracted from stderr (leaving genuine `SIGABRT`s as
+//! `ended by signal 6`).
 //!
 //! THE CONTROL (rule 23): [`judge`] is the one check both cases use, and `every_test_passes_is
 //! _caught` hands it what a driver planted to say "every test passes" would print (the summary
 //! `test result: ok. ran 2: 2 passed, 0 failed` with status 0) for the package with `fails`: the
 //! check must refuse it. A judge that passed it would pass a driver that runs nothing.
-//!
-//! macOS only: Linux has no test sandbox, and every run there is `NOT RUN` (test_run.rs
-//! `Host::has_sandbox`); that is its own case, below, which asserts exactly that line.
 //!
 //! Run: `cargo test -p blaze-cli --test test_command_runs` (needs the toolchain's shelf in the
 //! owner's home, as tests/command_rungs.rs does). Expected: `test a_pass_and_a_failure ... ok`,
@@ -91,6 +88,10 @@ fn write_source(path: &Path, text: &str, what: &str) {
     std::fs::write(path, text).unwrap_or_else(|error| panic!("writing {what}: {error}"));
 }
 
+fn read_file_bytes(path: &Path, what: &str) -> impl AsRef<[u8]> + use<> {
+    std::fs::read(path).unwrap_or_else(|error| panic!("reading {what}: {error}"))
+}
+
 fn pause_poll() {
     std::thread::sleep(Duration::from_millis(10));
 }
@@ -121,12 +122,12 @@ fn fixture<T>(name: &str, files: &[(&str, &str)], check: impl FnOnce(&Path, &Pat
     result
 }
 
-fn run(dir: &Path, home: &Path, args: &[&str]) -> Said {
+fn run_cmd(dir: &Path, home: &Path, subcommand: &str, args: &[&str]) -> Said {
     // A full pipe must never stall the compiler while the fixture waits for it to exit.
     let stdout = home.join("test.stdout");
     let stderr = home.join("test.stderr");
     let mut child = Command::new(env!("CARGO_BIN_EXE_blaze"))
-        .arg("test")
+        .arg(subcommand)
         .args(args)
         .current_dir(dir)
         .env("PWD", dir)
@@ -143,23 +144,27 @@ fn run(dir: &Path, home: &Path, args: &[&str]) -> Said {
             break status;
         }
         if started.elapsed() > DEADLINE {
-            child.kill().expect("stop the timed-out test command");
+            child.kill().expect("stop the timed-out command");
             let killed = Instant::now();
-            while child.try_wait().expect("reap the killed test command").is_none() {
+            while child.try_wait().expect("reap the killed command").is_none() {
                 assert!(killed.elapsed() < Duration::from_secs(10), "reaping blaze in {}", dir.display());
                 pause_poll();
             }
-            panic!("`blaze test` past {DEADLINE:?} in {}: the command hung (rule 18)", dir.display());
+            panic!("`blaze {subcommand}` past {DEADLINE:?} in {}: the command hung (rule 18)", dir.display());
         }
         pause_poll();
     };
-    let said = Said {
+    Said {
         stdout: std::fs::read_to_string(stdout).expect("read blaze's standard output"),
         // Lossy on purpose: a test child's raw standard error is quoted in it, and a child that
         // writes bytes that are not UTF-8 is evidence to show, not a reason to hide the rest.
         stderr: String::from_utf8_lossy(&std::fs::read(stderr).expect("read blaze's standard error")).into_owned(),
         code: status.code(),
-    };
+    }
+}
+
+fn run(dir: &Path, home: &Path, args: &[&str]) -> Said {
+    let said = run_cmd(dir, home, "test", args);
     // The check's lines first (D147, D151), then the tests' alone.
     let Some(tests) = said.stdout.strip_prefix(CHECK_FIRST) else {
         panic!("{}", evidence(&format!("the check's own lines first, exactly:\n{CHECK_FIRST}"), &said));
@@ -200,7 +205,7 @@ fn byte_evidence(why: &str, code: Option<i32>, stderr: &[u8], stdout: &[u8]) -> 
 /// the package (with `fails` when `failing`), else what differs.
 fn judge(said: &Said, failing: bool) -> Result<(), String> {
     let lines: Vec<&str> = said.stdout.lines().collect();
-    let tail = if failing { ["FAILED fails: ended by signal 6", BOTH_SUMMARY].as_slice() } else { [PASS_SUMMARY].as_slice() };
+    let tail = if failing { ["FAILED fails: panicked", BOTH_SUMMARY].as_slice() } else { [PASS_SUMMARY].as_slice() };
     if lines.len() < tail.len() || lines[lines.len() - tail.len()..] != *tail {
         return Err(format!("the summary is not\n{}\n", tail.join("\n")));
     }
@@ -209,13 +214,23 @@ fn judge(said: &Said, failing: bool) -> Result<(), String> {
             return Err(format!("a suite with a failing test ended with status {:?}", said.code));
         }
         let first = lines[0];
-        let time = first.strip_prefix("FAILED fails after ").and_then(|rest| rest.strip_suffix(" s: ended by signal 6"));
-        let timed = time.is_some_and(|t| t.split_once('.').is_some_and(|(s, ms)| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && ms.len() == 3 && ms.bytes().all(|b| b.is_ascii_digit())));
+        let time = first
+            .strip_prefix("FAILED fails after ")
+            .and_then(|rest| rest.split_once(" s: panicked: "))
+            .map(|(t, msg)| (t, msg));
+        let timed = time.is_some_and(|(t, msg)| {
+            t.split_once('.').is_some_and(|(s, ms)| {
+                !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && ms.len() == 3 && ms.bytes().all(|b| b.is_ascii_digit())
+            }) && msg.contains("assertion `left == right` failed")
+        });
         if !timed {
-            return Err("the first line is not `FAILED fails after d.ddd s: ended by signal 6`".into());
+            return Err("the first line is not `FAILED fails after d.ddd s: panicked: assertion `left == right` failed`".into());
         }
-        let Some(header) = lines.get(1).and_then(|line| line.strip_prefix("---- fails output: ")).and_then(|s| s.strip_suffix(" ----")) else {
-            return Err("the failure's output block does not open on the second line".into());
+        let Some(header_idx) = lines.iter().position(|line| line.starts_with("---- fails output: ")) else {
+            return Err("the failure's output block header is missing".into());
+        };
+        let Some(header) = lines.get(header_idx).and_then(|line| line.strip_prefix("---- fails output: ")).and_then(|s| s.strip_suffix(" ----")) else {
+            return Err("the failure's output block header is malformed".into());
         };
         if header.contains(", the first ") {
             return Err("the assertion's output exceeded the reporter's cap and its beginning was cut".into());
@@ -225,10 +240,10 @@ fn judge(said: &Said, failing: bool) -> Result<(), String> {
         }
         let rule = lines.iter().position(|line| line.len() >= 4 && line.bytes().all(|b| b == b'-'));
         let Some(rule) = rule else { return Err("the failure's output block is not closed by a rule".into()) };
-        if !lines[2..rule].iter().any(|line| line.contains("panicked at ") && line.ends_with("src/lib.rs:6:5:")) {
+        if !lines[header_idx + 1..rule].iter().any(|line| line.contains("panicked at ") && line.ends_with("src/lib.rs:6:5:")) {
             return Err("the panic's location is not the assert_eq! invocation at src/lib.rs:6:5".into());
         }
-        if !lines[2..rule].iter().any(|line| line.contains("assertion `left == right` failed")) {
+        if !lines[header_idx + 1..rule].iter().any(|line| line.contains("assertion `left == right` failed")) {
             return Err("the failure's output does not hold the panic's words".into());
         }
         if lines.len() != rule + 1 + tail.len() {
@@ -246,57 +261,42 @@ fn judge(said: &Said, failing: bool) -> Result<(), String> {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn a_pass_and_a_failure() {
     let lib = format!("{PASS}\n{FAIL}");
     let (said, stderr, stdout) = fixture("test_command_runs_both", &[("Cargo.toml", MANIFEST), ("src/lib.rs", &lib)], |dir, home| {
         // The shared runner decodes stdout before returning. Preserve the file evidence
         // even if a malformed byte stops that decode.
         let result = std::panic::catch_unwind(|| run(dir, home, &["--", "--deadline", "20s"]));
-        let stderr = std::fs::read(home.join("test.stderr")).expect("read the command's stderr bytes");
-        let stdout = std::fs::read(home.join("test.stdout")).expect("read the command's stdout bytes");
+        let stderr = read_file_bytes(&home.join("test.stderr"), "the command's stderr bytes");
+        let stdout = read_file_bytes(&home.join("test.stdout"), "the command's stdout bytes");
+        let (stderr, stdout) = (stderr.as_ref(), stdout.as_ref());
         let said = match result {
             Ok(said) => said,
             Err(payload) => {
-                eprintln!("{}", byte_evidence("the command runner did not return a status", None, &stderr, &stdout));
+                eprintln!("{}", byte_evidence("the command runner did not return a status", None, stderr, stdout));
                 std::panic::resume_unwind(payload);
             }
         };
-        (said, stderr, stdout)
+        (said, stderr.to_vec(), stdout.to_vec())
     });
     let report = |why: &str| byte_evidence(why, said.code, &stderr, &stdout);
-    let diagnostic = std::str::from_utf8(&stderr)
-        .unwrap_or_else(|_| panic!("{}", report("the command wrote binary stderr outside its escaped report")));
-    if let Err(why) = judge(&said, true) {
-        panic!("{}", report(&why));
+    let diagnostic = std::str::from_utf8(&stderr);
+    assert!(diagnostic.is_ok(), "{}", report("the command wrote non-UTF-8 stderr"));
+    if let Ok(diag) = diagnostic {
+        assert!(!diag.contains(" signal 6: stderr ("), "{}", report("a normal Rust panic must not trigger a signal 6 crash dump"));
     }
-    // Check the child's fd 2 independently of the report's merged stdout/stderr tail.
-    let (before, block) = diagnostic.split_once(" signal 6: stderr (")
-        .unwrap_or_else(|| panic!("{}", report("missing the child's signal report")));
-    assert!(before.ends_with("/fails"), "{}", report("signal reported for the wrong test"));
-    let (length, block) = block.split_once(" bytes) ----\n")
-        .unwrap_or_else(|| panic!("{}", report("missing the stderr byte count")));
-    let total = length.parse::<usize>().unwrap_or_else(|_| panic!("{}", report("invalid stderr byte count")));
-    let (child, parent) = block.split_once("---- end escaped stderr ----\n")
-        .unwrap_or_else(|| panic!("{}", report("incomplete escaped child stderr")));
-    assert!(child.lines().all(|line| line.is_ascii() && line.len() <= 100), "{}", report("invalid escaped line"));
-    // Only fd 2 writes in this fixture. The stdout reporter adds a final newline if
-    // necessary, so take exactly the announced number of original bytes from its block.
-    let shown = said.stdout.splitn(3, '\n').nth(2).expect("judge checked the output header");
-    let original = shown.as_bytes().get(..total).unwrap_or_else(|| panic!("{}", report("incorrect child stderr count")));
-    let expected = original.iter().take(4000).flat_map(|&byte| std::ascii::escape_default(byte));
-    assert!(child.lines().flat_map(str::bytes).eq(expected), "{}", report("fd 2 differs from the failure's output"));
-    let original = std::str::from_utf8(original).unwrap_or_else(|_| panic!("{}", report("the assertion was not text")));
-    assert!(original.lines().any(|line| line.contains("panicked at ") && line.ends_with("src/lib.rs:6:5:"))
-        && original.contains("assertion `left == right` failed"), "{}", report("fd 2 is missing the assertion"));
-    assert!(parent.lines().any(|line| line.starts_with("last published: ") && line != "last published: none")
-        && parent.lines().any(|line| line == "pending need: none")
-        && parent.lines().any(|line| line == "refusal stub: no refused first call observed by the parent"),
-        "{}", report("missing first-call evidence for the panic"));
+    let judged = judge(&said, true);
+    assert!(judged.is_ok(), "{}", report(judged.as_ref().err().map_or("", String::as_str)));
+    assert!(
+        !said.stdout.contains("Rust cannot catch foreign exceptions"),
+        "{}",
+        report("a guest test panic unwound into host catch_unwind and aborted as a foreign exception")
+    );
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn a_pass_alone() {
     let said = blaze_test("test_command_runs_pass", PASS);
     if let Err(why) = judge(&said, false) {
@@ -305,7 +305,7 @@ fn a_pass_alone() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn pinned_core_transparent_arguments_and_results() {
     let source = r#"
 use core::{mem::{ManuallyDrop, transmute}, num::NonZeroU32, ptr::NonNull};
@@ -343,13 +343,166 @@ fn passes() {
     }
 }
 
+/// Linux test sandbox (user/net/ipc/mount namespaces + read-only `/` + Landlock ABI >= 6 + seccomp, `test.md` piece 9):
+/// - writes, `chmod`, pathname `AF_UNIX`, and loopback TCP inside `$TMPDIR`/private netns succeed;
+/// - writes and `chmod` outside `$TMPDIR` are refused (`ReadOnlyFilesystem`/`PermissionDenied`);
+/// - external TCP (`1.1.1.1:80`) is refused (`NetworkUnreachable`) and host `/tmp` UNIX sockets are masked (`NotFound`);
+/// - capabilities are dropped (`CapEff == 0`), `RLIMIT_CORE == 0`, and spawning a helper works;
+/// - `#[should_panic(expected = ...)]` succeeds via the launcher-owned `fd:4` channel (no guest-
+///   writable unwind file in `$TMPDIR/..`), while `std::process::exit(101)` is NOT classified as a panic;
+/// - helpers spawned inside a test are killed when the test leader exits.
 #[test]
 #[cfg(target_os = "linux")]
-fn no_sandbox_runs_nothing() {
-    let said = blaze_test("test_command_runs_linux", PASS);
-    let line = "NOT RUN passes: cannot be run yet: no test sandbox is built for Linux yet, and blaze runs no test unsandboxed (rule 9; test.md, piece 9)";
-    assert!(said.stdout.lines().any(|l| l == line), "{}", evidence(line, &said));
-    assert_ne!(said.code, Some(0), "a suite that ran nothing is not a pass\n{}", said.stdout);
+fn linux_sandbox_confines_writes_and_distinguishes_exit_101() {
+    use std::os::unix::net::UnixListener;
+
+    // Bind a real host pathname UNIX socket in `/tmp` outside the test's `$TMPDIR`: the sandbox's
+    // empty `/tmp` tmpfs mask must make it completely unreachable from inside the test.
+    let host_sock_dir = std::env::temp_dir().join(format!("blaze_host_sock_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&host_sock_dir);
+    std::fs::create_dir_all(&host_sock_dir).expect("create host_sock_dir");
+    let host_sock_path = host_sock_dir.join("daemon.sock");
+    let _host_listener = UnixListener::bind(&host_sock_path).expect("bind host daemon socket");
+
+    let source = format!(r##"
+#[test]
+fn tmpdir_writes_chmod_unix_and_loopback_work() {{
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::{{UnixListener, UnixStream}};
+    use std::net::{{TcpListener, TcpStream}};
+
+    let tmp = std::env::temp_dir();
+    let p = tmp.join("ok.sh");
+    std::fs::write(&p, b"#!/bin/sh\n").expect("write inside TMPDIR");
+    assert_eq!(std::fs::read(&p).expect("read back"), b"#!/bin/sh\n");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod inside TMPDIR must succeed");
+
+    // Sandbox-local pathname AF_UNIX bind + connect inside TMPDIR (short path under SUN_LEN).
+    let sock = tmp.join("s.sock");
+    if sock.as_os_str().len() < 100 {{
+        let srv = UnixListener::bind(&sock).expect("pathname AF_UNIX bind inside TMPDIR");
+        let _cli = UnixStream::connect(&sock).expect("pathname AF_UNIX connect inside TMPDIR");
+        let _ = srv.accept().expect("accept local AF_UNIX");
+    }}
+    let (_a, _b) = UnixStream::pair().expect("anonymous AF_UNIX socketpair allowed");
+
+    // Sandbox-local loopback TCP works inside the private netns.
+    let tcp = TcpListener::bind("127.0.0.1:0").expect("loopback TCP bind inside private netns");
+    let addr = tcp.local_addr().expect("loopback local_addr");
+    let _conn = TcpStream::connect(addr).expect("loopback TCP connect inside private netns");
+    let _ = tcp.accept().expect("loopback TCP accept");
+
+    let status = std::process::Command::new("/bin/true").status().expect("spawn helper");
+    assert!(status.success());
+}}
+
+#[test]
+fn outside_writes_chmod_external_net_host_sockets_caps_and_core_are_confined() {{
+    use std::os::unix::fs::PermissionsExt;
+    let cwd = std::env::current_dir().expect("current dir");
+    let escaped = cwd.join("escaped.txt");
+    let err = std::fs::write(&escaped, b"nope").expect_err("creating file outside TMPDIR must be denied");
+    assert!(
+        matches!(err.kind(), std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::PermissionDenied),
+        "expected EROFS/EACCES creating file outside TMPDIR, got {{err:?}}"
+    );
+    let err2 = std::fs::OpenOptions::new()
+        .write(true)
+        .open(cwd.join("Cargo.toml"))
+        .expect_err("opening existing file for write outside TMPDIR must be denied");
+    assert!(
+        matches!(err2.kind(), std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::PermissionDenied),
+        "expected EROFS/EACCES writing Cargo.toml, got {{err2:?}}"
+    );
+    let err_chmod = std::fs::set_permissions(cwd.join("Cargo.toml"), std::fs::Permissions::from_mode(0o600))
+        .expect_err("chmod outside TMPDIR must be denied by read-only mount");
+    assert!(
+        matches!(err_chmod.kind(), std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::PermissionDenied),
+        "expected EROFS/EPERM on outside chmod, got {{err_chmod:?}}"
+    );
+    // External non-loopback network is unreachable in the private netns.
+    let err_ext = std::net::TcpStream::connect("1.1.1.1:80").expect_err("external TCP must fail");
+    assert!(
+        matches!(err_ext.kind(), std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::PermissionDenied),
+        "expected ENETUNREACH/EPERM on external TCP, got {{err_ext:?}}"
+    );
+    // Host pathname UNIX socket in /tmp is invisible behind the empty /tmp tmpfs mask.
+    let err_unix = std::os::unix::net::UnixStream::connect("{host_sock}")
+        .expect_err("host pathname AF_UNIX socket must be unreachable");
+    assert!(
+        matches!(err_unix.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied),
+        "expected ENOENT/EACCES on host pathname AF_UNIX socket, got {{err_unix:?}}"
+    );
+    // All capabilities dropped (`CapEff: 0000000000000000`) and core dumps disabled (`Max core file size 0 0`).
+    let status_txt = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    assert!(status_txt.contains("CapEff:\t0000000000000000"), "expected CapEff == 0:\n{{status_txt}}");
+    assert!(status_txt.contains("CapPrm:\t0000000000000000"), "expected CapPrm == 0:\n{{status_txt}}");
+    let limits_txt = std::fs::read_to_string("/proc/self/limits").expect("read /proc/self/limits");
+    let core_line = limits_txt.lines().find(|l| l.starts_with("Max core file size")).expect("Max core file size line");
+    let cols: Vec<&str> = core_line["Max core file size".len()..].split_whitespace().collect();
+    assert_eq!(&cols[..2], &["0", "0"], "expected RLIMIT_CORE == (0, 0), got {{core_line}}");
+
+    // No guest-writable unwind marker exists beside TMPDIR.
+    let parent_entries: Vec<_> = std::fs::read_dir(std::env::temp_dir().parent().unwrap())
+        .expect("read parent")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("unwound-"))
+        .collect();
+    assert!(parent_entries.is_empty(), "expected no filesystem unwind marker beside TMPDIR, found {{parent_entries:?}}");
+}}
+
+#[test]
+#[should_panic(expected = "expected boom")]
+fn should_panic_works_with_unwound_channel() {{
+    panic!("expected boom");
+}}
+
+#[test]
+fn exit_101_without_unwind_is_not_panic() {{
+    // Also spawn a background sleeper before exiting: the runner must kill the child's process
+    // group upon leader exit so no helper outlives the test.
+    let child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep helper");
+    eprintln!("HELPER_PID={{}}", child.id());
+    std::process::exit(101);
+}}
+"##, host_sock = host_sock_path.display());
+
+    let said = blaze_test("test_command_runs_linux_sandbox", &source);
+    let _ = std::fs::remove_dir_all(&host_sock_dir);
+    assert_eq!(said.code, Some(1), "{}", evidence("only exit_101 test should fail", &said));
+    assert!(
+        said.stdout.contains("FAILED exit_101_without_unwind_is_not_panic")
+            && !said.stdout.contains("FAILED exit_101_without_unwind_is_not_panic: panicked")
+            && said.stdout.contains("3 passed, 1 failed"),
+        "{}",
+        evidence("3 sandbox/should_panic tests pass; exit(101) fails without being classified as panicked", &said)
+    );
+    let helper_pid: u32 = said
+        .stdout
+        .lines()
+        .chain(said.stderr.lines())
+        .find_map(|l| l.trim().strip_prefix("HELPER_PID=").and_then(|s| s.parse().ok()))
+        .expect("expected HELPER_PID=<pid> in captured failure output");
+    let mut alive = true;
+    for _ in 0..50 {
+        let stat_path = format!("/proc/{helper_pid}/stat");
+        match std::fs::read_to_string(&stat_path) {
+            Err(_) => {
+                alive = false;
+                break;
+            }
+            Ok(s) if s.contains(") Z ") => {
+                alive = false;
+                break;
+            }
+            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    assert!(!alive, "spawned helper pid {helper_pid} outlived its finished test process!");
 }
 
 // Deliberately put beta first in the manifest. The command orders results by owner and path.
@@ -436,13 +589,11 @@ fn only_dependent_test_refused(stdout: &str, code: Option<i32>) -> bool {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn refused_first_call_does_not_hide_the_next_test() {
-    // A ref binding extends the value temporary's lifetime (Reference, "Temporary lifetime
-    // extension"). The builder supports the place initializer only (walk/matches/ref_bind.rs)
-    // and refuses this valid value initializer in walk.rs plain_binding. Keep it in the
-    // *callee* so the launcher first enters a successfully built test.
-    let lib = "fn refused_callee() { let ref _word = 7u8; }\n\
+    // A `let` binding with an `@` subpattern is refused in walk.rs `plain_binding` with
+    // `REFUSED`. Keep it in the *callee* so the launcher first enters a successfully built test.
+    let lib = "fn refused_callee() { let _word @ _ = 7u8; }\n\
                #[test] fn a_needs_callee() { refused_callee(); }\n\
                #[test] fn b_returns() {}\n";
     let said = fixture("test_command_refused_call", &[("Cargo.toml", MANIFEST), ("src/lib.rs", lib)], |dir, home| {
@@ -463,7 +614,7 @@ fn the_refusal_oracle_catches_one_stopped_and_not_run_as_pass() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn runs_both_workspace_packages() {
     let lock = format!("{LOCK_ALPHA}{LOCK_BETA}");
     let manifest = format!("{WORKSPACE}\n[profile.dev]\npanic = \"abort\"\n");
@@ -497,7 +648,7 @@ fn runs_both_workspace_packages() {
 /// workspace without the setting is not refused; `runs_both_workspace_packages` (abort, no
 /// dependency) runs its 2 tests.
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn tests_over_a_dependency_built_to_abort_stop_up_front() {
     const ALPHA_ON_BETA: &str = "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nbeta = { path = \"../beta\" }\n";
     const LOCK: &str = "version = 4\n\n[[package]]\nname = \"alpha\"\nversion = \"0.1.0\"\ndependencies = [\n \"beta\",\n]\n\n[[package]]\nname = \"beta\"\nversion = \"0.1.0\"\n";
@@ -542,7 +693,7 @@ fn every_test_passes_is_caught() {
     let rule = "-".repeat(80);
     let quiet = Said {
         stdout: format!(
-            "FAILED fails after 0.012 s: ended by signal 6\n---- fails output: 79 bytes ----\nthread 'main' (1) panicked at src/lib.rs:6:5:\nassertion `left == right` failed\n{rule}\nFAILED fails: ended by signal 6\n{BOTH_SUMMARY}\n"
+            "FAILED fails after 0.012 s: panicked: assertion `left == right` failed\n---- fails output: 79 bytes ----\nthread 'main' (1) panicked at src/lib.rs:6:5:\nassertion `left == right` failed\n{rule}\nFAILED fails: panicked\n{BOTH_SUMMARY}\n"
         ),
         stderr: String::new(),
         code: Some(0),
@@ -556,7 +707,7 @@ fn every_test_passes_is_caught() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn incremental_reruns_only_changed_test_and_reuses_unchanged() {
     let make_lib = |a_expr: &str, b_expr: &str| {
         format!(
@@ -623,7 +774,7 @@ fn incremental_reruns_only_changed_test_and_reuses_unchanged() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn impure_test_is_not_kept_and_reruns() {
     let source = "#[test]\nfn reads_clock() {\n    let _ = std::time::SystemTime::now();\n}\n";
     fixture("test_command_impure_clock", &[("Cargo.toml", MANIFEST), ("src/lib.rs", source)], |dir, home| {
@@ -647,4 +798,420 @@ fn impure_test_is_not_kept_and_reruns() {
         let second = run(dir, home, &["--", "--deadline", "20s"]);
         check("second impure run reruns instead of reusing", &second);
     });
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn termination_returning_tests_pass_fail_and_cache() {
+    let source = r#"
+use std::process::ExitCode;
+
+fn answer() -> u32 {
+    42
+}
+
+#[test]
+fn plain_unit() {
+    assert_eq!(answer(), 42);
+}
+
+#[test]
+fn result_str_ok() -> Result<(), &'static str> {
+    if answer() == 42 { Ok(()) } else { Err("wrong") }
+}
+
+#[test]
+fn result_string_ok() -> Result<(), String> {
+    if answer() == 42 { Ok(()) } else { Err(String::from("wrong")) }
+}
+
+#[test]
+fn result_string_err() -> Result<(), String> {
+    Err(String::from("termination boom"))
+}
+
+#[test]
+fn exit_code_ok() -> ExitCode {
+    ExitCode::SUCCESS
+}
+
+#[test]
+fn exit_code_42() -> ExitCode {
+    ExitCode::from(42)
+}
+"#;
+    fixture("test_command_termination_shim", &[("Cargo.toml", MANIFEST), ("src/lib.rs", source)], |dir, home| {
+        // 1. Cold run: 4 pass (plain_unit, result_str_ok, result_string_ok, exit_code_ok),
+        //    2 fail cleanly (result_string_err with code 1 + "termination boom", exit_code_42 with code 42),
+        //    ZERO `NOT RUN`!
+        let cold = run(dir, home, &["--", "--deadline", "20s"]);
+        assert_eq!(cold.code, Some(1), "{}", evidence("failing termination tests fail the suite", &cold));
+        assert!(!cold.stdout.contains("NOT RUN"), "{}", evidence("no NOT RUN for Termination tests", &cold));
+        assert!(cold.stdout.contains("FAILED result_string_err"), "{}", evidence("result_string_err failed", &cold));
+        assert!(cold.stdout.contains("termination boom"), "{}", evidence("Error message from Result::report printed", &cold));
+        assert!(cold.stdout.contains("FAILED exit_code_42") && cold.stdout.contains("code 42"), "{}", evidence("exit_code_42 failed with code 42", &cold));
+        let expect_summary = "test result: FAILED. ran 6: 4 passed, 2 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky";
+        assert_eq!(cold.stdout.lines().last(), Some(expect_summary), "{}", evidence(expect_summary, &cold));
+
+        // 2. Warm rerun of only the 4 passing tests: all 4 reused from kept results (`ran 0`, `4 reused`).
+        let warm = run(dir, home, &["--", "--skip", "err", "--skip", "42", "--deadline", "20s"]);
+        let expect_warm = "test result: ok. ran 0: 0 passed, 0 failed; 4 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 2 filtered out; 0 flaky\n";
+        assert_eq!(warm.code, Some(0), "{}", evidence("warm passing termination tests reused", &warm));
+        assert_eq!(warm.stdout, expect_warm, "{}", evidence(expect_warm, &warm));
+    });
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn scoped_test_checks_only_selected_member_and_its_deps() {
+    let files: &[(&str, &str)] = &[
+        ("Cargo.toml", "[workspace]\nmembers = [\"dep\", \"a\", \"b\"]\nresolver = \"2\"\n"),
+        ("dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        (
+            "dep/src/lib.rs",
+            "#[cfg(test)]\nmod tests;\n\npub fn answer() -> u32 {\n    42\n}\n\n#[cfg(test)]\n#[test]\nfn dep_inline_test() {\n    assert_eq!(answer(), 42);\n}\n",
+        ),
+        ("dep/src/tests.rs", "#[test]\nfn dep_submod_test() {\n    assert_eq!(super::answer(), 42);\n}\n"),
+        (
+            "a/Cargo.toml",
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        ),
+        ("a/src/lib.rs", "#[test]\nfn a_uses_dep() {\n    assert_eq!(dep::answer(), 42);\n}\n"),
+        ("b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+        ("b/src/lib.rs", "pub fn broken() -> u8 {\n    \"not a number\"\n}\n\n#[test]\nfn b_test() {}\n"),
+    ];
+    fixture("test_command_scoped_member", files, |dir, home| {
+        // 1. Member directory: `blaze test a` checks only `a` + `dep` (never broken sibling `b`),
+        //    has 0 errors (even though `dep` has both an inline `#[cfg(test)]` fn and a
+        //    `#[cfg(test)] mod tests;` file), and runs and passes `a`'s test.
+        let by_dir = run(dir, home, &["a", "--", "--deadline", "20s"]);
+        let expect_cold = "test result: ok. ran 1: 1 passed, 0 failed; 0 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
+        assert_eq!(by_dir.code, Some(0), "{}", evidence("blaze test a passes without checking b", &by_dir));
+        assert_eq!(by_dir.stdout, expect_cold, "{}", evidence(expect_cold, &by_dir));
+        assert!(!by_dir.stderr.contains("b/src/lib.rs"), "{}", evidence("b must not be checked by `blaze test a`", &by_dir));
+
+        // 2. `-p a` selects the same package scope: hits the scoped check certificate and reuses
+        //    `a`'s kept test result without checking `b`.
+        let by_pkg = run(dir, home, &["-p", "a", "--", "--deadline", "20s"]);
+        let expect_warm = "test result: ok. ran 0: 0 passed, 0 failed; 1 reused from kept results; 0 not kept; 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
+        assert_eq!(by_pkg.code, Some(0), "{}", evidence("blaze test -p a passes without checking b", &by_pkg));
+        assert_eq!(by_pkg.stdout, expect_warm, "{}", evidence(expect_warm, &by_pkg));
+        assert!(!by_pkg.stderr.contains("b/src/lib.rs"), "{}", evidence("b must not be checked by `blaze test -p a`", &by_pkg));
+
+        // 3. Soundness control: whole-workspace `blaze check` was NOT poisoned by the scoped runs
+        //    and still reports `b`'s type error.
+        let whole_check = run_cmd(dir, home, "check", &[]);
+        assert_ne!(whole_check.code, Some(0), "{}", evidence("whole-workspace `blaze check` must report b's error", &whole_check));
+        assert!(
+            whole_check.stdout.contains("b/src/lib.rs") || whole_check.stderr.contains("b/src/lib.rs"),
+            "{}",
+            evidence("whole-workspace `blaze check` mentions b/src/lib.rs", &whole_check),
+        );
+
+        // 4. Whole-workspace `blaze test` (no member / no -p) also still checks `b` and reports its error.
+        let whole_test = run_cmd(dir, home, "test", &["--", "--list"]);
+        assert!(
+            whole_test.stdout.contains("b/src/lib.rs") || whole_test.stderr.contains("b/src/lib.rs"),
+            "{}",
+            evidence("whole-workspace `blaze test` still checks b/src/lib.rs", &whole_test),
+        );
+
+        // 5. Re-running `blaze test a` after whole-workspace `blaze check` still stays clean.
+        let after_whole = run(dir, home, &["a", "--", "--deadline", "20s"]);
+        assert_eq!(after_whole.code, Some(0), "{}", evidence("blaze test a stays clean after whole check", &after_whole));
+        assert_eq!(after_whole.stdout, expect_warm, "{}", evidence(expect_warm, &after_whole));
+    });
+}
+
+/// Scans CAS segment files under `store_root` for `BZTH` suite head records (zeroing only the
+/// per-row 8-byte `micros` wall-time field so every `TestId`, outcome tag, `NotKept` reason,
+/// 32-byte `BZTR` address, asks table, and read table are compared byte-for-byte) and counts
+/// kept `BZTR` pass records (`kept == 0`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn collect_bzth_and_bztr(store_root: &Path) -> (blaze_own::AVec<'static, blaze_own::AVec<'static, u8>>, usize) {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut heads = blaze_own::AVec::new_in(alloc);
+    let mut bztr_kept = blaze_own::AVec::new_in(alloc);
+    let listed = Command::new("/usr/bin/find").arg(store_root).args(["-type", "f"]).output().expect("list store files");
+    assert!(listed.status.success(), "find store files failed");
+    let paths = core::str::from_utf8(&listed.stdout).expect("utf8 store paths");
+    for file in paths.lines() {
+        let raw = read_file_bytes(Path::new(file), file);
+        let bytes = raw.as_ref();
+        let mut i = 0usize;
+        while i + 24 <= bytes.len() {
+            if &bytes[i..i + 4] == b"BZTH" {
+                let ver = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap());
+                let rows = u32::from_le_bytes(bytes[i + 8..i + 12].try_into().unwrap()) as usize;
+                let asks = u32::from_le_bytes(bytes[i + 12..i + 16].try_into().unwrap()) as usize;
+                let reads = u32::from_le_bytes(bytes[i + 16..i + 20].try_into().unwrap()) as usize;
+                let pad = u32::from_le_bytes(bytes[i + 20..i + 24].try_into().unwrap());
+                if ver == 1 && pad == 0 && rows <= 1024 && asks <= 65536 && reads <= 65536 {
+                    let total = 24 + rows * 88 + asks * 40 + reads * 64;
+                    if i + total <= bytes.len() {
+                        let mut rec = blaze_own::AVec::with_capacity_in(total, alloc);
+                        rec.extend_from_slice(&bytes[i..i + total]);
+                        for r in 0..rows {
+                            // Each 88-byte row stores `micros: u64` at offset 72..80.
+                            let off = 24 + r * 88 + 72;
+                            rec[off..off + 8].fill(0);
+                        }
+                        heads.push(rec);
+                        i += total;
+                        continue;
+                    }
+                }
+            } else if i + 64 <= bytes.len()
+                && &bytes[i..i + 4] == b"BZTR"
+                && bytes[i + 4] == 1
+                && bytes[i + 5] == 0
+                && bytes[i + 6..i + 16] == [0u8; 10]
+                && bytes[i + 56..i + 64] == [0u8; 8]
+            {
+                let mut rec = [0u8; 64];
+                rec.copy_from_slice(&bytes[i..i + 64]);
+                bztr_kept.push(rec);
+                i += 64;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    // Background GC compaction may copy records into a newer segment while the superseded
+    // segment is still within its retention grace window; deduplicate identical records.
+    heads.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+    heads.dedup_by(|a, b| a.as_slice() == b.as_slice());
+    bztr_kept.sort();
+    bztr_kept.dedup();
+    (heads, bztr_kept.len())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn copy_dir_files(src: &Path, dst: &Path) {
+    let status = Command::new("/bin/cp").arg("-R").arg(src).arg(dst).status().expect("cp -R store");
+    assert!(status.success(), "cp -R store failed");
+}
+
+/// Regression for parallel `Codes::Pooled` + `SuiteCache` + lock-free `SyncTypedFrom`:
+/// - compiles cold workspace functions, transitive statics (`BASE -> TABLE`), and body-local items
+///   across 4 parallel code workers via `FromRecord` (`SnapshotTyped`);
+/// - preserves pure vs impure (`NotKept::Clock`) classification and warm cache reuse;
+/// - produces byte-for-byte identical `BZTR` test-result records as `--workers 1` (`Codes::Serial`),
+///   and cross-reuses kept results in both directions (`Pooled -> Serial` and `Serial -> Pooled`).
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn pooled_workers_match_serial_bztr_and_purity() {
+    let lib = r#"
+static BASE: u64 = 17;
+static TABLE: [&u64; 2] = [&BASE, &BASE];
+
+#[inline(never)]
+fn shared_compute(x: u64) -> u64 {
+    fn local_step(v: u64) -> u64 {
+        v.wrapping_mul(3).wrapping_add(1)
+    }
+    let p: *const u64 = TABLE[0];
+    assert!(!p.is_null());
+    local_step(x + *TABLE[0] + *TABLE[1])
+}
+
+#[test]
+fn pure_one() {
+    assert_eq!(shared_compute(1), 106);
+}
+
+#[test]
+fn pure_two() {
+    assert_eq!(shared_compute(2), 109);
+}
+
+#[test]
+fn pure_three() {
+    assert_eq!(shared_compute(3), 112);
+}
+
+#[test]
+fn pure_four() {
+    assert_eq!(shared_compute(4), 115);
+}
+
+#[test]
+fn impure_clock() {
+    let t = std::time::Instant::now();
+    assert_eq!(shared_compute(5), 118);
+    let _ = t.elapsed();
+}
+"#;
+    fixture("test_command_pooled_vs_serial", &[("Cargo.toml", MANIFEST), ("src/lib.rs", lib)], |dir, home| {
+        let expect_cold = "test result: ok. ran 5: 5 passed, 0 failed; 0 reused from kept results; 1 not kept (1 read the real clock); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
+        let expect_warm = "test result: ok. ran 1: 1 passed, 0 failed; 4 reused from kept results; 1 not kept (1 read the real clock); 0 ignored; 0 benches not run; 0 filtered out; 0 flaky\n";
+
+        // 0. Warm `blaze check` once via `--list` and snapshot the checked store (empty code store)
+        //    so both `--workers 1` (`Codes::Serial`) and `--workers 4` (`Codes::Pooled`) compile
+        //    cold code records over the exact same check records.
+        let listed = run(dir, home, &["--", "--list"]);
+        assert_eq!(listed.code, Some(0), "{}", evidence("warm check via --list", &listed));
+        let store_dir = home.join(".blaze/v2/store");
+        let checked_snapshot = home.join("store_checked_snapshot");
+        copy_dir_files(&store_dir, &checked_snapshot);
+
+        // 1. Cold serial (`--workers 1`).
+        let serial_cold = run(dir, home, &["--workers", "1", "--", "--deadline", "20s"]);
+        assert_eq!(serial_cold.code, Some(0), "{}", evidence("serial cold passes", &serial_cold));
+        assert!(serial_cold.stdout.ends_with(expect_cold), "{}", evidence(expect_cold, &serial_cold));
+        let (serial_heads, serial_passes) = collect_bzth_and_bztr(&store_dir);
+        assert_eq!(serial_passes, 4, "serial run must keep exactly the 4 pure tests (got {serial_passes})");
+        assert_eq!(serial_heads.len(), 1, "expected 1 BZTH head record in serial store");
+
+        // 2. Cross-mode reuse (Serial -> Pooled): `--workers 4` reuses all 4 serial-kept passes.
+        let pooled_on_serial = run(dir, home, &["--workers", "4", "--", "--deadline", "20s"]);
+        assert_eq!(pooled_on_serial.code, Some(0), "{}", evidence("pooled reuses serial cache", &pooled_on_serial));
+        assert!(pooled_on_serial.stdout.ends_with(expect_warm), "{}", evidence(expect_warm, &pooled_on_serial));
+
+        // 3. Restore the warm-checked / empty-code-store snapshot and run cold pooled (`--workers 4`).
+        let rm_ok = Command::new("/bin/rm").arg("-rf").arg(&store_dir).status().expect("rm -rf store");
+        assert!(rm_ok.success(), "rm -rf store failed");
+        copy_dir_files(&checked_snapshot, &store_dir);
+        let pooled_cold = run(dir, home, &["--workers", "4", "--", "--deadline", "20s"]);
+        assert_eq!(pooled_cold.code, Some(0), "{}", evidence("pooled cold passes", &pooled_cold));
+        assert!(pooled_cold.stdout.ends_with(expect_cold), "{}", evidence(expect_cold, &pooled_cold));
+
+        // 4. Rule 25 determinism: `BZTH` head records (every TestId, outcome, NotKept reason,
+        //    32-byte `BZTR` address, asks table, and read table) and kept `BZTR` pass count must
+        //    be byte-for-byte identical between `--workers 1` (`Codes::Serial`) and `--workers 4`
+        //    (`Codes::Pooled`).
+        let (pooled_heads, pooled_passes) = collect_bzth_and_bztr(&store_dir);
+        assert_eq!(pooled_passes, 4, "pooled run must keep exactly the 4 pure tests (got {pooled_passes})");
+        assert_eq!(
+            serial_heads, pooled_heads,
+            "BZTH head & BZTR addresses under --workers 4 (Codes::Pooled) must match --workers 1 (Codes::Serial) byte-for-byte"
+        );
+
+        // 5. Warm pooled (`--workers 4`): reuses all 4 pure tests, reruns only impure_clock.
+        let pooled_warm = run(dir, home, &["--workers", "4", "--", "--deadline", "20s"]);
+        assert_eq!(pooled_warm.code, Some(0), "{}", evidence("pooled warm passes", &pooled_warm));
+        assert!(pooled_warm.stdout.ends_with(expect_warm), "{}", evidence(expect_warm, &pooled_warm));
+
+        // 6. Cross-mode reuse (Pooled -> Serial): `--workers 1` reuses all 4 pooled-kept passes.
+        let serial_on_pooled = run(dir, home, &["--workers", "1", "--", "--deadline", "20s"]);
+        assert_eq!(serial_on_pooled.code, Some(0), "{}", evidence("serial reuses pooled cache", &serial_on_pooled));
+        assert!(serial_on_pooled.stdout.ends_with(expect_warm), "{}", evidence(expect_warm, &serial_on_pooled));
+    });
+}
+
+/// `CARGO_BIN_EXE_<name>` launcher stubs (`test.md` piece 17): integration tests can read, inspect,
+/// shell-exec, and spawn workspace `[[bin]]` targets through BOTH compile-time
+/// `env!("CARGO_BIN_EXE_helper")` (`/target/debug/bin/<pkg>/<bin>`) AND runtime
+/// `std::env::var("CARGO_BIN_EXE_helper")`, including concurrent multi-child spawns, while unit
+/// tests do NOT receive `CARGO_BIN_EXE_*`.
+#[test]
+fn integration_test_spawns_cargo_bin_exe_stub() {
+    let manifest = "\
+[package]
+name = \"binapp\"
+version = \"0.1.0\"
+edition = \"2024\"
+
+[[bin]]
+name = \"helper\"
+path = \"src/main.rs\"
+";
+    let lib_rs = "\
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit_test_does_not_receive_cargo_bin_exe() {
+        assert!(std::env::var_os(\"CARGO_BIN_EXE_helper\").is_none());
+    }
+}
+";
+    let main_rs = "\
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    println!(\"helper-ok:{}\", args.join(\",\"));
+}
+";
+    let integ_rs = "\
+use std::path::Path;
+use std::process::Command;
+
+#[test]
+fn spawns_via_compile_time_and_runtime_env() {
+    let compile_path = env!(\"CARGO_BIN_EXE_helper\");
+    assert_eq!(compile_path, \"/target/debug/bin/binapp/helper\");
+    assert!(Path::new(compile_path).exists(), \"advertised stub path must exist\");
+
+    // Verify a real file is readable at the advertised compile-time path (not only exec/stat).
+    let bytes = std::fs::read(compile_path).expect(\"std::fs::read on advertised CARGO_BIN_EXE path\");
+    assert!(!bytes.is_empty(), \"stub executable file must be non-empty\");
+
+    let runtime_path = std::env::var(\"CARGO_BIN_EXE_helper\").expect(\"runtime CARGO_BIN_EXE_helper\");
+    assert!(Path::new(&runtime_path).exists(), \"runtime stub path must exist\");
+
+    // Spawn two children concurrently (one via compile-time guest path, one via runtime stub path)
+    // to exercise concurrent multi-connection serving on the binary stub Unix listener.
+    let child_a = Command::new(compile_path)
+        .args([\"alpha\", \"one\"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect(\"spawn compile-time CARGO_BIN_EXE_helper\");
+    let child_b = Command::new(&runtime_path)
+        .args([\"beta\", \"two\"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect(\"spawn runtime CARGO_BIN_EXE_helper\");
+
+    let out_a = child_a.wait_with_output().expect(\"wait child_a\");
+    let out_b = child_b.wait_with_output().expect(\"wait child_b\");
+    assert!(out_a.status.success(), \"child_a failed: status={:?} stderr={}\", out_a.status, String::from_utf8_lossy(&out_a.stderr));
+    assert!(out_b.status.success(), \"child_b failed: status={:?} stderr={}\", out_b.status, String::from_utf8_lossy(&out_b.stderr));
+    assert_eq!(String::from_utf8_lossy(&out_a.stdout).trim(), \"helper-ok:alpha,one\");
+    assert_eq!(String::from_utf8_lossy(&out_b.stdout).trim(), \"helper-ok:beta,two\");
+
+    // Copying `CARGO_BIN_EXE_*` to an arbitrary temp path (with no adjacent sidecar file) must
+    // remain directly runnable, matching Cargo's self-contained executable behavior.
+    let copied = std::env::temp_dir().join(\"blaze_copied_helper_bin\");
+    let _ = std::fs::remove_file(&copied);
+    std::fs::copy(compile_path, &copied).expect(\"copy CARGO_BIN_EXE_helper to temp path\");
+    let copy_out = Command::new(&copied)
+        .args([\"copied\", \"ok\"])
+        .output()
+        .expect(\"spawn copied CARGO_BIN_EXE_helper\");
+    let _ = std::fs::remove_file(&copied);
+    assert!(copy_out.status.success(), \"copied helper failed: status={:?} stderr={}\", copy_out.status, String::from_utf8_lossy(&copy_out.stderr));
+    assert_eq!(String::from_utf8_lossy(&copy_out.stdout).trim(), \"helper-ok:copied,ok\");
+
+    // On Linux, `/target/debug/bin` is bind-mounted in the kernel namespace so even an external
+    // `/bin/sh` child sees and executes the exact compile-time path.
+    #[cfg(target_os = \"linux\")]
+    {
+        let sh_out = Command::new(\"/bin/sh\")
+            .args([\"-c\", \"\\\"$1\\\" via shell\", \"sh\", compile_path])
+            .output()
+            .expect(\"spawn /bin/sh with compile-time CARGO_BIN_EXE_helper\");
+        assert!(sh_out.status.success(), \"sh failed: status={:?} stderr={}\", sh_out.status, String::from_utf8_lossy(&sh_out.stderr));
+        assert_eq!(String::from_utf8_lossy(&sh_out.stdout).trim(), \"helper-ok:via,shell\");
+    }
+}
+";
+    fixture(
+        "bin_exe",
+        &[
+            ("Cargo.toml", manifest),
+            ("src/lib.rs", lib_rs),
+            ("src/main.rs", main_rs),
+            ("tests/spawns_bin.rs", integ_rs),
+        ],
+        |dir, home| {
+            let said = run(dir, home, &["--", "--deadline", "60s"]);
+            assert_eq!(said.code, Some(0), "{}", evidence("CARGO_BIN_EXE stub test passes", &said));
+            assert!(
+                said.stdout.contains("2 passed, 0 failed"),
+                "{}",
+                evidence("2 passed, 0 failed", &said)
+            );
+        },
+    );
 }

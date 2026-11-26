@@ -97,7 +97,7 @@ pub(crate) fn freeze_field_regions<'n, 'a, S: NamesSource<'n>>(
     // The one region counter's facts: each declared count the names' (D155), what the column
     // was laid by in every store.
     let arity = HeadsArity { heads: &store.maps, opaques: &[], names };
-    let reader = store.regions.reader(store.tys.alloc());
+    let reader = store.regions.reader(store.work_alloc());
     let mut at = AVec::with_capacity_in(fields.len(), alloc);
     let mut list = AVec::new_in(alloc);
     for (field, &(variant, index, written_ty)) in fields.iter().zip(written.iter()) {
@@ -339,7 +339,59 @@ fn read_copy_impl<'a>(store: &Store<'_>, langs: super::BorrowLangs, adt: tc::Ite
     let [sized, meta_sized, pointee_sized, destruct] = langs.relates_nothing;
     let sized = sized.or_else(|| store.sized.map(checker_of));
     let adt_preds = store.preds.get(&adt)?;
+    // Lazily populated mapping from impl lifetime param index to ADT lifetime param index,
+    // read from `imp`'s self_ty region column when `imp` has a `RegionOutlives` clause.
+    let mut lt_map: Option<AVec<'a, Option<u32>>> = None;
     for c in store.preds.get(&imp)?.clauses.iter() {
+        if let tc::PClause::RegionOutlives { long, short } = *c {
+            let map = match &mut lt_map {
+                Some(m) => m,
+                slot @ None => {
+                    let reader = store.regions.reader(store.work_alloc());
+                    let adt_lts = usize::try_from(store.adts.get(&adt)?.lifetimes).ok()?;
+                    let (self_col, _) = reader.impl_header(imp).ok()?;
+                    let self_slice = self_col.as_slice();
+                    if self_slice.len() < adt_lts {
+                        return None;
+                    }
+                    let mut m: AVec<'a, Option<u32>> = AVec::new_in(alloc);
+                    for (j, &r) in self_slice.get(..adt_lts)?.iter().enumerate() {
+                        if let Region::Param(imp_p) = r {
+                            let pi = usize::try_from(imp_p).ok()?;
+                            if m.len() <= pi {
+                                m.resize(pi + 1, None);
+                            }
+                            if let Some(entry) = m.get_mut(pi) {
+                                if entry.is_some() {
+                                    // Same impl lifetime bound twice on the ADT: cannot invert uniquely.
+                                    return None;
+                                }
+                                *entry = u32::try_from(j).ok();
+                            }
+                        }
+                    }
+                    slot.insert(m)
+                }
+            };
+            let map_reg = |r: Region| -> Option<Region> {
+                match r {
+                    Region::Static => Some(Region::Static),
+                    Region::Param(p) => usize::try_from(p).ok().and_then(|pi| map.get(pi).copied().flatten()).map(Region::Param),
+                    Region::Late { .. } => None,
+                }
+            };
+            let adt_long = map_reg(long)?;
+            let adt_short = map_reg(short)?;
+            if adt_long == Region::Static
+                || adt_long == adt_short
+                || adt_preds.clauses.iter().any(|ac| {
+                    matches!(*ac, tc::PClause::RegionOutlives { long: al, short: as_ } if al == adt_long && as_ == adt_short)
+                })
+            {
+                continue;
+            }
+            return None;
+        }
         if let tc::PClause::TypeOutlives { ty, region } = *c {
             // A `T: 'r` clause already required by the ADT's own predicates (e.g.
             // `struct ReflectVtable<T: 'static, A>` with `impl<T: 'static, A> Copy`) is
@@ -559,37 +611,228 @@ fn is_uncond_copy<'n, 'a, S: NamesSource<'n>>(
     scratch.get(s..e).is_some_and(|need| need.iter().all(|&b| !b))
 }
 
-/// Structural drop summary for `adt`: `(needs_drop_unconditionally, drop_args_span)`.
+/// Structural drop summary for an ADT ([`drop_facts_of`]).
+pub(super) struct DropFactsSummary {
+    pub(super) needs_drop: bool,
+    pub(super) drop_args: Option<(u32, u32)>,
+    pub(super) drop_strict: Option<(u32, u32)>,
+    pub(super) drop_lifetimes: Option<(u32, u32)>,
+}
+
+fn all_param_bits(generics: u32) -> u64 {
+    if generics >= 64 { u64::MAX } else { (1u64 << generics) - 1 }
+}
+
+/// Bitmask of `adt`'s generic arguments (`0..generics`) that are NOT marked `#[may_dangle]` on
+/// `adt`'s unique `Drop` impl (RFC 1327): bit `j` set means dropping `adt` may inspect arbitrary
+/// lifetimes inside argument `j`. Conservative `all_param_bits(generics)` when unread.
+fn drop_impl_strict_mask<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    langs: super::BorrowLangs,
+    adt: tc::ItemKey,
+    generics: u32,
+) -> u64 {
+    let all = all_param_bits(generics);
+    if generics == 0 || generics > 64 {
+        return all;
+    }
+    let Some(drop_tr) = langs.drop else { return all };
+    let Some(impls) = answer_impls(r, drop_tr, tc::Shape::Adt(adt)) else { return all };
+    let &[imp] = &impls[..] else { return all };
+    if !r.store.impls.contains_key(&imp) {
+        let Some(lib) = r.keys.library_in(r.names, imp) else { return all };
+        if !super::ensure_one(r, Want::Impl(lib)) {
+            return all;
+        }
+    }
+    let Some(lib) = r.keys.library_in(r.names, imp) else { return all };
+    let Some(item) = r.names.signature_text_of(lib) else { return all };
+    if !item.text.contains("may_dangle") {
+        return all;
+    }
+    let Some(krate) = r.names.crate_of(lib) else { return all };
+    let edition = r.names.edition_of(krate).unwrap_or(blaze_surface::Edition::E2024);
+    let Ok(md_mask) = blaze_file_items::impl_may_dangle_params(item.text, edition) else {
+        return all;
+    };
+    if md_mask == 0 {
+        return all;
+    }
+    let tys = r.store.tys.view();
+    let Some(head) = r.store.impls.get(&imp) else { return all };
+    let Ok(tc::PNode::Adt(k, l)) = tys.node(head.self_ty) else { return all };
+    if k != adt {
+        return all;
+    }
+    let Ok(args) = tys.list(l) else { return all };
+    let mut strict = all;
+    for (j, &a) in args.iter().enumerate() {
+        if j < 64
+            && let Ok(tc::PNode::Param(p)) = tys.node(a)
+            && p < 64
+            && (md_mask & (1u64 << p)) != 0
+        {
+            strict &= !(1u64 << j);
+        }
+    }
+    strict
+}
+
+/// Collects every `PNode::Param(p)` appearing anywhere inside `root` (even behind references or
+/// pointers) into `strict_params` (RFC 1327: a strict `Drop` impl can inspect any lifetime inside
+/// its non-`#[may_dangle]` argument).
+fn collect_strict_params(
+    tys: tc::PTys<'_>,
+    root: tc::PTy,
+    generics: u32,
+    strict_params: &mut u64,
+    scratch: &mut AVec<'_, tc::PTy>,
+) -> bool {
+    scratch.clear();
+    scratch.push(root);
+    let mut steps = 0u32;
+    while let Some(ty) = scratch.pop() {
+        steps += 1;
+        if steps > MOST_DROP_NODES {
+            *strict_params = all_param_bits(generics);
+            return false;
+        }
+        match tys.node(ty) {
+            Ok(tc::PNode::Param(p)) => {
+                if p < generics && p < 64 {
+                    *strict_params |= 1u64 << p;
+                }
+            }
+            Ok(
+                tc::PNode::Ref(_, i)
+                | tc::PNode::Ptr(_, i)
+                | tc::PNode::Slice(i)
+                | tc::PNode::Array(i, _)
+                | tc::PNode::Pat(i, _),
+            ) => scratch.push(i),
+            Ok(
+                tc::PNode::Tuple(l)
+                | tc::PNode::Record(_, l)
+                | tc::PNode::Union(l)
+                | tc::PNode::FnPtr(l, _)
+                | tc::PNode::Adt(_, l)
+                | tc::PNode::Opaque(_, l)
+                | tc::PNode::FnDef(_, l)
+                | tc::PNode::Dynamic(l)
+                | tc::PNode::ExTrait(_, l),
+            ) => {
+                if let Ok(es) = tys.list(l) {
+                    scratch.extend_from_slice(es);
+                }
+            }
+            Ok(tc::PNode::Alias { args, .. }) => {
+                if let Ok(es) = tys.list(args) {
+                    scratch.extend_from_slice(es);
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Marks every `Region::Param(lp)` with `lp < lifetimes` appearing in `slice` into `mask`.
+fn mark_region_params(slice: &[Region], lifetimes: u32, mask: &mut u64) {
+    for &r in slice {
+        if let Region::Param(lp) = r
+            && lp < lifetimes
+            && lp < 64
+        {
+            *mask |= 1u64 << lp;
+        }
+    }
+}
+
+/// Counts total region slots occupied by `root` in pre-order (matching `RegionCol`), using
+/// `region_arity` per node. Returns `None` if any node cannot be counted or exceeds `MOST_DROP_NODES`.
+fn subtree_region_count(tys: tc::PTys<'_>, root: tc::PTy, arity: &impl Arity, scratch: &mut AVec<'_, tc::PTy>) -> Option<usize> {
+    scratch.clear();
+    scratch.push(root);
+    let mut total = 0usize;
+    let mut steps = 0u32;
+    while let Some(t) = scratch.pop() {
+        steps += 1;
+        if steps > MOST_DROP_NODES {
+            return None;
+        }
+        let node = tys.node(t).ok()?;
+        let own = usize::try_from(region_arity(t, node, arity).ok()?).ok()?;
+        total = total.checked_add(own)?;
+        match node {
+            tc::PNode::Ref(_, i) | tc::PNode::Ptr(_, i) | tc::PNode::Slice(i) | tc::PNode::Pat(i, _) | tc::PNode::Array(i, _) => scratch.push(i),
+            tc::PNode::Tuple(l)
+            | tc::PNode::Record(_, l)
+            | tc::PNode::Union(l)
+            | tc::PNode::FnPtr(l, _)
+            | tc::PNode::Adt(_, l)
+            | tc::PNode::Alias { args: l, .. }
+            | tc::PNode::Dynamic(l)
+            | tc::PNode::FnDef(_, l)
+            | tc::PNode::Opaque(_, l)
+            | tc::PNode::ExTrait(_, l) => {
+                scratch.extend_from_slice(tys.list(l).ok()?);
+            }
+            tc::PNode::ExProj { args, term, .. } => {
+                scratch.push(term);
+                scratch.extend_from_slice(tys.list(args).ok()?);
+            }
+            _ => {}
+        }
+    }
+    Some(total)
+}
+
+/// Structural drop summary for `adt`: `needs_drop`, `drop_args`, `drop_strict` (RFC 1327), and
+/// `drop_lifetimes` (which declared lifetime parameters of `adt` are actually observed by drop).
 /// Computes a bounded fixed point over ADTs reachable from `adt`'s fields in dropping positions
 /// and files a `BorrowAdt` (`DROP_ADT_DETAIL`) read row for each nested ADT inspected (rule 21).
 #[expect(clippy::too_many_arguments, reason = "the ADT's already-queried Copy/Drop facts and output buffers")]
-pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
+pub(super) fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
     langs: super::BorrowLangs,
     adt: tc::ItemKey,
     adt_drop_impl: Option<bool>,
     adt_uncond_copy: bool,
     need: &mut AVec<'a, bool>,
+    strict_need: &mut AVec<'a, bool>,
+    lt_need: &mut AVec<'a, bool>,
     reads: &mut AVec<'a, Read>,
     alloc: Alloc<'a>,
-) -> (bool, Option<(u32, u32)>) {
+) -> DropFactsSummary {
     let is_inert = |k: tc::ItemKey| langs.manually_drop == Some(k) || langs.phantom_data == Some(k);
     if is_inert(adt) || adt_uncond_copy {
-        let generics = BodyHeadFacts::new(&*r.store, r.names).adt(adt).map_or(0, |row| row.generics);
-        return push_drop_mask(generics, 0, need);
-    }
-    if adt_drop_impl != Some(false) {
-        return (true, None);
+        let (generics, lifetimes) = BodyHeadFacts::new(&*r.store, r.names).adt(adt).map_or((0, 0), |row| (row.generics, row.lifetimes));
+        let (needs_drop, drop_args) = push_drop_mask(generics, 0, need);
+        let drop_strict = push_bool_mask(generics, 0, strict_need);
+        let drop_lifetimes = if lifetimes <= 64 { push_bool_mask(lifetimes, 0, lt_need) } else { None };
+        return DropFactsSummary { needs_drop, drop_args, drop_strict, drop_lifetimes };
     }
     let Some(root_row) = BodyHeadFacts::new(&*r.store, r.names).adt(adt) else {
-        return (true, None);
+        return DropFactsSummary { needs_drop: true, drop_args: None, drop_strict: None, drop_lifetimes: None };
     };
     let root_generics = root_row.generics;
+    let root_lifetimes = root_row.lifetimes;
+    if adt_drop_impl == Some(true) {
+        let strict_mask = drop_impl_strict_mask(r, langs, adt, root_generics);
+        let drop_strict = if root_generics <= 64 { push_bool_mask(root_generics, strict_mask, strict_need) } else { None };
+        return DropFactsSummary { needs_drop: true, drop_args: None, drop_strict, drop_lifetimes: None };
+    }
+    if adt_drop_impl != Some(false) {
+        return DropFactsSummary { needs_drop: true, drop_args: None, drop_strict: None, drop_lifetimes: None };
+    }
     if root_row.kind == tc::AdtKind::Union {
-        return push_drop_mask(root_generics, 0, need);
+        let (needs_drop, drop_args) = push_drop_mask(root_generics, 0, need);
+        let drop_strict = push_bool_mask(root_generics, 0, strict_need);
+        let drop_lifetimes = if root_lifetimes <= 64 { push_bool_mask(root_lifetimes, 0, lt_need) } else { None };
+        return DropFactsSummary { needs_drop, drop_args, drop_strict, drop_lifetimes };
     }
     if root_generics > 64 {
-        return (true, None);
+        return DropFactsSummary { needs_drop: true, drop_args: None, drop_strict: None, drop_lifetimes: None };
     }
 
     // Discover reachable ADTs in dropping positions (BFS, bounded by MOST_DROP_ADTS).
@@ -597,16 +840,32 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
         key: tc::ItemKey,
         fixed: Option<(bool, u64)>,
         generics: u32,
+        lifetimes: u32,
         uncond: bool,
         params: u64,
+        has_drop_impl: bool,
+        strict_params: u64,
+        drop_lts: u64,
     }
     let mut nodes: AVec<'a, DropNode> = AVec::new_in(alloc);
-    nodes.push(DropNode { key: adt, fixed: None, generics: root_generics, uncond: false, params: 0 });
+    nodes.push(DropNode {
+        key: adt,
+        fixed: None,
+        generics: root_generics,
+        lifetimes: root_lifetimes,
+        uncond: false,
+        params: 0,
+        has_drop_impl: false,
+        strict_params: 0,
+        drop_lts: 0,
+    });
     let mut cursor = 0usize;
     let mut capped = false;
-    let mut field_tys: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+    let mut field_tys: AVec<'a, (tc::PTy, u32, u32)> = AVec::new_in(alloc);
     let mut field_spans: AVec<'a, (usize, usize)> = AVec::new_in(alloc);
     let mut ty_stack: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+    let mut lt_stack: AVec<'a, (tc::PTy, usize, usize)> = AVec::new_in(alloc);
+    let mut strict_stack: AVec<'a, tc::PTy> = AVec::new_in(alloc);
     let mut copy_scratch: AVec<'a, bool> = AVec::new_in(alloc);
 
     while let Some(key) = nodes.get(cursor).map(|n| n.key) {
@@ -627,25 +886,61 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
         };
         let drop_impl = if is_root {
             adt_drop_impl
-        } else if inert || uncond_copy {
+        } else if inert || uncond_copy || langs.drop.is_none() {
             Some(false)
         } else {
             super::has_impl(r, langs.drop, key).ok()
         };
-        let row_opt = BodyHeadFacts::new(&*r.store, r.names).adt(key);
-        let (made, union, generics) = match row_opt {
-            Some(row) => (true, row.kind == tc::AdtKind::Union, row.generics),
-            None => (false, false, 0),
+        let (made, union, generics, lifetimes) = match BodyHeadFacts::new(&*r.store, r.names).adt(key) {
+            Some(row) => (true, row.kind == tc::AdtKind::Union, row.generics, row.lifetimes),
+            None => (false, false, 0, 0),
+        };
+        let impl_strict = if drop_impl == Some(true) {
+            drop_impl_strict_mask(r, langs, key, generics)
+        } else if !made || generics > 64 || drop_impl.is_none() {
+            all_param_bits(generics)
+        } else {
+            0
         };
         let fields_start = field_tys.len();
-        let mut fhash = tc::StableHasher::new("blaze-ladder front2 borrow drop fields v1");
-        if let Some(row) = row_opt {
+        let mut fhash = tc::StableHasher::new("blaze-ladder front2 borrow drop fields v3");
+        fhash.u64(impl_strict);
+        fhash.u32(lifetimes);
+        if let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(key) {
             let tys = r.store.tys.view();
+            let reader = r.store.regions.reader(r.store.work_alloc());
             fhash.u32(u32::try_from(row.fields.len()).unwrap_or(u32::MAX));
-            for f in row.fields.iter() {
-                field_tys.push(f.ty);
-                let mut hb = MOST_DROP_NODES;
-                hash_pty_for_drop(tys, f.ty, &mut fhash, &mut hb, &mut ty_stack);
+            for (vi, v) in row.variants.iter().enumerate() {
+                for (fi, f) in row.fields.get(v.fields.range()).unwrap_or(&[]).iter().enumerate() {
+                    let v_idx = u32::try_from(vi).unwrap_or(u32::MAX);
+                    let f_idx = u32::try_from(fi).unwrap_or(u32::MAX);
+                    field_tys.push((f.ty, v_idx, f_idx));
+                    let mut hb = MOST_DROP_NODES;
+                    hash_pty_for_drop(tys, f.ty, &mut fhash, &mut hb, &mut ty_stack);
+                    if lifetimes > 0 {
+                        match reader.field(key, v_idx, f_idx) {
+                            Ok(col) if col.ty() == f.ty => {
+                                fhash.tag(1);
+                                fhash.u32(u32::try_from(col.as_slice().len()).unwrap_or(u32::MAX));
+                                for &reg in col.as_slice() {
+                                    match reg {
+                                        Region::Static => fhash.tag(0),
+                                        Region::Param(p) => {
+                                            fhash.tag(1);
+                                            fhash.u32(p);
+                                        }
+                                        Region::Late { binder, var } => {
+                                            fhash.tag(2);
+                                            fhash.u32(binder);
+                                            fhash.u32(var);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => fhash.tag(0),
+                        }
+                    }
+                }
             }
         }
         let fields_end = field_tys.len();
@@ -663,9 +958,20 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
         } else {
             None
         };
+        let init_drop_lts = if inert || uncond_copy || union {
+            0
+        } else if !made || lifetimes > 64 || drop_impl != Some(false) {
+            all_param_bits(lifetimes)
+        } else {
+            0
+        };
         if let Some(node) = nodes.get_mut(cursor) {
             node.generics = generics;
+            node.lifetimes = lifetimes;
             node.fixed = fixed;
+            node.has_drop_impl = drop_impl == Some(true);
+            node.strict_params = impl_strict;
+            node.drop_lts = init_drop_lts;
             if let Some((u, p)) = fixed {
                 node.uncond = u;
                 node.params = p;
@@ -676,7 +982,9 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
             let tys = r.store.tys.view();
             ty_stack.clear();
             if let Some(slice) = field_tys.get(fields_start..fields_end) {
-                ty_stack.extend_from_slice(slice);
+                for &(fty, _, _) in slice {
+                    ty_stack.push(fty);
+                }
             }
             let mut steps = 0u32;
             while let Some(t) = ty_stack.pop() {
@@ -698,7 +1006,17 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
                                 capped = true;
                                 break;
                             }
-                            nodes.push(DropNode { key: nested, fixed: None, generics: 0, uncond: false, params: 0 });
+                            nodes.push(DropNode {
+                                key: nested,
+                                fixed: None,
+                                generics: 0,
+                                lifetimes: 0,
+                                uncond: false,
+                                params: 0,
+                                has_drop_impl: false,
+                                strict_params: 0,
+                                drop_lts: 0,
+                            });
                         }
                         if let Ok(es) = tys.list(args) {
                             ty_stack.extend_from_slice(es);
@@ -712,33 +1030,43 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
     }
 
     if capped {
-        return (true, None);
+        return DropFactsSummary { needs_drop: true, drop_args: None, drop_strict: None, drop_lifetimes: None };
     }
 
-    // Monotone fixed point over `nodes`: each pass only sets `uncond = true` or sets bits in `params`.
+    // Monotone fixed point over `nodes`: each pass only sets `uncond = true` or sets bits in
+    // `params` / `strict_params` / `drop_lts`.
     let tys = r.store.tys.view();
+    let arity = HeadsArity { heads: &r.store.maps, opaques: &[], names: r.names };
+    let reader = r.store.regions.reader(r.store.work_alloc());
     let max_iters = nodes.len().saturating_add(2);
     for _ in 0..max_iters {
         let mut changed = false;
         for idx in 0..nodes.len() {
-            let Some((fixed, generics, old_uncond, old_params)) = nodes.get(idx).map(|n| (n.fixed, n.generics, n.uncond, n.params)) else {
+            let Some((node_key, fixed, generics, lifetimes, old_uncond, old_params, old_strict, old_lts)) =
+                nodes.get(idx).map(|n| (n.key, n.fixed, n.generics, n.lifetimes, n.uncond, n.params, n.strict_params, n.drop_lts))
+            else {
                 continue;
             };
-            if fixed.is_some() || old_uncond {
+            if fixed.is_some() {
                 continue;
             }
             let Some(&(fs, fe)) = field_spans.get(idx) else { continue };
             let mut uncond = old_uncond;
             let mut params = old_params;
+            let mut strict_params = old_strict;
+            let mut drop_lts = old_lts;
             ty_stack.clear();
             if let Some(slice) = field_tys.get(fs..fe) {
-                ty_stack.extend_from_slice(slice);
+                for &(fty, _, _) in slice {
+                    ty_stack.push(fty);
+                }
             }
             let mut steps = 0u32;
             while let Some(t) = ty_stack.pop() {
                 steps += 1;
                 if steps > MOST_DROP_NODES {
                     uncond = true;
+                    strict_params = all_param_bits(generics);
                     break;
                 }
                 match tys.node(t) {
@@ -761,13 +1089,13 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
                             params |= 1u64 << p;
                         } else {
                             uncond = true;
-                            break;
                         }
                     }
                     Ok(tc::PNode::Tuple(l)) => match tys.list(l) {
                         Ok(es) => ty_stack.extend_from_slice(es),
                         Err(_) => {
                             uncond = true;
+                            strict_params = all_param_bits(generics);
                             break;
                         }
                     },
@@ -775,34 +1103,173 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
                     Ok(tc::PNode::Adt(nested, args)) => {
                         let Some(target) = nodes.iter().find(|n| n.key == nested) else {
                             uncond = true;
-                            break;
+                            collect_strict_params(tys, t, generics, &mut strict_params, &mut strict_stack);
+                            continue;
                         };
-                        if target.uncond {
+                        let target_uncond = target.uncond;
+                        let target_params = target.params;
+                        let target_strict = target.strict_params;
+                        let target_has_drop = target.has_drop_impl;
+                        if target_uncond {
                             uncond = true;
-                            break;
                         }
-                        let mask = target.params;
                         let Ok(es) = tys.list(args) else {
                             uncond = true;
+                            strict_params = all_param_bits(generics);
                             break;
                         };
                         for (j, &arg) in es.iter().enumerate() {
-                            if j >= 64 || (mask & (1u64 << j)) != 0 {
+                            let is_strict = j >= 64 || (target_strict & (1u64 << j)) != 0;
+                            if is_strict {
+                                collect_strict_params(tys, arg, generics, &mut strict_params, &mut strict_stack);
+                            } else if target_has_drop || target_uncond || (target_params & (1u64 << j)) != 0 {
+                                // `#[may_dangle]` on `Drop` or structural glue: recurse into `arg`.
                                 ty_stack.push(arg);
                             }
                         }
                     }
                     _ => {
                         uncond = true;
-                        break;
+                        collect_strict_params(tys, t, generics, &mut strict_params, &mut strict_stack);
                     }
                 }
             }
-            if (uncond != old_uncond || params != old_params)
+            // Per-lifetime drop liveness: walk each field in lockstep with its region column,
+            // stopping at non-dropping types (`&T`, `*const T`, `fn(..)`, scalars, inert args).
+            if lifetimes > 0 && lifetimes <= 64 && drop_lts != all_param_bits(lifetimes) {
+                for &(fty, v_idx, f_idx) in field_tys.get(fs..fe).unwrap_or(&[]) {
+                    if drop_lts == all_param_bits(lifetimes) {
+                        break;
+                    }
+                    let Ok(col) = reader.field(node_key, v_idx, f_idx) else {
+                        drop_lts = all_param_bits(lifetimes);
+                        break;
+                    };
+                    if col.ty() != fty {
+                        drop_lts = all_param_bits(lifetimes);
+                        break;
+                    }
+                    let regs = col.as_slice();
+                    lt_stack.clear();
+                    lt_stack.push((fty, 0, regs.len()));
+                    let mut lt_steps = 0u32;
+                    while let Some((t, c_start, c_len)) = lt_stack.pop() {
+                        lt_steps += 1;
+                        if lt_steps > MOST_DROP_NODES {
+                            drop_lts = all_param_bits(lifetimes);
+                            break;
+                        }
+                        let Some(sub_regs) = regs.get(c_start..c_start + c_len) else {
+                            drop_lts = all_param_bits(lifetimes);
+                            break;
+                        };
+                        match tys.node(t) {
+                            Ok(
+                                tc::PNode::Bool
+                                | tc::PNode::Char
+                                | tc::PNode::Int(_)
+                                | tc::PNode::Uint(_)
+                                | tc::PNode::Float(_)
+                                | tc::PNode::Never
+                                | tc::PNode::Ptr(..)
+                                | tc::PNode::Ref(..)
+                                | tc::PNode::FnDef(..)
+                                | tc::PNode::FnPtr(..)
+                                | tc::PNode::ConstValue { .. }
+                                | tc::PNode::ConstParam(_)
+                                | tc::PNode::Param(_),
+                            ) => {}
+                            Ok(tc::PNode::Array(elem, _) | tc::PNode::Pat(elem, _)) => {
+                                lt_stack.push((elem, c_start, c_len));
+                            }
+                            Ok(tc::PNode::Tuple(l)) => {
+                                let Ok(es) = tys.list(l) else {
+                                    mark_region_params(sub_regs, lifetimes, &mut drop_lts);
+                                    continue;
+                                };
+                                let mut cur = c_start;
+                                let mut ok = true;
+                                for &el in es {
+                                    let Some(n) = subtree_region_count(tys, el, &arity, &mut strict_stack) else {
+                                        ok = false;
+                                        break;
+                                    };
+                                    if cur + n > c_start + c_len {
+                                        ok = false;
+                                        break;
+                                    }
+                                    lt_stack.push((el, cur, n));
+                                    cur += n;
+                                }
+                                if !ok {
+                                    mark_region_params(sub_regs, lifetimes, &mut drop_lts);
+                                }
+                            }
+                            Ok(tc::PNode::Adt(nested, args)) => {
+                                let Some(target) = nodes.iter().find(|n| n.key == nested) else {
+                                    mark_region_params(sub_regs, lifetimes, &mut drop_lts);
+                                    continue;
+                                };
+                                let Ok(t_lts) = usize::try_from(target.lifetimes) else {
+                                    mark_region_params(sub_regs, lifetimes, &mut drop_lts);
+                                    continue;
+                                };
+                                if t_lts > c_len {
+                                    mark_region_params(sub_regs, lifetimes, &mut drop_lts);
+                                    continue;
+                                }
+                                for j in 0..t_lts {
+                                    if (j >= 64 || (target.drop_lts & (1u64 << j)) != 0)
+                                        && let Some(&Region::Param(lp)) = regs.get(c_start + j)
+                                        && lp < lifetimes
+                                        && lp < 64
+                                    {
+                                        drop_lts |= 1u64 << lp;
+                                    }
+                                }
+                                let Ok(es) = tys.list(args) else {
+                                    mark_region_params(sub_regs, lifetimes, &mut drop_lts);
+                                    continue;
+                                };
+                                let mut cur = c_start + t_lts;
+                                let mut ok = true;
+                                for (j, &arg) in es.iter().enumerate() {
+                                    let Some(n) = subtree_region_count(tys, arg, &arity, &mut strict_stack) else {
+                                        ok = false;
+                                        break;
+                                    };
+                                    if cur + n > c_start + c_len {
+                                        ok = false;
+                                        break;
+                                    }
+                                    let is_strict = j >= 64 || (target.strict_params & (1u64 << j)) != 0;
+                                    if is_strict {
+                                        if let Some(arg_regs) = regs.get(cur..cur + n) {
+                                            mark_region_params(arg_regs, lifetimes, &mut drop_lts);
+                                        }
+                                    } else if target.has_drop_impl || target.uncond || (target.params & (1u64 << j)) != 0 {
+                                        lt_stack.push((arg, cur, n));
+                                    }
+                                    cur += n;
+                                }
+                                if !ok {
+                                    mark_region_params(sub_regs, lifetimes, &mut drop_lts);
+                                }
+                            }
+                            _ => {
+                                mark_region_params(sub_regs, lifetimes, &mut drop_lts);
+                            }
+                        }
+                    }
+                }
+            }
+            if (uncond != old_uncond || params != old_params || strict_params != old_strict || drop_lts != old_lts)
                 && let Some(node) = nodes.get_mut(idx)
             {
                 node.uncond = uncond;
                 node.params = params;
+                node.strict_params = strict_params;
+                node.drop_lts = drop_lts;
                 changed = true;
             }
         }
@@ -812,17 +1279,33 @@ pub fn drop_facts_of<'n, 'a, S: NamesSource<'n>>(
     }
 
     match nodes.first() {
-        Some(root) if !root.uncond => push_drop_mask(root_generics, root.params, need),
-        _ => (true, None),
+        Some(root) => {
+            let (needs_drop, drop_args) = if !root.uncond {
+                push_drop_mask(root_generics, root.params, need)
+            } else {
+                (true, None)
+            };
+            let drop_strict = push_bool_mask(root_generics, root.strict_params, strict_need);
+            let drop_lifetimes = if root.lifetimes <= 64 { push_bool_mask(root.lifetimes, root.drop_lts, lt_need) } else { None };
+            DropFactsSummary { needs_drop, drop_args, drop_strict, drop_lifetimes }
+        }
+        None => DropFactsSummary { needs_drop: true, drop_args: None, drop_strict: None, drop_lifetimes: None },
     }
 }
 
-fn push_drop_mask(generics: u32, mask: u64, need: &mut AVec<'_, bool>) -> (bool, Option<(u32, u32)>) {
-    let Ok(start) = u32::try_from(need.len()) else { return (true, None) };
+fn push_bool_mask(generics: u32, mask: u64, out: &mut AVec<'_, bool>) -> Option<(u32, u32)> {
+    let start = u32::try_from(out.len()).ok()?;
     for j in 0..generics {
-        need.push(j < 64 && (mask & (1u64 << j)) != 0);
+        out.push(j < 64 && (mask & (1u64 << j)) != 0);
     }
-    (false, Some((start, generics)))
+    Some((start, generics))
+}
+
+fn push_drop_mask(generics: u32, mask: u64, need: &mut AVec<'_, bool>) -> (bool, Option<(u32, u32)>) {
+    match push_bool_mask(generics, mask, need) {
+        Some(span) => (false, Some(span)),
+        None => (true, None),
+    }
 }
 
 fn hash_pty_for_drop(tys: tc::PTys<'_>, root: tc::PTy, h: &mut tc::StableHasher, budget: &mut u32, stack: &mut AVec<'_, tc::PTy>) {
@@ -957,7 +1440,8 @@ mod field_row_tests {
     }
 
     /// `&'a (dyn Tr<'b> + 'c)` in `struct D<'a, 'b, 'c>`: the column is `['a, 'c, 'b]` (the
-    /// object's own slot before its trait's). The row preserves all three lifetime bindings.
+    /// reference's slot, the object's own slot, then its trait's); the row walks `Dynamic` and
+    /// `ExTrait` in pre-order matching `RegionCol` / `RegionSlots`, yielding `['a, 'c, 'b]`.
     #[test]
     fn a_trait_objects_position_is_its_own_slot() {
         let mut t = PortableTys::new_in(a());

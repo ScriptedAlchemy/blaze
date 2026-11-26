@@ -82,7 +82,7 @@ pub const TERM_NODES: usize = 1 << 16;
 pub const READS_CAP: usize = 1 << 20;
 
 /// What a row asked (the module doc's list). The byte is the question's first.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(u8)]
 pub enum ReadKind {
     Adt = 1,
@@ -699,7 +699,7 @@ pub fn laid_answer(laid: &LaidState, names: &[StateName]) -> ContentId {
     niche_parts(laid.niche).hash(f);
     names.len().hash(f);
     for n in names {
-        (n.identity, n.offset, n.size, n.flag).hash(f);
+        (n.identity, n.offset, n.size, n.flag, n.rest).hash(f);
     }
     h.finish()
 }
@@ -1011,6 +1011,10 @@ impl Adts for Recorded<'_> {
 
     fn const_fn_instance(&self, key: InstanceKey, ground: &mut PortableTys<'_>) -> Option<Instance> {
         self.world.const_fn_instance(key, ground)
+    }
+
+    fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut PortableTys<'_>) -> Option<blaze_build::vtable::VtableRef> {
+        self.world.const_vtable_ref(key, ground)
     }
 
     fn format_template(&self, owner: ItemKey, expr: ExprId) -> Option<&[blaze_build::FmtPiece<'_>]> {

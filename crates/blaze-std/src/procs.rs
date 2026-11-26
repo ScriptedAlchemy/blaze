@@ -178,12 +178,14 @@ pub mod hermetic;
 // Children started linked to this process (test zygote, run parent): a native world's only.
 #[cfg(unix)]
 mod linked;
+#[cfg(target_os = "linux")]
+pub use self::linked::run::{TestSandbox, UNWOUND_FD, UnwoundChannel};
 #[cfg(unix)]
 pub use self::linked::{
     BorrowedFd, Exit, Linked, LinkedSpec, Spawner, Waited,
     run::{
-        CHILD_FD, ChannelError, DetachedSpec, Input, Message, OutPipe, Output, PREFIX, ParentDeath, Pipes, Read, Reaped, Run,
-        RunChild, RunError, RunFault, RunSpec, RunStep, RunWaited, Served, ServedEnd, Started, Streams, whole_messages,
+        CHILD_FD, ChannelError, ChannelReady, DetachedSpec, Input, Message, OutPipe, Output, PREFIX, ParentDeath, Pipes, Read, Reaped, Run,
+        RunChild, RunError, RunFault, RunSpec, RunStep, RunWaited, Served, ServedEnd, Started, Streams, Write, whole_messages,
     },
     sim_child::{Act, MOST_DELAY, SimChild},
     sim_term::{OnTerminate, SIGTERM, TermChild},

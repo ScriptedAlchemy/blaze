@@ -147,9 +147,10 @@
 //! - **No variant.** An enum of no inhabited variant is uninhabited: it has no value, and
 //!   code that would hold one is unreachable. A variant that is absent from the layout
 //!   (uninhabited, its fields all zero-sized) has no fields to write.
-//! - **Copies.** A copy switches on the discriminant, copies that variant's fields alone,
-//!   then writes its tag ([`layout::Layouts::tag_write`]; none for a niche variant whose
-//!   field holds it): a copy never reads a byte that the value's variant does not define.
+//! - **Copies.** Aggregate copies (structs, tuples, arrays, unions, enums, and coroutine states)
+//!   emit one byte-and-provenance-preserving bulk copy (`Op::Memcpy` when statically disjoint,
+//!   `Op::Memmove` otherwise) rather than expanding nested enums into per-variant switch trees.
+//!   LIR `sroa`/`memopt` and the backends lower small constant-length copies to loads and stores.
 //! - **Construction.** A tuple variant's ctor call `V(a, b)`, a unit variant `V` and a struct
 //!   variant literal `V { .. }` write the tag, then each field, in a temporary (layout keeps
 //!   another variant's fields clear of a niche, so the order is free).
@@ -240,7 +241,9 @@ use blaze_lir::VerifyError;
 use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
 pub use instance::{
-    Instance, InstanceKey, REIFY_SHIM_ITEM, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized, reify_shim_instance, reify_shim_key_args, reify_shim_of,
+    Instance, InstanceKey, REIFY_SHIM_ITEM, TEST_REPORT_SHIM_ITEM, VTABLE_SHIM_ITEM, closure_method_key_args, copy_written, ground, ground_own, instance_key, instance_key_normalized,
+    instance_key_normalized_own, reify_shim_instance,
+    reify_shim_key_args, reify_shim_of, test_report_shim_instance, test_report_shim_key_args, test_report_shim_of, vtable_shim_instance, vtable_shim_key_args, vtable_shim_of,
 };
 pub use walk::arith_checks::PanicConst;
 pub use walk::coroutine::{CoroutineFacts, CoroutineOf, StateShape, coroutine_facts, coroutine_of, coroutines_in, identity as coroutine_identity};
@@ -550,6 +553,16 @@ pub trait Adts {
         None
     }
 
+    /// The vtable reference that key `key` names in an evaluated constant's record (a
+    /// `DataTarget::Vtable(key)` of a [`Adts::const_value`], [`Adts::const_block_value`] or
+    /// [`Adts::promoted_value`] answer: `const X: &dyn Tr = &S;`), its types interned in `ground`.
+    /// No answer is refused with [`BuildError::NoConstVtable`]. An evaluator's record names the
+    /// table of each of its vtable words (blaze-consteval `ConstRecord::vtables`).
+    fn const_vtable_ref(&self, key: vtable::VtableKey, ground: &mut PortableTys<'_>) -> Option<vtable::VtableRef> {
+        let _ = (key, ground);
+        None
+    }
+
     /// The template of `format_args!` expression `expr` of the body of `owner`: its literal
     /// texts (escapes and `{{`/`}}` processed) and placeholders in order, one placeholder per
     /// row of the expression's `fmt_uses` that is not a count (walk/fmt.rs). The checker's
@@ -798,8 +811,8 @@ pub struct StaticItem {
     pub thread_local: bool,
     /// `static mut`.
     pub mutable: bool,
-    /// `#[linkage = "extern_weak"]` on an `extern` block's static: its value is the address of
-    /// the weak foreign symbol (null when undefined at link/load time), never a load from it.
+    /// Foreign `#[linkage = "extern_weak"]`: evaluates to the symbol's address directly (or null
+    /// if undefined) rather than loading from `*(&symbol)`.
     pub extern_weak: bool,
 }
 
@@ -999,6 +1012,9 @@ pub enum BuildError {
     /// The value of constant path, const block or promoted borrow `expr` holds a fn pointer to
     /// instance `key`, which [`Adts::const_fn_instance`] does not give.
     NoConstFnInstance { expr: ExprId, key: InstanceKey },
+    /// The value of constant path, const block or promoted borrow `expr` holds a vtable pointer
+    /// `key`, which [`Adts::const_vtable_ref`] does not give.
+    NoConstVtable { expr: ExprId, key: vtable::VtableKey },
     /// Path pattern `pat` names const `item`, whose value [`Adts::const_value`] does not hold.
     NoPatConstValue { pat: PatId, item: ItemKey },
     /// A layout read a record that is not made yet: `item`'s (an enum's explicit discriminant).
@@ -1037,6 +1053,10 @@ pub enum BuildError {
     /// the operation and its rule (unwinding in the body, a compound value live across a
     /// suspend, a cancel path that suspends...).
     Coroutine(blaze_lir::coroutine::CoroutineError),
+    /// The flow lowering refused an `async` block's body when building its state recipe
+    /// (`blaze-flow-lower::lower_async_witness` / `state_recipe`), naming the exact `Refusal`
+    /// form and item-relative byte range (rule 19).
+    CoroutineRecipe { owner: ItemKey, ordinal: u32, refusal: blaze_flow_lower::Refusal },
     /// An unsizing coercion at `expr` the build refuses by the rule `rule` (walk/unsize_nested.rs):
     /// through ADT `adt` (none: at the pointer itself), `why`: a struct where no field or more
     /// than one field holding bytes differs, a union, an enum, a nesting past `UNSIZE_DEPTH`.
@@ -1151,6 +1171,15 @@ impl fmt::Display for BuildError {
                     expr.0
                 )
             }
+            BuildError::NoConstVtable { expr, key } => {
+                write!(
+                    f,
+                    "expression {}: the value of the constant, const block or promoted borrow here holds a vtable pointer {key:?}, \
+                     which no record the build's `Adts` holds names (every evaluated record names the table of each of its vtable words: \
+                     blaze-consteval `ConstRecord::vtables`)",
+                    expr.0
+                )
+            }
             BuildError::NoPatConstValue { pat, item } => {
                 write!(f, "pattern {}: const item {:#x} has no evaluated value in the build's `Adts`", pat.0, item.0)
             }
@@ -1187,6 +1216,11 @@ impl fmt::Display for BuildError {
             BuildError::Lir(error) => write!(f, "blaze-lir's builder refused the function: {error}"),
             BuildError::Verify(error) => write!(f, "the LIR built does not verify: {error}"),
             BuildError::Coroutine(error) => write!(f, "an async block's body was not split: {error}"),
+            BuildError::CoroutineRecipe { owner, ordinal, refusal } => write!(
+                f,
+                "async block {ordinal} of {:#x}: its state recipe was refused by flow lowering ({:?} at {}..{})",
+                owner.0, refusal.form, refusal.range.start, refusal.range.end
+            ),
             BuildError::Unsize { expr, adt: Some(adt), why, rule } => {
                 write!(f, "expression {}: an unsizing coercion through ADT {:#x}: {why} ({rule})", expr.0, adt.0)
             }
@@ -1325,6 +1359,41 @@ pub fn build_reify_shim<A: Allocator + Copy>(
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
     walk::build_reify_shim(callee, sig, subst, adts, alloc)
+}
+
+/// Builds the by-value `self` `VTableShim` for `target` (named by [`VTABLE_SHIM_ITEM`]): takes
+/// `(data_ptr: *mut Self, args..)` where `data_ptr` points to the concrete receiver in memory
+/// (e.g. a `Box<dyn FnOnce>`'s heap allocation), moves `Self` out by value according to its Rust
+/// ABI, and calls `target` directly.
+///
+/// `sig` is `Some` for a concrete impl method (`subst.args == target.args`) or a fn item's
+/// `FnOnce::call_once` (`subst.args == fn_item_args`); `None` for a closure's `FnOnce::call_once`
+/// or a fn pointer's `FnOnce::call_once`.
+pub fn build_vtable_shim<A: Allocator + Copy>(
+    target: Instance,
+    sig: Option<&FnSig<'_>>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    walk::build_vtable_shim(target, sig, subst, adts, alloc)
+}
+
+/// Builds the test report shim for a monomorphic `#[test]` fn returning a `T: Termination` other
+/// than `()` (docs/v2/plan/design/test.md, piece 8; named by [`TEST_REPORT_SHIM_ITEM`]): takes C
+/// `main`'s `(argc, argv)` arguments (ignored), calls `test()`, passes its return value to
+/// `<R as Termination>::report` (`report_fn`), and returns the resulting `ExitCode` byte
+/// zero-extended to `i32` (`0` = pass, non-zero = failure).
+pub fn build_test_report_shim<A: Allocator + Copy>(
+    test: ItemKey,
+    test_sig: &FnSig<'_>,
+    report_fn: ItemKey,
+    report_sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    walk::build_test_report_shim(test, test_sig, report_fn, report_sig, subst, adts, alloc)
 }
 
 /// Builds the CTOR FN `ctor` of variant `variant` (a struct's is 0) of a tuple struct or tuple

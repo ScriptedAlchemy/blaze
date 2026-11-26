@@ -29,7 +29,7 @@ use blaze_typeck as tc;
 use blaze_typeck::{ItemKey, ReadList};
 
 use super::body::Body;
-use super::check::{BodyScope, CheckFail, Records, check_rounds};
+use super::check::{BodyScope, CheckFail, Records};
 use super::source::NamesSource;
 
 const READS_DOMAIN: &str = "blaze-ladder checked body read list 1";
@@ -49,7 +49,7 @@ impl ReadsDigest {
 
 /// The digest of `list` ([`ReadsDigest::of`]); with `keep`, also each row's [`KeptRow`]
 /// pushed there, in the list's (sorted) order.
-fn digest_rows(list: &ReadList<'_>, scratch: Alloc<'_>, mut keep: Option<&mut Vec<KeptRow, Global>>) -> ReadsDigest {
+fn digest_rows(list: &ReadList<'_>, scratch: Alloc<'_>, mut keep: Option<&mut Vec<KeptRow, Alloc<'static>>>) -> ReadsDigest {
     use core::hash::Hash;
     let mut h = Hasher::new(READS_DOMAIN);
     let questions = list.questions();
@@ -178,19 +178,19 @@ impl core::fmt::Display for ReadsDiff {
 /// read, kept in the store ([`super::heads::Store::reads`]). About 50 bytes a body, and 16 a
 /// row for a list of at most [`MOST_KEPT_ROWS`] rows (the refusal's evidence).
 pub struct Digests {
-    by_owner: HashMap<ItemKey, FiledReads, Global>,
-    rows: Vec<KeptRow, Global>,
-}
-
-impl Default for Digests {
-    fn default() -> Digests {
-        Digests::new()
-    }
+    by_owner: HashMap<ItemKey, FiledReads, Alloc<'static>>,
+    rows: Vec<KeptRow, Alloc<'static>>,
 }
 
 impl Digests {
-    pub fn new() -> Digests {
-        Digests { by_owner: HashMap::new_in(Global), rows: Vec::new_in(Global) }
+    pub fn new_in(alloc: Alloc<'static>) -> Digests {
+        Digests { by_owner: HashMap::new_in(alloc), rows: Vec::new_in(alloc) }
+    }
+
+    pub fn clear(&mut self) {
+        let Digests { by_owner, rows } = self;
+        by_owner.clear();
+        rows.clear();
     }
 
     /// `list`, read by a clean check of `owner`'s body, filed as its digest (and its rows, for
@@ -222,7 +222,7 @@ impl Digests {
         let mut diff = ReadsDiff { first_rows: had.count, second_rows: questions.len() as u32, first_kept: had.kept.is_some(), second_only: Vec::new_in(Global), second_differ: 0, first_only: 0, shown: Vec::new_in(Global) };
         let Some((start, len)) = had.kept else { return diff };
         let first = &self.rows[start as usize..(start + len) as usize];
-        let mut now: Vec<KeptRow, Global> = Vec::with_capacity_in(questions.len(), Global);
+        let mut now: Vec<KeptRow, Alloc<'static>> = Vec::with_capacity_in(questions.len(), *self.rows.allocator());
         let _ = digest_rows(list, scratch, Some(&mut now));
         for (at, row) in now.iter().enumerate() {
             let then = first.iter().find(|r| r.question == row.question);
@@ -335,6 +335,11 @@ fn provisional_pending_assoc_cycle(
             work.push(anchor.ty);
         }
     }
+    for site in body.typeck.inline_fors.iter() {
+        if let blaze_lower::typeck::InlineForKind::Variants { ty, .. } = site.kind {
+            work.push(ty);
+        }
+    }
     const MOST_WALK: u32 = 1 << 16;
     let mut steps = 0u32;
     while let Some(ty) = work.pop() {
@@ -420,8 +425,13 @@ pub(crate) fn check_body_keyed<'n, S: NamesSource<'n>>(
     root_keys: Option<&mut std::vec::Vec<u64, Global>>,
 ) -> Result<tc::Checked<'static>, CheckFail> {
     r.store.provisional_used.borrow_mut().clear();
-    let mut done = check_rounds(r, body, scope, count, asked, root_keys)?;
-    let scratch = r.store.tys.alloc();
+    // Defer auto-trait goals on async futures whose superset interior fails, then decide them on
+    // each async block's exact witness interior (stalled_goals.rs, borrows.rs `witness_and_decide`),
+    // matching `ProjectWorld::check` and `ProjectWorld::check_borrows`. `check_counted` has no
+    // deferring entry and keeps `Stalls::Gap`.
+    let stalls = if count.is_none() { super::stalled_goals::Stalls::Decide } else { super::stalled_goals::Stalls::Gap };
+    let mut done = super::check::check_rounds_as(r, body, scope, count, asked, stalls, root_keys)?;
+    let scratch = r.store.work_alloc();
     let owner = body.typeck.owner;
     let mut used_provisional = false;
     if !r.store.provisional_used.borrow().is_empty() {
@@ -436,6 +446,46 @@ pub(crate) fn check_body_keyed<'n, S: NamesSource<'n>>(
     }
     // Its opaques' hidden types, for an auto trait asked by another body (front2 opaque_auto.rs).
     super::opaque_auto::file(r, body, &done)?;
+    if !done.stalled.is_empty() {
+        let mut decision_reads: AVec<'_, super::reads::Read> = AVec::new_in(scratch);
+        let at = body.typeck.expr_ranges.get(body.typeck.root.ix()).copied().unwrap_or(tc::Range { start: 0, end: 0 });
+        match super::borrows::witness_and_decide(r, body, &done, &mut decision_reads, scratch) {
+            super::stalled_goals::Decision::Nothing | super::stalled_goals::Decision::Proved => {
+                done.stalled.clear();
+            }
+            super::stalled_goals::Decision::Findings(found) => {
+                let diags = found
+                    .into_iter()
+                    .map(|d| (tc::DiagCode::Unsatisfied, tc::Range { start: d.start, end: d.end }, d.text.as_str().into()))
+                    .collect();
+                return Err(super::check::said(r, owner, diags, scratch));
+            }
+            super::stalled_goals::Decision::Gaps(gaps) => {
+                return Err(CheckFail::Gap { owner, gaps });
+            }
+            super::stalled_goals::Decision::Refused(super::project::Refused::Check(fail)) => {
+                return Err(fail);
+            }
+            super::stalled_goals::Decision::Refused(_) => {
+                return Err(CheckFail::Check {
+                    owner,
+                    error: tc::CheckError::FutureWitness {
+                        reason: "deciding the stalled auto-trait goals of an async body refused",
+                        at,
+                    },
+                });
+            }
+            super::stalled_goals::Decision::Reads(_) => {
+                return Err(CheckFail::Check {
+                    owner,
+                    error: tc::CheckError::FutureWitness {
+                        reason: "deciding the stalled auto-trait goals of an async body failed to record its read list",
+                        at,
+                    },
+                });
+            }
+        }
+    }
     let filed = done.file_out();
     // A check that read a provisional impl header during constant evaluation does not file its
     // read-list digest: once the impl's associated types finish, subsequent checks read the
@@ -515,7 +565,7 @@ mod tests {
         let alloc = blaze_own::testing::heap().alloc();
         let owner = ItemKey(7);
         let (sig, sized, copy) = (Question::FnSig(ItemKey(9)), Question::Lang(LangItem::Sized), Question::Lang(LangItem::Copy));
-        let mut digests = Digests::new();
+        let mut digests = Digests::new_in(blaze_own::testing::heap().alloc());
         digests.file(owner, &list(&[(sig, 1), (sized, 2)], alloc), alloc).expect("first filing");
         digests.file(owner, &list(&[(sig, 1), (sized, 2)], alloc), alloc).expect("the same list again is the same digest");
         let mut rows = [(sig, 1), (sized, 3), (copy, 4)];

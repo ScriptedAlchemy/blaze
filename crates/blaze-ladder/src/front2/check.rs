@@ -31,9 +31,16 @@ use blaze_lower::scoped::Prepares;
 use super::world_items::{BodyWorld, Fill, Gap};
 pub use super::body_reads::{check_body_asked, check_body_filed};
 
-/// The most checks of one body: each round makes at least one record, so past this the
-/// fills do not converge.
+/// The base round cap for loops and for a body check that stops discovering new holes.
 pub const MOST_ROUNDS: u32 = 256;
+
+/// The upper round cap for a body check while it keeps discovering new holes (e.g., large
+/// async test bodies whose transitive demand chains legitimately exceed `MOST_ROUNDS`).
+pub const MOST_PROGRESS_ROUNDS: u32 = 2048;
+
+/// Once a body check passes `MOST_ROUNDS`, stop if this many consecutive rounds discover no
+/// new distinct holes so a stuck fill loop cannot burn to `MOST_PROGRESS_ROUNDS`.
+const MOST_STALLED_ROUNDS: u32 = 64;
 
 /// Where a body is written: what its paths are resolved against.
 pub struct BodyScope<'s> {
@@ -81,12 +88,13 @@ pub enum CheckFail {
     /// `filed`, one per diagnostic: where it is filed (front2 expansion_origin.rs): in expanded
     /// text, at the user's tokens or at the call; elsewhere [`Filed::Own`](super::expansion_origin::Filed::Own).
     Diags { owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, filed: Vec<super::expansion_origin::Filed, Global> },
-    /// Still `Need` after [`MOST_ROUNDS`]. `last`: the last round's HOLES (the questions it had
-    /// no answer to, never every question it asked: rt-loop a1750's `tempo_main_with` printed
-    /// 4,200 asked questions and no hole). `shown`: what stopped, by path (rule 19), made by
-    /// [`rounds_fail`]: the loop, the records it made, the holes left and the first of them
-    /// with its item's path.
-    Rounds { owner: ItemKey, last: Vec<Question, Global>, shown: Box<str, Global> },
+    /// Still `Need` after `rounds` rounds (bounded by [`MOST_ROUNDS`] when stalled, or
+    /// [`MOST_PROGRESS_ROUNDS`] while discovering new holes). `last`: the last round's HOLES (the
+    /// questions it had no answer to, never every question it asked: rt-loop a1750's
+    /// `tempo_main_with` printed 4,200 asked questions and no hole). `shown`: what stopped, by
+    /// path (rule 19), made by [`rounds_fail`]: the loop, the records it made, the holes left and
+    /// the first of them with its item's path.
+    Rounds { owner: ItemKey, rounds: u32, last: Vec<Question, Global>, shown: Box<str, Global> },
     /// The constant `key` an array length in a head names has no value: the evaluator's
     /// refusal, or [`ConstFail::Nested`] for one met while another constant is evaluated.
     /// `shown` is what `key` names ([`key_shown`]: rule 19), beside the key tools grep.
@@ -131,12 +139,12 @@ impl core::fmt::Display for CheckFail {
                 }
                 Ok(())
             }
-            CheckFail::Rounds { last, shown, .. } => {
+            CheckFail::Rounds { rounds, last, shown, .. } => {
                 let need = last.first().map_or("a record", |question| match question.record_kind() {
                     tc::RecordKind::Body => "the checked body record of a dependency item",
                     tc::RecordKind::Item => "an item record",
                 });
-                write!(f, "checking the body in its source file: still needs {need} after {MOST_ROUNDS} rounds: {shown}")
+                write!(f, "checking the body in its source file: still needs {need} after {rounds} rounds: {shown}")
             }
             CheckFail::ReadsDiffer { owner, diff } => write!(f, "checking {owner:?} again read other answers than its first check: two read-list digests under one body (rule 21): {diff}"),
             CheckFail::Resolve { owner, item, error, args } => write!(f, "in {owner:?}, the call of {item:?} at [{args}]: {error}"),
@@ -161,6 +169,15 @@ pub struct Records<'r, 'n, S = &'n Names<'n>> {
     /// that names a constant; `None` while a constant is being evaluated (and where a caller
     /// has none: such a length is then [`ConstFail::Nested`]).
     pub consts: Option<(&'r mut Consts<'n>, &'r Prepares<'n>)>,
+}
+
+impl<'r, 'n, S> Records<'r, 'n, S> {
+    /// Prepared macros available for lowering a defining body (e.g. an `impl Trait` auto-trait
+    /// reveal or `_`-returning fn inference), even while `&mut Consts` is borrowed by an active
+    /// constant evaluation.
+    pub(super) fn prepared(&self) -> Option<&'r Prepares<'n>> {
+        self.consts.as_ref().map(|c| c.1).or(self.store.prepared)
+    }
 }
 
 /// The order the loop makes what a round noted: as asked, or reversed (a test's second run).
@@ -202,23 +219,6 @@ pub fn check_body_metered<'n, S: NamesSource<'n>>(
     super::body_reads::check_body_keyed(r, body, scope, Some((tally, clock)), None, Some(root_keys))
 }
 
-/// The check loop itself: `body` checked round by round, leaving in `asked` what a check that
-/// did NOT end in a clean `Checked` asked of the world (front2 reads.rs: every body has a read
-/// list): the read list of a run that finished but is returned as a failure (diagnostics, or a
-/// gap answered as missing), and the questions of the last round that ended in a need. A clean
-/// check's list is still in its `Checked`: only [`check_body_asked`] and [`check_body_filed`]
-/// (front2 body_reads.rs) call this, and each files the list out before the `Checked` is kept.
-pub(crate) fn check_rounds<'n, S: NamesSource<'n>>(
-    r: &mut Records<'_, 'n, S>,
-    body: &Body<'_>,
-    scope: &BodyScope<'_>,
-    count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
-    asked: Option<&mut super::reads::Asked<'_>>,
-    root_keys: Option<&mut Vec<u64, Global>>,
-) -> Result<tc::Checked<'static>, CheckFail> {
-    check_rounds_as(r, body, scope, count, asked, super::stalled_goals::Stalls::Gap, root_keys)
-}
-
 /// The E0412s and E0405s of `owner`'s OWN signature (its head's [`super::type_miss::HeadMiss`]es, in the
 /// store the head was made in or one filed from its record), as findings of its body's check:
 /// item-relative in the fn's text, as its body's own misses are. A caller's check never asks
@@ -230,7 +230,7 @@ fn signature_misses<'r, 'n, S: NamesSource<'n>>(r: &'r Records<'_, 'n, S>, owner
 
 /// The body `owner` finished with the findings `diags`: each filed where its tokens came from,
 /// before it leaves the task that made it (drive.md, ruled 20:57), in `alloc` (the store's).
-fn said<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, alloc: blaze_own::Alloc<'_>) -> CheckFail {
+pub(super) fn said<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, alloc: blaze_own::Alloc<'_>) -> CheckFail {
     let lib = r.keys.library_in(r.names, owner);
     // A member of a trait or an impl has no library key (keys.rs `library_in`): it is placed by
     // its container's, its text found in the container's (expansion_origin.rs
@@ -255,6 +255,216 @@ fn infer_boxed(alloc: blaze_own::Alloc<'static>) -> blaze_own::Box<InferCtx<'sta
 }
 
 const _: () = assert!(core::mem::size_of::<blaze_own::Box<InferCtx<'static>, blaze_own::Alloc<'static>>>() == 2 * core::mem::size_of::<usize>());
+
+/// Per-round inference context that optionally borrows `store.stretch_facts` (strictly
+/// single-threaded inside one worker's stretch, zero TLS/statics/unsafe). Recursive checks see
+/// `store.stretch_facts == None` and use a fresh cache; [`Self::restore_to`] commits or rolls back
+/// and returns the cache to `store.stretch_facts`.
+struct RoundCx {
+    cx: blaze_own::Box<InferCtx<'static>, blaze_own::Alloc<'static>>,
+    replaced: Option<tc::infer::FactCache<'static>>,
+    committed: bool,
+}
+
+impl RoundCx {
+    fn new(alloc: blaze_own::Alloc<'static>, owner: ItemKey, allow_reuse: bool, slot: &mut Option<tc::infer::FactCache<'static>>) -> Self {
+        let mut cx = infer_boxed(alloc);
+        let replaced = if allow_reuse && let Some(mut reused) = slot.take() {
+            core::mem::swap(&mut cx.facts, &mut reused);
+            cx.facts.begin_body_reuse(owner);
+            Some(reused)
+        } else {
+            None
+        };
+        RoundCx { cx, replaced, committed: false }
+    }
+
+    fn is_reusing(&self) -> bool {
+        self.replaced.is_some()
+    }
+
+    fn mark_commit(&mut self) {
+        self.committed = true;
+    }
+
+    fn restore_to(mut self, slot: &mut Option<tc::infer::FactCache<'static>>) {
+        if let Some(mut orig) = self.replaced.take() {
+            self.cx.facts.end_body_reuse(self.committed);
+            core::mem::swap(&mut self.cx.facts, &mut orig);
+            *slot = Some(orig);
+        }
+    }
+}
+
+/// Replays every cached `(Question, digest)` read hit in the stretch-reused [`tc::infer::FactCache`]
+/// during this finished round into `done.reads` and replays the world's `Buckets`/`Names` side
+/// effects so incremental read lists stay 100% sound and byte-identical (rules 21, 25).
+fn merge_replayed_reads<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    scope: &BodyScope<'_>,
+    owner: ItemKey,
+    done: &mut tc::Checked<'static>,
+    facts: &tc::infer::FactCache<'static>,
+    alloc: blaze_own::Alloc<'static>,
+) -> Result<(), CheckFail> {
+    if !facts.has_replayed_reads() {
+        return Ok(());
+    }
+    let mut replayed: blaze_own::Vec<(Question, u64), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    facts.for_each_replayed_read(|q, h| replayed.push((q, h)));
+    if replayed.is_empty() {
+        return Ok(());
+    }
+    replayed.sort_unstable_by_key(|&(q, _)| q);
+    replayed.dedup_by_key(|pair| pair.0);
+    let mut seen_cache: Option<Seen> = None;
+    for &(q, _) in replayed.iter() {
+        if done.reads.hash_of(&q).is_some() {
+            continue;
+        }
+        match q {
+            Question::ImplsOf(trait_, shape) => {
+                let seen = match seen_cache {
+                    Some(s) => s,
+                    None => match Seen::of_checked_body(r.names, scope.module) {
+                        Ok(s) => {
+                            seen_cache = Some(s);
+                            s
+                        }
+                        Err(why) => return Err(CheckFail::Buckets { owner, error: Unfilled::Sight(why) }),
+                    },
+                };
+                let home = trait_home(r.names, r.keys, r.store, trait_, shape).map_err(|error| CheckFail::Head { owner, error })?;
+                let b = r.buckets.get_or_insert_with(|| Buckets::for_source_in(r.names, r.index, alloc));
+                let ba = b.alloc();
+                b.admit_shared(r.names, r.keys, home, Ask::Trait(trait_, shape), ba).map_err(|e| match e {
+                    AdmitError::Tables(error) => CheckFail::Tables { owner, error },
+                    AdmitError::Question(error) => CheckFail::ImplQuestion { owner, error },
+                })?;
+                b.sight(r.names, seen, ba).map_err(|why| CheckFail::Buckets { owner, error: Unfilled::Sight(why) })?;
+            }
+            Question::Lang(item) => {
+                if let Ok(Some(lib)) = super::langs::find(r.index, crate::resolve::Paths { names: r.names }, item) {
+                    let _ = r.keys.item(lib);
+                }
+            }
+            Question::TraitDef(t) => {
+                if let Some(lib) = r.keys.library_in(r.names, t) {
+                    if let (Some(head), Some(_)) = (r.store.maps.traits.get(&lib), r.store.trait_defs.get(&t)) {
+                        if r.store.from_trait.get().is_none()
+                            && head.generics == 2
+                            && r.index.lang_name_of(lib).and_then(super::langs::trait_lang).is_none()
+                        {
+                            let found = super::langs::find(r.index, crate::resolve::Paths { names: r.names }, tc::LangItem::From).ok().flatten();
+                            r.store.from_trait.set(Some(found));
+                        }
+                    } else {
+                        let _ = crate::resolve::Paths { names: r.names }.detail(lib);
+                    }
+                }
+            }
+            Question::Adt(item) => {
+                if !r.store.adts.contains_key(&item)
+                    && let Some(lib) = r.keys.library_in(r.names, item)
+                {
+                    let _ = crate::resolve::Paths { names: r.names }.detail(lib);
+                }
+            }
+            Question::ImplHeader(item) => {
+                if r.store.impl_or_provisional(item).is_none()
+                    && let Some(lib) = r.keys.library_in(r.names, item)
+                {
+                    let _ = crate::resolve::Paths { names: r.names }.detail(lib);
+                }
+            }
+            Question::FnSig(item) => {
+                if !r.store.fns.contains_key(&item) && !r.store.ctors.contains_key(&item) {
+                    let _ = super::by_origin::kind_of_key(r.names, r.keys, item);
+                }
+            }
+            Question::Predicates(item) => {
+                let item = r.store.ctors.get(&item).map_or(item, |c| c.adt);
+                if !r.store.rpitit_defaults.contains_key(&item) && !r.store.preds.contains_key(&item) {
+                    let _ = super::by_origin::predicates_unmade(r.names, r.keys, r.store, item);
+                }
+            }
+            Question::AssocItem(container, _) => {
+                if r.store.impl_or_provisional(container).is_none() {
+                    let is_trait = r.keys.library_in(r.names, container).is_some_and(|lib| r.store.maps.traits.contains_key(&lib));
+                    if !is_trait && let Some(lib) = r.keys.library_in(r.names, container) {
+                        let _ = crate::resolve::Paths { names: r.names }.detail(lib);
+                    }
+                }
+            }
+            Question::AssocGenerics(trait_, _) => {
+                if let Some(lib) = r.keys.library_in(r.names, trait_)
+                    && !r.store.maps.traits.contains_key(&lib)
+                {
+                    let _ = crate::resolve::Paths { names: r.names }.detail(lib);
+                }
+            }
+            Question::ConstParams(item) => {
+                let _ = super::by_origin::const_params_of(r.names, r.keys, r.store, item);
+            }
+            Question::FieldDefaults(adt) => {
+                if !r.store.field_defaults.contains_key(&adt)
+                    && !r.store.adts.contains_key(&adt)
+                    && let Some(lib) = r.keys.library_in(r.names, adt)
+                {
+                    let _ = crate::resolve::Paths { names: r.names }.detail(lib);
+                }
+            }
+            Question::TypeAlias(item) => {
+                if let Some(lib) = r.keys.library_in(r.names, item)
+                    && !r.store.maps.aliases.contains_key(&lib)
+                {
+                    let _ = crate::resolve::Paths { names: r.names }.detail(lib);
+                }
+            }
+            Question::Attrs(d) => {
+                if r.store.adts.get(&d).is_some_and(|a| a.kind == tc::AdtKind::Struct) {
+                    let _ = r.store.is_auto_copy_pub(r.names, r.keys, d);
+                }
+            }
+            _ => {}
+        }
+    }
+    let orig_q = done.reads.rows.column::<0>();
+    let orig_h = done.reads.rows.column::<1>();
+    let mut merged: blaze_own::Soa<(Question, u64), blaze_own::Alloc<'static>> =
+        blaze_own::Soa::with_capacity_in(orig_q.len() + replayed.len(), alloc);
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < orig_q.len() && j < replayed.len() {
+        let (Some(&oq), Some(&oh), Some(&(rq, rh))) = (orig_q.get(i), orig_h.get(i), replayed.get(j)) else {
+            break;
+        };
+        match oq.cmp(&rq) {
+            core::cmp::Ordering::Less => {
+                merged.push((oq, oh));
+                i += 1;
+            }
+            core::cmp::Ordering::Greater => {
+                merged.push((rq, rh));
+                j += 1;
+            }
+            core::cmp::Ordering::Equal => {
+                merged.push((oq, oh));
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while let (Some(&oq), Some(&oh)) = (orig_q.get(i), orig_h.get(i)) {
+        merged.push((oq, oh));
+        i += 1;
+    }
+    while let Some(&(rq, rh)) = replayed.get(j) {
+        merged.push((rq, rh));
+        j += 1;
+    }
+    done.reads.rows = merged;
+    Ok(())
+}
 
 /// Pre-unroll probe pass for a body containing `inline for`: resolves `expr_ty` for each
 /// `inline for` iterable expression without failing on downstream diagnostics that depend on
@@ -300,8 +510,8 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
 ) -> Result<tc::Checked<'static>, CheckFail> {
     let allow_diags = r.store.inline_for_probe;
     let owner = body.typeck.owner;
-    // The store's allocator: the checked body outlives the round (`Checked<'static>`).
-    let alloc = r.store.tys.alloc();
+    // The store's per-body work allocator: the checked body lives for this body check.
+    let alloc = r.store.work_alloc();
     let mut hints = Needs::new_in(alloc);
     // The records made between rounds, for a refusal past the last ([`rounds_fail`]).
     let mut made = 0u64;
@@ -316,41 +526,63 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     // maker `make_once` calls too (`Buckets::for_source`); over a lowering store the first impl
     // fill makes it, as before.
     if r.store.seeds.is_some() && r.buckets.is_none() {
-        *r.buckets = Some(Buckets::for_source(r.names, r.index));
+        *r.buckets = Some(Buckets::for_source_in(r.names, r.index, alloc));
     }
-    // The body's gate (front2 asks.rs `Gate`): round 0's syntactic prefetch, before the walk.
-    r.store.gate.borrow_mut().start(alloc);
+    // The body's gate (front2 asks.rs `Gate`): only collect round 0's syntactic prefetch when a
+    // gauge/meter is attached; without a meter the gate is never inspected.
+    if meter.is_some() {
+        r.store.gate.borrow_mut().start(alloc);
+    } else {
+        *r.store.gate.borrow_mut() = super::asks::Gate::Off;
+    }
     // How this body's world meets a hole (world_items.rs `BodyWorld::stops_at_holes`): the
     // same test, read once; the store's seeds and asks do not change during a check.
     let stops_at_holes = r.store.stops_at_holes();
-    let mut holes = RoundHoles::new();
-    for round in 0..MOST_ROUNDS {
+    let mut holes = RoundHoles::new_in(alloc);
+    let mut stalled_rounds = 0u32;
+    let mut rounds_run = 0u32;
+    let mut patched: Option<super::body_const_gaps::PatchedConsts> = None;
+    for round in 0..MOST_PROGRESS_ROUNDS {
+        rounds_run = round + 1;
         r.store.hidden.set_leaking(&leaks);
         // Facts made on the spot this round (world_items.rs `BodyWorld::store_want`; under the
         // one ask, what it made: `Store::imports`).
         let imported_at = r.store.imports();
-        let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
-        let view: BodyView<'_> = body.typeck.view(tys);
+        let tys = match &patched {
+            Some(p) => p.tys.view(&r.store.tys),
+            None => body.tys.view(&r.store.tys),
+        }
+        .map_err(|error| CheckFail::Check { owner, error })?;
+        let mut view: BodyView<'_> = body.typeck.view(tys);
+        if let Some(p) = &patched {
+            view.type_lists = &p.type_lists;
+        }
         let trace_ask = r.store.trace;
-        let world = world_at(r, scope);
+        let allow_facts_reuse = !allow_diags
+            && r.store.inferring_output_stack.is_empty()
+            && r.store.inferred_outputs.is_empty()
+            && r.store.provisional_impls.is_empty();
         // Boxed, made in a frame of its own: this frame stays on the stack under the whole
         // check (blaze-int notes t29 overflow-bt4.txt: 48,576 bytes).
-        let mut cx = infer_boxed(alloc);
+        let mut round_cx = RoundCx::new(alloc, owner, allow_facts_reuse, &mut r.store.stretch_facts);
+        let world = world_at(r, scope);
         if root_keys.is_some() {
-            cx.keep_root_keys();
+            round_cx.cx.keep_root_keys();
         }
         // A measurement for tests (heads.rs `Store::trace`): the last round's trace is kept.
         if let Some(ask) = trace_ask {
-            cx.trace_trait_goals(ask);
+            round_cx.cx.trace_trait_goals(ask);
         }
         let out = match &mut count {
-            Some((tally, clock)) => tc::check_counted(&view, &world, &mut *cx, &hints, tally, *clock, alloc),
+            Some((tally, clock)) => tc::check_counted(&view, &world, &mut *round_cx.cx, &hints, tally, *clock, alloc),
             // Stalled goals decided after the async bodies' flows (front2 stalled_goals.rs).
-            None if stalls == super::stalled_goals::Stalls::Decide => tc::check_deferring(&view, &world, &mut *cx, &hints, alloc),
-            None => tc::check(&view, &world, &mut *cx, &hints, alloc),
+            None if stalls == super::stalled_goals::Stalls::Decide => tc::check_deferring(&view, &world, &mut *round_cx.cx, &hints, alloc),
+            None => tc::check(&view, &world, &mut *round_cx.cx, &hints, alloc),
         };
-        // Round 0's walk is over: what its prefetch named is the gate's set.
-        r.store.gate.borrow_mut().freeze(alloc);
+        // Round 0's walk is over: defer building the gate's set until a round actually needs it.
+        if round == 0 && meter.is_some() {
+            r.store.gate.borrow_mut().freeze(alloc);
+        }
         // An auto trait of another fn's opaque: its defining body filed (checked only if no
         // clean check of it is filed yet), the opaque leaked to this check, the round again.
         let out = match out {
@@ -358,23 +590,25 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             Err(error) => {
                 drop(world);
                 if trace_ask.is_some() {
-                    r.store.traced = cx.take_trace();
+                    r.store.traced = round_cx.cx.take_trace();
                 }
+                round_cx.restore_to(&mut r.store.stretch_facts);
                 handle_check_error(r, body, owner, error, &mut leaks, asked.as_deref_mut(), alloc)?;
+                stalled_rounds = 0;
                 continue;
             }
         };
         if let Some((tally, _)) = count.as_mut() {
-            cx.add_solver_counts(&mut tally.solve);
+            round_cx.cx.add_solver_counts(&mut tally.solve);
         }
         if let Some(cost) = meter {
             let mut solve = tc::Solve::default();
-            cx.add_solver_counts(&mut solve);
+            round_cx.cx.add_solver_counts(&mut solve);
             cost.round(&solve);
         }
         if let Some(keys) = root_keys.as_deref_mut() {
             keys.clear();
-            keys.extend_from_slice(cx.root_keys());
+            keys.extend_from_slice(round_cx.cx.root_keys());
         }
         let mut fills = world.fills.into_inner();
         if r.order == BuildOrder::Reversed {
@@ -382,38 +616,65 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         }
         let mut gaps = world.gaps.into_inner();
         if trace_ask.is_some() {
-            r.store.traced = cx.take_trace();
+            r.store.traced = round_cx.cx.take_trace();
         }
-        gaps.extend(body.typeck.const_gaps.iter().map(|&gap| Gap::BodyConst { owner, gap }));
+        for (idx, &gap) in body.typeck.const_gaps.iter().enumerate() {
+            if patched.as_ref().is_some_and(|p| p.resolved.get(idx).copied().unwrap_or(false)) {
+                continue;
+            }
+            gaps.push(Gap::BodyConst { owner, gap });
+        }
         let round_gaps = !gaps.is_empty();
         if round_gaps {
             merge_gaps(&mut all_gaps, gaps);
         }
         let needs = match out {
-            // A finished check with a diagnostic is not a checked body: each is a finding.
-            // A written type that named nothing (E0412, front2 type_miss.rs) is a finding too,
-            // before the checker's: the body was checked with the error type in its place. So is
-            // one of the fn's own signature (its head's, `Store::type_misses`): a body whose
-            // head holds the error type is never a clean check, even where the walk read none.
-            Outcome::Done(done) if !round_gaps && !allow_diags && (!done.diags.is_empty() || !body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) => {
-                let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
-                let view: BodyView<'_> = body.typeck.view(tys);
-                return Err(collect_done_diags(r, body, scope, &view, owner, done, asked.as_deref_mut(), alloc));
-            }
-            Outcome::Done(done) if !round_gaps => {
-                if !allow_diags
-                    && let Some(inferred_out) = done.inferred_output
-                {
-                    let _ = r.store.file_inferred_output(owner, done.types.view(), inferred_out);
+            Outcome::Done(mut done) => {
+                if round_cx.is_reusing() {
+                    merge_replayed_reads(r, scope, owner, &mut done, &round_cx.cx.facts, alloc)?;
                 }
-                // The shared goals the finished round took (blaze-solve share.rs `GoalHit`): the
-                // one read each, which the body's result names (tables/task.rs).
-                let mut hits = Vec::with_capacity_in(cx.goal_hits().len(), Global);
-                hits.extend_from_slice(cx.goal_hits());
-                r.store.goal_hits = hits;
-                return Ok(done);
-            }
-            Outcome::Done(done) => {
+                if !round_gaps && r.store.inferred_outputs.is_empty() && r.store.provisional_impls.is_empty() {
+                    round_cx.mark_commit();
+                }
+                // A finished check with a diagnostic is not a checked body: each is a finding.
+                // A written type that named nothing (E0412, front2 type_miss.rs) is a finding too,
+                // before the checker's: the body was checked with the error type in its place. So is
+                // one of the fn's own signature (its head's, `Store::type_misses`): a body whose
+                // head holds the error type is never a clean check, even where the walk read none.
+                if !round_gaps && !allow_diags && (!done.diags.is_empty() || !body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) {
+                    round_cx.restore_to(&mut r.store.stretch_facts);
+                    let tys = match &patched {
+                        Some(p) => p.tys.view(&r.store.tys),
+                        None => body.tys.view(&r.store.tys),
+                    }
+                    .map_err(|error| CheckFail::Check { owner, error })?;
+                    let mut view: BodyView<'_> = body.typeck.view(tys);
+                    if let Some(p) = &patched {
+                        view.type_lists = &p.type_lists;
+                    }
+                    return Err(collect_done_diags(r, body, scope, &view, owner, done, asked.as_deref_mut(), alloc));
+                }
+                if !round_gaps {
+                    if !allow_diags
+                        && let Some(inferred_out) = done.inferred_output
+                    {
+                        let _ = r.store.file_inferred_output(owner, done.types.view(), inferred_out);
+                    }
+                    // The shared goals the finished round took (blaze-solve share.rs `GoalHit`): the
+                    // one read each, which the body's result names (tables/task.rs).
+                    r.store.goal_hits.clear();
+                    r.store.goal_hits.extend_from_slice(round_cx.cx.goal_hits());
+                    round_cx.restore_to(&mut r.store.stretch_facts);
+                    return Ok(done);
+                }
+                round_cx.restore_to(&mut r.store.stretch_facts);
+                // A finished check with unresolved BodyConst argument gaps whose callee and
+                // declared const parameter type are now known: evaluate and re-check.
+                if super::body_const_gaps::resolve(r, body, &done, &mut patched, alloc)? {
+                    all_gaps.clear();
+                    stalled_rounds = 0;
+                    continue;
+                }
                 if !r.store.inferring_output_stack.is_empty() {
                     for g in all_gaps.iter() {
                         if let Gap::InferredOutputCycle { owner: a, callee: b } = *g {
@@ -427,10 +688,19 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                 }
                 return Err(CheckFail::Gap { owner, gaps: all_gaps });
             }
-            Outcome::Need(needs) => needs,
+            Outcome::Need(needs) => {
+                round_cx.restore_to(&mut r.store.stretch_facts);
+                needs
+            }
         };
-        holes.round(round, &needs.missing);
+        let new_holes = holes.round(round, &needs.missing);
+        if new_holes > 0 {
+            stalled_rounds = 0;
+        } else {
+            stalled_rounds += 1;
+        }
         if let Some(cost) = meter {
+            r.store.gate.borrow_mut().materialize(alloc);
             cost.again(&needs, &r.store.gate.borrow());
         }
         if let Some(asked) = asked.as_deref_mut() {
@@ -449,6 +719,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             return Err(CheckFail::Gap { owner, gaps: all_gaps });
         }
         if fills.is_empty() && r.store.imports() != imported_at {
+            stalled_rounds = 0;
             hints = needs;
             continue;
         }
@@ -505,8 +776,11 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
             }
         }
         hints = needs;
+        if rounds_run >= MOST_ROUNDS && stalled_rounds >= MOST_STALLED_ROUNDS {
+            break;
+        }
     }
-    Err(rounds_exhausted(r, owner, made, &hints, &holes))
+    Err(rounds_exhausted(r, owner, made, rounds_run, &hints, &holes))
 }
 
 #[cold]
@@ -526,12 +800,13 @@ fn rounds_exhausted<'n, S: NamesSource<'n>>(
     r: &Records<'_, 'n, S>,
     owner: ItemKey,
     made: u64,
+    rounds: u32,
     hints: &Needs<'static>,
     holes: &RoundHoles,
 ) -> CheckFail {
     let mut last = Vec::new_in(Global);
     last.extend_from_slice(&hints.missing);
-    let mut fail = rounds_fail(r, owner, "the body's check", made, last);
+    let mut fail = rounds_fail(r, owner, "the body's check", made, rounds, last);
     if let CheckFail::Rounds { last, shown, .. } = &mut fail {
         *shown = format!("{shown}; {}", holes.said(last)).into_boxed_str();
     }
@@ -610,17 +885,17 @@ fn collect_done_diags<'n, S: NamesSource<'n>>(
 /// that does not make what is asked). Questions are `Copy` and `Ord`: no text is made per round.
 struct RoundHoles {
     /// `(holes, new)` of each round, in order.
-    per_round: Vec<(u32, u32), Global>,
+    per_round: blaze_own::Vec<(u32, u32), blaze_own::Alloc<'static>>,
     /// Each distinct hole and the first round it was met in, sorted by the question.
-    seen: Vec<(Question, u32), Global>,
+    seen: blaze_own::Vec<(Question, u32), blaze_own::Alloc<'static>>,
 }
 
 impl RoundHoles {
-    fn new() -> RoundHoles {
-        RoundHoles { per_round: Vec::new_in(Global), seen: Vec::new_in(Global) }
+    fn new_in(alloc: blaze_own::Alloc<'static>) -> RoundHoles {
+        RoundHoles { per_round: blaze_own::Vec::new_in(alloc), seen: blaze_own::Vec::new_in(alloc) }
     }
 
-    fn round(&mut self, round: u32, missing: &[Question]) {
+    fn round(&mut self, round: u32, missing: &[Question]) -> u32 {
         let mut new = 0u32;
         for &q in missing {
             if let Err(at) = self.seen.binary_search_by(|(s, _)| s.cmp(&q)) {
@@ -629,6 +904,7 @@ impl RoundHoles {
             }
         }
         self.per_round.push((missing.len() as u32, new));
+        new
     }
 
     /// `holes per round (new): r0 12 (12), .. ; N distinct over R rounds, the last new one in
@@ -670,10 +946,10 @@ impl RoundHoles {
 /// kind and its item's path ([`key_shown`]). Few records over many rounds is a chain of needs
 /// each found only once the one before it is made (a round per link); many is a body that
 /// needs many records.
-pub(crate) fn rounds_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, what: &str, made: u64, last: Vec<Question, Global>) -> CheckFail {
+pub(crate) fn rounds_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, what: &str, made: u64, rounds: u32, last: Vec<Question, Global>) -> CheckFail {
     use core::fmt::Write as _;
     let mut shown = String::new();
-    let _ = write!(shown, "{what} of {} made {made} records over {MOST_ROUNDS} rounds, and its last round met {} holes", key_shown(r, owner), last.len());
+    let _ = write!(shown, "{what} of {} made {made} records over {rounds} rounds, and its last round met {} holes", key_shown(r, owner), last.len());
     for (i, q) in last.iter().take(MOST_HOLES_SHOWN).enumerate() {
         let sep = if i == 0 { ": " } else { "; " };
         let text = format!("{q:?}");
@@ -686,7 +962,7 @@ pub(crate) fn rounds_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner:
     if last.len() > MOST_HOLES_SHOWN {
         let _ = write!(shown, "; and {} more", last.len() - MOST_HOLES_SHOWN);
     }
-    CheckFail::Rounds { owner, last, shown: shown.into_boxed_str() }
+    CheckFail::Rounds { owner, rounds, last, shown: shown.into_boxed_str() }
 }
 
 /// The most holes a [`CheckFail::Rounds`] names.
@@ -902,7 +1178,7 @@ fn adt_args_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<
     let mut shown = args.len();
     while let Some(&arg) = shown.checked_sub(1).and_then(|i| args.get(i)) {
         let Some(&Some(d)) = defaults.get(shown - 1) else { break };
-        if !names_no_param(heads, d, r.store.tys.alloc()) || ty_shown(r, heads, d) != ty_shown(r, tys, arg) {
+        if !names_no_param(heads, d, r.store.work_alloc()) || ty_shown(r, heads, d) != ty_shown(r, tys, arg) {
             break;
         }
         shown -= 1;
@@ -1635,7 +1911,7 @@ fn trait_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<'_>
     // (`{Rhs}`) its own, by the index the trait's header gives it (heads.rs `param_names`).
     let shown: Vec<String, Global> = tys.list(args).map(|l| l.iter().map(|&t| ty_shown(r, tys, t)).collect()).unwrap_or_default();
     let mut params: Vec<(Name, u32), Global> = Vec::new_in(Global);
-    let params_read = super::heads::lower(r.names, lib, text.text)
+    let params_read = super::heads::lower_alloc(r.names, lib, text.text, r.store.work_alloc())
         .map_err(|e| format!("{e:?}"))
         .and_then(|low| super::heads::param_names(&low.view(), 1, &mut params, super::heads::Consts::Keep).map_err(|e| format!("{e:?}")));
     let unread = |why: &dyn core::fmt::Display| Some(format!("the trait `{this}`'s `#[diagnostic::on_unimplemented]` does not read ({why})"));
@@ -1745,7 +2021,8 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     // `Vec<T>`) is selected where the instance is made, as on a bare parameter: an impl picked
     // here would be picked at types that are not the instance's. The impls of the self type's
     // shape are walked by reach.rs `Instances`.
-    if holds_param(ground.view(), args).map_err(|error| CheckFail::Check { owner, error })? {
+    let alloc = r.store.work_alloc();
+    if holds_param(ground.view(), args, alloc).map_err(|error| CheckFail::Check { owner, error })? {
         return Ok(Target::AtInstance(item));
     }
     // A self type whose `Clone` (and `Copy`) the LANGUAGE may give (below): the build asks
@@ -1770,7 +2047,6 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
         false => None,
         true => copy_trait(r, owner)?,
     };
-    let alloc = r.store.tys.alloc();
     // For a refusal past the last round ([`rounds_fail`]).
     let (mut made, mut hole) = (0u64, None);
     for _ in 0..MOST_ROUNDS {
@@ -1786,8 +2062,9 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
         if let Err(tc::ResolveError::NoImpl { trait_, .. }) = out
             && builtin
         {
-            let mut asked: Vec<tc::PTy, Global> = Vec::new_in(Global);
-            asked.extend_from_slice(ground.view().list(args).map_err(|error| CheckFail::Check { owner, error })?);
+            let args_slice = ground.view().list(args).map_err(|error| CheckFail::Check { owner, error })?;
+            let mut asked: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'static>> = blaze_own::Vec::with_capacity_in(args_slice.len(), alloc);
+            asked.extend_from_slice(args_slice);
             let given = tc::holds(&world, trait_, &asked, ground, alloc).and_then(|given| match (given, copy) {
                 (true, Some(copy)) => tc::holds(&world, copy, &asked[..1], ground, alloc).map(|_| true),
                 (given, _) => Ok(given),
@@ -1817,7 +2094,7 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     }
     let mut last = Vec::new_in(Global);
     last.extend(hole);
-    Err(rounds_fail(r, owner, &format!("instance resolution of the call of {}", key_shown(r, item)), made, last))
+    Err(rounds_fail(r, owner, &format!("instance resolution of the call of {}", key_shown(r, item)), made, MOST_ROUNDS, last))
 }
 
 /// Resolves a trait method `item` at concrete ground `args` (interned in `r.store.tys`) to its
@@ -1833,7 +2110,7 @@ pub(crate) fn resolve_instance_full<'n, S: NamesSource<'n>>(
         _ => return Ok(None),
     };
     let Some(module) = r.keys.library_in(r.names, container) else { return Ok(None) };
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     let mut ground = tc::PortableTys::new_in(alloc);
     let mut g_args: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'static>> =
         blaze_own::Vec::with_capacity_in(args.len(), alloc);
@@ -1915,11 +2192,12 @@ pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, sc
     let shown = |e| CheckFail::Check { owner, error: e };
     let Some(&me) = c.types.view().list(args).map_err(shown)?.first() else { return Ok(()) };
     let tc::PNode::Closure { owner: of, ordinal, .. } = c.types.view().node(me).map_err(shown)? else { return Ok(()) };
-    if of != owner || holds_param(c.types.view(), args).map_err(shown)? {
+    let alloc = r.store.work_alloc();
+    if of != owner || holds_param(c.types.view(), args, alloc).map_err(shown)? {
         return Ok(());
     }
     let Some(&e) = c.closures.column::<0>().get(ordinal as usize) else { return Ok(()) };
-    let mut held: Vec<tc::PTy, Global> = Vec::new_in(Global);
+    let mut held: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
     for (p, by) in blaze_build::layout::captures(c, e) {
         if matches!(by, tc::CaptureKind::ByValue)
             && let Some(&t) = c.local_ty.get(p.ix())
@@ -1931,7 +2209,6 @@ pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, sc
         return Ok(());
     }
     let Some(copy) = copy_trait(r, owner)? else { return Ok(()) };
-    let alloc = r.store.tys.alloc();
     for &t in held.iter() {
         let mut done = false;
         // For a refusal past the last round ([`rounds_fail`]).
@@ -1963,7 +2240,7 @@ pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, sc
         if !done {
             let mut last = Vec::new_in(Global);
             last.extend(hole);
-            return Err(rounds_fail(r, owner, "whether a closure's capture is `Copy`", made, last));
+            return Err(rounds_fail(r, owner, "whether a closure's capture is `Copy`", made, MOST_ROUNDS, last));
         }
     }
     Ok(())
@@ -1971,8 +2248,8 @@ pub fn reach_capture_copy<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, sc
 
 /// Whether any type of `args` holds a type or const parameter (or a projection or opaque type,
 /// which name one in a generic body), by a work list.
-fn holds_param(v: tc::PTys<'_>, args: tc::List) -> Result<bool, tc::CheckError> {
-    let mut work: Vec<tc::PTy, Global> = Vec::new_in(Global);
+fn holds_param(v: tc::PTys<'_>, args: tc::List, alloc: blaze_own::Alloc<'static>) -> Result<bool, tc::CheckError> {
+    let mut work: blaze_own::Vec<tc::PTy, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
     work.extend_from_slice(v.list(args)?);
     while let Some(t) = work.pop() {
         let lists = match v.node(t)? {
@@ -2045,6 +2322,7 @@ pub(super) enum MakeFail {
     Tables(TablesReadError),
     Question(ImplQuestionError),
     Const(LibKey, ConstFail),
+    Hidden(super::opaque_auto::HiddenFail),
 }
 
 impl From<AdmitError> for MakeFail {
@@ -2064,16 +2342,24 @@ impl MakeFail {
             MakeFail::Tables(error) => CheckFail::Tables { owner, error },
             MakeFail::Question(error) => CheckFail::ImplQuestion { owner, error },
             MakeFail::Const(key, error) => CheckFail::Const { owner, key, shown: lib_shown(r, key), error: Box::new_in(error, Global) },
+            MakeFail::Hidden(error) => super::opaque_auto::into_check_fail(r, owner, error),
         }
     }
 }
 
 /// The most constants one fill may need evaluated before it is made (rule 18).
-const MOST_CONSTS: u32 = 64;
+/// Constants evaluated for one head fill before giving up (array lengths, pattern bounds, or
+/// explicit enum discriminants such as `nix::errno::consts::Errno`).
+const MOST_CONSTS: u32 = 1024;
 
 /// Builds a [`CheckFail::Const`] carrying [`ConstFail::Nested`] for `key` on `owner`.
 pub(super) fn const_nested_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, key: LibKey) -> CheckFail {
     MakeFail::Const(key, ConstFail::Nested { item: checker_of(key), shown: lib_shown(r, key) }).at(r, owner)
+}
+
+/// Builds a [`CheckFail::Const`] carrying `error` for `key` on `owner`.
+pub(super) fn const_eval_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, key: LibKey, error: ConstFail) -> CheckFail {
+    MakeFail::Const(key, error).at(r, owner)
 }
 
 /// [`make`] for front2/const_qpath.rs (the trait's members and the impl candidates a
@@ -2127,7 +2413,7 @@ pub fn eval_len<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,c: LibKey) ->
         return eval_len_inner(r, c);
     };
     if r.consts.is_none() { return eval_len_inner(r, c) }
-    let capture = r.store.maps.capture_const(r.store.tys.alloc());
+    let capture = r.store.maps.capture_const(r.store.work_alloc());
     let result = eval_len_inner(r, c);
     let inputs = r.store.maps.finish_capture(capture).expect("the pooled world's source recorder");
     r.store.maps.const_proofs.as_mut().expect("the pooled world's source proofs").finish(start, c, inputs);
@@ -2154,7 +2440,13 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
     // constant item's head first; `c` may be one's need key, whose checker key is that head's.
     let filed = super::anon::file_asked(&mut *r.store, &mut *r.keys).map_err(|e| ConstFail::Eval(format!("constant {:?}: {e}", checker_of(c)).into_boxed_str()));
     let (value, asked) = match filed {
-        Ok(asked) => (consts.value(r, prepared, checker_of(c)).map(int_of), asked),
+        Ok(asked) => {
+            let active_before = r.store.active_consts_len();
+            r.store.push_active_const(c);
+            let got = consts.value(r, prepared, checker_of(c)).map(int_of);
+            r.store.truncate_active_consts(active_before);
+            (got, asked)
+        }
         Err(e) => (Err(e), Vec::new_in(Global)),
     };
     // The other anonymous constants asked with it (an enum's other discriminants) are
@@ -2165,13 +2457,18 @@ fn eval_len_inner<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
     // whose header writes `W<{ size_of::<u8>() }>` stays a refused candidate, a named gap of
     // the questions it could answer, as before there was an evaluator behind the heads.
     let anonymous = |k: LibKey| super::anon::need_key(checker_of(k)) == k;
-    let mut more: Vec<(LibKey, u128), Global> = Vec::new_in(Global);
-    let mut failed: Vec<(LibKey, Box<str, Global>), Global> = Vec::new_in(Global);
+    let eval_alloc = r.store.work_alloc();
+    let mut more: blaze_own::Vec<(LibKey, u128), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(eval_alloc);
+    let mut failed: blaze_own::Vec<(LibKey, Box<str>), blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(eval_alloc);
     for &o in asked.iter() {
         if o == c || r.store.maps.const_bits.contains_key(&o) || r.store.maps.anon_failed.contains_key(&o) {
             continue;
         }
-        match consts.value(r, prepared, checker_of(o)).map(int_of) {
+        let active_before = r.store.active_consts_len();
+        r.store.push_active_const(o);
+        let got = consts.value(r, prepared, checker_of(o)).map(int_of);
+        r.store.truncate_active_consts(active_before);
+        match got {
             Ok(Some(bits)) => more.push((o, bits)),
             Ok(None) => failed.push((o, Box::from("its value is not an integer of at most 16 bytes"))),
             Err(e) => failed.push((o, format!("{e}").into_boxed_str())),
@@ -2223,7 +2520,7 @@ pub(super) fn make_all<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fills:
 /// Makes the answer to `ImplsOf(trait_, shape)` from the one impl index (the same buckets the
 /// checker's questions fill) and returns the impls it holds; `None` when a candidate's header
 /// refused: the question then stays a gap, so the back half's asking it refuses by name.
-pub fn answer_impls<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,trait_: ItemKey, shape: tc::Shape) -> Option<Vec<ItemKey, Global>> {
+pub fn answer_impls<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,trait_: ItemKey, shape: tc::Shape) -> Option<blaze_own::Vec<ItemKey, blaze_own::Alloc<'static>>> {
     // Selection reads the trait's head too (`TraitDef`): made with its answer.
     if !r.store.trait_defs.contains_key(&trait_) {
         let want = super::fill::want_of_key(r.names, r.keys, trait_).ok()?;
@@ -2237,8 +2534,9 @@ pub fn answer_impls<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,trait_: I
     if b.trait_gap(trait_, shape).is_some() {
         return None;
     }
-    let mut out = Vec::new_in(Global);
-    out.extend_from_slice(b.impls_of(trait_, shape)?);
+    let slice = b.impls_of(trait_, shape)?;
+    let mut out = blaze_own::Vec::with_capacity_in(slice.len(), r.store.work_alloc());
+    out.extend_from_slice(slice);
     Some(out)
 }
 
@@ -2247,7 +2545,8 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
         Fill::Store(want) => r.store.ensure(r.names, r.keys, want).map_err(MakeFail::Head),
         Fill::Impls(trait_, shape, seen) => {
             let (names, index, order) = (r.names, r.index, r.order);
-            let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source(names, index));
+            let alloc = r.store.work_alloc();
+            let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source_in(names, index, alloc));
             let mut heads = Lowering { names, keys: &mut *r.keys, store: &mut *r.store };
             match trait_question(names, &mut heads, b, trait_, shape, seen, order)? {
                 Made::Made => Ok(()),
@@ -2256,7 +2555,8 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
         }
         Fill::Inherent(shape, name) => {
             let (names, index, order) = (r.names, r.index, r.order);
-            let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source(names, index));
+            let alloc = r.store.work_alloc();
+            let b = &*r.buckets.get_or_insert_with(|| Buckets::for_source_in(names, index, alloc));
             let mut heads = Lowering { names, keys: &mut *r.keys, store: &mut *r.store };
             match inherent_question(names, &mut heads, b, shape, name, order)? {
                 Made::Made => Ok(()),
@@ -2264,7 +2564,46 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
             }
         }
         Fill::InferredOutput(_) => Ok(()),
+        Fill::ConstHolds(cond, digest) => eval_where_const(r, cond, digest),
+        Fill::DefineOpaque(opaque) => super::opaque_auto::define_for_reveal(r, opaque).map_err(MakeFail::Hidden),
     }
+}
+
+/// Evaluates a queued `where const { COND }` condition at its ground arguments and caches
+/// the resulting `tc::ConstHolds` in `r.store.where_const_answers`.
+fn eval_where_const<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, cond: ItemKey, digest: u64) -> Result<(), MakeFail> {
+    if r.store.where_const_answers.contains_key(&(cond, digest)) {
+        return Ok(());
+    }
+    let req = {
+        let mut pending = r.store.where_const_pending.borrow_mut();
+        pending.iter().position(|p| p.cond == cond && p.digest == digest).map(|idx| pending.remove(idx))
+    };
+    let Some(req) = req else {
+        r.store.where_const_answers.insert((cond, digest), tc::ConstHolds::Error);
+        return Ok(());
+    };
+    if !r.store.fns.contains_key(&cond) {
+        let _ = r.store.ensure_where_const_head(r.names, r.keys, cond).map_err(MakeFail::Head)?;
+    }
+    if !r.store.fns.contains_key(&cond) {
+        r.store.where_const_answers.insert((cond, digest), tc::ConstHolds::Error);
+        return Ok(());
+    }
+    let Some((consts, prepared)) = r.consts.take() else {
+        r.store.where_const_answers.insert((cond, digest), tc::ConstHolds::Error);
+        return Ok(());
+    };
+    let alloc = r.store.work_alloc();
+    let evaluated = consts.value_with_args(r, prepared, cond, req.tys.view(), &req.args, None, alloc);
+    let answer = match evaluated.ok().and_then(super::consts::int_of) {
+        Some(0) => tc::ConstHolds::False,
+        Some(1) => tc::ConstHolds::True,
+        _ => tc::ConstHolds::Error,
+    };
+    r.consts = Some((consts, prepared));
+    r.store.where_const_answers.insert((cond, digest), answer);
+    Ok(())
 }
 
 enum InferredErr {
@@ -2280,7 +2619,7 @@ fn resolve_inferred_outputs<'n, S: NamesSource<'n>>(
     targets: &[ItemKey],
 ) -> Result<(), InferredErr> {
     const MOST_INFER_OUTPUTS: u32 = 256;
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     let base_caller = r.store.has_unresolved_inferred_output(caller).then_some(caller);
     let mut stack: blaze_own::Vec<ItemKey, blaze_own::Alloc<'static>> = blaze_own::Vec::new_in(alloc);
     for &t in targets.iter().rev() {
@@ -2302,7 +2641,7 @@ fn resolve_inferred_outputs<'n, S: NamesSource<'n>>(
             r.store.inferring_output_stack.extend_from_slice(&stack);
             r.store.inferred_output_wanted = None;
             r.store.inferred_output_cycle = None;
-            let Some(prepared) = r.consts.as_ref().map(|c| c.1) else {
+            let Some(prepared) = r.prepared() else {
                 return Err(InferredErr::Gap(Gap::BodyRecord(tc::Question::FnSig(cur))));
             };
             let target = match r.keys.library_in(r.names, cur) {
@@ -2321,7 +2660,7 @@ fn resolve_inferred_outputs<'n, S: NamesSource<'n>>(
                 return Err(InferredErr::Gap(Gap::InferredOutputFailed { item: cur, why: "inline for expansion failed" }));
             }
             let view = lowered.lowered.view();
-            let spell = match Spelling::of(&view) {
+            let spell = match Spelling::of_in(&view, alloc) {
                 Ok(s) => s,
                 Err(_) => {
                     return Err(InferredErr::Gap(Gap::InferredOutputFailed { item: cur, why: "body names could not be spelled" }));
@@ -2448,7 +2787,7 @@ impl<'n> ImplHeads<'n> for Importing<'_, 'n> {
             });
         }
         let _cost = super::tables::cost::Cost::enter_want(self.store.cost, want);
-        let filed = self.seeds.seed(self.store, self.keys, want, self.store.tys.alloc());
+        let filed = self.seeds.seed(self.store, self.keys, want, self.store.work_alloc());
         if matches!(filed, Ok(super::heads::Seeded::Filed)) && self.store.made(want) {
             self.store.imported.set(self.store.imported.get() + 1);
             return Ok(Made::Made);
@@ -2474,10 +2813,11 @@ pub(super) fn trait_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S,
     // Only impls written where the orphan rules allow (`trait_home`) are candidates.
     let home = trait_home(names, heads.keys(), heads.store(), trait_, shape).map_err(MakeFail::Head)?;
     // Over a bucket index: this question's buckets of the crates `home` admits.
-    b.admit_shared(names, heads.keys(), home, ask, heads.store().tys.alloc()).map_err(MakeFail::from)?;
+    let ba = b.alloc();
+    b.admit_shared(names, heads.keys(), home, ask, ba).map_err(MakeFail::from)?;
     // And only impls of the crates the asking body sees (`Seen`): none of a crate downstream
     // of a checked body's, whose headers are then never made for it either.
-    let sight = b.sight(names, seen, heads.store().tys.alloc()).map_err(|why| MakeFail::Buckets(Unfilled::Sight(why)))?;
+    let sight = b.sight(names, seen, ba).map_err(|why| MakeFail::Buckets(Unfilled::Sight(why)))?;
     let mut candidates = b.trait_candidates(trait_, shape, home);
     // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
     // decides an auto trait's structural rule, and the solver matches it to no positive
@@ -2502,7 +2842,7 @@ pub(super) fn inherent_question<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names:
     let _cost = super::tables::cost::Cost::enter(heads.store().cost, super::tables::cost::Part::Impls);
     // Only impls written in the type's own crate (`inherent_home`) are candidates.
     let home = inherent_home(names, heads.keys(), heads.store(), shape).map_err(MakeFail::Head)?;
-    b.admit_shared(names, heads.keys(), home, ask, heads.store().tys.alloc()).map_err(MakeFail::from)?;
+    b.admit_shared(names, heads.keys(), home, ask, b.alloc()).map_err(MakeFail::from)?;
     // The name filters first, from the impls' member rows (no header made): an impl
     // that declares no member of the name is never the answer, so its header is not
     // lowered for it. rustc finds an inherent item by name before it unifies self
@@ -2527,7 +2867,7 @@ fn lower_heads<'n, S: NamesSource<'n>, H: ImplHeads<'n>>(names: S, heads: &mut H
     while let Some(&k) = if order == BuildOrder::Reversed { iter.next_back() } else { iter.next() } {
         let ck = checker_of(k);
         if heads.store().impls.contains_key(&ck)
-            || (heads.store().maps.evaluating.get() > 0 && heads.store().provisional_impls.contains_key(&ck))
+            || heads.store().is_provisional_active(ck)
             || b.has_failed(k)
         {
             continue;
@@ -2580,4 +2920,41 @@ fn refused_derive_words(row: &blaze_scope::names_record::FailedRow<'_>) -> Box<s
         row.path, row.file, row.why
     )
     .into_boxed_str()
+}
+
+#[cfg(test)]
+mod round_cap_tests {
+    use super::{MOST_PROGRESS_ROUNDS, MOST_ROUNDS, MOST_STALLED_ROUNDS, RoundHoles};
+    use blaze_typeck::{ItemKey, Question};
+
+    #[test]
+    fn round_holes_distinguishes_progress_from_stalled_loops() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut progressing = RoundHoles::new_in(alloc);
+        let mut stalled_rounds = 0u32;
+        for r in 0..500u32 {
+            let new = progressing.round(r, &[Question::FnSig(ItemKey(u128::from(r) + 1))]);
+            assert_eq!(new, 1, "each new hole in round {r} counts as forward progress");
+            stalled_rounds = 0;
+        }
+        assert_eq!(stalled_rounds, 0);
+        assert!(500 > MOST_ROUNDS && 500 < MOST_PROGRESS_ROUNDS);
+
+        let mut stuck = RoundHoles::new_in(alloc);
+        let mut stuck_rounds = 0u32;
+        let mut stopped_at = None;
+        for r in 0..MOST_PROGRESS_ROUNDS {
+            let new = stuck.round(r, &[Question::FnSig(ItemKey(42))]);
+            if new > 0 {
+                stuck_rounds = 0;
+            } else {
+                stuck_rounds += 1;
+            }
+            if r + 1 >= MOST_ROUNDS && stuck_rounds >= MOST_STALLED_ROUNDS {
+                stopped_at = Some(r + 1);
+                break;
+            }
+        }
+        assert_eq!(stopped_at, Some(MOST_ROUNDS), "a stuck loop stops right at MOST_ROUNDS");
+    }
 }

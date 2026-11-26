@@ -112,7 +112,7 @@
 // Two builders (std.md, "Two builders"): what is plain Rust is compiled by rustc and by blaze;
 // what needs blaze's extensions is under `cfg(blaze)`, the cfg blaze sets for every crate it
 // compiles, each with a plain form under `cfg(not(blaze))` that says what the extension adds.
-#![cfg_attr(blaze, feature(blaze_comptime, blaze_const_exprs, blaze_verify))]
+#![cfg_attr(blaze, feature(blaze_comptime, blaze_const_exprs, blaze_verify, lang_items))]
 #![feature(
     allocator_ext,
     atomic_internals,
@@ -212,6 +212,9 @@ pub mod entry;
 pub mod env;
 /// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
 pub mod eval;
+/// Zero-cost compile-time enum reflection traits (`Enum`, `UnitEnum`, `EnumMeta`,
+/// `FromVariantStr`, `FromLowercaseStr`, `FromSnakeStr`) and `const fn` introspection.
+pub mod reflect;
 /// Flat values: `Flat`, bytes that mean the same on any thread, process or machine.
 #[expect(
     unsafe_code,
@@ -231,6 +234,9 @@ pub mod host;
 // pays for at start"): a program that turns none on links none of their dependencies.
 #[cfg(feature = "image")]
 pub mod image;
+/// Fast Starship-class Git prompt and status driven over `bstd::fs` (sans-IO core in `blaze-git`).
+#[cfg(feature = "git")]
+pub mod git;
 /// The simulated host behind the capabilities blaze-core has no effect for, and how a call
 /// on one fails.
 pub mod hosted;
@@ -312,7 +318,7 @@ pub mod record_ty;
 /// Zero-unsafe, sans-IO, Flecs 4.2-equivalent archetype Entity-Component-System (`World`,
 /// generational `Entity`, `(Rel, Target)` pairs with `ChildOf` cascade & `IsA` prefab inheritance,
 /// incrementally synced `CachedQuery`, reactive observers, and conflict-free phased `Pipeline`).
-pub mod ecs;
+pub use blaze_ecs as ecs;
 pub mod prefab;
 /// The native backend's reads of its host's facts.
 #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
@@ -396,7 +402,7 @@ pub mod yaml;
 /// Bounded, traversal-safe Store/Deflate ZIP archive reader and writer over [`compress`] and [`digest::Crc32`].
 pub mod zip;
 /// Pure `#![no_std]` RFC 8878 Zstandard compression and decompression (`XXH64` checksums).
-pub mod zstd;
+pub use blaze_zstd as zstd;
 /// A worker's state as a value the pool owns, in typed columns (D171): `Workers`, `Slot<T>`,
 /// `cx.on_worker`.
 #[expect(
@@ -906,6 +912,7 @@ pub mod prelude {
             cx::Cx,
             entry::Error,
             mem::{Alloc, Frame, Heap, String, format_in},
+            reflect::{Enum, EnumMeta, FromLowercaseStr, FromSnakeStr, FromVariantStr, UnitEnum},
             vec::Vec,
         };
 

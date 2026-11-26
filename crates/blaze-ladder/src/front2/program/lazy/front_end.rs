@@ -78,12 +78,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             return crate::front2::world_items::ctor_world(self.front.names, &self.front.keys, &self.front.index, &self.store, self.buckets.as_ref(), key, &self.asked, &self.asked_gaps, f);
         };
         let body = &live.made;
-        let view = body.lowered.view();
-        // A function of the lowering alone, made once when the body was checked.
-        let Ok(spell) = Spelling::of(&view) else {
-            return Err(ResolveError::Missing(tc::Question::FnSig(self.rows.key[i])));
-        };
-        let scope = body.scope(&spell);
+        // Ground-type queries (`resolve`, `holds`, `adt_drop_impl`, `normalize`) never resolve
+        // written AST paths, so reuse the prebuilt `fixed_spell` instead of rebuilding a per-body
+        // `Spelling` HashMap on every call.
+        let scope = body.scope(&self.fixed_spell);
         let world = BodyWorld {
             names: self.front.names,
             keys: &self.front.keys,
@@ -352,14 +350,16 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         let live = self.live_by_key(owner).ok_or(blaze_build::SiteGap::NotLive { owner })?;
         let anchor_owner = live.made.param_subst.as_ref().map_or(owner, |(orig, _)| *orig);
-        super::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, anchor_owner, &live.made, expr)
+        let mut cache = self.site_cache.borrow_mut();
+        super::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, anchor_owner, &live.made, expr, Some(&mut cache))
     }
 
     /// By program/seam_rules.rs `def_site`, from `item`'s head and the names source: no body
     /// is read (a `Fn*` method has none).
     fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         let anchor = self.spec_orig(item).unwrap_or(item);
-        super::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, anchor)
+        let mut cache = self.site_cache.borrow_mut();
+        super::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, anchor, Some(&mut cache))
     }
 
     /// From `owner`'s live body by program/seam_rules.rs `expr_offset`: no file asked, so a
@@ -372,7 +372,8 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// program/seam_rules.rs `source_position`: the item's first byte today and today's text of
     /// its file, from the names source (over records, item_grain.rs `row_now` and `file_now`).
     fn source_position(&self, item: ItemKey, site: u32) -> Result<(u32, u32), crate::seam::PositionGap> {
-        super::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site)
+        let mut cache = self.site_cache.borrow_mut();
+        super::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site, Some(&mut cache))
     }
 
     /// The start [`LazyProgram::decide_start`] decided, when it is a Rust start.
@@ -506,7 +507,7 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     fn drop_trait(&self) -> Option<(ItemKey, Option<ItemKey>)> {
         let tr = self.made_lang(LangItem::Drop)?;
-        Some((tr, self.front.keys.filed_member(tr, MemberKind::Fn, "drop")))
+        Some((tr, self.lang_trait_fn(LangItem::Drop, "drop")))
     }
 
     fn lang_item(&self, item: LangItem) -> Result<Option<ItemKey>, crate::seam::LangRefusal> {
@@ -542,6 +543,17 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         let mut declared = false;
         names.each_member(lib, &mut |m| declared |= m.kind == blaze_surface::ItemKind::Function && m.name == Some(name));
         declared.then(|| crate::front2::keys::member_key_of(tr, MemberKind::Fn, name))
+    }
+
+    fn termination_report(&self) -> Option<ItemKey> {
+        let lib = self.front.index.lang(crate::front2::test_entry::TERMINATION_LANG)?;
+        let tr = checker_of(lib);
+        if let Some(filed) = self.front.keys.filed_member(tr, MemberKind::Fn, "report") {
+            return Some(filed);
+        }
+        let mut declared = false;
+        self.front.names.each_member(lib, &mut |m| declared |= m.kind == blaze_surface::ItemKind::Function && m.name == Some("report"));
+        declared.then(|| crate::front2::keys::member_key_of(tr, MemberKind::Fn, "report"))
     }
 
     fn fmt_argument_adt(&self) -> Option<ItemKey> {
@@ -703,7 +715,7 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     /// As `Front2Program::const_at`: the evaluator the program keeps checks any body and makes
     /// any impl row the value needs.
-    fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], closures: &crate::run::ClosureTable) -> Result<DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
+    fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], build: crate::front2::const_at::BuildFacts<'_>) -> Result<DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
         let prepared = self.prepared;
         let alloc = self.store.tys.alloc();
         let mut records = Records {
@@ -716,14 +728,14 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
             consts: None,
         };
         let made = match need {
-            crate::front2::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, prepared, item, from, args, Some(closures), alloc),
+            crate::front2::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, prepared, item, from, args, Some(build), alloc),
             crate::front2::const_at::ConstNeed::Block { .. } | crate::front2::const_at::ConstNeed::Promoted { .. } => {
                 let owner = need.item();
                 let in_body = records.store.fns.get(&owner).and_then(|h| need.in_body(h.text));
                 let Some((owner, root, key)) = in_body else {
                     return Err(crate::front2::const_at::ConstAtWhy::Eval(crate::front2::consts::ConstFail::Body { item: owner, error: BodyError::NoHead(owner) }));
                 };
-                self.consts.body_value(&mut records, prepared, owner, root, key, from, args, Some(closures), alloc)
+                self.consts.body_value(&mut records, prepared, owner, root, key, from, args, Some(build), alloc)
             }
         };
         made.map(crate::front2::const_at::data_record).map_err(crate::front2::const_at::ConstAtWhy::Eval)
@@ -735,6 +747,10 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// instance's arguments (`const_at`).
     fn const_fn_instance(&self, key: blaze_build::InstanceKey, ground: &mut tc::PortableTys<'_>, scratch: blaze_own::Alloc<'_>) -> Option<blaze_build::Instance> {
         self.consts.fn_instance(key, ground, scratch)
+    }
+
+    fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut tc::PortableTys<'_>, scratch: blaze_own::Alloc<'_>) -> Option<blaze_build::vtable::VtableRef> {
+        self.consts.vtable_ref(key, ground, scratch)
     }
 
     fn evaluates_at_args(&self) -> bool {
@@ -759,5 +775,9 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
 impl<'n, S: NamesSource<'n>> blaze_build::type_name::TypeNames for LazyProgram<'n, S> {
     fn item_path(&self, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
         crate::front2::type_name::item_path(self.front.names, &self.front.keys, &self.store, item, out)
+    }
+
+    fn variant_name(&self, adt: ItemKey, variant: u32, out: &mut dyn FnMut(&str)) -> bool {
+        crate::front2::type_name::variant_name(self.front.names, &self.front.keys, adt, variant, out)
     }
 }

@@ -485,6 +485,20 @@ fn scalar_int_mask(ty: Ty, ptr_bits: u32) -> Option<(u32, u128)> {
     Some((bits, mask))
 }
 
+/// Returns `true` when `op` is a scalar integer division or remainder whose known constant
+/// divisor `cb` (masked to the type's width via `mask`) can never trap:
+/// - `Op::Udiv | Op::Urem`: `cb != 0`
+/// - `Op::Sdiv | Op::Srem`: `cb != 0 && cb != mask` (neither `0` nor `-1`)
+#[inline]
+fn is_trap_free_div_rem_const(op: Op, cb: Option<u128>, mask: u128) -> bool {
+    let Some(c) = cb else { return false };
+    match op {
+        Op::Udiv | Op::Urem => c != 0,
+        Op::Sdiv | Op::Srem => c != 0 && c != mask,
+        _ => false,
+    }
+}
+
 #[inline]
 fn is_power_of_two_gt1(v: u128) -> bool {
     v > 1 && (v & (v - 1)) == 0
@@ -598,6 +612,224 @@ fn compute_dom_tree<A: Allocator + Copy>(
     (idom, children)
 }
 
+#[inline]
+fn inst_writes_mem(op: Op, flags: Flags) -> bool {
+    match op {
+        Op::Load => flags.contains(Flags::VOLATILE),
+        Op::Store
+        | Op::Call
+        | Op::CallIndirect
+        | Op::Invoke
+        | Op::InvokeIndirect
+        | Op::Memcpy
+        | Op::Memmove
+        | Op::Memset
+        | Op::MaskedStore
+        | Op::Scatter
+        | Op::AtomicLoad
+        | Op::AtomicStore
+        | Op::AtomicRmw
+        | Op::Cmpxchg
+        | Op::Fence
+        | Op::Asm
+        | Op::AsmBr
+        | Op::TargetIntrinsic
+        | Op::Suspend
+        | Op::SlotLive
+        | Op::SlotDead => true,
+        _ => false,
+    }
+}
+
+/// Computes, for every block `b`, whether `b` can soundly inherit `idom[b]`'s end-of-block
+/// `mem_known` table.
+///
+/// A reachable non-entry block `b` with `d = idom[b]` can inherit `d`'s `mem_known` iff no path
+/// from the end of `d` to the start of `b` (without revisiting `d`) passes through a block that
+/// writes memory or synchronizes. Direct single-predecessor edges pass in O(1); multi-predecessor
+/// blocks (read-only loops with cold trap exits, write-free diamonds) use a bounded backward walk
+/// over a flat CSR predecessor table.
+fn compute_can_inherit_idom_mem<A: Allocator + Copy>(
+    view: &View<'_>,
+    reached: &[bool],
+    idom: &[u32],
+    alloc: &A,
+) -> Vec<bool, A> {
+    const MAX_MEM_PATH_VISITS: usize = 64;
+
+    let blocks = view.blocks();
+    let mut pred_deg: Vec<u32, A> = filled(blocks, 0, alloc);
+    let mut only_idom_pred = filled(blocks, true, alloc);
+    if let Some(slot) = only_idom_pred.first_mut() {
+        *slot = false;
+    }
+
+    // Pass 1: count reachable predecessor edges per block and detect the single-idom fast path.
+    let mut total_edges: usize = 0;
+    for pred in 0..blocks {
+        if !reached.get(pred).copied().unwrap_or(false) {
+            continue;
+        }
+        let pred_u32 = usize_u32(pred);
+        let term = view.terminator(Block(pred_u32));
+        each(view, term, |item| {
+            if let Item::Edge(edge) = item {
+                let to = u32_ix(edge.block);
+                if to < blocks && reached.get(to).copied().unwrap_or(false) {
+                    if let Some(deg) = pred_deg.get_mut(to) {
+                        *deg = deg.saturating_add(1);
+                    }
+                    total_edges = total_edges.saturating_add(1);
+                    if idom.get(to).copied() != Some(pred_u32) {
+                        set_at(&mut only_idom_pred, to, false);
+                    }
+                }
+            }
+        });
+    }
+
+    // Pass 2: populate flat CSR predecessor table (`pred_offsets` + `pred_list`) in `alloc`.
+    let mut pred_offsets: Vec<u32, A> = Vec::with_capacity_in(blocks.saturating_add(1), *alloc);
+    let mut pred_cursor: Vec<u32, A> = Vec::with_capacity_in(blocks, *alloc);
+    let mut acc: u32 = 0;
+    pred_offsets.push(0);
+    for b in 0..blocks {
+        pred_cursor.push(acc);
+        acc = acc.saturating_add(get_u32(&pred_deg, b).unwrap_or(0));
+        pred_offsets.push(acc);
+    }
+    let mut pred_list: Vec<u32, A> = filled(total_edges, NONE, alloc);
+    for pred in 0..blocks {
+        if !reached.get(pred).copied().unwrap_or(false) {
+            continue;
+        }
+        let pred_u32 = usize_u32(pred);
+        let term = view.terminator(Block(pred_u32));
+        each(view, term, |item| {
+            if let Item::Edge(edge) = item {
+                let to = u32_ix(edge.block);
+                if to < blocks
+                    && reached.get(to).copied().unwrap_or(false)
+                    && let Some(cur) = pred_cursor.get_mut(to)
+                {
+                    let pos = u32_ix(*cur);
+                    *cur = cur.saturating_add(1);
+                    set_at(&mut pred_list, pos, pred_u32);
+                }
+            }
+        });
+    }
+
+    // Classify reachable blocks that may write memory or synchronize.
+    // Dead-end trap/unreachable blocks have no outgoing CFG edges and can never appear on any
+    // path from `idom[b]` to `b`.
+    let mut writes_mem = filled(blocks, false, alloc);
+    for blk in 0..blocks {
+        if !reached.get(blk).copied().unwrap_or(false) {
+            continue;
+        }
+        let blk_u32 = usize_u32(blk);
+        let term_op = view.op(view.terminator(Block(blk_u32)));
+        if matches!(term_op, Op::Trap | Op::Unreachable) {
+            continue;
+        }
+        for inst in view.block(Block(blk_u32)) {
+            let op = view.op(inst);
+            let flags = Flags(get_u8(view.flags, inst).unwrap_or(0));
+            if inst_writes_mem(op, flags) {
+                set_at(&mut writes_mem, blk, true);
+                break;
+            }
+        }
+    }
+
+    // Determine `can_inherit_idom_mem[b]` for every reachable non-entry block `b`.
+    let mut can_inherit = filled(blocks, false, alloc);
+    let mut seen_stamp: Vec<u32, A> = filled(blocks, 0, alloc);
+    let mut work: Vec<u32, A> = Vec::with_capacity_in(MAX_MEM_PATH_VISITS, *alloc);
+    let mut stamp: u32 = 0;
+
+    for b in 1..blocks {
+        if !reached.get(b).copied().unwrap_or(false) {
+            continue;
+        }
+        let d = get_u32(idom, b).unwrap_or(NONE);
+        if get_u32(&pred_deg, b).unwrap_or(0) == 0 || d == NONE {
+            continue;
+        }
+        if only_idom_pred.get(b).copied().unwrap_or(false) {
+            set_at(&mut can_inherit, b, true);
+            continue;
+        }
+
+        stamp = stamp.wrapping_add(1);
+        if stamp == 0 {
+            for s in seen_stamp.iter_mut() {
+                *s = 0;
+            }
+            stamp = 1;
+        }
+        work.clear();
+
+        let mut visited: usize = 0;
+        let mut write_free = true;
+
+        let b_start = get_u32(&pred_offsets, b).map(u32_ix).unwrap_or(0);
+        let b_end = get_u32(&pred_offsets, b.saturating_add(1)).map(u32_ix).unwrap_or(b_start);
+        for &p in pred_list.get(b_start..b_end).unwrap_or(&[]) {
+            if p == d {
+                continue;
+            }
+            let pi = u32_ix(p);
+            if get_u32(&seen_stamp, pi) == Some(stamp) {
+                continue;
+            }
+            visited = visited.saturating_add(1);
+            if visited > MAX_MEM_PATH_VISITS {
+                write_free = false;
+                break;
+            }
+            set_at(&mut seen_stamp, pi, stamp);
+            work.push(p);
+        }
+
+        if write_free {
+            'walk: while let Some(u) = work.pop() {
+                let ui = u32_ix(u);
+                if writes_mem.get(ui).copied().unwrap_or(true) {
+                    write_free = false;
+                    break;
+                }
+                let u_start = get_u32(&pred_offsets, ui).map(u32_ix).unwrap_or(0);
+                let u_end =
+                    get_u32(&pred_offsets, ui.saturating_add(1)).map(u32_ix).unwrap_or(u_start);
+                for &q in pred_list.get(u_start..u_end).unwrap_or(&[]) {
+                    if q == d {
+                        continue;
+                    }
+                    let qi = u32_ix(q);
+                    if get_u32(&seen_stamp, qi) == Some(stamp) {
+                        continue;
+                    }
+                    visited = visited.saturating_add(1);
+                    if visited > MAX_MEM_PATH_VISITS {
+                        write_free = false;
+                        break 'walk;
+                    }
+                    set_at(&mut seen_stamp, qi, stamp);
+                    work.push(q);
+                }
+            }
+        }
+
+        if write_free {
+            set_at(&mut can_inherit, b, true);
+        }
+    }
+
+    can_inherit
+}
+
 /// Runs the single-pass dominator-scoped Acyclic E-Graph (`aegraph`) optimizer over `view`,
 /// followed by dead-code elimination, returning a verified [`Func`] and optimization telemetry.
 pub fn aegraph_optimize<A: Allocator + Copy>(
@@ -637,13 +869,17 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
         ..AegraphStats::default()
     };
 
+    let mut inst_kept = filled(len, true, &alloc);
     let mut table = ScopedENodes::new(len, &alloc);
-    let mut mem_known: Vec<(u32, i32, u16, u32), A> = Vec::new_in(alloc);
+    let mut mem_known: Vec<(u32, i32, u16, u8, u32), A> = Vec::new_in(alloc);
+    let mut mem_saved: Vec<(u32, i32, u16, u8, u32), A> = Vec::new_in(alloc);
 
-    // Explicit DFS over the dominator tree with scoped hash-consing rollback.
+    let can_inherit_idom_mem = compute_can_inherit_idom_mem(&view, &reached, &idom, &alloc);
+
+    // Explicit DFS over the dominator tree with scoped hash-consing and memory-state rollback.
     enum Frame {
         Enter(u32),
-        Exit(usize),
+        Exit { table_mark: usize, mem_mark: usize },
     }
     let mut dfs: Vec<Frame, A> = Vec::with_capacity_in(blocks * 2, alloc);
     if reached[0] {
@@ -652,40 +888,59 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
 
     while let Some(frame) = dfs.pop() {
         match frame {
-            Frame::Exit(mark) => table.rollback(mark),
+            Frame::Exit { table_mark, mem_mark } => {
+                table.rollback(table_mark);
+                mem_known.clear();
+                if let Some(saved) = mem_saved.get(mem_mark..) {
+                    mem_known.extend_from_slice(saved);
+                }
+                mem_saved.truncate(mem_mark);
+            }
             Frame::Enter(b) => {
-                let mark = table.mark();
-                dfs.push(Frame::Exit(mark));
+                let table_mark = table.mark();
+                let mem_mark = mem_saved.len();
+                mem_saved.extend_from_slice(&mem_known);
+                dfs.push(Frame::Exit { table_mark, mem_mark });
                 // Push children in reverse so they visit in forward order.
                 for &child in dom_children[b as usize].iter().rev() {
                     dfs.push(Frame::Enter(child));
                 }
 
-                mem_known.clear();
+                if !can_inherit_idom_mem.get(u32_ix(b)).copied().unwrap_or(false) {
+                    mem_known.clear();
+                }
                 let range = view.block(Block(b));
                 for inst in range {
                     let op = view.op(inst);
                     let flags = Flags(view.flags[inst]);
                     let ty = Ty(view.tys[inst]);
 
-                    // Local sound store-to-load forwarding & redundant non-volatile load GVN.
+                    // Sound store-to-load forwarding & redundant non-volatile load GVN across
+                    // local and write-free dominated CFG paths (single-pred edges, read-only loops
+                    // and write-free diamonds).
                     match op {
                         Op::Load if !flags.contains(Flags::VOLATILE) => {
                             let Some(at) = get_u32(view.data, inst).map(u32_ix) else { continue };
                             let Some((raw_ptr, raw_off)) = extra_pair(&view, at) else { continue };
                             let Some(ptr) = stand_of(&stands, raw_ptr) else { continue };
                             let off = raw_off.cast_signed();
-                            if let Some(&(_, _, _, prev_v)) = mem_known
+                            let align = view.mem_attrs(inst).map_or(0, |m| m.align);
+                            if let Some(&(_, _, _, prev_align, prev_v)) = mem_known
                                 .iter()
-                                .find(|&&(p, o, t, _)| p == ptr && o == off && t == ty.0)
+                                .find(|&&(p, o, t, _, _)| p == ptr && o == off && t == ty.0)
                             {
                                 set_at(&mut stands, inst, prev_v);
                                 copy_const(&mut known_const, inst, prev_v);
+                                if align <= prev_align
+                                    && let Some(k) = inst_kept.get_mut(inst)
+                                {
+                                    *k = false;
+                                }
                                 stats.gvn_hits += 1;
                                 continue;
                             }
                             if mem_known.len() < 32 {
-                                mem_known.push((ptr, off, ty.0, usize_u32(inst)));
+                                mem_known.push((ptr, off, ty.0, align, usize_u32(inst)));
                             }
                             continue;
                         }
@@ -696,9 +951,10 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                             let Some(ptr) = stand_of(&stands, raw_ptr) else { continue };
                             let off = raw_off.cast_signed();
                             let Some(val_ty) = get_u16(view.tys, u32_ix(raw_val)) else { continue };
+                            let align = view.mem_attrs(inst).map_or(0, |m| m.align);
                             // Conservative alias flush, then record exact forwarded store.
                             mem_known.clear();
-                            mem_known.push((ptr, off, val_ty, val));
+                            mem_known.push((ptr, off, val_ty, align, val));
                             continue;
                         }
                         Op::Load
@@ -710,6 +966,8 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                         | Op::Memcpy
                         | Op::Memmove
                         | Op::Memset
+                        | Op::MaskedStore
+                        | Op::Scatter
                         | Op::AtomicLoad
                         | Op::AtomicStore
                         | Op::AtomicRmw
@@ -717,7 +975,10 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                         | Op::Fence
                         | Op::Asm
                         | Op::AsmBr
-                        | Op::TargetIntrinsic => {
+                        | Op::TargetIntrinsic
+                        | Op::Suspend
+                        | Op::SlotLive
+                        | Op::SlotDead => {
                             mem_known.clear();
                         }
                         _ => {}
@@ -887,20 +1148,28 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                         | Op::Shl
                         | Op::Lshr
                         | Op::Ashr
+                        | Op::Rotl
+                        | Op::Rotr
                         | Op::Udiv
-                        | Op::Urem => {
+                        | Op::Urem
+                        | Op::Sdiv
+                        | Op::Srem => {
                             let Some((bits, mask)) = scalar_int_mask(ty, ptr_bits) else { continue };
-                            let at = view.data[inst] as usize;
-                            let a = stands[view.extra[at] as usize];
-                            let b = stands[view.extra[at + 1] as usize];
-                            let ca = known_const[a as usize];
-                            let cb = known_const[b as usize];
+                            let Some(at) = get_u32(view.data, inst).map(u32_ix) else { continue };
+                            let Some((raw_a, raw_b)) = extra_pair(&view, at) else { continue };
+                            let Some(a) = stand_of(&stands, raw_a) else { continue };
+                            let Some(b) = stand_of(&stands, raw_b) else { continue };
+                            let ca = get_const(&known_const, a);
+                            let cb = get_const(&known_const, b);
 
-                            // 1. Exact constant folding (trapping div/rem by zero returns Err -> skipped).
+                            // 1. Exact constant folding (trapping div/rem returns Err -> skipped;
+                            //    never drop `srem(_, -1)`).
                             if let (Some(va), Some(vb)) = (ca, cb) {
-                                if let Ok(res) = binary(op, va, vb, bits) {
-                                    known_const[inst] = Some(res);
-                                    edit_const[inst] = Some(res);
+                                if !(op == Op::Srem && vb == mask)
+                                    && let Ok(res) = binary(op, va, vb, bits)
+                                {
+                                    set_at(&mut known_const, inst, Some(res));
+                                    set_at(&mut edit_const, inst, Some(res));
                                     stats.constants_folded += 1;
                                     continue;
                                 }
@@ -986,7 +1255,7 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                                         folded_const = Some(mask); // x ^ !x == all_ones
                                     }
                                 }
-                                Op::Shl | Op::Lshr | Op::Ashr => {
+                                Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr => {
                                     if let Some(sh) = cb {
                                         if (sh % u128::from(bits)) == 0 {
                                             folded_val = Some(a);
@@ -1011,31 +1280,49 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
                                         stats.strength_reductions += 1;
                                     }
                                 }
+                                Op::Sdiv => {
+                                    if cb == Some(1) && mask != 1 {
+                                        folded_val = Some(a);
+                                    }
+                                }
+                                Op::Srem => {
+                                    if cb == Some(1) && mask != 1 {
+                                        folded_const = Some(0);
+                                    }
+                                }
                                 _ => {}
                             }
 
                             if let Some(target) = folded_val {
-                                stands[inst] = target;
-                                known_const[inst] = known_const[target as usize];
+                                set_at(&mut stands, inst, target);
+                                copy_const(&mut known_const, inst, target);
+                                if is_trap_free_div_rem_const(op, cb, mask) {
+                                    set_at(&mut inst_kept, inst, false);
+                                }
                                 stats.identities_folded += 1;
                                 continue;
                             }
                             if let Some(cval) = folded_const {
-                                known_const[inst] = Some(cval);
-                                edit_const[inst] = Some(cval);
+                                set_at(&mut known_const, inst, Some(cval));
+                                set_at(&mut edit_const, inst, Some(cval));
                                 stats.identities_folded += 1;
                                 continue;
                             }
 
-                            // 3. Dominator-scoped GVN (skip potentially-trapping Udiv/Urem unless divisor known nonzero).
-                            if matches!(op, Op::Udiv | Op::Urem) && cb.map_or(true, |v| v == 0) {
+                            // 3. Dominator-scoped GVN (skip potentially-trapping div/rem unless divisor is proven trap-free).
+                            if matches!(op, Op::Udiv | Op::Urem | Op::Sdiv | Op::Srem)
+                                && !is_trap_free_div_rem_const(op, cb, mask)
+                            {
                                 continue;
                             }
                             let (ka, kb) = if is_commutative(op) && a > b { (b, a) } else { (a, b) };
-                            let key = ENodeKey { op: op as u8, ty: ty.0, cond: 0, a: ka, b: kb, c: 0 };
-                            if let Some(prev) = table.get_or_insert(key, inst as u32) {
-                                stands[inst] = prev;
-                                known_const[inst] = known_const[prev as usize];
+                            let key = ENodeKey { op: inst_op_byte(&view, inst), ty: ty.0, cond: 0, a: ka, b: kb, c: 0 };
+                            if let Some(prev) = table.get_or_insert(key, usize_u32(inst)) {
+                                set_at(&mut stands, inst, prev);
+                                copy_const(&mut known_const, inst, prev);
+                                if is_trap_free_div_rem_const(op, cb, mask) {
+                                    set_at(&mut inst_kept, inst, false);
+                                }
                                 stats.gvn_hits += 1;
                             }
                         }
@@ -1474,7 +1761,7 @@ fn aegraph_optimize_inner<A: Allocator + Copy>(
 
     let edit = Edit {
         block_kept: filled(blocks, true, &alloc),
-        inst_kept: filled(len, true, &alloc),
+        inst_kept,
         stands,
         constant: edit_const,
         jump: filled(len, NONE, &alloc),
@@ -1503,6 +1790,8 @@ pub const fn op_latency_cycles(op: Op) -> u32 {
         | Op::Shl
         | Op::Lshr
         | Op::Ashr
+        | Op::Rotl
+        | Op::Rotr
         | Op::Icmp
         | Op::Select => 1,
         Op::Mul | Op::Umulhi | Op::Smulhi => 3,
@@ -1661,6 +1950,8 @@ const fn is_licm_pure(op: Op) -> bool {
             | Op::Shl
             | Op::Lshr
             | Op::Ashr
+            | Op::Rotl
+            | Op::Rotr
             | Op::Zext
             | Op::Sext
             | Op::Trunc
@@ -2361,6 +2652,104 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                             }
                         }
                     }
+                } else if op == Op::Trunc && (ty == Ty::I64 || ty == Ty::I32) {
+                    // Fold widened multiply-high idioms into single-instruction `Op::Umulhi`/`Op::Smulhi`:
+                    //   `trunc(lshr|ashr(mul(zext(a), zext(b)), W) -> iW) -> umulhi(a, b)`
+                    //   `trunc(lshr|ashr(mul(sext(a), sext(b)), W) -> iW) -> smulhi(a, b)`
+                    // (Also handles a folded wide constant operand fitting in `iW`!)
+                    let narrow_bits = ty.bits(ptr_bits);
+                    let wide_ty = if ty == Ty::I64 { Ty::I128 } else { Ty::I64 };
+                    let wide_bits = wide_ty.bits(ptr_bits);
+                    let narrow_mask = if narrow_bits == 64 {
+                        u128::from(u64::MAX)
+                    } else {
+                        u128::from(u32::MAX)
+                    };
+                    if let Some(sh_raw) = get_u32(view.data, inst) {
+                        let shi = u32_ix(sh_raw);
+                        let shop = view.op(shi);
+                        if matches!(shop, Op::Lshr | Op::Ashr)
+                            && inst_ty(&view, shi) == Some(wide_ty)
+                            && get_u8(view.flags, shi).is_some_and(|f| shop.info().flags.meanings_only(Flags(f)).0 == 0)
+                            && let Some(sh_at) = get_u32(view.data, shi).map(u32_ix)
+                            && let Some((mul_raw, amt_raw)) = extra_pair(&view, sh_at)
+                            && get_const(&known, amt_raw) == Some(u128::from(narrow_bits))
+                        {
+                            let mi = u32_ix(mul_raw);
+                            if view.op(mi) == Op::Mul
+                                && inst_ty(&view, mi) == Some(wide_ty)
+                                && get_u8(view.flags, mi)
+                                    .is_some_and(|f| Op::Mul.info().flags.meanings_only(Flags(f)).0 == 0)
+                                && let Some(m_at) = get_u32(view.data, mi).map(u32_ix)
+                                && let Some((ma_raw, mb_raw)) = extra_pair(&view, m_at)
+                            {
+                                enum MulHiArg {
+                                    Val(u32),
+                                    Const(u128),
+                                }
+                                let extract_unsigned = |v: u32| -> Option<MulHiArg> {
+                                    let vi = u32_ix(v);
+                                    if view.op(vi) == Op::Zext && inst_flags_zero(&view, vi) {
+                                        let inner = get_u32(view.data, vi)?;
+                                        if inst_ty(&view, u32_ix(inner)) == Some(ty) {
+                                            let mv = get_u32(&val_map, u32_ix(inner))?;
+                                            if mv != NONE {
+                                                return Some(MulHiArg::Val(mv));
+                                            }
+                                        }
+                                    }
+                                    if let Some(c) = get_const(&known, v)
+                                        && c <= narrow_mask
+                                    {
+                                        return Some(MulHiArg::Const(c));
+                                    }
+                                    None
+                                };
+                                let extract_signed = |v: u32| -> Option<MulHiArg> {
+                                    let vi = u32_ix(v);
+                                    if view.op(vi) == Op::Sext && inst_flags_zero(&view, vi) {
+                                        let inner = get_u32(view.data, vi)?;
+                                        if inst_ty(&view, u32_ix(inner)) == Some(ty) {
+                                            let mv = get_u32(&val_map, u32_ix(inner))?;
+                                            if mv != NONE {
+                                                return Some(MulHiArg::Val(mv));
+                                            }
+                                        }
+                                    }
+                                    if let Some(c) = get_const(&known, v) {
+                                        let sc = sext(c, wide_bits);
+                                        let fits = if narrow_bits == 64 {
+                                            i64::try_from(sc).is_ok()
+                                        } else {
+                                            i32::try_from(sc).is_ok()
+                                        };
+                                        if fits {
+                                            return Some(MulHiArg::Const(c & narrow_mask));
+                                        }
+                                    }
+                                    None
+                                };
+                                let matched = match (extract_unsigned(ma_raw), extract_unsigned(mb_raw)) {
+                                    (Some(la), Some(rb)) => Some((Op::Umulhi, la, rb)),
+                                    _ => match (extract_signed(ma_raw), extract_signed(mb_raw)) {
+                                        (Some(la), Some(rb)) => Some((Op::Smulhi, la, rb)),
+                                        _ => None,
+                                    },
+                                };
+                                if let Some((mulhi_op, la, rb)) = matched {
+                                    let lhs_m = match la {
+                                        MulHiArg::Val(v) => v,
+                                        MulHiArg::Const(c) => push_const_inst(&mut func, ty, ptr_bits, c, loc),
+                                    };
+                                    let rhs_m = match rb {
+                                        MulHiArg::Val(v) => v,
+                                        MulHiArg::Const(c) => push_const_inst(&mut func, ty, ptr_bits, c, loc),
+                                    };
+                                    replaced = Some(push_binary_inst(&mut func, mulhi_op, ty, lhs_m, rhs_m, loc));
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if replaced.is_none()
@@ -2375,6 +2764,47 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                         let ca = known[raw_a as usize];
                         let cb = known[raw_b as usize];
                         if a != NONE && b_val != NONE {
+
+                        // Helper: recognize `(x << k1) op (x >> k2)` (in either order) where `k1 + k2 == bits`
+                        // (`bits in {8, 16, 32, 64}`, `k1 > 0 && k2 > 0`) for `Op::Or`/`Op::Xor`/`Op::Add`
+                        // -> `Op::Rotl(x, k1)` (lowers to a single `extr` on AArch64!).
+                        let try_rotate = |lhs_raw: u32, rhs_raw: u32| -> Option<(u32, u128)> {
+                            if !matches!(bits, 8 | 16 | 32 | 64) {
+                                return None;
+                            }
+                            let extract_shift = |cand: u32, want_op: Op| -> Option<(u32, u128)> {
+                                let ci = u32_ix(cand);
+                                if view.op(ci) == want_op
+                                    && inst_ty(&view, ci) == Some(ty)
+                                    && want_op.info().flags.meanings_only(Flags(get_u8(view.flags, ci)?)).0 == 0
+                                {
+                                    let cat = u32_ix(get_u32(view.data, ci)?);
+                                    let (sx, sc) = extra_pair(&view, cat)?;
+                                    let k = get_const(&known, sc)?;
+                                    return Some((sx, k));
+                                }
+                                None
+                            };
+                            let pair = match (extract_shift(lhs_raw, Op::Shl), extract_shift(rhs_raw, Op::Lshr)) {
+                                (Some(l), Some(r)) => Some((l, r)),
+                                _ => match (extract_shift(rhs_raw, Op::Shl), extract_shift(lhs_raw, Op::Lshr)) {
+                                    (Some(l), Some(r)) => Some((l, r)),
+                                    _ => None,
+                                },
+                            };
+                            if let Some(((x1, k1), (x2, k2))) = pair
+                                && x1 == x2
+                                && k1 > 0
+                                && k2 > 0
+                                && k1.checked_add(k2) == Some(u128::from(bits))
+                            {
+                                let mx = get_u32(&val_map, u32_ix(x1))?;
+                                if mx != NONE {
+                                    return Some((mx, k1));
+                                }
+                            }
+                            None
+                        };
 
                         // Helper: extract `(inner_x, c1)` if `raw_op` is `same_op(inner_x, c1)` (or commutative).
                         let extract_chain_const = |cand: u32, want_op: Op, comm: bool| -> Option<(u32, u128)> {
@@ -2652,6 +3082,12 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                                         replaced = Some(push_binary_inst(&mut func, Op::Add, ty, mp, xy, loc));
                                     }
                                 }
+                                if replaced.is_none()
+                                    && let Some((mx, k1)) = try_rotate(raw_a, raw_b)
+                                {
+                                    let kc = push_const_inst(&mut func, ty, ptr_bits, k1, loc);
+                                    replaced = Some(push_binary_inst(&mut func, Op::Rotl, ty, mx, kc, loc));
+                                }
                             }
                             Op::Sub => {
                                 if ca == Some(0) {
@@ -2673,7 +3109,12 @@ pub fn materialize_strength_reduction<A: Allocator + Copy>(
                                 }
                             }
                             Op::And | Op::Or | Op::Xor => {
-                                if op == Op::Xor && (cb == Some(mask) || ca == Some(mask)) {
+                                if matches!(op, Op::Or | Op::Xor)
+                                    && let Some((mx, k1)) = try_rotate(raw_a, raw_b)
+                                {
+                                    let kc = push_const_inst(&mut func, ty, ptr_bits, k1, loc);
+                                    replaced = Some(push_binary_inst(&mut func, Op::Rotl, ty, mx, kc, loc));
+                                } else if op == Op::Xor && (cb == Some(mask) || ca == Some(mask)) {
                                     // `x ^ !0 -> not(x)` (enables AArch64 `bic`/`orn`/`eon` fusion).
                                     let src = if cb == Some(mask) { a } else { b_val };
                                     let out_idx = usize_u32(func.ops.len());
@@ -2842,7 +3283,7 @@ pub fn hoist_loop_invariants<A: Allocator + Copy>(
             && preheader != NONE
             && preheader < header
             && dominates(&idom, preheader, header)
-            && view.op(view.terminator(Block(preheader))) == Op::Jump;
+            && matches!(view.op(view.terminator(Block(preheader))), Op::Jump | Op::Br);
 
         if valid_preheader {
             // Sort loop blocks in layout order so hoisting preserves def-before-use order.
@@ -2866,7 +3307,10 @@ pub fn hoist_loop_invariants<A: Allocator + Copy>(
                                 let vi = v as usize;
                                 let def_b = inst_block[vi];
                                 let defined_outside = !in_loop[def_b as usize] && dominates(&idom, def_b, preheader);
-                                let already_hoisted_here = hoist_to[vi] == preheader;
+                                let h_blk = hoist_to.get(vi).copied().unwrap_or(NONE);
+                                let already_hoisted_here = h_blk != NONE
+                                    && h_blk <= preheader
+                                    && dominates(&idom, h_blk, preheader);
                                 if !defined_outside && !already_hoisted_here {
                                     all_ok = false;
                                 }
@@ -3403,5 +3847,692 @@ mod tests {
             let after = eval::run_in(res.func.view(), &args, 100_000, alloc).unwrap();
             assert_eq!(before, after, "mismatch on ({nv}, {kv})");
         }
+    }
+
+    #[test]
+    fn rotate_idiom_folds_or_xor_add_shifts_to_rotl_and_matches_eval() {
+        let alloc = TestHeap;
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I32)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x = b.param(Ty::I64);
+        let y = b.param(Ty::I32);
+
+        // 1. `Or(Shl(x, 13), Lshr(x, 51))` (exact `arx_mix` idiom)
+        let c13 = b.iconst(Ty::I64, 13);
+        let c51 = b.iconst(Ty::I64, 51);
+        let l1 = b.binary(Op::Shl, Flags::NONE, x, c13);
+        let r1 = b.binary(Op::Lshr, Flags::NONE, x, c51);
+        let rot1 = b.binary(Op::Or, Flags::NONE, l1, r1);
+
+        // 2. Reversed order `Or(Lshr(x, 45), Shl(x, 19))`
+        let c19 = b.iconst(Ty::I64, 19);
+        let c45 = b.iconst(Ty::I64, 45);
+        let r2 = b.binary(Op::Lshr, Flags::NONE, x, c45);
+        let l2 = b.binary(Op::Shl, Flags::NONE, x, c19);
+        let rot2 = b.binary(Op::Or, Flags::NONE, r2, l2);
+
+        // 3. `Xor(Shl(x, 7), Lshr(x, 57))`
+        let c7 = b.iconst(Ty::I64, 7);
+        let c57 = b.iconst(Ty::I64, 57);
+        let l3 = b.binary(Op::Shl, Flags::NONE, x, c7);
+        let r3 = b.binary(Op::Lshr, Flags::NONE, x, c57);
+        let rot3 = b.binary(Op::Xor, Flags::NONE, l3, r3);
+
+        // 4. `Add(Lshr(x, 33), Shl(x, 31))`
+        let c31 = b.iconst(Ty::I64, 31);
+        let c33 = b.iconst(Ty::I64, 33);
+        let r4 = b.binary(Op::Lshr, Flags::NONE, x, c33);
+        let l4 = b.binary(Op::Shl, Flags::NONE, x, c31);
+        let rot4 = b.binary(Op::Add, Flags::NONE, r4, l4);
+
+        // 5. 32-bit `Or(Shl(y, 5), Lshr(y, 27))`
+        let w5 = b.iconst(Ty::I32, 5);
+        let w27 = b.iconst(Ty::I32, 27);
+        let ly = b.binary(Op::Shl, Flags::NONE, y, w5);
+        let ry = b.binary(Op::Lshr, Flags::NONE, y, w27);
+        let roty = b.binary(Op::Or, Flags::NONE, ly, ry);
+        let roty64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, roty);
+
+        let t1 = b.binary(Op::Xor, Flags::NONE, rot1, rot2);
+        let t2 = b.binary(Op::Xor, Flags::NONE, rot3, rot4);
+        let t3 = b.binary(Op::Add, Flags::NONE, t1, t2);
+        let out = b.binary(Op::Xor, Flags::NONE, t3, roty64);
+        b.ret(&[out]);
+        let func = b.finish_checked().unwrap();
+
+        let res = sota_optimize_fixpoint(func.view(), RegBudget::AARCH64, 3, |_| 1, alloc).unwrap();
+        let v = res.func.view();
+        let rotl_count = (0..v.len()).filter(|&i| v.op(i) == Op::Rotl).count();
+        let shl_count = (0..v.len()).filter(|&i| v.op(i) == Op::Shl).count();
+        let lshr_count = (0..v.len()).filter(|&i| v.op(i) == Op::Lshr).count();
+        assert_eq!(rotl_count, 5, "expected all 5 shift-pair rotates folded to Op::Rotl");
+        assert_eq!(shl_count, 0, "expected all dead Shl ops swept");
+        assert_eq!(lshr_count, 0, "expected all dead Lshr ops swept");
+
+        for &(xv, yv) in &[
+            (0u64, 0u32),
+            (1, 1),
+            (u64::MAX, u32::MAX),
+            (0x1234_5678_9abc_def0, 0xdead_beef),
+            (0x8000_0000_0000_0001, 0x8000_0001),
+        ] {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(yv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(res.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "rotate rewrite mismatch on ({xv:#x}, {yv:#x})");
+        }
+    }
+
+    #[test]
+    fn mulhi_idiom_folds_widened_i128_mul_shift_trunc_to_umulhi_and_matches_eval() {
+        let alloc = TestHeap;
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let a = b.param(Ty::I64);
+        let bv = b.param(Ty::I64);
+
+        // 1. Standard Rust `((a as u128).wrapping_mul(b as u128) >> 64) as u64` -> `Umulhi(a, b)`
+        let za = b.convert(Op::Zext, Flags::NONE, Ty::I128, a);
+        let zb = b.convert(Op::Zext, Flags::NONE, Ty::I128, bv);
+        let prod = b.binary(Op::Mul, Flags::NONE, za, zb);
+        let c64 = b.iconst(Ty::I128, 64);
+        let hi_w = b.binary(Op::Lshr, Flags::NONE, prod, c64);
+        let hi = b.convert(Op::Trunc, Flags::NONE, Ty::I64, hi_w);
+
+        // 2. Constant-folded wide rhs: `((a as u128) * 0xa076_1d64_78bd_642f_u128 >> 64) as u64` -> `Umulhi(a, secret)`
+        let secret_w = b.iconst(Ty::I128, 0xa076_1d64_78bd_642f);
+        let prod_c = b.binary(Op::Mul, Flags::NONE, za, secret_w);
+        let hi_cw = b.binary(Op::Lshr, Flags::NONE, prod_c, c64);
+        let hi_c = b.convert(Op::Trunc, Flags::NONE, Ty::I64, hi_cw);
+
+        // 3. Signed `(((a as i128).wrapping_mul(b as i128)) >> 64) as i64` -> `Smulhi(a, b)`
+        let sa = b.convert(Op::Sext, Flags::NONE, Ty::I128, a);
+        let sb = b.convert(Op::Sext, Flags::NONE, Ty::I128, bv);
+        let sprod = b.binary(Op::Mul, Flags::NONE, sa, sb);
+        let shi_w = b.binary(Op::Ashr, Flags::NONE, sprod, c64);
+        let shi = b.convert(Op::Trunc, Flags::NONE, Ty::I64, shi_w);
+
+        let t = b.binary(Op::Xor, Flags::NONE, hi, hi_c);
+        let out = b.binary(Op::Xor, Flags::NONE, t, shi);
+        b.ret(&[out]);
+        let func = b.finish_checked().unwrap();
+
+        let res = sota_optimize_fixpoint(func.view(), RegBudget::AARCH64, 3, |_| 1, alloc).unwrap();
+        let v = res.func.view();
+        let umulhi_cnt = (0..v.len()).filter(|&i| v.op(i) == Op::Umulhi).count();
+        let smulhi_cnt = (0..v.len()).filter(|&i| v.op(i) == Op::Smulhi).count();
+        let i128_mul_cnt = (0..v.len()).filter(|&i| v.op(i) == Op::Mul && Ty(v.tys[i]) == Ty::I128).count();
+        assert_eq!(umulhi_cnt, 2, "expected 2 Op::Umulhi ops");
+        assert_eq!(smulhi_cnt, 1, "expected 1 Op::Smulhi op");
+        assert_eq!(i128_mul_cnt, 0, "expected all widened i128 Mul ops eliminated");
+
+        for &(av, bv) in &[
+            (0u64, 0u64),
+            (1, u64::MAX),
+            (u64::MAX, u64::MAX),
+            (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+            (0xdead_beef_cafe_babe, 0x9e37_79b9_7f4a_7c15),
+        ] {
+            let args = [Val::Int(u128::from(av)), Val::Int(u128::from(bv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(res.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "mulhi rewrite mismatch on ({av:#x}, {bv:#x})");
+        }
+    }
+
+    #[test]
+    fn aegraph_forwards_load_across_single_pred_dominated_edge() {
+        use crate::{builder::MemAttrs, func::SlotKind};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let s1 = b.slot(16, 3, SlotKind::Temp);
+        let s2 = b.slot(16, 3, SlotKind::Temp);
+        let out_slot = b.slot(8, 3, SlotKind::Temp);
+        let [b0, b1, b2] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(b0);
+        let x = b.param(Ty::I64);
+        let key = b.param(Ty::I64);
+        let sp1 = b.slot_addr(s1);
+        let sp2 = b.slot_addr(s2);
+        let out_p = b.slot_addr(out_slot);
+        let c8 = b.iconst(Ty::I64, 8);
+        let c16 = b.iconst(Ty::I64, 16);
+        b.store(Flags::NONE, x, sp1, 8, MemAttrs::aligned(3));
+        // `Memmove` clears `mem_known` so the load in `b0` is a real memory read, not a store forward.
+        b.bulk(Op::Memmove, Flags::NONE, sp2, sp1, c16, MemAttrs::aligned(3));
+        let p1 = b.ptr_add(Flags::NONE, sp2, c8);
+        let v = b.load(Ty::I64, Flags::NONE, p1, 0, MemAttrs::aligned(3));
+        let gt = b.icmp(IntCond::Ugt, v, key);
+        b.br(Flags::NONE, gt, (b1, &[]), (b2, &[]));
+
+        // `b1` has unique predecessor `b0`: recomputes `PtrAdd(sp2, 8)` (GVN'd to `p1`) and
+        // reloads from it -> must forward `v` and eliminate the second load!
+        b.begin(b1);
+        let c8_b1 = b.iconst(Ty::I64, 8);
+        let p2 = b.ptr_add(Flags::NONE, sp2, c8_b1);
+        let v2 = b.load(Ty::I64, Flags::NONE, p2, 0, MemAttrs::aligned(3));
+        b.store(Flags::NONE, v2, out_p, 0, MemAttrs::aligned(3));
+        b.ret(&[v2]);
+
+        b.begin(b2);
+        b.ret(&[key]);
+
+        let func = b.finish_checked().unwrap();
+        let loads_before = (0..func.view().len()).filter(|&i| func.view().op(i) == Op::Load).count();
+        assert_eq!(loads_before, 2);
+
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        verify(opt.func.view()).unwrap();
+        let loads_after = (0..opt.func.view().len())
+            .filter(|&i| opt.func.view().op(i) == Op::Load)
+            .count();
+        assert_eq!(
+            loads_after, 1,
+            "expected redundant load in single-pred dominated child block to be eliminated"
+        );
+
+        for &(xv, kv) in &[(10u64, 5u64), (5, 10), (7, 7), (u64::MAX, 0)] {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(kv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(opt.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "single-pred load forwarding mismatch on ({xv}, {kv})");
+        }
+    }
+
+    #[test]
+    fn aegraph_isolates_mem_known_across_domtree_siblings() {
+        use crate::{builder::MemAttrs, func::SlotKind};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let s1 = b.slot(8, 3, SlotKind::Temp);
+        let s2 = b.slot(8, 3, SlotKind::Temp);
+        let [b0, b1, b2] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(b0);
+        let x = b.param(Ty::I64);
+        let flag = b.param(Ty::I64);
+        let sp1 = b.slot_addr(s1);
+        let sp2 = b.slot_addr(s2);
+        let c8 = b.iconst(Ty::I64, 8);
+        b.store(Flags::NONE, x, sp1, 0, MemAttrs::aligned(3));
+        b.bulk(Op::Memmove, Flags::NONE, sp2, sp1, c8, MemAttrs::aligned(3));
+        let _v = b.load(Ty::I64, Flags::NONE, sp2, 0, MemAttrs::aligned(3));
+        let zero = b.iconst(Ty::I64, 0);
+        let cond = b.icmp(IntCond::Ne, flag, zero);
+        b.br(Flags::NONE, cond, (b1, &[]), (b2, &[]));
+
+        // First dom-tree child: stores 99 into `sp2`.
+        b.begin(b1);
+        let c99 = b.iconst(Ty::I64, 99);
+        b.store(Flags::NONE, c99, sp2, 0, MemAttrs::aligned(3));
+        let v1 = b.load(Ty::I64, Flags::NONE, sp2, 0, MemAttrs::aligned(3));
+        b.ret(&[v1]);
+
+        // Sibling dom-tree child: MUST see `b0`'s `v`, NEVER `b1`'s `99`!
+        b.begin(b2);
+        let v2 = b.load(Ty::I64, Flags::NONE, sp2, 0, MemAttrs::aligned(3));
+        b.ret(&[v2]);
+
+        let func = b.finish_checked().unwrap();
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        verify(opt.func.view()).unwrap();
+        let loads_after = (0..opt.func.view().len())
+            .filter(|&i| opt.func.view().op(i) == Op::Load)
+            .count();
+        assert_eq!(loads_after, 1, "expected both sibling child loads forwarded without cross-pollution");
+
+        for &(xv, fv, expected) in &[(42u64, 1u64, 99u64), (42, 0, 42), (7, 0, 7), (7, 1, 99)] {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(fv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(opt.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "sibling isolation mismatch on ({xv}, {fv})");
+            match after {
+                Outcome::Returned(vals) => assert_eq!(vals.as_slice(), &[Val::Int(u128::from(expected))]),
+                other => panic!("expected Returned, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn aegraph_clears_mem_known_at_diamond_join_block() {
+        use crate::{builder::MemAttrs, func::SlotKind};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let s1 = b.slot(8, 3, SlotKind::Temp);
+        let s2 = b.slot(8, 3, SlotKind::Temp);
+        let [b0, b1, b2, b3] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(b0);
+        let x = b.param(Ty::I64);
+        let flag = b.param(Ty::I64);
+        let sp1 = b.slot_addr(s1);
+        let sp2 = b.slot_addr(s2);
+        let c8 = b.iconst(Ty::I64, 8);
+        b.store(Flags::NONE, x, sp1, 0, MemAttrs::aligned(3));
+        b.bulk(Op::Memmove, Flags::NONE, sp2, sp1, c8, MemAttrs::aligned(3));
+        let _v = b.load(Ty::I64, Flags::NONE, sp2, 0, MemAttrs::aligned(3));
+        let zero = b.iconst(Ty::I64, 0);
+        let cond = b.icmp(IntCond::Ne, flag, zero);
+        b.br(Flags::NONE, cond, (b1, &[]), (b2, &[]));
+
+        b.begin(b1);
+        let c99 = b.iconst(Ty::I64, 99);
+        b.store(Flags::NONE, c99, sp2, 0, MemAttrs::aligned(3));
+        b.jump((b3, &[]));
+
+        b.begin(b2);
+        b.jump((b3, &[]));
+
+        // Diamond join `b3` has `idom[b3] == b0` but predecessors `b1` and `b2` (`!= idom[b3]`):
+        // its load MUST NOT be forwarded from `b0`!
+        b.begin(b3);
+        let v3 = b.load(Ty::I64, Flags::NONE, sp2, 0, MemAttrs::aligned(3));
+        let sum = b.binary(Op::Add, Flags::NONE, _v, v3);
+        b.ret(&[sum]);
+
+        let func = b.finish_checked().unwrap();
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        verify(opt.func.view()).unwrap();
+        let loads_after = (0..opt.func.view().len())
+            .filter(|&i| opt.func.view().op(i) == Op::Load)
+            .count();
+        assert_eq!(loads_after, 2, "join block load must NOT be forwarded across diamond merge");
+
+        for &(xv, fv, expected) in &[(42u64, 1u64, 141u64), (42, 0, 84), (10, 1, 109), (10, 0, 20)] {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(fv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(opt.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "diamond join mismatch on ({xv}, {fv})");
+            match after {
+                Outcome::Returned(vals) => assert_eq!(vals.as_slice(), &[Val::Int(u128::from(expected))]),
+                other => panic!("expected Returned, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn aegraph_forwards_load_across_read_only_loop() {
+        use crate::{builder::MemAttrs, func::SlotKind};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let s_src = b.slot(8, 3, SlotKind::Temp);
+        let s_a = b.slot(8, 3, SlotKind::Temp);
+        let s_b = b.slot(32, 3, SlotKind::Temp);
+        let [b0, b_hdr, b_trap, b_check, b_latch, b_after] =
+            [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(b0);
+        let x = b.param(Ty::I64);
+        let k = b.param(Ty::I64);
+        let p_src = b.slot_addr(s_src);
+        let p_a = b.slot_addr(s_a);
+        let p_b = b.slot_addr(s_b);
+        let c10 = b.iconst(Ty::I64, 10);
+        let c20 = b.iconst(Ty::I64, 20);
+        let c30 = b.iconst(Ty::I64, 30);
+        let c40 = b.iconst(Ty::I64, 40);
+        b.store(Flags::NONE, c10, p_b, 0, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c20, p_b, 8, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c30, p_b, 16, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c40, p_b, 24, MemAttrs::aligned(3));
+        let c8 = b.iconst(Ty::I64, 8);
+        b.store(Flags::NONE, x, p_src, 0, MemAttrs::aligned(3));
+        // `Memmove` clears `mem_known` so `v = load(p_a, 0)` is a genuine load, not store-forwarded.
+        b.bulk(Op::Memmove, Flags::NONE, p_a, p_src, c8, MemAttrs::aligned(3));
+        let v = b.load(Ty::I64, Flags::NONE, p_a, 0, MemAttrs::aligned(3));
+        let j0 = b.iconst(Ty::I64, 3);
+        b.jump((b_hdr, &[j0]));
+
+        // Read-only loop `while load(p_b[j]) > k { j -= 1 }` with a cold trap side-exit.
+        b.begin(b_hdr);
+        let j = b.param(Ty::I64);
+        let c4 = b.iconst(Ty::I64, 4);
+        let in_bounds = b.icmp(IntCond::Ult, j, c4);
+        b.br(Flags::NONE, in_bounds, (b_check, &[]), (b_trap, &[]));
+
+        // Cold dead-end trap block: even a write here can never reach the loop or `b_after`.
+        b.begin(b_trap);
+        let c_bad = b.iconst(Ty::I64, 777);
+        b.store(Flags::NONE, c_bad, p_a, 0, MemAttrs::aligned(3));
+        b.trap(1);
+
+        b.begin(b_check);
+        let c8_loop = b.iconst(Ty::I64, 8);
+        let off = b.binary(Op::Mul, Flags::NONE, j, c8_loop);
+        let elem_p = b.ptr_add(Flags::NONE, p_b, off);
+        let elem = b.load(Ty::I64, Flags::NONE, elem_p, 0, MemAttrs::aligned(3));
+        let gt = b.icmp(IntCond::Ugt, elem, k);
+        b.br(Flags::NONE, gt, (b_latch, &[]), (b_after, &[elem]));
+
+        b.begin(b_latch);
+        let c1 = b.iconst(Ty::I64, 1);
+        let j_next = b.binary(Op::Sub, Flags::NONE, j, c1);
+        b.jump((b_hdr, &[j_next]));
+
+        // After the read-only loop, `load(p_a, 0)` must forward to `v` and be eliminated!
+        b.begin(b_after);
+        let stopped = b.param(Ty::I64);
+        let v2 = b.load(Ty::I64, Flags::NONE, p_a, 0, MemAttrs::aligned(3));
+        let sum1 = b.binary(Op::Add, Flags::NONE, v, v2);
+        let sum2 = b.binary(Op::Add, Flags::NONE, sum1, stopped);
+        b.ret(&[sum2]);
+
+        let func = b.finish_checked().unwrap();
+        let loads_before =
+            (0..func.view().len()).filter(|&i| func.view().op(i) == Op::Load).count();
+        assert_eq!(loads_before, 3);
+
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        verify(opt.func.view()).unwrap();
+        let loads_after =
+            (0..opt.func.view().len()).filter(|&i| opt.func.view().op(i) == Op::Load).count();
+        assert_eq!(
+            loads_after, 2,
+            "expected reload of `p_a` after read-only loop (with cold trap exit) to be eliminated"
+        );
+
+        for &(xv, kv, expected) in
+            &[(42u64, 25u64, 104u64), (42, 10, 94), (42, 40, 124), (7, 15, 24)]
+        {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(kv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(opt.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "read-only loop forwarding mismatch on ({xv}, {kv})");
+            match after {
+                Outcome::Returned(vals) => {
+                    assert_eq!(vals.as_slice(), &[Val::Int(u128::from(expected))]);
+                }
+                other => panic!("expected Returned, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn aegraph_clears_mem_known_across_writing_loop() {
+        use crate::{builder::MemAttrs, func::SlotKind};
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let s_src = b.slot(8, 3, SlotKind::Temp);
+        let s_a = b.slot(8, 3, SlotKind::Temp);
+        let s_b = b.slot(32, 3, SlotKind::Temp);
+        let [b0, b_hdr, b_trap, b_check, b_latch, b_after] =
+            [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(b0);
+        let x = b.param(Ty::I64);
+        let k = b.param(Ty::I64);
+        let p_src = b.slot_addr(s_src);
+        let p_a = b.slot_addr(s_a);
+        let p_b = b.slot_addr(s_b);
+        let c10 = b.iconst(Ty::I64, 10);
+        let c20 = b.iconst(Ty::I64, 20);
+        let c30 = b.iconst(Ty::I64, 30);
+        let c40 = b.iconst(Ty::I64, 40);
+        b.store(Flags::NONE, c10, p_b, 0, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c20, p_b, 8, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c30, p_b, 16, MemAttrs::aligned(3));
+        b.store(Flags::NONE, c40, p_b, 24, MemAttrs::aligned(3));
+        let c8 = b.iconst(Ty::I64, 8);
+        b.store(Flags::NONE, x, p_src, 0, MemAttrs::aligned(3));
+        b.bulk(Op::Memmove, Flags::NONE, p_a, p_src, c8, MemAttrs::aligned(3));
+        let v = b.load(Ty::I64, Flags::NONE, p_a, 0, MemAttrs::aligned(3));
+        let j0 = b.iconst(Ty::I64, 3);
+        b.jump((b_hdr, &[j0]));
+
+        b.begin(b_hdr);
+        let j = b.param(Ty::I64);
+        let c4 = b.iconst(Ty::I64, 4);
+        let in_bounds = b.icmp(IntCond::Ult, j, c4);
+        b.br(Flags::NONE, in_bounds, (b_check, &[]), (b_trap, &[]));
+
+        b.begin(b_trap);
+        b.trap(1);
+
+        b.begin(b_check);
+        let c8_loop = b.iconst(Ty::I64, 8);
+        let off = b.binary(Op::Mul, Flags::NONE, j, c8_loop);
+        let elem_p = b.ptr_add(Flags::NONE, p_b, off);
+        let elem = b.load(Ty::I64, Flags::NONE, elem_p, 0, MemAttrs::aligned(3));
+        let gt = b.icmp(IntCond::Ugt, elem, k);
+        b.br(Flags::NONE, gt, (b_latch, &[]), (b_after, &[elem]));
+
+        // Loop body writes to `p_a`, so `mem_known` MUST be cleared at `b_hdr`!
+        b.begin(b_latch);
+        let c99 = b.iconst(Ty::I64, 99);
+        b.store(Flags::NONE, c99, p_a, 0, MemAttrs::aligned(3));
+        let c1 = b.iconst(Ty::I64, 1);
+        let j_next = b.binary(Op::Sub, Flags::NONE, j, c1);
+        b.jump((b_hdr, &[j_next]));
+
+        b.begin(b_after);
+        let stopped = b.param(Ty::I64);
+        let v2 = b.load(Ty::I64, Flags::NONE, p_a, 0, MemAttrs::aligned(3));
+        let sum1 = b.binary(Op::Add, Flags::NONE, v, v2);
+        let sum2 = b.binary(Op::Add, Flags::NONE, sum1, stopped);
+        b.ret(&[sum2]);
+
+        let func = b.finish_checked().unwrap();
+        let loads_before =
+            (0..func.view().len()).filter(|&i| func.view().op(i) == Op::Load).count();
+        assert_eq!(loads_before, 3);
+
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        verify(opt.func.view()).unwrap();
+        let loads_after =
+            (0..opt.func.view().len()).filter(|&i| opt.func.view().op(i) == Op::Load).count();
+        assert_eq!(
+            loads_after, 3,
+            "reload after a memory-writing loop MUST NOT be forwarded or eliminated"
+        );
+
+        for &(xv, kv, expected) in
+            &[(42u64, 25u64, 161u64), (42, 10, 151), (42, 40, 124), (7, 15, 116)]
+        {
+            let args = [Val::Int(u128::from(xv)), Val::Int(u128::from(kv))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(opt.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "writing loop mismatch on ({xv}, {kv})");
+            match after {
+                Outcome::Returned(vals) => {
+                    assert_eq!(vals.as_slice(), &[Val::Int(u128::from(expected))]);
+                }
+                other => panic!("expected Returned, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn aegraph_eliminates_folded_udiv_by_one_and_preserves_trapping_div_rem() {
+        use crate::eval::Trap;
+
+        let alloc = TestHeap;
+
+        // 1. Exact `offset_from_unsigned` pattern: `udiv (sub a, b), 1` plus folded-constant
+        //    divisor `sub(2, 1)`, `sdiv(_, 1)`, and `urem(_, 1)` -> folds to `sub a, b` with
+        //    ZERO `Op::Udiv` / `Op::Sdiv` / `Op::Urem` / `Op::Srem` remaining!
+        let mut b = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let a = b.param(Ty::I64);
+        let bv = b.param(Ty::I64);
+        let diff = b.binary(Op::Sub, Flags::NONE, a, bv);
+        let one = b.iconst(Ty::I64, 1);
+        let two = b.iconst(Ty::I64, 2);
+        let folded_one = b.binary(Op::Sub, Flags::NONE, two, one);
+        let q1 = b.binary(Op::Udiv, Flags::NONE, diff, one);
+        let q2 = b.binary(Op::Udiv, Flags::NONE, q1, folded_one);
+        let q3 = b.binary(Op::Sdiv, Flags::NONE, q2, one);
+        let r0 = b.binary(Op::Urem, Flags::NONE, a, one);
+        let sr0 = b.binary(Op::Srem, Flags::NONE, bv, one);
+        let s1 = b.binary(Op::Add, Flags::NONE, q3, r0);
+        let out_v = b.binary(Op::Add, Flags::NONE, s1, sr0);
+        b.ret(&[out_v]);
+        let func = b.finish_checked().unwrap();
+
+        let opt = aegraph_optimize(func.view(), alloc).unwrap();
+        let ov = opt.func.view();
+        for i in 0..ov.len() {
+            assert!(
+                !matches!(ov.op(i), Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem),
+                "expected zero div/rem ops after folding by 1, found {:?} at {i}",
+                ov.op(i)
+            );
+        }
+        for &(av, bval) in &[(0u64, 0u64), (100, 42), (u64::MAX, 17), (i64::MIN.cast_unsigned(), 1)] {
+            let args = [Val::Int(u128::from(av)), Val::Int(u128::from(bval))];
+            let before = eval::run_in(func.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(ov, &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after, "div-by-1 fold mismatch on ({av}, {bval})");
+        }
+
+        // Also check `Flags::EXACT | Flags::NONZERO` (as emitted by `offset_from_unsigned` on `u8`).
+        let mut be = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig_e = be.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        be.set_signature(sig_e);
+        let ee = be.create_block(BlockKind::Normal);
+        be.begin(ee);
+        let ea = be.param(Ty::I64);
+        let eb = be.param(Ty::I64);
+        let ediff = be.binary(Op::Sub, Flags::NONE, ea, eb);
+        let eone = be.iconst(Ty::I64, 1);
+        let eq = be.binary(Op::Udiv, Flags::EXACT | Flags::NONZERO, ediff, eone);
+        be.ret(&[eq]);
+        let func_e = be.finish_checked().unwrap();
+        let opt_e = aegraph_optimize(func_e.view(), alloc).unwrap();
+        assert!(
+            !(0..opt_e.func.view().len()).any(|i| opt_e.func.view().op(i) == Op::Udiv),
+            "expected `udiv exact nonzero (diff, 1)` to be completely eliminated"
+        );
+
+        // 2. Duplicate trap-free `udiv(x, 3)` GVN drops the redundant second `udiv`.
+        let mut bg = Builder::<TestHeap, Full>::new_in(64, alloc);
+        let sig_g = bg.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        bg.set_signature(sig_g);
+        let eg = bg.create_block(BlockKind::Normal);
+        bg.begin(eg);
+        let gx = bg.param(Ty::I64);
+        let c3 = bg.iconst(Ty::I64, 3);
+        let d1 = bg.binary(Op::Udiv, Flags::NONE, gx, c3);
+        let d2 = bg.binary(Op::Udiv, Flags::NONE, gx, c3);
+        let sum = bg.binary(Op::Add, Flags::NONE, d1, d2);
+        bg.ret(&[sum]);
+        let func_g = bg.finish_checked().unwrap();
+        let opt_g = aegraph_optimize(func_g.view(), alloc).unwrap();
+        let udiv_cnt = (0..opt_g.func.view().len())
+            .filter(|&i| opt_g.func.view().op(i) == Op::Udiv)
+            .count();
+        assert_eq!(udiv_cnt, 1, "expected duplicate trap-free `udiv(x, 3)` eliminated by GVN");
+
+        // 3. Potentially-trapping `udiv(x, 0)`, `sdiv(x, -1)`, `srem(x, -1)`, and `udiv(x, y)`
+        //    MUST be preserved even when their result is unused!
+        let check_kept = |op: Op, rhs_const: Option<u128>, test_x: u64, test_y: u64, expect_trap: Option<Trap>| {
+            let mut bt = Builder::<TestHeap, Full>::new_in(64, alloc);
+            let sig_t = bt.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            bt.set_signature(sig_t);
+            let et = bt.create_block(BlockKind::Normal);
+            bt.begin(et);
+            let tx = bt.param(Ty::I64);
+            let ty_p = bt.param(Ty::I64);
+            let rhs = match rhs_const {
+                Some(c) => bt.iconst(Ty::I64, c),
+                None => ty_p,
+            };
+            let _dead_trap = bt.binary(op, Flags::NONE, tx, rhs);
+            bt.ret(&[tx]);
+            let ft = bt.finish_checked().unwrap();
+
+            let ot = aegraph_optimize(ft.view(), alloc).unwrap();
+            let cnt = (0..ot.func.view().len()).filter(|&i| ot.func.view().op(i) == op).count();
+            assert_eq!(cnt, 1, "expected trapping {op:?} (rhs={rhs_const:?}) preserved by aegraph");
+
+            let args = [Val::Int(u128::from(test_x)), Val::Int(u128::from(test_y))];
+            let before = eval::run_in(ft.view(), &args, 10_000, alloc).unwrap();
+            let after = eval::run_in(ot.func.view(), &args, 10_000, alloc).unwrap();
+            assert_eq!(before, after);
+            if let Some(trap) = expect_trap {
+                assert_eq!(after, Outcome::<TestHeap>::Trapped(trap));
+            }
+        };
+
+        let neg1_u64 = u128::from(u64::MAX);
+        let smin_u64 = i64::MIN.cast_unsigned();
+        check_kept(Op::Udiv, Some(0), 10, 1, Some(Trap::DivByZero));
+        check_kept(Op::Sdiv, Some(neg1_u64), smin_u64, 1, Some(Trap::DivOverflow));
+        check_kept(Op::Srem, Some(neg1_u64), smin_u64, 1, None);
+        check_kept(Op::Udiv, None, 10, 0, Some(Trap::DivByZero));
     }
 }

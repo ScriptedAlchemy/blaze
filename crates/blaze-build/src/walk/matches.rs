@@ -59,11 +59,11 @@ enum ResidualTest {
 #[derive(Clone, Copy)]
 pub(super) struct At {
     /// The place; of an unsized type (`[T]`, `str`), the memory of the wide pointer to it.
-    at: (Value, i32),
+    pub(super) at: (Value, i32),
     /// Its ground type.
     g: PTy,
     /// The default binding mode is `ref`: a reference was followed by a non-reference pattern.
-    by_ref: bool,
+    pub(super) by_ref: bool,
     /// The scrutinee's value copied into the match's own slot: a `ref mut` would write a copy.
     copy: bool,
 }
@@ -175,6 +175,75 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         })
     }
 
+    /// Single-arm irrefutable plain by-value binding match (`match e { mut iter => body }`, as
+    /// `for` loops desugar): moves/binds directly without creating a temporary scrutinee drop
+    /// mask (`Held::Moved`), so an iterator holding a drop impl does not leave an unnamed mask
+    /// slot alive across an `.await` inside the loop body.
+    pub(super) fn try_match_whole_bind(&mut self, e: ExprId, scrutinee: ExprId, arms: List, s: V) -> Result<bool, BuildError> {
+        let list = self.body.arms.get(arms.range()).ok_or(malformed("a match's arms past `arms`"))?;
+        let [arm] = list else { return Ok(false) };
+        if arm.guard.is_some() {
+            return Ok(false);
+        }
+        let Pat::Bind { ann, sub: None, .. } = self.pat(arm.pat)? else {
+            return Ok(false);
+        };
+        if ann.by_ref.is_some() || self.checked.union_pat_of(arm.pat).is_some() {
+            return Ok(false);
+        }
+        if self.scrutinee_in_place(scrutinee)? || self.owned_field_scrutinee(scrutinee)?.is_some() {
+            return Ok(false);
+        }
+        if self.adjust_rows(scrutinee).is_empty()
+            && let Some(x) = self.local_of(scrutinee)?
+        {
+            self.moved(e, x)?;
+        }
+        match s {
+            V::Place(at, off) if self.live && self.is_fresh(scrutinee)? => self.bind_at(arm.pat, (at, off))?,
+            _ => {
+                self.bind_value(arm.pat, s)?;
+                self.end_temp_val(s);
+            }
+        }
+        let mark = u32::try_from(self.scope_pats.len()).map_err(|_| malformed("drop scope depth past u32::MAX"))?;
+        self.scope_marks.push(mark);
+        self.own(arm.pat, true)?;
+        self.work.push(Task::ScopeEnd(e));
+        self.work.push(Task::Eval(arm.body));
+        Ok(true)
+    }
+
+    /// Whether pattern `root` contains any `ref` / `ref mut` binding (which borrows from the
+    /// scrutinee's place).
+    pub(super) fn pat_has_ref(&self, root: PatId) -> Result<bool, BuildError> {
+        let mut todo = Vec::new_in(self.alloc);
+        todo.push(root);
+        while let Some(p) = todo.pop() {
+            match self.pat(p)? {
+                Pat::Bind { ann, sub, .. } => {
+                    if ann.by_ref.is_some() {
+                        return Ok(true);
+                    }
+                    todo.extend(sub);
+                }
+                Pat::Ref { inner, .. } => todo.push(inner),
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
+                    let list = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
+                    todo.extend_from_slice(list);
+                }
+                Pat::Struct { fields, .. } => {
+                    let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
+                    for fp in fps {
+                        todo.push(fp.pat);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     /// Starts match `e` by tests: the scrutinee's place (a scalar copied to a slot), every arm
     /// tested in turn (`arm_tested`).
     pub(super) fn match_tested(&mut self, e: ExprId, scrutinee: ExprId, arms: List, s: V, srepr: Repr) -> Result<(), BuildError> {
@@ -195,6 +264,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let to = self.arm_blocks[first as usize];
         self.jump(to, &[]);
         let tested = Some(At { at, g, by_ref: false, copy });
+        let res = self.join_slot(repr);
         self.matches.push(MatchState {
             expr: e,
             scrutinee: at.0,
@@ -202,13 +272,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             of_enum: None,
             join,
             repr,
+            res,
             first,
             arms: n,
             guarded: true,
-            by_ref: false,
+            by_ref: None,
             owner: Owner::None,
             tested,
         });
+        self.du_match_enter();
         let m = (self.matches.len() - 1) as u32;
         self.work.push(Task::MatchEnd);
         for i in (0..n).rev() {
@@ -291,10 +363,18 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             }
         };
         self.begin(pass);
-        self.scope_marks.push(self.scope_pats.len() as u32);
+        let mark = u32::try_from(self.scope_pats.len()).map_err(|_| malformed("drop scope depth past u32::MAX"))?;
+        self.scope_marks.push(mark);
         let bound = self.bind_tested(arm.pat, at);
         self.move_arm_end();
         bound?;
+        if arm.guard.is_none()
+            && !at.by_ref
+            && !self.pat_has_ref(arm.pat)?
+            && let Some(slot) = self.whole_slot(at.at)
+        {
+            self.end_temp_slot(slot);
+        }
         self.work.push(Task::ArmEnd { m });
         self.work.push(Task::ScopeEnd(arm.body));
         // An `if let` guard (walk/lets.rs `let_guard`): its links, each failure to `next`.
@@ -615,6 +695,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         self.arm_effect(super::moves::Pending::Own(target), hold)?;
                     } else if !by_ref {
                         self.own_kept(target, true);
+                    } else {
+                        self.track_local_slot(target);
                     }
                     if let Some(s) = sub {
                         todo.push((s, at));
@@ -671,6 +753,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 let repr = self.local_repr(p)?;
                 let (size, align) = self.size_align(repr);
                 let slot = self.b.slot(size, align, SlotKind::Named);
+                self.name_slot(slot, blaze_flow_lower::identity::Identity::Binding(p));
                 self.slots[p.ix()] = Some((Home::Slot(slot), repr));
                 (Home::Slot(slot), repr)
             }

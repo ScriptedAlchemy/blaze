@@ -62,15 +62,26 @@ struct World {
     /// The enum `Poll` (`Ready` 0, `Pending` 1) and the struct `Pin`.
     poll: ItemKey,
     pin: ItemKey,
-    /// `struct D { x: u64 }`, its host `Drop` fn, `fn mk_d() -> D` and `drop_in_place`.
+    /// `struct D { x: u64 }`, its host `Drop` fn, `fn mk_d() -> D`, `fn consume_d(d: D)` and
+    /// `drop_in_place`.
     d: ItemKey,
     drop_d: ItemKey,
     mk_d: ItemKey,
+    consume_d: ItemKey,
     dip: ItemKey,
     /// `struct Twice`, `fn twice() -> Twice` and the host's `<Twice as Future>::poll`.
     twice_adt: ItemKey,
     twice: ItemKey,
     twice_poll: ItemKey,
+    /// `struct ZstFut {}`, `fn zst_fut() -> ZstFut` and the host's `<ZstFut as Future>::poll`.
+    zst_fut_adt: ItemKey,
+    zst_fut: ItemKey,
+    zst_fut_poll: ItemKey,
+    /// `struct Big { a..d: u64 }` (`Copy`, 32 bytes), `fn mk_big() -> Big`, `fn sum_big(b: Big) -> u64`,
+    /// plus fieldless `enum Tag { A, B, C }` (`Copy`) and `fn tag_plus(t: Tag, n: u64) -> u64`.
+    mk_big: ItemKey,
+    sum_big: ItemKey,
+    tag_plus: ItemKey,
     /// Names with no body of their own: `main`, the host's executor, and the item a
     /// coroutine's resume fn is named by (`AsyncItems::resume`).
     main: ItemKey,
@@ -110,6 +121,8 @@ thread_local! {
     static MADE: Cell<u32> = const { Cell::new(0) };
     /// How many polls the executor made.
     static POLLS: Cell<u32> = const { Cell::new(0) };
+    /// Remaining pending polls for the zero-sized future `ZstFut`.
+    static ZST_LEFT: Cell<u32> = const { Cell::new(0) };
     static SCRIPT: Cell<Script> = const { Cell::new(Script::Complete) };
     static POLL: Cell<PollLayout> = const { Cell::new(PollLayout { tag_at: 0, tag_bytes: 0, ready: 0, pending: 0, payload_at: 0 }) };
     /// The driven state's tag: its offset and its width in bytes.
@@ -128,6 +141,62 @@ extern "C" fn host_drop_d(p: *const u64) {
 extern "C" fn host_mk_d(out: *mut u64) {
     // SAFETY: `out` is the caller's result slot of one D.
     unsafe { out.write(5) };
+}
+
+/// `consume_d(d: D)`: consumes a `D` (passed by address, as a `Drop` aggregate) and drops it on
+/// the host.
+extern "C" fn host_consume_d(p: *const u64) {
+    host_drop_d(p);
+}
+
+/// `mk_big()`: writes a 32-byte `Copy` `Big { 10, 10, 10, 10 }` through the result pointer.
+extern "C" fn host_mk_big(out: *mut u64) {
+    // SAFETY: `out` is the caller's result slot of one `Big` (four u64s).
+    unsafe {
+        for i in 0..4 {
+            out.add(i).write(10);
+        }
+    }
+}
+
+/// `sum_big(b: Big) -> u64`: reads a `Big` passed by address and returns the sum of its four fields.
+extern "C" fn host_sum_big(p: *const u64) -> u64 {
+    // SAFETY: `p` points to a live `Big` (four u64s).
+    unsafe { p.read() + p.add(1).read() + p.add(2).read() + p.add(3).read() }
+}
+
+/// `tag_plus(t: Tag, n: u64) -> u64`: reads a 1-byte unit enum `Tag` passed by address and returns
+/// `discriminant * 10 + n`.
+extern "C" fn host_tag_plus(p: *const u8, n: u64) -> u64 {
+    // SAFETY: `p` points to a live 1-byte `Tag` enum discriminant.
+    u64::from(unsafe { p.read() }) * 10 + n
+}
+
+/// `zst_fut()`: zero-sized `ZstFut`; sets `ZST_LEFT = 1` so the first poll is `Pending` and the
+/// second is `Ready(77)`.
+extern "C" fn host_zst_fut() {
+    MADE.with(|m| m.set(m.get() + 1));
+    ZST_LEFT.with(|l| l.set(1));
+}
+
+/// `<ZstFut as Future>::poll(self: Pin<&mut ZstFut>, cx) -> Poll<u64>`: verifies the dangling
+/// pointer is non-null, returns `Pending` once, then `Ready(77)`.
+extern "C" fn host_poll_zst_fut(out: *mut u8, pin: *const *mut u8, _cx: *mut u8) {
+    let l = POLL.with(Cell::get);
+    // SAFETY: `pin` is the caller's `Pin<&mut ZstFut>`, holding a non-null dangling pointer;
+    // `out` is its result slot of one `Poll<u64>`.
+    unsafe {
+        let this = pin.read();
+        assert!(!this.is_null(), "Pin<&mut ZstFut> must carry a non-null aligned dangling pointer");
+        let left = ZST_LEFT.with(Cell::get);
+        if left == 0 {
+            out.add(l.payload_at).cast::<u64>().write_unaligned(77);
+            write_tag(out, l, l.ready);
+        } else {
+            ZST_LEFT.with(|c| c.set(left - 1));
+            write_tag(out, l, l.pending);
+        }
+    }
 }
 
 /// `twice()`: a `Twice` whose two words are both 2 (so no field order matters here: the
@@ -261,6 +330,7 @@ fn open_world() -> World {
     let md = fx.r(Mutbl::Mut, dt);
     let drop_d = fx.func("drop_d", 0, &[md], unit, StdVec::new());
     let mk_d = fx.func("mk_d", 0, &[], dt, StdVec::new());
+    let consume_d = fx.func("consume_d", 0, &[dt], unit, StdVec::new());
     let raw = fx.ty(PNode::Ptr(Mutbl::Mut, p0));
     let dip = fx.func("drop_in_place", 1, &[raw], unit, StdVec::new());
     fx.unsized_fn_param(dip, 0);
@@ -270,6 +340,24 @@ fn open_world() -> World {
     fx.imp("impl Future for Twice", 0, twice_t, Some((future, &[])), &[("Output", u64_)], StdVec::new());
     let twice = fx.func("twice", 0, &[], twice_t, StdVec::new());
     let twice_poll = fx.func("twice_poll", 0, &[], unit, StdVec::new());
+
+    let zst_fut_adt = fx.strukt("ZstFut", 0, &[]);
+    let zst_fut_t = fx.adt(zst_fut_adt, &[]);
+    fx.imp("impl Future for ZstFut", 0, zst_fut_t, Some((future, &[])), &[("Output", u64_)], StdVec::new());
+    let zst_fut = fx.func("zst_fut", 0, &[], zst_fut_t, StdVec::new());
+    let zst_fut_poll = fx.func("zst_fut_poll", 0, &[], unit, StdVec::new());
+
+    let big_adt = fx.strukt("Big", 0, &[("a", u64_), ("b", u64_), ("c", u64_), ("d", u64_)]);
+    let big_t = fx.adt(big_adt, &[]);
+    fx.imp("copy_big", 0, big_t, Some((copy, &[])), &[], StdVec::new());
+    let mk_big = fx.func("mk_big", 0, &[], big_t, StdVec::new());
+    let sum_big = fx.func("sum_big", 0, &[big_t], u64_, StdVec::new());
+
+    let empty: &[PTy] = &[];
+    let (tag_adt, _) = fx.enum_("Tag", 0, &[("A", empty), ("B", empty), ("C", empty)]);
+    let tag_t = fx.adt(tag_adt, &[]);
+    fx.imp("copy_tag", 0, tag_t, Some((copy, &[])), &[], StdVec::new());
+    let tag_plus = fx.func("tag_plus", 0, &[tag_t, u64_], u64_, StdVec::new());
 
     let main = fx.func("main", 0, &[], u64_, StdVec::new());
     let drive = fx.func("drive", 0, &[], u64_, StdVec::new());
@@ -286,10 +374,17 @@ fn open_world() -> World {
         d,
         drop_d,
         mk_d,
+        consume_d,
         dip,
         twice_adt,
         twice,
         twice_poll,
+        zst_fut_adt,
+        zst_fut,
+        zst_fut_poll,
+        mk_big,
+        sum_big,
+        tag_plus,
         main,
         drive,
         resume,
@@ -645,6 +740,9 @@ fn run_laid(w: &World, progs: &[Prog<'_>], script: Script, laid: Option<&state_n
     let twice_t = ground.intern(PNode::Adt(w.twice_adt, none)).expect("`Twice`");
     let twice_at = ground.intern_list(&[twice_t]).expect("a list");
     bodies.push((w.poll_fn, twice_at, forward3(w.twice_poll)));
+    let zst_t = ground.intern(PNode::Adt(w.zst_fut_adt, none)).expect("`ZstFut`");
+    let zst_at = ground.intern_list(&[zst_t]).expect("a list");
+    bodies.push((w.poll_fn, zst_at, forward3(w.zst_fut_poll)));
     for (_, _, built) in bodies.iter() {
         super::emits(built, &[]);
     }
@@ -708,11 +806,17 @@ fn run_laid(w: &World, progs: &[Prog<'_>], script: Script, laid: Option<&state_n
     assert!(placed.iter().all(|&p| p), "a cycle among the built bodies");
     fns.push((w.main, None, &main));
     let host = [
-        (w.drop_d, host_drop_d as usize as u64),
-        (w.mk_d, host_mk_d as usize as u64),
-        (w.twice, host_twice as usize as u64),
-        (w.twice_poll, host_poll_twice as usize as u64),
-        (w.drive, host_drive as usize as u64),
+        (w.drop_d, host_drop_d as *const () as usize as u64),
+        (w.mk_d, host_mk_d as *const () as usize as u64),
+        (w.consume_d, host_consume_d as *const () as usize as u64),
+        (w.twice, host_twice as *const () as usize as u64),
+        (w.twice_poll, host_poll_twice as *const () as usize as u64),
+        (w.zst_fut, host_zst_fut as *const () as usize as u64),
+        (w.zst_fut_poll, host_poll_zst_fut as *const () as usize as u64),
+        (w.mk_big, host_mk_big as *const () as usize as u64),
+        (w.sum_big, host_sum_big as *const () as usize as u64),
+        (w.tag_plus, host_tag_plus as *const () as usize as u64),
+        (w.drive, host_drive as *const () as usize as u64),
     ];
     DROPS.with(|d| d.set(0));
     MADE.with(|m| m.set(0));
@@ -1060,6 +1164,128 @@ fn a_nested_async_block_reads_its_reordered_environment_by_declaration_index() {
     let ran = run(&w, &[Prog { item: wide, b: &b, root, lits: &lits }], Script::Complete);
     assert_eq!(ran, Ran { value: 70402, polls: 1, drops: 0, made: 0 });
     println!("coroutine emit 7: a nested block over (u8, u64, u8): ready({}) at poll {}", ran.value, ran.polls);
+}
+
+/// `async fn zst() -> u64 { zst_fut().await }`: awaiting a zero-sized `Future` (`Repr::None`)
+/// passes a non-null aligned dangling pointer to `Future::poll` without allocating a state slot.
+#[test]
+fn await_of_zero_sized_future_completes_without_state_slot() {
+    let mut w = open_world();
+    let zst = async_fn(&mut w, "zst", "zst_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    let awaited = call_await(&mut b, "zst_fut");
+    let body = b.block(&[], Some(awaited));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item: zst, b: &b, root, lits: &lits }];
+    let ran = run(&w, &progs, Script::Complete);
+    assert_eq!(ran, Ran { value: 77, polls: 2, drops: 0, made: 1 });
+    // Laid state with ZERO saved locals: the zero-sized future occupies no state bytes.
+    let laid = state_names::Laid::new((0, 0), &[], 1, crate::coroutine_state::StatePlant::None);
+    let ran_laid = run_laid(&w, &progs, Script::Complete, Some(&laid)).unwrap_or_else(|e| panic!("laid ZST await failed: {e}"));
+    assert_eq!(ran_laid, ran);
+}
+
+/// A non-`move` nested `async { ... }` block (`Capture::Ref`) capturing an immutable local
+/// `ByRef`, a mutable local `ByMutRef`, and a dropping local (`D`) by ref across `.await` reloads
+/// each capture pointer from its state environment on demand instead of holding a block-0 `load`
+/// SSA value live across the suspension (`vN is live across a suspend`).
+#[test]
+fn nested_borrow_async_block_reloads_by_ref_and_by_mut_ref_across_await() {
+    let mut w = open_world();
+    let owner = async_fn(&mut w, "borrow_owner", "borrow_owner_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let mut lits = StdVec::new();
+    let u64_ = b.ty(PNode::Uint(UintTy::U64));
+    // let base: u64 = 10;
+    let base = b.bind("base");
+    let k10 = lit(&mut b, &mut lits, 10);
+    let s_base = b.let_(base, Some(u64_), k10);
+    // let mut acc: u64 = 3;
+    let acc = b.bind_mut("acc");
+    let k3 = lit(&mut b, &mut lits, 3);
+    let s_acc = b.let_(acc, Some(u64_), k3);
+    // let d = mk_d();
+    let d = b.bind("d");
+    let mk = b.path(&["mk_d"]);
+    let d_val = b.call(mk, &[]);
+    let s_d = b.let_(d, None, d_val);
+
+    // Inner `async { let r = twice().await; acc = acc + r + base + d.x; acc }`
+    let awaited = call_await(&mut b, "twice");
+    let (s_r, r) = let_u64(&mut b, "r", awaited);
+    let acc_r = b.local(acc);
+    let r_e = b.local(r);
+    let base_e = b.local(base);
+    let d_e = b.local(d);
+    let dx = named_field(&mut b, d_e, "x");
+    let sum1 = bin(&mut b, BinOp::Add, acc_r, r_e);
+    let sum2 = bin(&mut b, BinOp::Add, sum1, base_e);
+    let sum3 = bin(&mut b, BinOp::Add, sum2, dx);
+    let acc_l = b.local(acc);
+    let assign = b.int(None);
+    b.exprs[assign.ix()] = Expr::Assign { lhs: acc_l, rhs: sum3 };
+    let s_assign = b.semi(assign);
+    let acc_out = b.local(acc);
+    let inner_body = b.block(&[s_r, s_assign], Some(acc_out));
+    let blk_e = b.async_block(inner_body, Capture::Ref);
+
+    let blk = b.bind("blk");
+    let s_blk = b.let_(blk, None, blk_e);
+    let blk_ref = b.local(blk);
+    let inner_waited = b.await_(blk_ref);
+    let (s_v, v) = let_u64(&mut b, "v", inner_waited);
+    let v_e = b.local(v);
+    let acc_after = b.local(acc);
+    let total = bin(&mut b, BinOp::Add, v_e, acc_after);
+    let body = b.block(&[s_base, s_acc, s_d, s_blk, s_v], Some(total));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item: owner, b: &b, root, lits: &lits }];
+
+    // `acc = 3 + 2 + 10 + 5 = 20`; outer returns `v + acc = 20 + 20 = 40`, with 1 drop of `d`.
+    let done = run(&w, &progs, Script::Complete);
+    assert_eq!(done, Ran { value: 40, polls: 3, drops: 1, made: 1 });
+
+    // Cancelled while suspended inside the inner `async { ... }` block: `d` still drops once.
+    let cancelled = run(&w, &progs, Script::CancelAfter(1));
+    assert_eq!(cancelled, Ran { value: u64::MAX, polls: 1, drops: 1, made: 1 });
+}
+
+/// A coroutine whose output is uninhabited (`!`, so `Poll<!>` is zero-sized / `Repr::None`)
+/// and an `.await` on that `Poll<!>` future both build and execute cleanly: each poll returns
+/// `Poll::Pending` without writing a tag, and cancelling while suspended drops live locals once.
+#[test]
+fn poll_of_never_coroutine_and_await_suspend_and_cancel_cleanly() {
+    let mut w = open_world();
+    let owner = async_fn(&mut w, "never_owner", "never_owner_future");
+    w.fx.finish();
+    let mut b = async_body();
+    let lits = StdVec::new();
+    // Inner `async move { let d = mk_d(); loop { let _ = twice().await; } }` -> Output = `!` (`Poll<!>`).
+    let d = b.bind("d");
+    let mk = b.path(&["mk_d"]);
+    let d_val = b.call(mk, &[]);
+    let s_d = b.let_(d, None, d_val);
+    let awaited = call_await(&mut b, "twice");
+    let s_await = b.semi(awaited);
+    let loop_body = b.block(&[s_await], None);
+    let loop_e = b.int(None);
+    b.exprs[loop_e.ix()] = Expr::Loop { body: loop_body };
+    let inner_body = b.block(&[s_d], Some(loop_e));
+    let blk_e = b.async_block(inner_body, Capture::Move);
+    let blk = b.bind("blk");
+    let s_blk = b.let_(blk, None, blk_e);
+    let blk_ref = b.local(blk);
+    let waited = b.await_(blk_ref);
+    let body = b.block(&[s_blk], Some(waited));
+    let root = b.async_block(body, Capture::Move);
+    let progs = [Prog { item: owner, b: &b, root, lits: &lits }];
+    // Two polls suspend through both the `Poll<!>` inner coroutine and the outer `.await` of it;
+    // cancelling after 2 polls drops `d` once (and `twice()` was constructed once).
+    let cancelled = run(&w, &progs, Script::CancelAfter(2));
+    assert_eq!(cancelled, Ran { value: u64::MAX, polls: 2, drops: 1, made: 1 });
 }
 
 mod async_unwind;

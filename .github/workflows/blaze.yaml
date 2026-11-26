@@ -152,7 +152,7 @@ jobs:
           path: ${{ runner.temp }}/gate-inventory
           if-no-files-found: warn
 
-  # The Lean proofs hold (rule verified-compiler; harness/v2/lean_gate.py, docs/v2/plan/proofs.md):
+  # The Lean proofs hold (rule verified-compiler; scripts/src/bin/lean_gate.rs, docs/v2/plan/proofs.md):
   # with the Lean lean/lean-toolchain pins, `lake build` of lean/ (core Lean: the semantics of
   # MIR, the proved passes, the models and their proofs) and of lean/analysis (the derivative
   # proofs, on Mathlib's prebuilt files from `lake exe cache get`: Mathlib is never compiled);
@@ -168,11 +168,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: ./.github/actions/script
         with:
-          version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu
-          enable-cache: false
+          job: lean
       - uses: actions/cache@v6
         with:
           path: |
@@ -204,7 +202,7 @@ jobs:
           fi
           "$lake" --version
       - run: |
-          uv run --frozen python harness/v2/lean_gate.py '{"command": "check"}'
+          "$BLAZE_SCRIPTS/lean_gate" '{"command": "check"}'
 
   # Every workflow parses and holds together (actionlint): a workflow whose YAML does not parse
   # fails on push with no jobs and says so nowhere (three release workflows after #1691, an

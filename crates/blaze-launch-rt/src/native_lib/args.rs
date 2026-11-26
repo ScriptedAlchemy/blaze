@@ -67,11 +67,18 @@ pub struct ProcessArgsOpts<'a> {
 /// Writable C argument strings and pointer arrays kept until process exit. Access is through
 /// raw pointers alone: an initializer may edit a string or replace an argv cell before main,
 /// and no Rust reference to those words is kept across that foreign call.
+#[derive(Clone, Copy)]
 pub struct ProcessArgs {
     argc: c_int,
     argv: *const *const c_char,
     envp: *const *const c_char,
 }
+
+// SAFETY: these are immutable descriptors of process-lived C allocations. Accessors only
+// return raw pointers. Each foreign caller must synchronize accesses to the pointed-to data
+// under the same C ABI contract as argv and environ during ordinary multithreaded execution.
+unsafe impl Send for ProcessArgs {}
+unsafe impl Sync for ProcessArgs {}
 
 impl ProcessArgs {
     pub fn new(opts: ProcessArgsOpts<'_>) -> Result<ProcessArgs, ArgsError> {

@@ -37,9 +37,18 @@
 extern crate alloc;
 use alloc::vec::Vec as AllocVec;
 use blaze_own::Vec;
+mod asm;
+mod coroutine;
 mod frame;
+mod shims;
 mod term;
 mod value;
+
+pub use coroutine::{CoroutinePlan, build_coroutine};
+pub use shims::{
+    build_builtin_clone, build_builtin_from, build_closure_shim, build_ctor_fn, build_drop_glue, build_fn_shim,
+    build_reify_shim, build_test_report_shim, build_vtable_shim,
+};
 
 #[cfg(test)]
 mod tests;
@@ -49,11 +58,13 @@ use core::fmt;
 
 use blaze_body::{Block as BodyBlock, Local, Stmt, Verified};
 use blaze_build::drop_facts::NeedsDropError;
+use blaze_build::intrinsics::IntrinsicError;
 use blaze_build::layout::{LayoutError, LayoutId, Layouts};
-use blaze_build::{Adts, Built, Instance, Panic, Subst};
+use blaze_build::vtable::{VtableError, VtableKey, VtableRef};
+use blaze_build::{Abi, Adts, Built, Instance, InstanceKey, Panic, Subst};
 use blaze_lir::func::{RefId, SlotId};
 use blaze_lir::{Block, Builder, Full, Ty, Value};
-use blaze_typeck::{ItemKey, PTy, PTys};
+use blaze_typeck::{ExprId, ItemKey, PTy, PTys};
 
 /// The target's pointer width: the walk's (blaze-build `PTR_BITS`).
 const PTR_BITS: u32 = 64;
@@ -81,8 +92,26 @@ pub enum BuildError {
     /// Row `stmt` calls `#[track_caller]` fn `name`, whose hidden location argument is not
     /// built here yet.
     TrackCaller { stmt: Stmt, name: &'static str },
+    /// A C ABI refusal at `stmt` (`None`: in the function's own signature).
+    CAbi { stmt: Option<Stmt>, why: &'static str },
+    /// An intrinsic call refused at `stmt`.
+    Intrinsic { stmt: Stmt, error: IntrinsicError },
+    /// A vtable construction or dispatch refusal at `stmt`.
+    Vtable { stmt: Option<Stmt>, error: VtableError },
+    /// The world gave no evaluated constant record for const item `item`.
+    NoConstValue { stmt: Stmt, item: ItemKey },
+    /// The world gave no evaluated constant record for anonymous `const { .. }` block `expr`.
+    NoConstBlock { stmt: Stmt, expr: ExprId },
+    /// The world gave no evaluated constant record for promoted borrow `expr`.
+    NoPromotedValue { stmt: Stmt, expr: ExprId },
+    /// The world gave no fn instance for relocation key `key` inside a constant record.
+    NoConstFnInstance { stmt: Stmt, key: InstanceKey },
+    /// The world gave no vtable ref for relocation key `key` inside a constant record.
+    NoConstVtable { stmt: Stmt, key: VtableKey },
     /// The LIR builder or its verifier refused the function.
     Lir(blaze_lir::BuildError),
+    /// The LIR coroutine split pass refused the coroutine body.
+    Coroutine(blaze_lir::coroutine::CoroutineError),
 }
 
 impl fmt::Display for BuildError {
@@ -99,7 +128,16 @@ impl fmt::Display for BuildError {
             BuildError::TrackCaller { stmt, name } => {
                 write!(f, "row {} of the body calls `#[track_caller]` fn `{name}`, whose location argument is not built yet", stmt.0)
             }
+            BuildError::CAbi { stmt, why } => write!(f, "row {} of the body: C ABI refused: {why}", at(stmt)),
+            BuildError::Intrinsic { stmt, error } => write!(f, "row {} of the body: {error}", stmt.0),
+            BuildError::Vtable { stmt, error } => write!(f, "row {} of the body: {error}", at(stmt)),
+            BuildError::NoConstValue { stmt, item } => write!(f, "row {} of the body: no evaluated constant value for {:#x}", stmt.0, item.0),
+            BuildError::NoConstBlock { stmt, expr } => write!(f, "row {} of the body: no evaluated const block value for e{}", stmt.0, expr.0),
+            BuildError::NoPromotedValue { stmt, expr } => write!(f, "row {} of the body: no evaluated promoted value for e{}", stmt.0, expr.0),
+            BuildError::NoConstFnInstance { stmt, key } => write!(f, "row {} of the body: no fn instance for const reloc {:?}", stmt.0, key.0),
+            BuildError::NoConstVtable { stmt, key } => write!(f, "row {} of the body: no vtable for const reloc {:?}", stmt.0, key.0),
             BuildError::Lir(error) => write!(f, "the LIR function: {error}"),
+            BuildError::Coroutine(error) => write!(f, "the coroutine split pass: {error}"),
         }
     }
 }
@@ -120,6 +158,8 @@ pub(crate) enum Held {
     /// Memory at a pointer the function was given: a parameter's caller's copy, or the hidden
     /// result pointer.
     At(Value),
+    /// Memory at a fixed byte offset from an entry pointer (e.g. a coroutine upvar inside `state`).
+    AtOff(Value, i32),
 }
 
 impl Held {
@@ -138,6 +178,17 @@ pub(crate) enum V {
     Mem { ptr: Value, off: i32, lay: LayoutId },
 }
 
+/// What the function being built was given of its caller's location (`#[track_caller]`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Track {
+    /// An untracked function: a location needed for a tracked callee is materialized from the call site.
+    No,
+    /// `Adts::track_caller` answered `None`: tracked calls and `caller_location` are refused by name.
+    Unsaid,
+    /// A tracked function: its hidden last parameter (`&'static Location<'static>`), forwarded to tracked callees.
+    Passed(Value),
+}
+
 /// How a value crosses a call of the Rust ABI: blaze-build's one plan, the walk's.
 pub(crate) use blaze_build::abi::Pass;
 
@@ -146,12 +197,20 @@ pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Copy> {
     pub(crate) v: Verified<'a>,
     /// The body's own type table, which its locals, constants and projections name.
     pub(crate) from: PTys<'a>,
+    /// The fn item whose body is being built (needed for anonymous const blocks and ABI).
+    pub(crate) item: ItemKey,
+    /// The fn item's calling convention (`Rust`, `C`, or `RustCall`).
+    pub(crate) abi: Abi,
+    /// Whether the fn being built is `#[track_caller]` and, if so, its hidden location parameter.
+    pub(crate) track: Track,
     pub(crate) subst: &'a mut Subst<'g, 't>,
     pub(crate) adts: &'a dyn Adts,
     pub(crate) alloc: A,
     pub(crate) b: Builder<A, Full>,
     pub(crate) layouts: Layouts<A>,
     pub(crate) panic: Panic,
+    /// Coroutine build state (`Some` only inside [`build_coroutine`]).
+    pub(crate) co: Option<coroutine::Co>,
     /// By local: its ground type, its layout and how it is held.
     pub(crate) tys: Vec<PTy, A>,
     pub(crate) lays: Vec<LayoutId, A>,
@@ -164,6 +223,11 @@ pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Copy> {
     pub(crate) exn: Option<Value>,
     /// How the result leaves: `_0`'s pass.
     pub(crate) ret: Pass,
+    /// Hidden result pointer when `ret` is `Pass::Ref` or `Pass::Memory`, reused by `TailCall`.
+    pub(crate) sret: Option<Value>,
+    /// Caller-owned `Pass::Ref` parameter buffers `(ptr, size, align)` eligible for reuse as
+    /// outgoing `Pass::Ref` argument buffers in `TailCall`.
+    pub(crate) ref_params: Vec<(Value, u64, u8), A>,
     /// By function reference place: the instance, and the reference made for it.
     pub(crate) refs: AllocVec<Instance, A>,
     pub(crate) ref_ids: Vec<RefId, A>,
@@ -173,6 +237,9 @@ pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Copy> {
     /// By thread-local reference place: the static item, and the reference made for it.
     pub(crate) thread_locals: AllocVec<ItemKey, A>,
     pub(crate) tls_ids: Vec<RefId, A>,
+    /// By vtable reference place: the vtable ref, and the reference made for it.
+    pub(crate) vtables: AllocVec<VtableRef, A>,
+    pub(crate) vtable_ids: Vec<RefId, A>,
     /// The row being built, which every error names.
     pub(crate) stmt: Option<Stmt>,
 }
@@ -190,22 +257,46 @@ pub fn build<A: Allocator + Copy>(
     adts: &dyn Adts,
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
-    match adts.abi(item) {
-        Some(blaze_build::Abi::Rust) => {}
-        Some(blaze_build::Abi::C | blaze_build::Abi::RustCall) => {
-            return Err(BuildError::Unsupported { stmt: body.entry(), what: "a body of a fn of the C or \"rust-call\" ABI" });
-        }
-        None => return Err(BuildError::NoAbi { item }),
-    }
+    let abi = adts.abi(item).ok_or(BuildError::NoAbi { item })?;
+    build_with_abi(body, from, item, abi, false, subst, adts, alloc)
+}
+
+/// Builds a closure's own lowered + drop-elaborated body (from `blaze_body_lower::lower_closure`)
+/// using `Abi::Rust` (independent of its enclosing `owner` item's ABI, which may be `extern "C"`).
+pub fn build_closure_body<A: Allocator + Copy>(
+    body: Verified<'_>,
+    from: PTys<'_>,
+    owner: ItemKey,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    build_with_abi(body, from, owner, Abi::Rust, true, subst, adts, alloc)
+}
+
+fn build_with_abi<A: Allocator + Copy>(
+    body: Verified<'_>,
+    from: PTys<'_>,
+    item: ItemKey,
+    abi: Abi,
+    is_closure: bool,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
     let mut cx = Cx {
         v: body,
         from,
+        item,
+        abi,
+        track: if is_closure { Track::No } else { Track::Unsaid },
         subst,
         adts,
         alloc: alloc,
         b: Builder::new_in(PTR_BITS, alloc),
         layouts: Layouts::new_in(alloc),
         panic: adts.panic(),
+        co: None,
         tys: Vec::new_in(alloc),
         lays: Vec::new_in(alloc),
         held: Vec::new_in(alloc),
@@ -213,15 +304,22 @@ pub fn build<A: Allocator + Copy>(
         blocks: Vec::new_in(alloc),
         exn: None,
         ret: Pass::Ignore,
+        sret: None,
+        ref_params: Vec::new_in(alloc),
         refs: AllocVec::new_in(alloc),
         ref_ids: Vec::new_in(alloc),
         statics: AllocVec::new_in(alloc),
         static_ids: Vec::new_in(alloc),
         thread_locals: AllocVec::new_in(alloc),
         tls_ids: Vec::new_in(alloc),
+        vtables: AllocVec::new_in(alloc),
+        vtable_ids: Vec::new_in(alloc),
         stmt: None,
     };
-    cx.frame()?;
+    if !is_closure {
+        cx.b.set_attrs(adts.fn_attrs(item));
+    }
+    cx.frame_inner(is_closure)?;
     cx.blocks()?;
     let func = cx.b.finish_verified().map_err(BuildError::Lir)?;
     Ok(Built {
@@ -232,7 +330,7 @@ pub fn build<A: Allocator + Copy>(
         // This builder marks no `unreachable` with its construct yet: its records carry no trap
         // rows (blaze-code record.rs `TrapSource`), so a fault in them is said by its code alone.
         traps: AllocVec::new_in(alloc),
-        vtables: AllocVec::new_in(alloc),
+        vtables: cx.vtables,
         // This builder has no `copy` of its own (blaze-build walk.rs): none counted.
         copy_insts: 0,
     })

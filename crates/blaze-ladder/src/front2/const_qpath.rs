@@ -402,6 +402,20 @@ impl Default for Table {
 }
 
 impl Table {
+    pub fn new_in(alloc: Alloc<'static>) -> Table {
+        Table { asked: Vec::new_in(alloc), tys: Vec::new_in(alloc), running: [None; MOST_NESTED] }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.asked.is_empty() && self.tys.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        let Table { asked, tys, running } = self;
+        asked.clear();
+        tys.clear();
+        *running = [None; MOST_NESTED];
+    }
     /// Keeps `ask` for [`eval_asked`]; one asked twice is kept once.
     pub fn ask(&mut self, ask: QAsk) {
         if !self.asked.as_slice().iter().any(|a| a.need == ask.need) {
@@ -557,12 +571,12 @@ fn self_of<H: Heads + ?Sized>(heads: &H, found: Target, segs: usize) -> Option<Q
 /// names library does not resolve to a trait and a ground type, heads with no evaluator
 /// behind them): the text is then evaluated as written, and refused by its own name.
 /// `resolve` reads a path in the head's module, in the type namespace.
-pub fn substitute<'h, H: Heads + ?Sized>(
+pub fn substitute<'a, 'h, H: Heads + ?Sized>(
     heads: &'h H,
     resolve: &dyn Fn(bool, &[&str]) -> Result<Target, ResolveError>,
     text: &str,
-    alloc: Alloc<'static>,
-) -> Result<Option<String<Alloc<'static>>>, Stop<'h>> {
+    alloc: Alloc<'a>,
+) -> Result<Option<String<Alloc<'a>>>, Stop<'h>> {
     let mut out = String::new_in(alloc);
     let mut copied = 0usize;
     let mut first_need: Option<LibKey> = None;
@@ -593,7 +607,10 @@ pub fn substitute<'h, H: Heads + ?Sized>(
         if let Some(why) = heads.anon_failed(need) {
             return Err(Stop::Failed { start: leaf.start, end: leaf.end, why });
         }
-        let ask = QAsk { need, trait_: tr.key, self_, name: String::from_str_in(leaf.name, alloc) };
+        let Some(ask_alloc) = heads.mark_alloc() else {
+            return Ok(None);
+        };
+        let ask = QAsk { need, trait_: tr.key, self_, name: String::from_str_in(leaf.name, ask_alloc) };
         if !heads.ask_qpath(ask) {
             return Ok(None);
         }
@@ -640,7 +657,15 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         } else if !r.store.maps.qpaths.borrow_mut().enter(need) {
             Err(ConstFail::QPathDepth { need: checker_of(need), most: MOST_NESTED as u32 })
         } else {
+            let active_before = r.store.active_consts_len();
+            r.store.push_active_const(need);
             let out = eval_one(r, need, trait_, self_, name.as_str());
+            r.store.truncate_active_consts(active_before);
+            if r.store.clear_provisional_for(need)
+                && let Some(b) = r.buckets.as_ref()
+            {
+                b.clear_provisional();
+            }
             r.store.maps.qpaths.borrow_mut().leave(need);
             out
         };
@@ -655,7 +680,7 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
             }
             Err(e) => {
                 use core::fmt::Write as _;
-                let mut why = String::new_in(r.store.tys.alloc());
+                let mut why = String::new_in(r.store.work_alloc());
                 if write!(why, "{e}").is_err() {
                     why.push_str(" (the rest of this refusal could not be written)");
                 }

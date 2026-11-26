@@ -805,7 +805,7 @@ fn an_attribute_without_arguments_gets_an_empty_stream() {
 /// An answer kept by another host version is never read: the version is in the base key. The
 /// control finds the same answer kept under this version.
 #[test]
-fn an_answer_of_another_host_version_is_not_read() {
+fn an_answer_of_a_previous_host_version_is_not_read() {
     let setup = setup(&[], 1);
     let root = folder("host-version");
     let pkg = package(&root, &[]);
@@ -1201,7 +1201,10 @@ fn forged_proc_macro_output_is_refused_by_the_expander() {
 fn a_fetched_package_s_macro_reads_its_own_manifest_and_nothing_above_it() {
     use blaze_wasi::{Open, ROOT_FD, System};
     const MANIFEST: &[u8] = b"[package]\nname = \"reth-rpc-api\"\n[dependencies]\njsonrpsee = \"0.26\"\n";
-    let files: Arc<[(String, &'static [u8])]> = Arc::from(vec![("Cargo.toml".to_owned(), MANIFEST), ("src/lib.rs".to_owned(), &b"//"[..])]);
+    let files: Arc<[(String, crate::sandbox::ListedBytes)]> = Arc::from(vec![
+        ("Cargo.toml".to_owned(), crate::sandbox::ListedBytes::Static(MANIFEST)),
+        ("src/lib.rs".to_owned(), crate::sandbox::ListedBytes::Static(&b"//"[..])),
+    ]);
     let env = crate::package_env::PackageEnv::set_only(vec![("CARGO_MANIFEST_DIR".to_owned(), PACKAGE.to_owned())]).unwrap_or_else(|e| panic!("{e}"));
     let package = Arc::new(Package::new(Files::Listed(files), env).unwrap_or_else(|e| panic!("{e}")));
     let mut sandbox = Sandbox::new(package);

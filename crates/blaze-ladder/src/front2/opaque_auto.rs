@@ -45,6 +45,7 @@ use std::format;
 
 use blaze_flow_lower::InteriorPart;
 use blaze_hash::HashMap;
+use blaze_id::ItemKey as LibKey;
 use blaze_own::{Alloc, Vec};
 use blaze_typeck as tc;
 use blaze_typeck::{Checked, CoroutineFacts, Hidden, ItemKey, List, PNode, PTy, PTys, PortableTys};
@@ -121,6 +122,12 @@ pub struct HiddenTable<'a> {
     tys: PortableTys<'a>,
     /// By the defining fn's checker key.
     rows: HashMap<ItemKey, Row<'a>, Alloc<'a>>,
+    /// Reverse index from each filed opaque's key to the defining fn's checker key in `rows`
+    /// (needed for TAIT opaques whose owner in `Store::opaques` is the type alias, not the
+    /// `#[define_opaque(..)]` defining fn).
+    opaque_owner: HashMap<ItemKey, ItemKey, Alloc<'a>>,
+    /// Memo of each crate's `#[define_opaque(..)]` defining fns for TAIT reveal.
+    pub(super) definers: super::tait::Definers<'a>,
     /// The opaques the running check reads the hidden type of (its own leak list, sorted).
     leaking: Vec<ItemKey, Alloc<'a>>,
     /// The defining fns on the work list while [`define`] runs.
@@ -162,11 +169,25 @@ impl<'a> HiddenTable<'a> {
             alloc,
             tys: PortableTys::new_in(alloc),
             rows: HashMap::new_in(alloc),
+            opaque_owner: HashMap::new_in(alloc),
+            definers: super::tait::Definers::new_in(alloc),
             leaking: Vec::new_in(alloc),
             defining: Vec::new_in(alloc),
             wanted: None,
             cycle: None,
         }
+    }
+
+    pub fn clear(&mut self) {
+        let HiddenTable { alloc: _, tys, rows, opaque_owner, definers, leaking, defining, wanted, cycle } = self;
+        tys.clear();
+        rows.clear();
+        opaque_owner.clear();
+        definers.clear();
+        leaking.clear();
+        defining.clear();
+        *wanted = None;
+        *cycle = None;
     }
 
     /// An empty leak list for one check, in the table's allocator.
@@ -200,7 +221,8 @@ impl<'a> HiddenTable<'a> {
         if !seen {
             return HiddenAnswer::Opaque;
         }
-        match self.rows.get(&owner).and_then(|row| row.hidden.iter().find(|h| h.0 == filed)) {
+        let row = self.rows.get(&owner).or_else(|| self.opaque_owner.get(&filed).and_then(|definer| self.rows.get(definer)));
+        match row.and_then(|row| row.hidden.iter().find(|h| h.0 == filed)) {
             Some(&(_, ty)) => HiddenAnswer::Known(Hidden { ty, types: self.tys.view() }),
             None => HiddenAnswer::NoneGiven,
         }
@@ -259,10 +281,8 @@ impl<'a> HiddenTable<'a> {
     fn wants(&self, owner: ItemKey, exprs: &[tc::Expr], done: &Checked<'_>) -> bool {
         if let Some(row) = self.rows.get(&owner) {
             // Only a newly checked producer can supply more precise facts. A read of its
-            // existing row does no flow work. The flow pass currently lowers async blocks.
-            return row.coroutines.iter().any(|&(at, _, interior)| {
-                at < tc::coroutine_id::CLOSURE_BASE && !interior.is_exact()
-            });
+            // existing row does no flow work.
+            return row.coroutines.iter().any(|&(_, _, interior)| !interior.is_exact());
         }
         !done.hidden.is_empty() || exprs.iter().any(|e| {
             matches!(e, tc::Expr::AsyncBlock { .. } | tc::Expr::Closure { is_async: true, .. })
@@ -361,6 +381,9 @@ impl<'a> HiddenTable<'a> {
                 }
             }
         }
+        for &(k, _) in &hidden {
+            self.opaque_owner.insert(k, owner);
+        }
         self.rows.insert(owner, Row { hidden, coroutines });
         Ok(())
     }
@@ -430,6 +453,10 @@ pub enum HiddenFail {
     Copy { owner: ItemKey, why: &'static str },
     /// A local coroutine's expression or closure signature did not yield its checked facts.
     Coroutine(tc::CheckError),
+    /// Checking the defining body met a constant that must be evaluated first while another
+    /// constant evaluation holds `&mut Consts` (`ConstFail::Nested`): bubbled back to
+    /// `Consts::value_listed`'s work list (`const_open::needed_first`) instead of stringified.
+    NeedConst { key: LibKey },
     /// The work list passed [`MOST_DEFINES`] checks.
     TooMany { opaque: ItemKey, most: u32 },
 }
@@ -458,6 +485,7 @@ impl core::fmt::Display for HiddenFail {
             ),
             HiddenFail::Copy { owner, why } => write!(f, "the hidden types of fn {owner:?}'s clean check could not be filed: {why}"),
             HiddenFail::Coroutine(e) => core::fmt::Display::fmt(e, f),
+            HiddenFail::NeedConst { key } => write!(f, "a defining body needs constant {key:?} evaluated first"),
             HiddenFail::TooMany { opaque, most } => {
                 write!(f, "the hidden type of the `impl Trait` type {opaque:?}: its defining bodies need more than {most} checks (rule 18)")
             }
@@ -465,10 +493,20 @@ impl core::fmt::Display for HiddenFail {
     }
 }
 
-fn gap(owner: ItemKey, fail: HiddenFail) -> CheckFail {
+pub(super) fn gap(owner: ItemKey, fail: HiddenFail) -> CheckFail {
     let mut gaps = std::vec::Vec::new();
     gaps.push(Gap::Hidden(fail));
     CheckFail::Gap { owner, gaps }
+}
+
+/// Converts a [`HiddenFail`] into a [`CheckFail`]: preserves [`HiddenFail::NeedConst`] as
+/// `CheckFail::Const { ConstFail::Nested }` so `Consts::value_listed`'s work list evaluates the
+/// needed constant first instead of failing the outer constant evaluation with a stringified gap.
+pub(super) fn into_check_fail<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, fail: HiddenFail) -> CheckFail {
+    match fail {
+        HiddenFail::NeedConst { key } => super::check::const_nested_fail(r, owner, key),
+        other => gap(owner, other),
+    }
 }
 
 fn shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Box<str> {
@@ -484,12 +522,12 @@ pub(crate) fn file<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, body: &Bo
     if !r.store.hidden.wants(owner, &body.typeck.exprs, done) {
         return Ok(());
     }
-    let alloc = r.store.tys.alloc();
+    let alloc = r.store.work_alloc();
     // Only suspension liveness can refine NeedsSavedLocals. Complete witnesses
     // (including a direct await) already carry both the captures and pending
     // future. Flow uses the same binding rows and cannot refine unknown places.
     let needs_flow = body.typeck.exprs.iter().enumerate().any(|(i, e)| {
-        matches!(e, tc::Expr::AsyncBlock { .. })
+        matches!(e, tc::Expr::AsyncBlock { .. } | tc::Expr::Closure { is_async: true, .. })
             && done.coroutine_witness(tc::ExprId(i as u32)) == Some(tc::CoroutineWitness::NeedsSavedLocals)
     });
     let exacts = if needs_flow {
@@ -535,7 +573,7 @@ pub(crate) fn after_auto_gap<'n, S: NamesSource<'n>>(
             r.store.hidden.wanted = Some(opaque);
             return Ok(false);
         }
-        define(r, opaque).map_err(|f| gap(owner, f))?;
+        define(r, opaque).map_err(|f| into_check_fail(r, owner, f))?;
     }
     if let Err(at) = leaks.binary_search(&opaque) {
         leaks.insert(at, opaque);
@@ -546,24 +584,49 @@ pub(crate) fn after_auto_gap<'n, S: NamesSource<'n>>(
 /// Files the defining body of `opaque` (and of every opaque its check stops on first), by a
 /// work list.
 fn define<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: ItemKey) -> Result<(), HiddenFail> {
+    define_with(r, opaque, false)
+}
+
+/// Files the defining body of `opaque` for post-analysis `Reveal::All` resolution (an instance's
+/// ground trait selection/normalization), resolving TAIT aliases to their `#[define_opaque(..)]`
+/// defining fn via `tait::defining_fn`.
+pub(crate) fn define_for_reveal<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: ItemKey) -> Result<(), HiddenFail> {
+    define_with(r, opaque, true)
+}
+
+fn define_with<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: ItemKey, allow_alias: bool) -> Result<(), HiddenFail> {
     let mut stack: Vec<ItemKey, Alloc<'static>> = r.store.hidden.new_leaks();
     stack.push(opaque);
-    let got = run(r, &mut stack);
+    let got = run(r, &mut stack, allow_alias);
     r.store.hidden.defining.clear();
     r.store.hidden.wanted = None;
     r.store.hidden.cycle = None;
     got
 }
 
-fn run<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, stack: &mut Vec<ItemKey, Alloc<'static>>) -> Result<(), HiddenFail> {
-    for _ in 0..MOST_DEFINES {
-        let Some(&opaque) = stack.last() else { return Ok(()) };
-        // A provided trait fn's default `impl Trait` is filed under its source (rpitit.rs).
-        let filed = super::rpitit::filed_as(r.store, opaque);
-        let Some(&(owner, index)) = r.store.opaques.get(&filed) else { return Err(HiddenFail::NoHead { opaque }) };
-        if super::tait::of_alias(index) {
+fn definer_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, opaque: ItemKey, allow_alias: bool) -> Result<(ItemKey, ItemKey), HiddenFail> {
+    // A provided trait fn's default `impl Trait` is filed under its source (rpitit.rs).
+    let filed = super::rpitit::filed_as(r.store, opaque);
+    let Some(&(owner, index)) = r.store.opaques.get(&filed) else { return Err(HiddenFail::NoHead { opaque }) };
+    if super::tait::of_alias(index) {
+        if !allow_alias {
             return Err(HiddenFail::AliasOpaque { opaque, alias: owner });
         }
+        let Some(lib) = r.keys.library_in(r.names, owner) else {
+            return Err(HiddenFail::AliasOpaque { opaque, alias: owner });
+        };
+        let Ok(definer_lib) = super::tait::defining_fn(&r.store.hidden.definers, r.names, lib) else {
+            return Err(HiddenFail::AliasOpaque { opaque, alias: owner });
+        };
+        return Ok((filed, super::keys::checker_of(definer_lib)));
+    }
+    Ok((filed, owner))
+}
+
+fn run<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, stack: &mut Vec<ItemKey, Alloc<'static>>, allow_alias: bool) -> Result<(), HiddenFail> {
+    for _ in 0..MOST_DEFINES {
+        let Some(&opaque) = stack.last() else { return Ok(()) };
+        let (filed, owner) = definer_of(r, opaque, allow_alias)?;
         if r.store.hidden.filed(owner) {
             if !r.store.hidden.gives(owner, filed) {
                 return Err(HiddenFail::NoneGiven { opaque, owner, shown: shown(r, owner) });
@@ -575,7 +638,7 @@ fn run<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, stack: &mut Vec<ItemK
         // their opaques is the cycle.
         r.store.hidden.defining.clear();
         for &o in stack.iter() {
-            if let Some(&(w, _)) = r.store.opaques.get(&super::rpitit::filed_as(r.store, o)) {
+            if let Ok((_, w)) = definer_of(r, o, allow_alias) {
                 r.store.hidden.defining.push(w);
             }
         }
@@ -603,7 +666,7 @@ fn run<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, stack: &mut Vec<ItemK
 /// `owner`'s body lowered and checked (a clean check files itself: body_reads.rs), or its
 /// refusal as printed (`Ok(Err)`, read by the work list with `wanted`).
 fn check_defining<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: ItemKey, owner: ItemKey) -> Result<Result<(), Box<str>>, HiddenFail> {
-    let Some(prepared) = r.consts.as_ref().map(|c| c.1) else {
+    let Some(prepared) = r.prepared() else {
         return Err(HiddenFail::NoPrepares { opaque, owner, shown: shown(r, owner) });
     };
     // A head or a constant the lowering needs is made and the body lowered again (front2
@@ -622,6 +685,14 @@ fn check_defining<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: It
         // bounds: front2 rpitit.rs; one at a place reveals its projection and never comes
         // here): no body defines it, so no check of one can reveal it.
         Err(BodyError::NoBody(_)) => return Err(HiddenFail::TraitFnInBounds { opaque, owner, shown: shown(r, owner) }),
+        Err(BodyError::Const { item, error }) if matches!(&*error, super::consts::ConstFail::Nested { .. }) => {
+            return Err(HiddenFail::NeedConst { key: item });
+        }
+        Err(
+            BodyError::Convert { why: Some(super::types::Why::NeedConst(key, _)), .. }
+            | BodyError::Head { error: super::heads::HeadError::Item(_, super::types::Why::NeedConst(key, _)), .. }
+            | BodyError::Generics { why: super::types::Why::NeedConst(key, _), .. },
+        ) => return Err(HiddenFail::NeedConst { key }),
         Err(e) => return Ok(Err(format!("its body was not lowered: {e}").into_boxed_str())),
     };
     let view = lowered.lowered.view();
@@ -646,13 +717,16 @@ fn check_defining<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, opaque: It
     // files nothing to compare.
     let checked = super::body_reads::check_body_filed_as(r, &lowered, &scope, None, None, super::stalled_goals::Stalls::Decide)
         .and_then(|(_, filed)| {
-            let scratch = r.store.tys.alloc();
+            let scratch = r.store.work_alloc();
             r.store.reads.file(lowered.typeck.owner, &filed.reads, scratch)
         });
-    Ok(match checked {
-        Ok(()) => Ok(()),
-        Err(e) => Err(format!("{e}").into_boxed_str()),
-    })
+    match checked {
+        Ok(()) => Ok(Ok(())),
+        Err(CheckFail::Const { key, error, .. }) if matches!(&*error, super::consts::ConstFail::Nested { .. }) => {
+            Err(HiddenFail::NeedConst { key })
+        }
+        Err(e) => Ok(Err(format!("{e}").into_boxed_str())),
+    }
 }
 
 /// `roots` of `from` interned into `out`, each reached node after its children (a table holds
@@ -772,6 +846,11 @@ mod tests {
     use crate::front2::project::{BodyRef, ProjectWorld};
     use crate::front2::stalled_goals::Stalls;
     use crate::refusal::SourceFile;
+
+    fn fixture_toolchain() -> Toolchain {
+        let home = std::env::var("HOME").expect("HOME");
+        Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("fixture toolchain")
+    }
 
     /// A defining body checked FOR a caller's auto trait takes the command's own check
     /// (`check_defining`, `Stalls::Decide`). Reduced from tempo zones/rpc ws.rs
@@ -909,8 +988,7 @@ fn boxed() -> Box<dyn std::future::Future<Output = ()> + Send> { Box::new(bytes_
 fn main() {}
 "#;
         let alloc = blaze_own::testing::heap().alloc();
-        let home = std::env::var("HOME").expect("HOME");
-        let tc = Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("fixture toolchain");
+        let tc = fixture_toolchain();
         let files = [("/witness/src/main.rs".to_owned(), SOURCE.to_owned())];
         let user = UserCrate {
             name: "witness", dir: "/witness/", root: "/witness/src/main.rs", files: &files,
@@ -1014,5 +1092,150 @@ fn main() {}
         let [d] = control.diagnostics.as_slice() else { panic!("one error for the Rc across the await: {control:?}") };
         assert_eq!(d.code, "E0277", "{control:?}");
         assert!(d.text.contains("Send") && d.start < d.end, "{control:?}");
+    }
+
+    /// `define_for_reveal` succeeds even while `r.consts` is `None` (as during `const_at`,
+    /// where `&mut Consts` is borrowed by the active constant evaluation, e.g. `Box<T>::new`
+    /// reading `SizedTypeProperties::LAYOUT` for a type mentioning an `async fn`'s `impl Future`)
+    /// because `Store::prepared` stays available; when both are `None`, it still returns
+    /// `HiddenFail::NoPrepares`.
+    #[test]
+    fn define_for_reveal_uses_store_prepared_when_consts_is_borrowed() {
+        use crate::front2::check::{BuildOrder, Records};
+
+        const SOURCE: &str = r#"
+async fn make_val() -> u8 { 7 }
+fn caller() { let _ = make_val(); }
+fn main() {}
+"#;
+        let alloc = blaze_own::testing::heap().alloc();
+        let tc = fixture_toolchain();
+        let files = [("/prepared_const_at/src/main.rs".into(), SOURCE.into())];
+        let user = UserCrate {
+            name: "prepared_const_at", dir: "/prepared_const_at/", root: "/prepared_const_at/src/main.rs", files: &files,
+            edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
+        };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture crate");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("fixture world");
+        let make_val_lib = world
+            .bodies(alloc)
+            .into_iter()
+            .find_map(|(body, _)| match body {
+                BodyRef::Free(k) if names.item_text(k)?.name == Some("make_val") => Some(k),
+                _ => None,
+            })
+            .expect("make_val body");
+        let want = super::super::heads::Want::Fn(make_val_lib);
+        world.store.ensure(world.front.names, &mut world.front.keys, want).expect("make_val head");
+        let opaque = world
+            .store
+            .opaques
+            .keys()
+            .copied()
+            .next()
+            .expect("make_val async opaque");
+        let mut buckets = None;
+        // Control: with both `consts: None` and `store.prepared: None`, returns `NoPrepares`.
+        let saved_prepared = world.store.prepared.take();
+        {
+            let mut r = Records {
+                names: world.front.names,
+                keys: &mut world.front.keys,
+                index: &world.front.index,
+                store: &mut world.store,
+                buckets: &mut buckets,
+                order: BuildOrder::AsAsked,
+                consts: None,
+            };
+            let err = super::define_for_reveal(&mut r, opaque).expect_err("without prepared macros, must fail");
+            assert!(matches!(err, super::HiddenFail::NoPrepares { .. }), "expected NoPrepares, got {err:?}");
+        }
+        // With `store.prepared: Some(...)` restored and `consts: None` (simulating `const_at`),
+        // `define_for_reveal` lowers and files `make_val`'s hidden type cleanly.
+        world.store.prepared = saved_prepared;
+        {
+            let mut r = Records {
+                names: world.front.names,
+                keys: &mut world.front.keys,
+                index: &world.front.index,
+                store: &mut world.store,
+                buckets: &mut buckets,
+                order: BuildOrder::AsAsked,
+                consts: None,
+            };
+            super::define_for_reveal(&mut r, opaque).expect("define_for_reveal must succeed with store.prepared");
+        }
+    }
+
+    /// When `define_for_reveal` checks an `async fn` defining body that contains an unevaluated
+    /// anonymous array-length constant (`[u8; 0 + 1 + 1]`, as `tokio::select!` expands to) while
+    /// an outer constant evaluation holds `&mut Consts` (`r.consts: None`, `evaluating > 0`), it
+    /// must return `HiddenFail::NeedConst` (not a stringified `HiddenFail::Defining`) so
+    /// `Consts::value_listed`'s work list evaluates the constant first and retries.
+    #[test]
+    fn define_for_reveal_propagates_const_nested() {
+        use crate::front2::check::{BuildOrder, Records};
+
+        const SOURCE: &str = r#"
+async fn make_val() -> u8 {
+    let arr: [u8; 0 + 1 + 1] = [1, 2];
+    arr[0]
+}
+fn caller() { let _ = make_val(); }
+fn main() {}
+"#;
+        let alloc = blaze_own::testing::heap().alloc();
+        let tc = fixture_toolchain();
+        let files = [("/nested_const_opaque/src/main.rs".into(), SOURCE.into())];
+        let user = UserCrate {
+            name: "nested_const_opaque", dir: "/nested_const_opaque/", root: "/nested_const_opaque/src/main.rs", files: &files,
+            edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
+        };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture crate");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("fixture world");
+        let make_val_lib = world
+            .bodies(alloc)
+            .into_iter()
+            .find_map(|(body, _)| match body {
+                BodyRef::Free(k) if names.item_text(k)?.name == Some("make_val") => Some(k),
+                _ => None,
+            })
+            .expect("make_val body");
+        let want = super::super::heads::Want::Fn(make_val_lib);
+        world.store.ensure(world.front.names, &mut world.front.keys, want).expect("make_val head");
+        let opaque = world
+            .store
+            .opaques
+            .keys()
+            .copied()
+            .next()
+            .expect("make_val async opaque");
+        let mut buckets = None;
+        // Simulate an active outer constant evaluation (`r.consts: None`, `evaluating: 1`).
+        world.store.maps.evaluating.set(1);
+        let err = {
+            let mut r = Records {
+                names: world.front.names,
+                keys: &mut world.front.keys,
+                index: &world.front.index,
+                store: &mut world.store,
+                buckets: &mut buckets,
+                order: BuildOrder::AsAsked,
+                consts: None,
+            };
+            super::define_for_reveal(&mut r, opaque).expect_err("must surface NeedConst when evaluating > 0")
+        };
+        world.store.maps.evaluating.set(0);
+        assert!(matches!(err, super::HiddenFail::NeedConst { .. }), "expected HiddenFail::NeedConst, got {err:?}");
     }
 }

@@ -167,6 +167,23 @@ pub trait Types {
         let _ = (view, path, position, arg, tys);
         Ok(None)
     }
+
+    /// Records explicitly written non-elided lifetimes (`'static` or a named enclosing lifetime)
+    /// of a closure parameter type `t` after expanding any type aliases (`Text<'a>` ->
+    /// `String<Alloc<'a>>`), in structural `(path, own)` order matching `lay_written_param`.
+    /// Returns `true` when handled; `false` falls back to syntactic `record_closure_param_regions`.
+    fn closure_param_regions(
+        &mut self,
+        view: &View<'_>,
+        t: TypeId,
+        tys: &mut PortableTys<'_>,
+        closure: tc::ExprId,
+        param: u32,
+        out: &mut dyn FnMut(tc::ClosureParamRegion),
+    ) -> bool {
+        let _ = (view, t, tys, closure, param, out);
+        false
+    }
 }
 
 impl ConstGapWhy {
@@ -414,22 +431,25 @@ pub struct TypeckBody<'a> {
     /// Canonical lexicographically-sorted [`tc::RecordSchema`] for each anonymous `Expr::Record`,
     /// ascending by [`ExprId`].
     pub record_expr_schemas: AVec<'a, (ExprId, tc::RecordSchema)>,
-    /// Closure parameter annotations whose outer reference explicitly writes `'static`
-    /// (`|lock: &'static str|`): `(closure_expr, param_index)`, ascending.
-    pub closure_static_params: AVec<'a, (ExprId, u32)>,
+    /// Explicit written non-elided lifetimes in closure parameter type annotations
+    /// (`|lock: &'static str|`, `|t: Typed<'c>|`), sorted ascending by `(closure, param, slot)`.
+    pub closure_param_regions: AVec<'a, tc::ClosureParamRegion>,
     /// Unexpanded `inline for pat in iter { body }` sites lowered in this body (ascending by
     /// [`ExprId`]); `front2` uses each site's checked `iter` type to unroll the body before
     /// final checking and codegen.
     pub inline_fors: AVec<'a, InlineForSite>,
 }
 
-/// Whether an `inline for` iterates over one aggregate or lockstep-zips two (`zip_fields(lhs, rhs)`).
+/// Whether an `inline for` iterates over one aggregate, lockstep-zips two (`zip_fields(lhs, rhs)`),
+/// or iterates over the variants of an enum type (`variants::<T>()`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InlineForKind {
     /// `inline for pat in iter { body }`.
     Single { iter: ExprId },
     /// `inline for pat in zip_fields(lhs, rhs) { body }`.
     Zip { lhs: ExprId, rhs: ExprId },
+    /// `inline for pat in variants::<T>() { body }`.
+    Variants { ty: PTy, ty_arg: TypeId },
 }
 
 /// One lowered `inline for pat in iter { body }` expression recorded on [`TypeckBody`].
@@ -482,7 +502,7 @@ impl<'a> TypeckBody<'a> {
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
             record_expr_schemas: &self.record_expr_schemas,
-            closure_static_params: &self.closure_static_params,
+            closure_param_regions: &self.closure_param_regions,
         }
     }
 }
@@ -768,6 +788,232 @@ impl Conv<'_, '_, '_, '_, '_> {
 
     fn opt_ty(&mut self, t: Option<TypeId>) -> Result<Option<PTy>, Refused> {
         t.map(|t| self.ty(t)).transpose()
+    }
+
+    /// Walks a closure parameter's written type `root` by structural child-index path, recording
+    /// every explicitly written non-elided lifetime (`'static` or a named enclosing lifetime,
+    /// never `'_`, an omitted lifetime, or a lifetime bound by an inner `for<..>` binder).
+    /// Keying by structural `(path, own)` avoids depending on sibling types' lifetime slot counts
+    /// (e.g. `&mut Vec<(X64Loc, X64Loc), Alloc<'a>>`).
+    fn record_closure_param_regions(&mut self, closure: ExprId, param: u32, root: TypeId) -> Result<(), Refused> {
+        #[derive(Clone, Copy)]
+        enum Frame {
+            Visit(TypeId, u64),
+            PopBound(usize),
+        }
+        let classify = |v: &View<'_>, nm: NameIdx, bound: &[Name; 32], bound_len: usize| -> Result<Option<tc::WrittenRegion>, Refused> {
+            let text = v.name_text(nm)?;
+            if text == "'static" {
+                Ok(Some(tc::WrittenRegion::Static))
+            } else if text == "'_" {
+                Ok(None)
+            } else {
+                let name = Name(v.name(nm)?);
+                if bound.iter().take(bound_len).any(|&b| b == name) {
+                    Ok(None)
+                } else {
+                    Ok(Some(tc::WrittenRegion::Named))
+                }
+            }
+        };
+        let mut stack: [Frame; 64] = [Frame::PopBound(0); 64];
+        let mut sp = 1usize;
+        if let Some(slot) = stack.get_mut(0) {
+            *slot = Frame::Visit(root, tc::ClosureParamRegion::ROOT);
+        }
+        let mut bound: [Name; 32] = [Name(0); 32];
+        let mut bound_len = 0usize;
+        let mut steps = 0u32;
+        while let Some(top) = sp.checked_sub(1) {
+            sp = top;
+            let Some(&frame) = stack.get(top) else { break };
+            let (tid, path) = match frame {
+                Frame::PopBound(prev) => {
+                    bound_len = prev;
+                    continue;
+                }
+                Frame::Visit(tid, path) => (tid, path),
+            };
+            steps += 1;
+            if steps > 128 {
+                break;
+            }
+            match self.v.ty(tid)? {
+                TypeRef::Ref { lifetime, inner, .. } => {
+                    if let Some(nm) = lifetime
+                        && let Some(kind) = classify(self.v, nm, &bound, bound_len)?
+                    {
+                        self.out.closure_param_regions.push(tc::ClosureParamRegion {
+                            closure,
+                            param,
+                            path,
+                            own: 0,
+                            kind,
+                        });
+                    }
+                    if let Some(next) = tc::ClosureParamRegion::push_step(path, 0)
+                        && let Some(slot) = stack.get_mut(sp)
+                    {
+                        *slot = Frame::Visit(inner, next);
+                        sp += 1;
+                    }
+                }
+                TypeRef::Ptr { inner, .. }
+                | TypeRef::Array { elem: inner, .. }
+                | TypeRef::Slice(inner)
+                | TypeRef::Pat { base: inner, .. } => {
+                    if let Some(next) = tc::ClosureParamRegion::push_step(path, 0)
+                        && let Some(slot) = stack.get_mut(sp)
+                    {
+                        *slot = Frame::Visit(inner, next);
+                        sp += 1;
+                    }
+                }
+                TypeRef::Tuple(elems) => {
+                    let ids = self.v.ids(elems)?;
+                    for (ci, &id) in ids.iter().enumerate().rev() {
+                        if let Ok(ci_u32) = u32::try_from(ci)
+                            && let Some(next) = tc::ClosureParamRegion::push_step(path, ci_u32)
+                            && let Some(slot) = stack.get_mut(sp)
+                        {
+                            *slot = Frame::Visit(TypeId(id), next);
+                            sp += 1;
+                        }
+                    }
+                }
+                TypeRef::FnPtr { params, ret, .. } => {
+                    let mut children: [(TypeId, u32); 16] = [(TypeId(0), 0); 16];
+                    let mut clen = 0usize;
+                    let mut ci = 0u32;
+                    for &row in self.v.rows(params)? {
+                        let p = Param::decode(row)?;
+                        if p.variadic {
+                            continue;
+                        }
+                        if let Some(ty) = p.ty {
+                            if let Some(slot) = children.get_mut(clen) {
+                                *slot = (ty, ci);
+                                clen += 1;
+                            }
+                            ci += 1;
+                        }
+                    }
+                    if let Some(ret_ty) = ret
+                        && let Some(slot) = children.get_mut(clen)
+                    {
+                        *slot = (ret_ty, ci);
+                        clen += 1;
+                    }
+                    if let Some(slice) = children.get(..clen) {
+                        for &(t, child_idx) in slice.iter().rev() {
+                            if let Some(next) = tc::ClosureParamRegion::push_step(path, child_idx)
+                                && let Some(slot) = stack.get_mut(sp)
+                            {
+                                *slot = Frame::Visit(t, next);
+                                sp += 1;
+                            }
+                        }
+                    }
+                }
+                TypeRef::For { binder, inner } => {
+                    let prev_bound = bound_len;
+                    for &row in self.v.rows(binder)? {
+                        if let GenericParam::Lifetime { name, .. } = GenericParam::decode(row)? {
+                            let nm = self.name(name)?;
+                            if let Some(dst) = bound.get_mut(bound_len) {
+                                *dst = nm;
+                                bound_len += 1;
+                            }
+                        }
+                    }
+                    let pushed_pop = if bound_len != prev_bound {
+                        if let Some(slot) = stack.get_mut(sp) {
+                            *slot = Frame::PopBound(prev_bound);
+                            sp += 1;
+                            true
+                        } else {
+                            bound_len = prev_bound;
+                            continue;
+                        }
+                    } else {
+                        false
+                    };
+                    if let Some(slot) = stack.get_mut(sp) {
+                        *slot = Frame::Visit(inner, path);
+                        sp += 1;
+                    } else if pushed_pop {
+                        sp -= 1;
+                        bound_len = prev_bound;
+                    }
+                }
+                TypeRef::Path(path_idx) => {
+                    let p = self.v.path(path_idx)?;
+                    let segs = self.v.segments(p)?;
+                    let Some((&last, earlier)) = segs.split_last() else { continue };
+                    let mut earlier_has_args = false;
+                    for &n in earlier {
+                        let es = Segment::decode(n)?;
+                        if es.kind == SegKind::Anchor || es.has_args || es.parenthesized {
+                            earlier_has_args = true;
+                            break;
+                        }
+                    }
+                    if earlier_has_args {
+                        continue;
+                    }
+                    let s = Segment::decode(last)?;
+                    if s.kind == SegKind::SelfTy || s.kind == SegKind::Anchor || s.parenthesized || s.return_notation || !s.has_args {
+                        continue;
+                    }
+                    let rows = self.v.rows(s.args)?;
+                    let mut lt_idx = 0u32;
+                    let mut arg_idx = 0u32;
+                    let mut ty_args: [(TypeId, u32); 16] = [(TypeId(0), 0); 16];
+                    let mut ty_len = 0usize;
+                    for &row in rows {
+                        match GenericArg::decode(row)? {
+                            GenericArg::Lifetime(nm) => {
+                                if let Some(kind) = classify(self.v, nm, &bound, bound_len)? {
+                                    self.out.closure_param_regions.push(tc::ClosureParamRegion {
+                                        closure,
+                                        param,
+                                        path,
+                                        own: lt_idx,
+                                        kind,
+                                    });
+                                }
+                                lt_idx += 1;
+                            }
+                            GenericArg::Type(t) => {
+                                if let Some(slot) = ty_args.get_mut(ty_len) {
+                                    *slot = (t, arg_idx);
+                                    ty_len += 1;
+                                }
+                                arg_idx += 1;
+                            }
+                            GenericArg::Const(_) => {
+                                arg_idx += 1;
+                            }
+                            GenericArg::AssocType { .. }
+                            | GenericArg::AssocConst { .. }
+                            | GenericArg::AssocBound { .. } => {}
+                        }
+                    }
+                    if let Some(slice) = ty_args.get(..ty_len) {
+                        for &(t, ci) in slice.iter().rev() {
+                            if let Some(next) = tc::ClosureParamRegion::push_step(path, ci)
+                                && let Some(slot) = stack.get_mut(sp)
+                            {
+                                *slot = Frame::Visit(t, next);
+                                sp += 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Each of call arguments `args` that is an integer literal, or a `-` whose operand is one
@@ -1160,7 +1406,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Continue { target: Some(target) } => tc::Expr::Continue { target },
             Expr::Continue { target: None } => return self.refuse("a continue with no target", r),
             Expr::Return { value } => tc::Expr::Return { value },
-            Expr::Become { .. } => return self.refuse("`become`", r),
+            Expr::Become { value } => tc::Expr::Become { value },
             Expr::Yield { .. } => return self.refuse("`yield`", r),
             Expr::Call { callee, args } => {
                 self.call_arg_ints(args)?;
@@ -1273,13 +1519,18 @@ impl Conv<'_, '_, '_, '_, '_> {
                 for (pi, &n) in self.v.rows(c.params)?.iter().enumerate() {
                     let p = Param::decode(n)?;
                     let Some(pat) = p.pat else { return self.refuse("a closure parameter with no pattern", r) };
-                    if let Some(tid) = p.ty
-                        && let TypeRef::Ref { lifetime: Some(nm), .. } = self.v.ty(tid)?
-                        && self.v.name_text(nm)? == "'static"
-                    {
-                        self.out.closure_static_params.push((e, pi as u32));
-                    }
                     let ty = self.opt_ty(p.ty)?;
+                    if let Some(tid) = p.ty {
+                        let p_idx = len(pi);
+                        let before = self.out.closure_param_regions.len();
+                        let handled = self.types.closure_param_regions(self.v, tid, self.tys, e, p_idx, &mut |r| {
+                            self.out.closure_param_regions.push(r);
+                        });
+                        if !handled {
+                            self.out.closure_param_regions.truncate(before);
+                            self.record_closure_param_regions(e, p_idx, tid)?;
+                        }
+                    }
                     self.out.pat_lists.push(pat);
                     self.out.opt_types.push(ty);
                 }
@@ -1309,9 +1560,13 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Underscore => tc::Expr::Underscore,
             Expr::Await(e) => tc::Expr::Await(e),
             Expr::InlineFor { pat, iter, body } => {
-                let kind = match zip_fields_call(self.v, iter)? {
-                    Some((lhs, rhs)) => InlineForKind::Zip { lhs, rhs },
-                    None => InlineForKind::Single { iter },
+                let kind = if let Some((lhs, rhs)) = zip_fields_call(self.v, iter)? {
+                    InlineForKind::Zip { lhs, rhs }
+                } else if let Some(ty_arg) = variants_call(self.v, iter)? {
+                    let ty = self.ty(ty_arg)?;
+                    InlineForKind::Variants { ty, ty_arg }
+                } else {
+                    InlineForKind::Single { iter }
                 };
                 self.out.inline_fors.push(InlineForSite { expr: e, pat, iter, body, kind });
                 tc::Expr::Missing
@@ -1394,7 +1649,7 @@ impl Conv<'_, '_, '_, '_, '_> {
                 tc::Pat::TupleStruct { path: self.path(path, true, PathNs::Value)?, elems: self.pats(elems)?, rest }
             }
             Pat::Struct { path, fields, rest } => {
-                let path = self.path(path, false, PathNs::Type)?;
+                let path = self.path(path, true, PathNs::Type)?;
                 let start = len(self.out.field_pats.len());
                 for &n in self.v.rows(fields)? {
                     let f = FieldPat::decode(n)?;
@@ -1505,7 +1760,7 @@ pub fn to_typeck<'a>(
         super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),
         record_expr_schemas: Vec::new_in(alloc),
-        closure_static_params: Vec::new_in(alloc),
+        closure_param_regions: Vec::new_in(alloc),
         inline_fors: Vec::new_in(alloc),
     };
     let mut slice_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(view.pats.len(), alloc);
@@ -1574,6 +1829,7 @@ pub fn to_typeck<'a>(
     // The same for the legacy arguments' terms (`BodyView::legacy_arg`); one argument is
     // one call's, so no id repeats.
     c.out.legacy_args.sort_unstable_by_key(|&(x, _)| x);
+    c.out.closure_param_regions.sort_unstable();
     for i in 0..view.pats.len() {
         let id = PatId(len(i));
         let ed = view.mark_of_pat(id)?.map_or(body_edition, |m| edition(m.edition));
@@ -1622,12 +1878,50 @@ fn zip_fields_call(v: &View<'_>, iter: ExprId) -> Result<Option<(ExprId, ExprId)
     Ok(Some((ExprId(lhs), ExprId(rhs))))
 }
 
+/// Recognizes `variants::<T>()` as an `inline for` iterable, returning `T`.
+fn variants_call(v: &View<'_>, iter: ExprId) -> Result<Option<TypeId>, Refused> {
+    let Expr::Call { callee, args } = v.expr(iter)? else {
+        return Ok(None);
+    };
+    if args.len != 0 {
+        return Ok(None);
+    }
+    let Expr::Path(p) = v.expr(callee)? else {
+        return Ok(None);
+    };
+    let path = v.path(p)?;
+    if path.absolute || path.lang.is_some() {
+        return Ok(None);
+    }
+    let [seg] = v.segments(path)? else {
+        return Ok(None);
+    };
+    let s = Segment::decode(*seg)?;
+    if s.kind != SegKind::Ident || !s.has_args || s.parenthesized {
+        return Ok(None);
+    }
+    let Some(name) = s.name else {
+        return Ok(None);
+    };
+    if v.name_text(name)? != "variants" {
+        return Ok(None);
+    }
+    let [arg_row] = *v.rows(s.args)? else {
+        return Ok(None);
+    };
+    let GenericArg::Type(ty_arg) = GenericArg::decode(arg_row)? else {
+        return Ok(None);
+    };
+    Ok(Some(ty_arg))
+}
+
 /// Prepares unexpanded `inline for pat in iter { body }` sites for the pre-unroll typeck pass:
-/// replaces each single site with `{ iter; }` and each `zip_fields(lhs, rhs)` site with
+/// replaces each single site with `{ iter; }`, each `zip_fields(lhs, rhs)` site with
 /// `{ lhs; rhs; }` (blanking the synthetic `zip_fields` call and path callee so `blaze-typeck`
-/// infers and records `expr_ty` for each iterable without resolving `zip_fields`), and blanks
-/// every unreachable expression and pattern inside `body` and `pat` to `Missing` so writeback
-/// never reports `Unreached`.
+/// infers and records `expr_ty` for each iterable without resolving `zip_fields`), and each
+/// `variants::<T>()` site with `{}` (blanking the synthetic `variants::<T>()` call and callee),
+/// and blanks every unreachable expression and pattern inside `body` and `pat` to `Missing` so
+/// writeback never reports `Unreached`.
 fn wire_inline_fors<'a>(out: &mut TypeckBody<'a>, alloc: Alloc<'a>) {
     enum Work {
         Expr(ExprId),
@@ -1639,6 +1933,17 @@ fn wire_inline_fors<'a>(out: &mut TypeckBody<'a>, alloc: Alloc<'a>) {
         let Some(&site) = out.inline_fors.get(i) else { continue };
         match site.kind {
             InlineForKind::Single { iter } => {
+                let site_range = out.expr_ranges.get(site.expr.ix()).copied().unwrap_or_default();
+                let loop_body_id = ExprId(len(out.exprs.len()));
+                out.exprs.push(tc::Expr::Block {
+                    stmts: List::EMPTY,
+                    tail: None,
+                    scope: ScopeId(0),
+                });
+                out.expr_ranges.push(site_range);
+                let loop_id = ExprId(len(out.exprs.len()));
+                out.exprs.push(tc::Expr::Loop { body: loop_body_id });
+                out.expr_ranges.push(site_range);
                 let stmt_id = StmtId(len(out.stmts.len()));
                 out.stmts.push(tc::Stmt::Expr { expr: iter, semi: true });
                 let start = len(out.stmt_lists.len());
@@ -1646,7 +1951,7 @@ fn wire_inline_fors<'a>(out: &mut TypeckBody<'a>, alloc: Alloc<'a>) {
                 if let Some(slot) = out.exprs.get_mut(site.expr.ix()) {
                     *slot = tc::Expr::Block {
                         stmts: List { start, len: 1 },
-                        tail: None,
+                        tail: Some(loop_id),
                         scope: ScopeId(0),
                     };
                 }
@@ -1670,6 +1975,23 @@ fn wire_inline_fors<'a>(out: &mut TypeckBody<'a>, alloc: Alloc<'a>) {
                 if let Some(slot) = out.exprs.get_mut(site.expr.ix()) {
                     *slot = tc::Expr::Block {
                         stmts: List { start, len: 2 },
+                        tail: None,
+                        scope: ScopeId(0),
+                    };
+                }
+            }
+            InlineForKind::Variants { .. } => {
+                if let Some(call_slot) = out.exprs.get_mut(site.iter.ix()) {
+                    let prev = core::mem::replace(call_slot, tc::Expr::Missing);
+                    if let tc::Expr::Call { callee, .. } = prev
+                        && let Some(callee_slot) = out.exprs.get_mut(callee.ix())
+                    {
+                        *callee_slot = tc::Expr::Missing;
+                    }
+                }
+                if let Some(slot) = out.exprs.get_mut(site.expr.ix()) {
+                    *slot = tc::Expr::Block {
+                        stmts: List::EMPTY,
                         tail: None,
                         scope: ScopeId(0),
                     };
@@ -1712,6 +2034,7 @@ fn wire_inline_fors<'a>(out: &mut TypeckBody<'a>, alloc: Alloc<'a>) {
                             work.push(Work::Expr(x));
                         }
                     }
+                    tc::Expr::Become { value } => work.push(Work::Expr(value)),
                     tc::Expr::Block { stmts, tail, .. } | tc::Expr::ConstBlock { stmts, tail, .. } => {
                         if let Some(slice) = out.stmt_lists.get(stmts.range()) {
                             for &s in slice {
