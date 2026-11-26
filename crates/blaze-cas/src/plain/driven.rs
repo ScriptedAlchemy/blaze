@@ -847,7 +847,8 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     /// Acquires the request's publication pin and adopts the generation the flip names.
     pub(super) fn pin_publication(&mut self) -> Result<(), StoreError> {
         let now = self.driver.wall_ns();
-        if self.core.pin_publication(now, &mut self.effects)? {
+        if self.core.stage_publication_pin(now)? {
+            self.core.commit(&[], now, &mut self.effects)?;
             self.run("pinning the store for publication")?;
             self.core.take_committed().ok_or(StoreError::Unfinished { what: "a publication pin" })??;
         }

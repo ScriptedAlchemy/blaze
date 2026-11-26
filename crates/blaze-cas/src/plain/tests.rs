@@ -595,7 +595,7 @@ fn publication_pin_sweep(plant: Plant) -> bool {
     let mut sim = Sim::new(165, Faults::default());
     let mut owner = Actor::new(reached(1), &root, Plant::None);
     settle(&mut sim, core::slice::from_mut(&mut owner));
-    assert!(!owner.store.pin_publication(sim.wall_ns(), &mut owner.effects).expect("empty view needs no pin"));
+    assert!(!owner.store.stage_publication_pin(sim.wall_ns()).expect("empty view needs no pin"));
     let pointer = key(86);
     let target = key(87);
     let pointer_tag = ReservedTag::Pointer.tag();
@@ -623,7 +623,8 @@ fn publication_pin_sweep(plant: Plant) -> bool {
     settle(&mut sim, core::slice::from_mut(&mut gc));
     assert!(gc.store.slice_parked());
 
-    assert!(writer.store.pin_publication(sim.wall_ns(), &mut writer.effects).expect("start publication pin"));
+    assert!(writer.store.stage_publication_pin(sim.wall_ns()).expect("stage publication pin"));
+    writer.store.commit(&[], sim.wall_ns(), &mut writer.effects).expect("start publication pin");
     settle(&mut sim, core::slice::from_mut(&mut writer));
     let pinned = writer.store.take_committed().expect("pin verdict").expect("publish pin");
     assert!(pinned.segments.is_empty());

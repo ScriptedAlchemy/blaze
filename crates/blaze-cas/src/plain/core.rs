@@ -3831,9 +3831,9 @@ impl<A: Allocator + Clone> Plain<A> {
         self.roots_pending.push(RootEdit::Unset(name.to_owned()));
     }
 
-    /// Pins the existing readable segments through the request's root publication. The lease
-    /// flip adopts the locked generation before the caller reads any records from it.
-    pub(super) fn pin_publication(&mut self, now_ns: u64, effects: &mut Vec<Effect>) -> Result<bool, StoreError> {
+    /// Stages a lease that pins the readable segments through the request's root publication.
+    /// The caller commits it before reading any records from the refreshed generation.
+    pub(super) fn stage_publication_pin(&mut self, now_ns: u64) -> Result<bool, StoreError> {
         if let Some(why) = &self.broken {
             return Err(why.clone());
         }
@@ -3848,7 +3848,6 @@ impl<A: Allocator + Clone> Plain<A> {
         }
         self.released = false;
         self.roots_pending.push(RootEdit::Lease { since: 0, opened_ns: self.opened_ns });
-        self.commit(&[], now_ns, effects)?;
         Ok(true)
     }
 
