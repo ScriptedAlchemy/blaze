@@ -47,6 +47,9 @@ use crate::server::random_id;
 use crate::sys::{SystemClock, ThreadFailed, current_pid, env_is_set, scope, sleep};
 
 mod grant_events;
+mod published_ahead;
+
+use published_ahead::{BufferedPack, Publication, ReadAhead};
 
 /// What every executor of a machine reserves: one holder's bookkeeping, not its compile, which
 /// the daemon's own budget admits.
@@ -242,6 +245,7 @@ fn elapsed_since(clock: SystemClock, started_ns: u64) -> Duration {
 pub struct ExportBudget<'a> {
     config: &'a Config,
     pr: Option<PrBudget>,
+    ahead: Option<ReadAhead>,
 }
 
 struct PrBudget {
@@ -269,7 +273,7 @@ struct UnitBudget {
 impl<'a> ExportBudget<'a> {
     /// A budget whose elapsed time starts when the export first needs the coordinator.
     pub fn new(config: &'a Config) -> Self {
-        Self { config, pr: None }
+        Self { config, pr: None, ahead: None }
     }
 
     fn admit(
@@ -652,7 +656,7 @@ fn import_using<A: AllocatorClone, B: Allocator>(
 
 /// A corrupted published manifest cannot authorize recompilation.
 fn published_packs<A: Allocator>(
-    unit: &Unit,
+    spec: &Digest,
     list: &[u8],
     alloc: A,
     error_alloc: WireAlloc,
@@ -661,7 +665,7 @@ fn published_packs<A: Allocator>(
         Error::Committed(format_in!(
             error_alloc,
             "unit {}: published pack list is not canonical: {why}",
-            hex(&unit.spec)
+            hex(spec)
         ))
     })
 }
@@ -705,12 +709,46 @@ impl ExportBudget<'_> {
         granted: &mut (impl Granted + ?Sized),
         cancelled: &AtomicBool,
     ) -> Result<Arrived, Error> {
+        self.run_with_next(unit, None, granted, cancelled)
+    }
+
+    /// Runs a unit in plan order, starting the next unit's bounded cache read before this
+    /// unit uses the coordinator. The next unit still has to reach its own turn to use it.
+    pub fn run_with_next(
+        &mut self,
+        unit: &Unit,
+        next: Option<Digest>,
+        granted: &mut (impl Granted + ?Sized),
+        cancelled: &AtomicBool,
+    ) -> Result<Arrived, Error> {
         let config = self.config;
         let alloc = config.blobs.alloc;
         ensure_not_cancelled(unit, cancelled, alloc)?;
-        if let Some(list) = config.blobs.published(&unit.spec, alloc)? {
-            let packs = published_packs(unit, &list, alloc, alloc)?;
-            let values = import(&config.blobs, &packs, alloc)?;
+        let ready = match &mut self.ahead {
+            Some(ahead) => ahead.before(unit.spec, next)?,
+            None => None,
+        };
+        let published = match ready {
+            Some(published) => Some(published),
+            None => config.blobs.published(&unit.spec, alloc)?
+                .map(|list| {
+                    let packs = published_packs(&unit.spec, &list, alloc, alloc)?;
+                    Ok::<_, Error>(Publication { packs, first: None })
+                })
+                .transpose()?,
+        };
+        if let Some(Publication { packs, mut first }) = published {
+            let values = import_using(
+                &packs,
+                |digest| {
+                    if first.as_ref().is_some_and(|pack| &pack.key == digest) {
+                        return Ok(first.take().map(|BufferedPack { bytes, .. }| bytes));
+                    }
+                    config.blobs.pack(digest, alloc)
+                },
+                alloc,
+                alloc,
+            )?;
             ensure_not_cancelled(unit, cancelled, alloc)?;
             return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None, alloc) });
         }
@@ -1932,8 +1970,8 @@ mod tests {
         };
         let second = PackRef { pack: [0x22; 32], ..first.clone() };
         let canonical = list_of(&[first.clone(), second.clone()], alloc);
-        assert!(published_packs(&unit, &canonical, alloc, alloc).is_ok());
-        assert!(published_packs(&unit, b"", alloc, alloc).is_ok(), "an empty unit is canonical");
+        assert!(published_packs(&unit.spec, &canonical, alloc, alloc).is_ok());
+        assert!(published_packs(&unit.spec, b"", alloc, alloc).is_ok(), "an empty unit is canonical");
 
         let mut with_extra = Vec::from_slice_in(canonical.as_slice(), alloc);
         with_extra.extend_from_slice(b"extra\n");
@@ -1950,7 +1988,7 @@ mod tests {
         ];
         for bytes in noncanonical {
             assert!(
-                matches!(published_packs(&unit, &bytes, alloc, alloc), Err(Error::Committed(_))),
+                matches!(published_packs(&unit.spec, &bytes, alloc, alloc), Err(Error::Committed(_))),
                 "a damaged published manifest must be refused, not rebuilt"
             );
         }
@@ -2008,7 +2046,7 @@ mod tests {
         assert!(matches!(decide(&LocalPolicy::Fallback, corrupt, alloc), Err(Error::Committed(_))));
 
         let unit = Unit { spec: [0x33; 32], names: Vec::new_in(alloc) };
-        let malformed = published_packs(&unit, b"not a pack", alloc, alloc).unwrap_err();
+        let malformed = published_packs(&unit.spec, b"not a pack", alloc, alloc).unwrap_err();
         assert!(matches!(
             decide(&LocalPolicy::Fallback, malformed, alloc),
             Err(Error::Committed(_))

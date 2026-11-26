@@ -113,6 +113,8 @@ pub(crate) enum DistError {
     Compile { shown: AString<'static> },
     /// Reading or writing a committed overlay entry failed.
     Store(StoreError),
+    /// The scoped read of published units could not start or finish.
+    PublishedRead(blaze_dist_local::Error),
 }
 
 impl fmt::Display for DistError {
@@ -164,6 +166,9 @@ impl fmt::Display for DistError {
             }
             DistError::Store(error) => {
                 write!(f, "the distributed build failed: {error}")
+            }
+            DistError::PublishedRead(error) => {
+                write!(f, "the distributed build failed while reading published units: {error}")
             }
         }
     }
@@ -1134,66 +1139,69 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         return Err(DistError::BadResultGate { shown });
     }
 
-    let cancelled = AtomicBool::new(false);
-    let mut budget = agent::ExportBudget::new(&dist.config);
-    let mut total_compiled = 0usize;
-    let mut total_cached = 0usize;
+    agent::ExportBudget::with_published_ahead(&dist.config, |budget| {
+        let cancelled = AtomicBool::new(false);
+        let mut total_compiled = 0usize;
+        let mut total_cached = 0usize;
 
-    for plan in plans.iter() {
-        let mut exec = UnitExecutor {
-            plan,
-            ids,
-            builder,
-            maker,
-            store,
-            roots,
-            scratch_alloc,
-            wire_alloc,
-            heap,
-            tail_compiled: 0,
-            tail_from_store: 0,
-            tail_instances: 0,
-            tail_compiled_keys: WireVec::new_in(wire_alloc),
-            ran_complete: false,
-            result_gate: dist.result_gate.as_ref()
-                .filter(|gate| gate.unit.as_ref().is_none_or(|unit| unit.as_str() == plan.unit_name.as_str()))
-                .map(|gate| gate.directory.as_str()),
-        };
-        let arrived = match budget.run(&plan.unit, &mut exec, &cancelled) {
-            Ok(arrived) => arrived,
-            Err(err) => match agent::decide(&dist.config.local, err, wire_alloc) {
-                Ok(()) => return Ok((DistExportOutcome::FallbackLocal, fp)),
-                Err(fatal) => {
-                    let mut shown = String::new_in(alloc);
-                    let _ = write!(shown, "{fatal}");
-                    return Err(DistError::UnitFailed {
-                        unit: own_str(plan.unit_name.as_str(), alloc),
-                        shown,
-                    });
-                }
-            },
-        };
-        let tail_compiled = exec.tail_compiled;
-        let tail_from_store = exec.tail_from_store;
-        let tail_instances = exec.tail_instances;
-        let tail_keys = exec.tail_compiled_keys;
-        let work_compiled = usize::try_from(arrived.compiled_here).unwrap_or(0);
-        let work_stored = usize::try_from(arrived.stored_here).unwrap_or(0);
-        total_compiled += work_compiled + tail_compiled;
-        total_cached += work_stored + tail_from_store;
-        store.merge_arrived(&arrived.values)?;
-        append_report_row(
-            dist.report.as_ref().map(|s| s.as_str()),
-            plan.unit_name.as_str(),
-            &plan.unit,
-            &arrived,
-            tail_compiled,
-            tail_from_store,
-            tail_instances,
-            tail_keys.as_slice(),
-            wire_alloc,
-        );
-    }
+        for (index, plan) in plans.iter().enumerate() {
+            let next = plans.get(index + 1).filter(|plan| !plan.is_final).map(|plan| plan.unit.spec);
+            let mut exec = UnitExecutor {
+                plan,
+                ids,
+                builder,
+                maker,
+                store,
+                roots,
+                scratch_alloc,
+                wire_alloc,
+                heap,
+                tail_compiled: 0,
+                tail_from_store: 0,
+                tail_instances: 0,
+                tail_compiled_keys: WireVec::new_in(wire_alloc),
+                ran_complete: false,
+                result_gate: dist.result_gate.as_ref()
+                    .filter(|gate| gate.unit.as_ref().is_none_or(|unit| unit.as_str() == plan.unit_name.as_str()))
+                    .map(|gate| gate.directory.as_str()),
+            };
+            let arrived = match budget.run_with_next(&plan.unit, next, &mut exec, &cancelled) {
+                Ok(arrived) => arrived,
+                Err(err) => match agent::decide(&dist.config.local, err, wire_alloc) {
+                    Ok(()) => return Ok((DistExportOutcome::FallbackLocal, fp)),
+                    Err(fatal) => {
+                        let mut shown = String::new_in(alloc);
+                        let _ = write!(shown, "{fatal}");
+                        return Err(DistError::UnitFailed {
+                            unit: own_str(plan.unit_name.as_str(), alloc),
+                            shown,
+                        });
+                    }
+                },
+            };
+            let tail_compiled = exec.tail_compiled;
+            let tail_from_store = exec.tail_from_store;
+            let tail_instances = exec.tail_instances;
+            let tail_keys = exec.tail_compiled_keys;
+            let work_compiled = usize::try_from(arrived.compiled_here).unwrap_or(0);
+            let work_stored = usize::try_from(arrived.stored_here).unwrap_or(0);
+            total_compiled += work_compiled + tail_compiled;
+            total_cached += work_stored + tail_from_store;
+            store.merge_arrived(&arrived.values)?;
+            append_report_row(
+                dist.report.as_ref().map(|s| s.as_str()),
+                plan.unit_name.as_str(),
+                &plan.unit,
+                &arrived,
+                tail_compiled,
+                tail_from_store,
+                tail_instances,
+                tail_keys.as_slice(),
+                wire_alloc,
+            );
+        }
 
-    Ok((DistExportOutcome::Completed { compiled: total_compiled, cached: total_cached }, fp))
+        Ok((DistExportOutcome::Completed { compiled: total_compiled, cached: total_cached }, fp))
+    })
+    .map_err(DistError::PublishedRead)?
 }
