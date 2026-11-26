@@ -972,6 +972,7 @@ fn export_program<'f>(
             &mut maker,
             &mut dist_store,
             &roots,
+            native_export.key,
             release,
             output_path,
             alloc,

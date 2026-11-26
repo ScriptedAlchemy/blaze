@@ -1069,6 +1069,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
     maker: &'a mut Maker<'b, crate::run_ids::Runnable, T>,
     store: &'a mut DistStore<'s, 'm, D>,
     roots: &'a ProductRoots<'a>,
+    native_image: blaze_drive::Key,
     release: bool,
     output_path: &str,
     scratch_alloc: Alloc<'a>,
@@ -1120,8 +1121,8 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
     });
     write_unit_plans(dist.report.as_ref().map(|path| path.as_str()), report, wire_alloc);
 
-    // Whole-program output fingerprint covering every unit digest and output path.
-    let fp = unit_digest_of(output_path, builder, release, prior_digests.as_slice(), &[], scratch_alloc);
+    // The local executable also incorporates the checked native archives and export bindings.
+    let fp = unit_digest_of(output_path, builder, release, prior_digests.as_slice(), &[native_image.0], scratch_alloc);
     if matches_output_fingerprint(output_path, &fp, wire_alloc) {
         return Ok((DistExportOutcome::NoOp, fp));
     }
