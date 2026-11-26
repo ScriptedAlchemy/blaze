@@ -8,7 +8,7 @@ on:
       suite:
         required: true
         type: choice
-        options: [items, front-equal, test-cache]
+        options: [items, front-equal, ladder-lib, test-cache]
 permissions:
   contents: read
 defaults:
@@ -53,13 +53,18 @@ jobs:
           timeout 15 git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
           tc=$(timeout 10 cat pins/toolchain)
           case "$SUITE" in
-            items) crate=blaze-ladder; target=front2_items; selection=(--test-threads=4) ;;
-            front-equal) crate=blaze-ladder; target=front_equal; selection=(--test-threads=4) ;;
-            test-cache) crate=blaze-cli; target=test_command_runs; selection=(pooled_workers_match_serial_bztr_and_purity --exact) ;;
+            items) crate=blaze-ladder; target=front2_items; cargo_target=(--test "$target"); selection=(--test-threads=4) ;;
+            front-equal) crate=blaze-ladder; target=front_equal; cargo_target=(--test "$target"); selection=(--test-threads=4) ;;
+            ladder-lib) crate=blaze-ladder; target=blaze_ladder; cargo_target=(--lib); selection=(--test-threads=4) ;;
+            test-cache)
+              crate=blaze-cli; target=test_command_runs; cargo_target=(--test "$target")
+              selection=(pooled_workers_match_serial_bztr_and_purity --exact)
+              timeout -k 20 780 cargo +"$tc" build --locked -p blaze-launcher --bins
+              ;;
             *) exit 2 ;;
           esac
-          timeout -k 20 1760 cargo +"$tc" test --locked -p "$crate" --test "$target" \
-            --no-run --message-format=json > "$evidence/build.jsonl"
+          timeout -k 20 1760 cargo +"$tc" test --locked -p "$crate" "${cargo_target[@]}" \
+            --no-run --message-format=json-render-diagnostics > "$evidence/build.jsonl"
           binary=$(timeout 20 jq -er --arg target "$target" \
             'select(.target.name==$target and .executable!=null).executable' "$evidence/build.jsonl")
           timeout -k 20 480 /usr/bin/time -v "$binary" --nocapture "${selection[@]}" 2>&1 | tee "$evidence/test.log"
