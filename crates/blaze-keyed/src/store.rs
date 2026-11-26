@@ -599,7 +599,7 @@ pub enum StoreError {
     /// its own and flips again; this is the stop after blaze-cas `CARRY_ROUNDS` rounds (or
     /// when the record cannot be carried: not mapped here, or a pointer), never a flip naming
     /// a record that may be gone.
-    SweptUnder { key: ContentId, segment: u64 },
+    SweptUnder { key: ContentId, segment: u64, phase: &'static str, rounds: u32 },
     /// The indexed root `root` of generation `generation` names the index `index`, which no
     /// segment holds (blaze-cas `Plain::root_through`).
     IndexGone { generation: u64, root: ContentId, index: ContentId },
@@ -689,9 +689,9 @@ impl fmt::Display for StoreError {
             StoreError::RootGone { generation, key } => {
                 write!(f, "the root {key:?} of generation {generation} names a record no segment holds")
             }
-            StoreError::SweptUnder { key, segment } => write!(
+            StoreError::SweptUnder { key, segment, phase, rounds } => write!(
                 f,
-                "a root of this commit names the record {key:?}, read from segment {segment:016x}, which another process's cleanup slice replaced since, after the commit carried such records forward as many rounds as it may (or this one could not be carried): the commit is not flipped, and the next command makes its records again"
+                "a root of this commit names the record {key:?}, read from segment {segment:016x}, which another process's cleanup slice replaced since. The commit stopped in {phase} after {rounds} carry rounds"
             ),
             StoreError::IndexGone { generation, root, index } => {
                 write!(f, "the indexed root {root:?} of generation {generation} names the index {index:?}, which no segment holds")

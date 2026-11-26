@@ -6577,7 +6577,8 @@ impl<A: Allocator + Clone> Plain<A> {
                     // commit's own, outside the lock, and it flips again ([`Plain::carry`]).
                     // After [`CARRY_ROUNDS`] the refusal is the stop.
                     if self.carry_rounds >= CARRY_ROUNDS || !self.cfg.writes.contains(&Namespace::LOCAL) {
-                        refused = Some(StoreError::SweptUnder { key, segment });
+                        let phase = if self.carry_rounds >= CARRY_ROUNDS { "the final root check" } else { "a read-only namespace" };
+                        refused = Some(StoreError::SweptUnder { key, segment, phase, rounds: self.carry_rounds });
                     } else {
                         self.carrying.clear();
                         self.carrying.extend(self.touches.iter().filter(|(id, _)| touch_missing(id)).copied());
@@ -7077,11 +7078,11 @@ impl<A: Allocator + Clone> Plain<A> {
             // Each key once: `reused` lists it with the one segment its lookup found.
             let Some((at, entry)) = self.swept_entry(segment, key) else {
                 // Not mapped here any more: nothing to carry from. The typed stop.
-                return self.commit_refused(StoreError::SweptUnder { key, segment }, roots);
+                return self.commit_refused(StoreError::SweptUnder { key, segment, phase: "an unavailable original entry", rounds: self.carry_rounds }, roots);
             };
             if ReservedTag::Pointer.is(entry.tag) {
                 // A pointer's carried value would read as its newest: not carried.
-                return self.commit_refused(StoreError::SweptUnder { key, segment }, roots);
+                return self.commit_refused(StoreError::SweptUnder { key, segment, phase: "a pointer selected for byte carry", rounds: self.carry_rounds }, roots);
             }
             if let Err(error) = out.put_known(&entry, self.maps[at].payload(&entry)) {
                 return self.commit_refused(error.into_store(entry.tag), roots);
@@ -7128,7 +7129,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 .filter(|(_, entry)| ReservedTag::Pointer.is(entry.tag))
                 .and_then(|(at, _)| self.maps.get(at));
             let Some(found) = found else {
-                missing = Some(StoreError::SweptUnder { key, segment });
+                missing = Some(StoreError::SweptUnder { key, segment, phase: "a pointer absent from the refreshed generation", rounds: self.carry_rounds });
                 break;
             };
             moved.push(((segment, key), (found.seg().id, key)));
