@@ -5813,8 +5813,9 @@ impl<'f> BodiesStage<'f> {
                     }
                 };
                 let file_outline = usize::try_from(outline_at).ok().and_then(|idx| handles.outlined.get(idx));
-                let read = match (records.file_now(0, file), NamesSource::edition_of(records, 0)) {
-                    (Some(text), Some(edition)) => {
+                let file_text = records.try_file_now(0, file);
+                let read = match (file_text.as_deref(), NamesSource::edition_of(records, 0)) {
+                    (Ok(text), Some(edition)) => {
                         let reused_view = file_outline
                             .filter(|one| one.edition == edition.byte())
                             .and_then(|one| one.made.as_ref().ok())
@@ -5990,7 +5991,11 @@ impl<'f> BodiesStage<'f> {
                     // function of the file's outline cell (`WHOLE`, which its text moves), the
                     // member's names cell (the records) and the graph's (the packs): the file
                     // edited, or the records made again, moves it.
-                    last.is = FileIs::Refused("its file's text could not be read through its crate's records");
+                    let why = match file_text {
+                        Err(error) => crate::engine_head_notes::leak(g, format_args!("its file's text could not be read through its crate's records: {error:?}")),
+                        Ok(_) => "its file's outline could not be read in its crate's edition",
+                    };
+                    last.is = FileIs::Refused(why);
                     last.reads = cells_of(&[own_name, file_name]);
                 }
             }
@@ -6004,10 +6009,15 @@ impl<'f> BodiesStage<'f> {
         // read as the record says, or the record stood a member they refuse. Its claims would then
         // not be a whole visit's (its entry and head subjects were the record's), so the setup
         // stops, naming the file (rule 3), never a body decided over the mix.
-        if let Some(claim) = member_files.iter().find(|claim| matches!(claim.is, FileIs::Refused(_)) && needed.contains(&claim.unit)) {
+        if let Some((task, why)) = member_files.iter().find_map(|claim| match claim.is {
+            FileIs::Refused(why) if needed.contains(&claim.unit) => Some((claim.file, why)),
+            _ => None,
+        }) {
+            let path = handles.outlined.binary_search_by_key(&task, |one| one.name).ok()
+                .and_then(|at| core::str::from_utf8(handles.outlined[at].path.as_slice()).ok());
             return Err(EngineCheckError::ReadyHost {
-                task: claim.file,
-                what: "a member taken from the members record below its heads was visited for an entered body no unit ranked before it holds, and its records refused this file: the record stood a member its records do not read (engine_bodies.rs `groups`, piece A)",
+                task,
+                what: crate::engine_head_notes::leak(g, format_args!("a member standing below its heads refused file {path:?}: {why} (engine_bodies.rs `groups`)")),
             }
             .into());
         }
