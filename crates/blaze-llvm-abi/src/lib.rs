@@ -113,5 +113,6 @@ unsafe extern "C" {
     pub fn LLVMDisposeTargetData(arg0: LLVMTargetDataRef);
     pub fn LLVMBlazeCreatePasses(arg0: LLVMTargetMachineRef) -> LLVMBlazePassesRef;
     pub fn LLVMBlazeDisposePasses(arg0: LLVMBlazePassesRef);
+    pub fn LLVMBlazeRequireDwarfUnwind(arg0: LLVMTargetMachineRef);
     pub fn LLVMBlazeRunPasses(arg0: LLVMBlazePassesRef, arg1: LLVMModuleRef, arg2: *const core::ffi::c_char, arg3: usize, arg4: LLVMBool) -> LLVMErrorRef;
 }

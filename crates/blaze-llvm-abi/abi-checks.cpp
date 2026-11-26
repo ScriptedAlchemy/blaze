@@ -28,6 +28,7 @@ static_assert(std::is_same_v<decltype(&LLVMSetDataLayout), void (*)(LLVMModuleRe
 static_assert(std::is_same_v<decltype(&LLVMDisposeTargetData), void (*)(LLVMTargetDataRef)>);
 static_assert(std::is_same_v<decltype(&LLVMBlazeCreatePasses), LLVMBlazePassesRef (*)(LLVMTargetMachineRef)>);
 static_assert(std::is_same_v<decltype(&LLVMBlazeDisposePasses), void (*)(LLVMBlazePassesRef)>);
+static_assert(std::is_same_v<decltype(&LLVMBlazeRequireDwarfUnwind), void (*)(LLVMTargetMachineRef)>);
 static_assert(std::is_same_v<decltype(&LLVMBlazeRunPasses), LLVMErrorRef (*)(LLVMBlazePassesRef, LLVMModuleRef, const char *, size_t, LLVMBool)>);
 static_assert(LLVMCodeGenLevelNone == 0);
 static_assert(LLVMCodeGenLevelLess == 1);

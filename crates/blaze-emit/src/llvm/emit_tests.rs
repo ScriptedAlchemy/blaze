@@ -30,6 +30,63 @@ fn machine() -> blaze_tier::Machine {
     blaze_tier::Machine { arch, os, features: 0 }
 }
 
+#[test]
+fn native_objects_import_llvm_unwind_for_each_landing() {
+    use blaze_code::unwind::Action;
+
+    let alloc = blaze_own::testing::heap().alloc();
+    for (kind, action) in [(BlockKind::Catch, Action::Catch), (BlockKind::Cleanup, Action::Cleanup), (BlockKind::Terminate, Action::Terminate)] {
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let ret = Param::of(Ty::I32);
+        let entry_sig = b.sig(Conv::C, Variadic::No, &[], &[ret]);
+        let call_sig = b.sig(Conv::C, Variadic::No, &[], &[]);
+        b.set_signature(entry_sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let normal = b.create_block(BlockKind::Normal);
+        let landing = b.create_block(kind);
+        let callee = b.reference(blaze_lir::func::RefKind::Func, 0);
+        b.begin(entry);
+        b.invoke(Flags::NONE, callee, call_sig, &[], normal, landing);
+        b.begin(normal);
+        b.call(Flags::NONE, callee, call_sig, &[]);
+        let value = b.iconst(Ty::I32, 7);
+        b.ret(&[value]);
+        b.begin(landing);
+        let exception = b.param(Ty::PTR);
+        match kind {
+            BlockKind::Catch => {
+                let value = b.iconst(Ty::I32, 42);
+                b.ret(&[value]);
+            }
+            BlockKind::Cleanup => {
+                b.call(Flags::NONE, callee, call_sig, &[]);
+                b.resume(exception);
+            }
+            BlockKind::Terminate => b.trap(123),
+            _ => unreachable!(),
+        }
+        let function = b.finish_verified().unwrap();
+        let module = prepare(Symbol([5; 32]), function.verified(), &ByPlace, alloc).unwrap();
+        for (os, data_align) in [(blaze_tier::Os::Linux, -4), (blaze_tier::Os::MacOs, -8)] {
+            let machine = blaze_tier::Machine { os, ..machine() };
+            let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 3, machine }, alloc).unwrap();
+            let view = CodeView::read(&emission.record).unwrap();
+            let unwind = blaze_code::unwind::read(view).unwrap();
+            let cfi = unwind.cfi().expect("LLVM's original PC-dependent frame rules");
+            assert!(unwind.has_lsda());
+            assert_eq!(cfi.code_align(), 1);
+            assert_eq!(cfi.data_align(), data_align);
+            assert!(usize::try_from(cfi.code_len()).unwrap() < view.code().len(), "import veneers are outside the LLVM FDE");
+            let landing = unwind.row(0);
+            assert_eq!(landing.action, action);
+            assert_eq!(landing.len, 4);
+            assert!(landing.landing < cfi.code_len());
+            let call = u32::from_le_bytes(view.code()[landing.start as usize..landing.start as usize + 4].try_into().unwrap());
+            assert_eq!(call & 0xfc00_0000, 0x9400_0000, "the LSDA still covers the relocated BL");
+        }
+    }
+}
+
 struct ByPlace;
 impl Names for ByPlace {
     fn name(&self, outside: Outside) -> Option<Named<'_>> {
@@ -93,6 +150,9 @@ fn release_record_reads_back() {
     assert_eq!(emission.backend, Backend::ReleaseBlob);
     assert_eq!(emission.symbol, Symbol([3; 32]));
     let view = CodeView::read(&emission.record).expect("the record reads");
+    let cfi = view.cfi().expect("the leaf has an authoritative FDE too");
+    assert!(!cfi.has_lsda());
+    assert_eq!(cfi.code_len() as usize, view.code().len());
     assert_eq!(view.targets(), 0, "the control function names nothing outside");
     assert_eq!(view.sites(), 0);
     assert_eq!(view.words(), 0);
@@ -324,7 +384,7 @@ fn a_c_link_name_cannot_call_the_break_intrinsic() {
 #[test]
 fn object_reader_refuses_an_unassigned_trap_id() {
     use super::{emit::EmitError, object::ReadError};
-    let ir = "declare void @llvm.aarch64.break(i32)\ndefine void @entry() {\n\
+    let ir = "declare void @llvm.aarch64.break(i32)\ndefine void @entry() uwtable {\n\
               call void @llvm.aarch64.break(i32 65535)\n  unreachable\n}\n";
     let module = object_fixture(ir);
     let error = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, Alloc::global()).err().unwrap();
@@ -373,7 +433,7 @@ fn native_call_and_tail_branch_execute_with_the_original_return_address() {
     let outside = std::format!("{}", super::LinkName(target));
     for tail in [false, true] {
         let ending = if tail { "ret i64 %v" } else { "%sum = add i64 %v, 7\n ret i64 %sum" };
-        let ir = std::format!("declare i64 @{outside}(i64)\ndefine i64 @entry(i64 %n) {{\n %v = tail call i64 @{outside}(i64 %n)\n {ending}\n}}\n");
+        let ir = std::format!("declare i64 @{outside}(i64)\ndefine i64 @entry(i64 %n) uwtable {{\n %v = tail call i64 @{outside}(i64 %n)\n {ending}\n}}\n");
         let mut module = object_fixture(&ir);
         module.references.push(Some(target));
         let made = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, Alloc::global()).unwrap();
@@ -457,7 +517,7 @@ fn native_objects_keep_local_offsets_data_addends_and_position_slots() {
 @{outside} = external global i8
 @d = private constant <{{ [8 x i8], ptr }}> <{{ [8 x i8] zeroinitializer, ptr getelementptr(i8, ptr @{outside}, i64 -7) }}>, align 8
 @blaze_pos_entry_0 = hidden externally_initialized global [1 x i32] zeroinitializer, align 4
-define i64 @entry() {{
+define i64 @entry() uwtable {{
   %p = load volatile ptr, ptr getelementptr(i8, ptr @d, i64 8), align 8
   %v = ptrtoint ptr %p to i64
   %line = load volatile i32, ptr @blaze_pos_entry_0, align 4
@@ -498,10 +558,11 @@ fn identity_names_the_schema_and_the_implementation_revision() {
     let real = identity(machine, 2);
     assert_eq!(real, identity(machine, 2), "identity is a pure function of its inputs");
     assert_ne!(real, identity(machine, 3), "the pipeline is material");
-    let mut other_magic = blaze_code::record::MAGIC;
-    other_magic[7] = b'8';
-    assert_ne!(real, identity_of(machine, 2, &other_magic, env!("BLAZE_EMIT_NATIVE_REVISION")), "the record schema is material");
-    assert_ne!(real, identity_of(machine, 2, &blaze_code::record::MAGIC, "a repaired reader"), "the implementation revision is material");
+    let magic = &blaze_code::record::CFI_MAGIC;
+    let revision = env!("BLAZE_EMIT_NATIVE_REVISION");
+    assert_eq!(real, identity_of(machine, 2, magic, revision));
+    assert_ne!(real, identity_of(machine, 2, &blaze_code::record::MAGIC, revision), "the record schema is material");
+    assert_ne!(real, identity_of(machine, 2, magic, "a repaired reader"), "the implementation revision is material");
     assert_eq!(env!("BLAZE_EMIT_NATIVE_REVISION").len(), 64, "build.rs hashes the implementation to 64 hex digits");
     assert!(env!("BLAZE_EMIT_NATIVE_REVISION").bytes().all(|b| b.is_ascii_hexdigit()));
 }

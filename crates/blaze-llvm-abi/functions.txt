@@ -25,4 +25,5 @@ LLVMSetDataLayout
 LLVMDisposeTargetData
 LLVMBlazeCreatePasses
 LLVMBlazeDisposePasses
+LLVMBlazeRequireDwarfUnwind
 LLVMBlazeRunPasses

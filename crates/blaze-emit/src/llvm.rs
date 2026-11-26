@@ -21,6 +21,7 @@ mod tls;
 mod traps;
 pub mod emit;
 pub mod object;
+mod object_unwind;
 #[cfg(test)]
 mod emit_tests;
 use abi::{LlType, Signature};

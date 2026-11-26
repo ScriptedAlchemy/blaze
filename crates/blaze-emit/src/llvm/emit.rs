@@ -2,7 +2,7 @@
 //!
 //! [`emit_release`] runs LLVM's own `O2` pipeline over the module the lowering lane's `prepare`
 //! made and emits it with LLVM's AArch64 code generator to an object file, which
-//! [`super::object::read`] turns into a sealed `bzcode07` record. [`emit_fold`] does the same
+//! [`super::object::read`] turns into a sealed machine-CFI record. [`emit_fold`] does the same
 //! for a folded group: one body and one thunk per other member. Both mint an [`Emission`] whose
 //! `backend` is `Some(..)`: the one place a record is named release or folded work, so a
 //! `--release` export claims only what LLVM actually made.
@@ -26,7 +26,7 @@ use blaze_own::{AVec, Alloc, CollectIn, FixedString};
 use blaze_pins::{LLVM_COMMIT, LLVM_VERSION};
 use blaze_tier::{Arch, Machine, Os};
 use blaze_llvm_abi::{
-    LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazePassesRef, LLVMBlazeRunPasses,
+    LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazePassesRef, LLVMBlazeRequireDwarfUnwind, LLVMBlazeRunPasses,
     LLVMCodeGenFileType, LLVMCodeGenOptLevel, LLVMCodeModel, LLVMContextCreate, LLVMContextDispose,
     LLVMContextRef, LLVMCopyStringRepOfTargetData, LLVMCreateMemoryBufferWithMemoryRangeCopy,
     LLVMCreateTargetDataLayout, LLVMCreateTargetMachine, LLVMDisposeErrorMessage,
@@ -69,7 +69,7 @@ const IDENTITY_DOMAIN: &str = "blaze-ladder native LLVM identity 1";
 /// any of these are different work, so the driver keys a recipe on this before any module
 /// exists.
 pub fn identity(machine: Machine, opt: u8) -> ContentId {
-    identity_of(machine, opt, &blaze_code::record::MAGIC, NATIVE_REVISION)
+    identity_of(machine, opt, &blaze_code::record::CFI_MAGIC, NATIVE_REVISION)
 }
 
 /// [`identity`] over the record schema and the implementation revision it is given, so a test
@@ -292,6 +292,9 @@ impl Session {
                 LLVMCodeModel::LLVMCodeModelSmall,
             )
         };
+        // SAFETY: this session owns the target machine and has not started code generation.
+        // Darwin must keep a DWARF FDE even for frames expressible in compact unwind form.
+        unsafe { LLVMBlazeRequireDwarfUnwind(machine_ref) };
         // The module's own triple and layout, from the target machine. The lowering lane's IR
         // has no module header (it starts at the first `define`), so without this the module
         // keeps an empty triple and the default layout: the pipeline would lay out for no

@@ -551,6 +551,12 @@ LLVMBlazeOpaquePasses *LLVMBlazeCreatePasses(LLVMTargetMachineRef Machine) {
 
 void LLVMBlazeDisposePasses(LLVMBlazeOpaquePasses *Passes) { delete Passes; }
 
+void LLVMBlazeRequireDwarfUnwind(LLVMTargetMachineRef Machine) {
+  auto &TM = *reinterpret_cast<TargetMachine *>(Machine);
+  if (TM.getTargetTriple().isOSBinFormatMachO())
+    TM.Options.MCOptions.EmitDwarfUnwind = EmitDwarfUnwindType::DwarfOnly;
+}
+
 /* Whether `Machine`'s target has a feature named `Name` (`Length` bytes), as rustc's
  * LLVMRustHasFeature asks: LLVM told a name it lacks only prints a warning and ignores it. */
 LLVMBool LLVMBlazeHasFeature(LLVMTargetMachineRef Machine, const char *Name, size_t Length) {

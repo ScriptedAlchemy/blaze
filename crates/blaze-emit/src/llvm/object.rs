@@ -19,7 +19,7 @@ use object::{
     BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionIndex, SectionKind, SymbolSection, elf, macho,
 };
 
-use super::{LlvmModule, traps::{Tag, Tags}};
+use super::{LlvmModule, object_unwind, traps::{Tag, Tags}};
 
 /// Why an object file could not be read back as a record.
 #[derive(Debug, PartialEq, Eq)]
@@ -49,6 +49,9 @@ pub enum ReadError {
     Writable { section: FixedString<32> },
     /// A recognized relocation whose operand or target cannot have the required meaning.
     Semantics { at: u64, what: &'static str },
+    /// The authoritative unwind information cannot be adopted into a code record.
+    Unwind { at: usize, what: &'static str },
+    UnwindCfi(blaze_code::unwind::cfi::CfiError),
     /// The record did not seal.
     Seal(RecordError),
 }
@@ -68,6 +71,8 @@ impl fmt::Display for ReadError {
             ReadError::AddressOfCode { at } => write!(f, "a constant at {at} holds an address of the code"),
             ReadError::Writable { section } => write!(f, "the code refers to the writable section {section}"),
             ReadError::Semantics { at, what } => write!(f, "native object relocation at {at}: {what}"),
+            ReadError::Unwind { at, what } => write!(f, "native object unwind data at {at:#x}: {what}"),
+            ReadError::UnwindCfi(error) => fmt::Display::fmt(error, f),
             ReadError::Seal(why) => write!(f, "the record did not seal: {why}"),
         }
     }
@@ -91,35 +96,53 @@ enum Destination {
 /// Reads `object` (what LLVM wrote for `module`) as a sealed code record in `alloc`.
 pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, tags: &Tags<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ReadError> {
     let file = object::File::parse(object).map_err(|_| ReadError::Object)?;
+    if file.kind() != object::ObjectKind::Relocatable {
+        return Err(ReadError::Unwind { at: 0, what: "unwind input must be a relocatable object" });
+    }
     if file.architecture() != object::Architecture::Aarch64 || !file.is_little_endian() {
         return Err(ReadError::Semantics { at: 0, what: "only little-endian AArch64 object code is supported" });
     }
     let name = function_name(module, alloc)?;
     let macho = file.format() == BinaryFormat::MachO;
-    let mut found: Option<(SectionIndex, u64)> = None;
+    if !macho && file.format() != BinaryFormat::Elf {
+        return Err(ReadError::Unwind { at: 0, what: "unsupported native unwind object format" });
+    }
+    let mut found = None;
     for symbol in file.symbols() {
         let (Ok(symbol_name), SymbolSection::Section(section)) = (symbol.name(), symbol.section()) else {
             continue;
         };
-        if plain(macho, symbol_name) == name {
-            found = Some((section, symbol.address()));
+        if symbol.kind() == object::SymbolKind::Text && plain(macho, symbol_name) == name {
+            if found.is_some() {
+                return Err(ReadError::Unwind { at: 0, what: "function symbol has multiple definitions" });
+            }
+            found = Some((section, symbol.address(), symbol.size()));
         }
     }
-    let (text, address) = found.ok_or(ReadError::NoFunction)?;
+    let (text, address, symbol_size) = found.ok_or(ReadError::NoFunction)?;
     let section = file.section_by_index(text).map_err(|_| ReadError::NoSection)?;
-    let range = atom(&file, text, address)?;
+    let bound = atom(&file, &section, address, symbol_size)?;
+    let unwind = object_unwind::find(&file, text, bound.clone(), alloc)?;
+    let range = bound.start..bound.start + unwind.extent();
     let start = usize::try_from(range.start).map_err(|_| ReadError::CodeOutside)?;
     let end = usize::try_from(range.end).map_err(|_| ReadError::CodeOutside)?;
-    let code = section.data().map_err(|_| ReadError::CodeOutside)?.get(start..end).ok_or(ReadError::CodeOutside)?;
+    let contents = section.data().map_err(|_| ReadError::CodeOutside)?;
+    let code = contents.get(start..end).ok_or(ReadError::CodeOutside)?;
+    if range.end < bound.end {
+        let bound_end = usize::try_from(bound.end).map_err(|_| ReadError::CodeOutside)?;
+        let tail = contents.get(end..bound_end).ok_or(ReadError::CodeOutside)?;
+        let (words, rest) = tail.as_chunks::<4>();
+        let padding = rest.is_empty() && words.iter().all(|&word| matches!(u32::from_le_bytes(word), 0 | 0xd503_201f));
+        if !padding || section.relocations().any(|(at, _)| (range.end..bound.end).contains(&at)) {
+            return Err(ReadError::Unwind { at: end, what: "function symbol has non-padding text beyond its FDE" });
+        }
+    }
 
     let mut record = CodeRecord::new_in(alloc);
     record.code.extend_from_slice(code);
     record.code_align = align_of(section.align()).max(blaze_code::record::LEAST_CODE_ALIGN);
     record.relro_align = blaze_code::record::LEAST_RELRO_ALIGN;
-    // The frame word: LLVM's own prologue sizes it, which the record's form does not read
-    // (the SOTA tier's `frame` is its pass's); a release record keeps the convention of the
-    // tier it stands in for, so the launcher's trap reporting finds the frame.
-    record.frame = 0;
+    unwind.write(&file, &mut record)?;
     for symbol in file.symbols().filter(|symbol| symbol.is_undefined()) {
         let symbol_name = plain(macho, symbol.name().map_err(|_| ReadError::Object)?);
         if module.references.iter().flatten().chain(module.implicit_references.iter()).any(|target| target.space == Space::Outside && target.symbol == blaze_code::record::Symbol::of_name(symbol_name)) {
@@ -219,25 +242,27 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, tags: &Tags<'_>, 
 
 /// Where in `text`, a section of a Mach-O object, the code of the function whose symbol is at
 /// `address` is: up to the next symbol there, or the end of the section.
-fn atom(file: &object::File<'_>, text: SectionIndex, address: u64) -> Result<core::ops::Range<u64>, ReadError> {
-    let section = file.section_by_index(text).map_err(|_| ReadError::NoSection)?;
+fn atom(file: &object::File<'_>, section: &object::Section<'_, '_>, address: u64, size: u64) -> Result<core::ops::Range<u64>, ReadError> {
+    let start = address.checked_sub(section.address()).ok_or(ReadError::CodeOutside)?;
     if file.format() == BinaryFormat::Elf {
-        if let Some(size) = file.symbols().find(|symbol| symbol.section() == SymbolSection::Section(text) && symbol.address() == address && symbol.kind() == object::SymbolKind::Text && symbol.size() != 0).map(|symbol| symbol.size()) {
-            let start = address.checked_sub(section.address()).ok_or(ReadError::CodeOutside)?;
-            let end = start.checked_add(size).filter(|end| *end <= section.size()).ok_or(ReadError::CodeOutside)?;
-            return Ok(start..end);
+        if size == 0 {
+            return Err(ReadError::Unwind { at: 0, what: "ELF function symbol has no extent" });
         }
+        let end = start.checked_add(size).filter(|&end| end <= section.size()).ok_or(ReadError::CodeOutside)?;
+        return Ok(start..end);
     }
     let next = file
         .symbols()
-        .filter(|it| it.section() == SymbolSection::Section(text) && it.address() > address)
+        .filter(|it| it.section() == SymbolSection::Section(section.index()) && it.address() > address)
         .filter(|it| it.kind() == object::SymbolKind::Text)
         .filter(|it| it.name().is_ok_and(|name| !name.starts_with(['l', 'L'])))
         .map(|it| it.address())
         .min();
-    let end = next.unwrap_or(section.address() + section.size());
-    let start = address.checked_sub(section.address()).ok_or(ReadError::CodeOutside)?;
-    Ok(start..end - section.address())
+    let end = next.map_or(section.size(), |end| end - section.address());
+    if start >= end || end > section.size() {
+        return Err(ReadError::CodeOutside);
+    }
+    Ok(start..end)
 }
 
 /// A defined symbol carries its offset even if it is global. Undefined symbols alone name
