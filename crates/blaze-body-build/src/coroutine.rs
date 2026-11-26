@@ -24,7 +24,7 @@ use blaze_body::{Block as BodyBlock, BlockKind as BodyKind, Local, LocalKind, Ve
 use blaze_build::coroutine_state::LaidState;
 use blaze_build::layout::{LayoutCx, LayoutId, Layouts, Variants};
 use blaze_build::{
-    Abi, Adts, AsyncItems, Built, BuiltCoroutine, CoroutineOf, Instance, Panic, StateShape, Subst, abi,
+    Abi, Adts, AsyncItems, Built, BuiltCoroutine, CoroutineOf, Instance, Panic, PanicConst, StateShape, Subst, abi,
     coroutine_identity, coroutine_of, ground, niche_of,
 };
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
@@ -524,12 +524,13 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// Emits the two finished-state panic blocks (`Panics { returned, panicked }`) for
     /// `blaze_lir::coroutine::split_with` / `split_in` when the library declares those lang items.
     fn coroutine_panics(&mut self) -> Result<Panics, BuildError> {
-        let returned = self.finished_panic_block("panic_const_async_fn_resumed")?;
-        let panicked = self.finished_panic_block("panic_const_async_fn_resumed_panic")?;
+        let returned = self.finished_panic_block(PanicConst::AsyncFnResumed)?;
+        let panicked = self.finished_panic_block(PanicConst::AsyncFnResumedAfterPanic)?;
         Ok(Panics { returned, panicked })
     }
 
-    fn finished_panic_block(&mut self, name: &'static str) -> Result<Option<Block>, BuildError> {
+    fn finished_panic_block(&mut self, panic: PanicConst) -> Result<Option<Block>, BuildError> {
+        let name = panic.lang();
         let Some(item) = self.adts.lang_fn(name) else {
             return Ok(None);
         };

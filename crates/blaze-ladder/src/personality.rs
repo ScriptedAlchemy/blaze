@@ -7,7 +7,7 @@
 //! `Placed::personality`), so the run's parent tells the program which slot it is
 //! (blaze-launch's run wire, `Down::Personality`) and the program's run mode writes that slot's
 //! entry thunk into every entry it makes. The walk takes the fn as a root: nothing calls it; the
-//! system's unwinder does, through the pointer (crate::seam's [`FnLang::ALL`] holds it, and
+//! system's unwinder does, through the pointer (crate::seam's [`FnLang::all`] holds it, and
 //! front2/reach.rs queues every fn of that list the program's world declares).
 //!
 //! A program built `panic = "abort"` lands nowhere (blaze-build `Panic::Abort` builds no

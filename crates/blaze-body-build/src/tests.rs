@@ -75,7 +75,7 @@ impl Adts for World {
     fn lang_fn(&self, name: &str) -> Option<ItemKey> {
         match name {
             "panic_cannot_unwind" => Some(CANNOT_UNWIND),
-            n if blaze_build::PanicConst::ALL.iter().any(|p| p.lang() == n) => Some(PANIC),
+            n if blaze_build::PanicConst::ARITHMETIC.iter().any(|p| p.lang() == n) => Some(PANIC),
             _ => None,
         }
     }
@@ -473,7 +473,7 @@ impl Adts for RichWorld<'_> {
     fn lang_fn(&self, name: &str) -> Option<ItemKey> {
         match name {
             "panic_cannot_unwind" => Some(CANNOT_UNWIND),
-            n if blaze_build::PanicConst::ALL.iter().any(|p| p.lang() == n) => Some(PANIC),
+            n if blaze_build::PanicConst::ARITHMETIC.iter().any(|p| p.lang() == n) => Some(PANIC),
             _ => None,
         }
     }

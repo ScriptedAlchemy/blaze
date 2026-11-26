@@ -48,7 +48,7 @@ use blaze_typeck::{BinOp, ExprId, List};
 use super::{Callee, PTR_BITS, Walk};
 use crate::{BuildError, Instance};
 
-/// A failed arithmetic check: which of the pinned core's `panic_const_*` lang fns it calls.
+/// A compiler-generated assertion's entry point in the pinned core's `panic_const!` list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanicConst {
     AddOverflow,
@@ -61,12 +61,13 @@ pub enum PanicConst {
     ShlOverflow,
     DivByZero,
     RemByZero,
+    AsyncFnResumed,
+    AsyncFnResumedAfterPanic,
 }
 
 impl PanicConst {
-    /// Every check's entry point: a front end tables each one the program declares, as it
-    /// tables `panic_bounds_check`.
-    pub const ALL: [PanicConst; 10] = [
+    /// Entry points for arithmetic assertions.
+    pub const ARITHMETIC: [PanicConst; 10] = [
         PanicConst::AddOverflow,
         PanicConst::SubOverflow,
         PanicConst::MulOverflow,
@@ -78,6 +79,9 @@ impl PanicConst {
         PanicConst::DivByZero,
         PanicConst::RemByZero,
     ];
+
+    /// Entry points for polling a finished coroutine.
+    pub const COROUTINE: [PanicConst; 2] = [PanicConst::AsyncFnResumed, PanicConst::AsyncFnResumedAfterPanic];
 
     /// Its `#[lang = ".."]` name (the pinned core's `panic_const!` list).
     pub const fn lang(self) -> &'static str {
@@ -97,6 +101,8 @@ impl PanicConst {
             PanicConst::ShlOverflow => &["panic_const_shl_overflow"],
             PanicConst::DivByZero => &["panic_const_div_by_zero"],
             PanicConst::RemByZero => &["panic_const_rem_by_zero"],
+            PanicConst::AsyncFnResumed => &["panic_const_async_fn_resumed"],
+            PanicConst::AsyncFnResumedAfterPanic => &["panic_const_async_fn_resumed_panic"],
         }
     }
 }

@@ -885,7 +885,7 @@ impl Adts for TestAdts<'_> {
             "panic_cannot_unwind" => self.world.cannot_unwind,
             // The arithmetic checks' entry points (walk/arith_checks.rs): one fn for all; no
             // test of this world reaches one (tests/arith_panics.rs runs them).
-            n if crate::PanicConst::ALL.iter().any(|p| p.lang() == n) => Some(PANIC_CONST),
+            n if crate::PanicConst::ARITHMETIC.iter().any(|p| p.lang() == n) => Some(PANIC_CONST),
             _ => None,
         }
     }

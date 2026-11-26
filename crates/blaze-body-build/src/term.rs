@@ -1312,8 +1312,8 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
             AssertKind::DivisionByZero => PanicConst::DivByZero.lang(),
             AssertKind::RemainderByZero => PanicConst::RemByZero.lang(),
             AssertKind::Bounds => return self.bounds_panic(msg, unwind),
-            AssertKind::ResumedAfterReturn => "panic_const_async_fn_resumed",
-            AssertKind::ResumedAfterPanic => "panic_const_async_fn_resumed_panic",
+            AssertKind::ResumedAfterReturn => PanicConst::AsyncFnResumed.lang(),
+            AssertKind::ResumedAfterPanic => PanicConst::AsyncFnResumedAfterPanic.lang(),
         };
         let (instance, may_unwind) = self.lang_instance(lang_name, &[])?;
         let loc = self.caller_arg(instance, lang_name)?;

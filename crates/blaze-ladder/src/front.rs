@@ -60,8 +60,7 @@ pub enum FnLang {
     PanicBoundsCheck,
     /// `#[lang = "drop_in_place"]`: what a drop calls; its instances are built as drop glue.
     DropInPlace,
-    /// `#[lang = "panic_const_*"]`: what a failed arithmetic check calls (blaze-build
-    /// walk/arith_checks.rs).
+    /// `#[lang = "panic_const_*"]`: what a compiler-generated assertion calls.
     PanicConst(blaze_build::PanicConst),
     /// `#[lang = "eh_personality"]`: the personality routine every unwind entry's CIE names
     /// (std/src/sys/personality/gcc.rs `rust_eh_personality`); reached by no call, called by

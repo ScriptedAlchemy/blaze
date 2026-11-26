@@ -19,7 +19,7 @@
 //!
 //! The entry points are the pinned core's (library/core/src/panicking.rs `pub mod
 //! panic_const`): each `-> !`, so a test cannot return from one. Each run is a forked child:
-//! a host entry point ends the child with its own status (`10 + PanicConst::ALL` index), a
+//! a host entry point ends the child with its own status (`10 + PanicConst::ARITHMETIC` index), a
 //! returned value is written to a pipe; the parent reads which.
 //!
 //! The program, at `T` and an operator drawn:
@@ -51,7 +51,7 @@ use crate::{Abi, Adts, Built, PanicConst, Planted, Subst};
 struct World {
     fx: Fx,
     main: ItemKey,
-    /// One fn per entry point, in [`PanicConst::ALL`]'s order.
+    /// One fn per entry point, in [`PanicConst::ARITHMETIC`]'s order.
     panics: StdVec<ItemKey>,
 }
 
@@ -62,7 +62,7 @@ fn world() -> World {
     let i64_ = fx.ty(PNode::Int(IntTy::I64));
     let never = fx.ty(PNode::Never);
     let main = fx.func("main", 0, &[], i64_, StdVec::new());
-    let panics = PanicConst::ALL.iter().map(|p| fx.func(p.lang(), 0, &[], never, StdVec::new())).collect();
+    let panics = PanicConst::ARITHMETIC.iter().map(|p| fx.func(p.lang(), 0, &[], never, StdVec::new())).collect();
     fx.finish();
     World { fx, main, panics }
 }
@@ -117,7 +117,7 @@ impl Adts for ArithAdts<'_> {
     }
 
     fn lang_fn(&self, name: &str) -> Option<ItemKey> {
-        PanicConst::ALL.iter().position(|p| p.lang() == name).map(|at| self.w.panics[at])
+        PanicConst::ARITHMETIC.iter().position(|p| p.lang() == name).map(|at| self.w.panics[at])
     }
 
     fn overflow_checks(&self) -> crate::OverflowChecks {
@@ -373,7 +373,7 @@ macro_rules! host_panics {
                 unsafe { _exit(PANICKED + $at) }
             }
         )+
-        /// The host fns, in [`PanicConst::ALL`]'s order.
+        /// The host fns, in [`PanicConst::ARITHMETIC`]'s order.
         const HOSTS: [extern "C" fn(); 10] = [$($name),+];
     };
 }
@@ -446,7 +446,7 @@ fn run(w: &World, form: Form, t: Int, a: u128, b: u128, s: Setting) -> Result<En
     }
     match (status >> 8) & 0xff {
         RETURNED if got == 8 => Ok(End::Value(i64::from_le_bytes(bytes))),
-        code if (PANICKED..PANICKED + 10).contains(&code) => Ok(End::Panic(PanicConst::ALL[(code - PANICKED) as usize])),
+        code if (PANICKED..PANICKED + 10).contains(&code) => Ok(End::Panic(PanicConst::ARITHMETIC[(code - PANICKED) as usize])),
         code => Err(format!("the child ended with status {code} (read {got} bytes)")),
     }
 }

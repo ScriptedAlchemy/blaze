@@ -783,11 +783,14 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 self.adt_row(lib, k)?;
             }
         }
-        // The trait fns an `.await` and a coroutine's entries call, which the body's callees do
+        let fns = ["into_future", "poll", "coroutine_resume"]
+            .into_iter()
+            .chain(blaze_build::PanicConst::COROUTINE.map(blaze_build::PanicConst::lang));
+        // The fns an `.await` and a coroutine's entries call, which the body's callees do
         // not list (the builder makes those calls, blaze-build coroutine.rs, by the keys the
         // seam's `lang_named` gives): each one's head made, so the build reads its ABI from it
         // (`fn_abi`: no row, the head's). A head not filed under that key is refused by name.
-        for name in ["into_future", "poll", "coroutine_resume"] {
+        for name in fns.clone() {
             let Some(lib) = self.front.index.lang(name) else { continue };
             // The key the seam's `lang_named` and `lang_item` give (keys.rs `asked_key`): a
             // trait's fn is filed under its member key, not its library key's first bytes.
@@ -817,7 +820,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         }
         // Each one's row, as a callee's: the build resolves the call it makes by the fn's row
         // (`fn_index`), a trait's fn tabled as declared, as `check_one_key` tables a callee.
-        for name in ["into_future", "poll", "coroutine_resume"] {
+        for name in fns {
             let Some(lib) = self.front.index.lang(name) else { continue };
             let k = crate::front2::keys::asked_key(self.front.names, lib);
             if !self.store.fns.contains_key(&k) {

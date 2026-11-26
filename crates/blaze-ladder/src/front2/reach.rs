@@ -215,7 +215,7 @@ pub struct Census<'n> {
     /// call, a path through a type, a trait's fn, a qualified path): not followed.
     pub not_followed: usize,
     /// Each step the walk took, as (the fn whose reading queued it, the fn queued), in the
-    /// order queued; a fn the builder calls on its own account (FnLang::ALL, drop glue's
+    /// order queued; a fn the builder calls on its own account (FnLang::all, drop glue's
     /// `Drop::drop`, an overloaded index, a held future's `poll`) is queued from [`AMBIENT`],
     /// and an impl fn an instance resolves to from the trait's fn decided at the call. What a
     /// test's static reach is read from (program/suite.rs `Suite::reach_of`, test.md piece 13).
@@ -529,7 +529,7 @@ fn queue_targets(r: &mut Records<'_, '_>, scope: &BodyScope<'_>, owner: ItemKey,
 }
 
 /// Walks from `first`'s callees (`first` checked as `owner` at `scope`) and from each fn the
-/// back half calls on its own account ([`FnLang::ALL`], the seam's one list) that the
+/// back half calls on its own account ([`FnLang::all`], the seam's one list) that the
 /// program's world declares: each fn once, its own callees queued when it checks.
 /// A body that did not check (`first` unchecked, or one met on the way) is no dead end: what it
 /// calls by name is walked too ([`queue_by_name`]), so the walk visits every fn reachable.
@@ -553,7 +553,7 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
         seen.insert(s.owner, ());
     }
     let mut queue: Vec<(ItemKey, Option<Reached>), Global> = Vec::new_in(Global);
-    for l in FnLang::ALL {
+    for l in FnLang::all() {
         let Some(lib) = r.index.fn_lang(l) else { continue };
         queue.push(match r.keys.item(lib) {
             Ok(k) => (k, None),

@@ -1,7 +1,7 @@
 //! What the code builder calls on its own account for what a reached body WRITES, queued by
 //! the walk ([`super::reach::reach`]) on demand, so every fn the build asks for was checked and
 //! tabled first. The builder's own list of always-possible calls (a panic, drop glue) is the
-//! seam's [`crate::front::FnLang::ALL`], queued for every program; what is here is queued only
+//! seam's [`crate::front::FnLang::all`], queued for every program; what is here is queued only
 //! when a reached body needs it:
 //!
 //! - a `format_args!` placeholder: core's `rt::Argument` constructor for its trait

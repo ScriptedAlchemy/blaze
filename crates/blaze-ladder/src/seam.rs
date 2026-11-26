@@ -41,22 +41,11 @@ pub use blaze_build::PositionGap;
 /// the one list both front ends answer from, so each tables the same set. A front end that
 /// tables only what it walks starts its walk at each one the program's world declares.
 impl FnLang {
-    pub const ALL: [FnLang; 14] = [
-        FnLang::PanicBoundsCheck,
-        FnLang::DropInPlace,
-        FnLang::EhPersonality,
-        FnLang::PanicCannotUnwind,
-        FnLang::PanicConst(PanicConst::AddOverflow),
-        FnLang::PanicConst(PanicConst::SubOverflow),
-        FnLang::PanicConst(PanicConst::MulOverflow),
-        FnLang::PanicConst(PanicConst::DivOverflow),
-        FnLang::PanicConst(PanicConst::RemOverflow),
-        FnLang::PanicConst(PanicConst::NegOverflow),
-        FnLang::PanicConst(PanicConst::ShrOverflow),
-        FnLang::PanicConst(PanicConst::ShlOverflow),
-        FnLang::PanicConst(PanicConst::DivByZero),
-        FnLang::PanicConst(PanicConst::RemByZero),
-    ];
+    pub fn all() -> impl Iterator<Item = FnLang> {
+        [Self::PanicBoundsCheck, Self::DropInPlace, Self::EhPersonality, Self::PanicCannotUnwind]
+            .into_iter()
+            .chain(PanicConst::ARITHMETIC.into_iter().chain(PanicConst::COROUTINE).map(Self::PanicConst))
+    }
 
     /// Its `#[lang = ".."]` name.
     pub const fn lang(self) -> &'static str {
@@ -70,7 +59,7 @@ impl FnLang {
     }
 
     pub fn named(lang: &str) -> Option<FnLang> {
-        FnLang::ALL.into_iter().find(|l| l.lang() == lang)
+        Self::all().find(|l| l.lang() == lang)
     }
 
     /// The `#[lang = ".."]` names a library declares this fn under, the pinned core's first.

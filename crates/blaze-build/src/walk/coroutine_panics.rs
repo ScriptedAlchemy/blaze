@@ -21,26 +21,21 @@ use blaze_lir::{Block, Flags};
 use blaze_typeck::List;
 
 use super::Walk;
-use crate::{BuildError, Instance};
-
-/// The library's panic of a poll after completion.
-pub(crate) const RESUMED: &str = "panic_const_async_fn_resumed";
-/// The library's panic of a poll after a poll that unwound.
-pub(crate) const RESUMED_PANIC: &str = "panic_const_async_fn_resumed_panic";
+use crate::{BuildError, Instance, PanicConst};
 
 impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The two finished-state blocks of the coroutine body being built, after
     /// [`Self::run_coroutine`]: no edge of the body leads to either.
     pub(super) fn coroutine_panics(&mut self) -> Result<Panics, BuildError> {
-        let returned = self.finished_block(RESUMED)?;
-        let panicked = self.finished_block(RESUMED_PANIC)?;
+        let returned = self.finished_block(PanicConst::AsyncFnResumed)?;
+        let panicked = self.finished_block(PanicConst::AsyncFnResumedAfterPanic)?;
         Ok(Panics { returned, panicked })
     }
 
     /// A block calling the library's lang fn `name` and never returning, if the library
     /// declares it.
-    fn finished_block(&mut self, name: &'static str) -> Result<Option<Block>, BuildError> {
-        let Some(item) = self.adts.lang_fn(name) else {
+    fn finished_block(&mut self, panic: PanicConst) -> Result<Option<Block>, BuildError> {
+        let Some(item) = self.adts.lang_fn(panic.lang()) else {
             return Ok(None);
         };
         let block = self.create();
