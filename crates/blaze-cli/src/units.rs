@@ -201,21 +201,20 @@ pub fn lay<'f, 'l>(
                 let Some(made) = made.take() else { return Err(CliError::Text { what: "a member's units were not made in the layout's dependency order (units.rs `deps_first`)" }) };
                 root_made.parts.push(Part { name: made.name, locate: Locate::Source(member_source(&made)), place: 0 });
                 members.push((made.name, made));
-                // A member proc-macro crate's files, whole: its module key holds them, so they are
-                // in the units' source (macro_files.rs, rule 21), each file and folder with its
-                // stamp, so the next sweep proves the crate unchanged by stats alone (rule 77).
-                if member.lib.iter().any(|lib| lib.proc_macro) {
+                // Proc-macro modules and deferred C requests need the same package snapshot.
+                // The next sweep can prove unchanged files and folders from their stamps.
+                if member.build.is_some() || member.lib.iter().any(|lib| lib.proc_macro) {
                     crate::macro_files::read_row(&cx, root, stamps, member.dir.as_str(), rows, frame)?;
                 }
             }
             // Non-member path packages: keep each target root's edition for the file walk and
-            // track proc-macro source trees in the sweep leaf table (rule 21).
+            // track build-script and proc-macro source trees in the sweep leaf table.
             for pkg in units.path_packages.iter() {
                 let edition = syntax_of(pkg.edition.syntax).byte();
                 for target in pkg.lib.iter().chain(pkg.bins.iter()).chain(pkg.build.iter()) {
                     path_roots.push((frame.alloc_str(target.root.as_str()), edition));
                 }
-                if pkg.lib.iter().any(|lib| lib.proc_macro) {
+                if pkg.build.is_some() || pkg.lib.iter().any(|lib| lib.proc_macro) {
                     crate::macro_files::read_row(&cx, root, stamps, pkg.dir.as_str(), rows, frame)?;
                 }
             }

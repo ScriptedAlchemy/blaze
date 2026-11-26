@@ -831,6 +831,8 @@ pub(crate) struct Standing<'r, 'm> {
     pub(crate) status: Status,
     /// The edge's handles: where the command runs and with what.
     pub(crate) checkout: &'r Dir<ReadWrite>,
+    /// The checked file identities for this answer, including packages with build scripts.
+    pub(crate) leaves: &'r sweep::Leaves<'m>,
     pub(crate) place: Place<'r>,
     pub(crate) toolchain: blaze_toolchain::ToolchainId,
     pub(crate) tools: [blaze_drive::Tool; blaze_drive::key::KINDS],
@@ -2237,6 +2239,7 @@ fn check_and_open<R>(
                     errors,
                     status: checked.status,
                     checkout: root,
+                    leaves: &pointer.leaves,
                     place,
                     toolchain,
                     tools: crate::home::tools(producers, crate::lints::Lints::NONE.rules),
