@@ -29,7 +29,6 @@ impl fmt::Debug for CliExit {
 enum CommandError {
     Usage,
     InvalidNumber { argument: &'static str, source: ParseIntError },
-    MachineFull,
     Carrier(blaze_dist_local::Error),
     Io(IoError),
 }
@@ -39,7 +38,6 @@ impl fmt::Display for CommandError {
         match self {
             Self::Usage => f.write_str(USAGE),
             Self::InvalidNumber { argument, source } => write!(f, "invalid {argument}: {source}"),
-            Self::MachineFull => f.write_str("the machine has no room"),
             Self::Carrier(source) => write!(f, "{source}"),
             Self::Io(source) => write!(f, "{source}"),
         }
@@ -92,8 +90,7 @@ fn coordinate(args: &[String<WireAlloc>], alloc: WireAlloc) -> Result<(), Comman
             .map_err(|source| CommandError::InvalidNumber { argument: "LEASE_MS", source })?,
         None => defaults.lease_ms,
     };
-    let need = blaze_dist_local::agent::NEED;
-    let mut admission = Admission::new(
+    let mut admission = Admission::for_pull_workers(
         AdmissionConfig {
             queue_limit: 1 << 16,
             busy_retry_ms: 100,
@@ -110,9 +107,6 @@ fn coordinate(args: &[String<WireAlloc>], alloc: WireAlloc) -> Result<(), Comman
             disk: u64::from(executors),
         },
     );
-    for _ in 0..executors {
-        admission.add_builder(0, "machine", need.clone(), alloc).ok_or(CommandError::MachineFull)?;
-    }
     let jobs = Jobs::new(
         admission,
         ExecutionConfig {
@@ -121,7 +115,8 @@ fn coordinate(args: &[String<WireAlloc>], alloc: WireAlloc) -> Result<(), Comman
             ..Default::default()
         },
         alloc,
-    );
+    )
+    .start_on_claim();
     let stop = Arc::new_in(AtomicBool::new(false), alloc);
     let server = Server::bind(
         path,

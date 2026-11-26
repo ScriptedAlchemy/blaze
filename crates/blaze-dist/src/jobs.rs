@@ -398,7 +398,6 @@ impl Execution {
             }
         }
         self.lead_heard = now;
-        self.heard.insert(WireString::from_str_in(lead, self.alloc), now);
         let mut log = Vec::new_in(out.allocator().clone());
         match &mut self.work {
             None => {
@@ -535,7 +534,10 @@ impl Execution {
         req: &WorkLeaseRequest,
         out: &mut Vec<Effect, impl Allocator + Clone>,
     ) -> Result<WorkLeaseAnswer, Refusal> {
-        self.work_call(now, from, req.attempt, out, |work, log| work.lease(now, from, req, log))
+        let executors = 1 + self.helpers.len();
+        self.work_call(now, from, req.attempt, out, |work, log| {
+            work.lease_among(now, from, req, executors, log)
+        })
     }
 
     /// `POST /v1/work/result`.
@@ -991,6 +993,7 @@ pub struct Jobs {
     platforms: BTreeMap<ExecutionId, (Digest, Reservation), WireAlloc>,
     pr_jobs: BTreeMap<u64, PrJobs, WireAlloc>,
     assignments: BTreeMap<WireString, Assignment, WireAlloc>,
+    starts_on_claim: bool,
     next_execution: u64,
     next_subscriber: u64,
 }
@@ -1018,9 +1021,17 @@ impl Jobs {
             platforms: BTreeMap::new_in(alloc),
             pr_jobs: BTreeMap::new_in(alloc),
             assignments: BTreeMap::new_in(alloc),
+            starts_on_claim: false,
             next_execution: 1,
             next_subscriber: 1,
         }
+    }
+
+    /// For a driver that starts workers on claim and only reports assignment effects.
+    /// Unclaimed reservations that received no worker calls have no process to stop.
+    pub fn start_on_claim(mut self) -> Self {
+        self.starts_on_claim = true;
+        self
     }
 
     /// Seed the execution and subscriber counters from a daemon instance identity, so a
@@ -1549,11 +1560,10 @@ impl Jobs {
             let namespace = e.namespace.clone();
             let mut except = Vec::new_in(out.allocator().clone());
             except.extend(e.executors().chain(e.lost.iter().map(WireString::as_str)));
-            let Some(helper) = self.admission.idle_for(&namespace, &platform, &need, &except)
+            let Some(helper) = self.admission.offer(now, &namespace, &platform, &need, &except, self.alloc)
             else {
                 continue;
             };
-            let helper = WireString::from_str_in(helper, self.alloc);
             drop(except);
             let Some(e) = self.executions.get_mut(&id) else { continue };
             let Ok(attempt) = e.add_helper(now, helper.as_str()) else { continue };
@@ -1567,12 +1577,21 @@ impl Jobs {
         }
     }
 
-    fn track_stop(&mut self, effect: &Effect) {
+    fn track_stop(&mut self, now: Millis, effect: &Effect) {
         if let Effect::Kill { executor, assignment } = effect
             && let Some(held) = self.assignments.get_mut(executor.as_str())
             && held.token == *assignment
         {
             held.stopping = true;
+            if self.starts_on_claim
+                && held.claimant.is_none()
+                && self
+                    .executions
+                    .get(&assignment.execution)
+                    .is_some_and(|e| !e.heard.contains_key(executor.as_str()))
+            {
+                self.killed(now, executor.as_str(), *assignment, true);
+            }
         }
     }
 
@@ -1638,8 +1657,7 @@ impl Jobs {
                     .map(|name| String::from_str_in(name.as_str(), out.allocator().clone()))
                     .or_else(|| {
                         self.admission
-                            .idle_for(&namespace, &platform, &need, &except)
-                            .map(|name| String::from_str_in(name, out.allocator().clone()))
+                            .offer(now, &namespace, &platform, &need, &except, out.allocator().clone())
                     });
                 drop(except);
                 let mut more = Vec::new_in(out.allocator().clone());
@@ -1668,12 +1686,12 @@ impl Jobs {
                 }
                 out.push((id, effect));
                 for effect in more {
-                    self.track_stop(&effect);
+                    self.track_stop(now, &effect);
                     out.push((id, effect));
                 }
                 continue;
             }
-            self.track_stop(&effect);
+            self.track_stop(now, &effect);
             out.push((id, effect));
         }
         let Some(e) = self.executions.get(&id) else { return };

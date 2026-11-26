@@ -206,6 +206,7 @@ pub struct Admission {
     /// Rebuilds that wait for their old builder to drain: the old one and the new reservation.
     rebuilds: BTreeMap<WireString, Reservation, WireAlloc>,
     next_executor: u64,
+    pull_slots: bool,
 }
 
 fn fits(used: &Reservation, add: &Reservation, capacity: &Reservation) -> bool {
@@ -230,7 +231,14 @@ impl Admission {
             queues: BTreeMap::new_in(alloc),
             rebuilds: BTreeMap::new_in(alloc),
             next_executor: 1,
+            pull_slots: false,
         }
+    }
+
+    /// A local pull coordinator has no resident builders. Its slots reserve room for one
+    /// assignment in the requesting namespace until that assignment's stop is acknowledged.
+    pub fn for_pull_workers(config: AdmissionConfig, alloc: WireAlloc) -> Self {
+        Self { pull_slots: true, ..Self::new(config, alloc) }
     }
 
     /// A machine and its declared capacity.
@@ -403,36 +411,40 @@ impl Admission {
         job: &Waiting,
         alloc: A,
     ) -> Option<(Box<str, A>, bool)> {
-        // An idle executor runs it only within what it reserved: a job never runs past its
-        // executor's share of the machine.
-        let idle = self.executors.values().find(|e| {
-            e.phase == ExecutorPhase::Ready
-                && e.busy.is_none()
-                && e.namespace == job.namespace
-                && covers(&e.reservation, &job.need)
-                && self.machines.get(e.machine.as_str()).is_some_and(|m| m.platform == job.platform)
-        });
-        if let Some(e) = idle {
-            return Some((box_str(e.id.as_str(), alloc), false));
+        if let Some(id) = self.idle_for(&job.namespace, &job.platform, &job.need, &[]) {
+            return Some((box_str(id, alloc), false));
         }
-        if job.namespace == Namespace::Main {
-            // Persistent builders are started by the operator, never on demand for a job.
+        if job.namespace == Namespace::Main && !self.pull_slots {
+            // Persistent Main builders are started by the operator.
             return None;
         }
-        let mut machines = Vec::new_in(alloc.clone());
-        machines.extend(
-            self.machines
-                .iter()
-                .filter(|(_, m)| m.platform == job.platform)
-                .map(|(name, _)| box_str(name.as_str(), alloc.clone())),
-        );
-        machines
-            .iter()
-            .find_map(|machine| {
-                self.create(now, machine, job.namespace.clone(), job.need.clone())
-                    .map(|id| box_str(id, alloc.clone()))
-            })
-            .map(|id| (id, true))
+        self.create_for(now, &job.namespace, &job.platform, &job.need)
+            .map(|id| (box_str(id, alloc), true))
+    }
+
+    fn create_for(
+        &mut self, now: Millis, namespace: &Namespace, platform: &Digest, need: &Reservation,
+    ) -> Option<&str> {
+        let (name, _) = self.machines.iter().find(|(name, machine)| {
+            machine.platform == *platform && fits(&self.used(name.as_str()), need, &machine.capacity)
+        })?;
+        let name = WireString::from_str_in(name.as_str(), self.alloc);
+        self.create(now, name.as_str(), namespace.clone(), need.clone())
+    }
+
+    /// A helper or replacement for this assignment. A local pull worker reserves its own
+    /// slot on demand, within the same machine budget as all other namespaces.
+    pub(crate) fn offer<A: Allocator>(
+        &mut self, now: Millis, namespace: &Namespace, platform: &Digest, need: &Reservation,
+        except: &[&str], alloc: A,
+    ) -> Option<String<A>> {
+        if let Some(id) = self.idle_for(namespace, platform, need, except) {
+            return Some(String::from_str_in(id, alloc));
+        }
+        if !self.pull_slots {
+            return None;
+        }
+        self.create_for(now, namespace, platform, need).map(|id| String::from_str_in(id, alloc))
     }
 
     /// Another idle executor of `namespace` on `platform` that covers `need`, for a
@@ -480,6 +492,10 @@ impl Admission {
         if e.busy != Some((execution, attempt)) {
             return;
         }
+        if self.pull_slots {
+            self.executors.remove(executor);
+            return;
+        }
         e.busy = None;
         e.idle_since = now;
         if e.phase == ExecutorPhase::Draining {
@@ -490,6 +506,10 @@ impl Admission {
 
     /// The executor died or was killed: its reservation is free.
     pub fn lost(&mut self, now: Millis, executor: &str) {
+        if self.pull_slots {
+            self.executors.remove(executor);
+            return;
+        }
         if let Some(e) = self.executors.get_mut(executor) {
             e.phase = ExecutorPhase::Stopped;
             e.busy = None;
@@ -511,6 +531,11 @@ impl Admission {
             {
                 e.phase = ExecutorPhase::Stopped;
                 gone.push((box_str(e.id.as_str(), alloc.clone()), e.busy.take()));
+            }
+        }
+        if self.pull_slots {
+            for (id, _) in &gone {
+                self.executors.remove(id.as_ref());
             }
         }
         gone

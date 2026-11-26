@@ -758,11 +758,7 @@ fn an_idle_builder_is_assigned_as_a_helper_and_both_workers_lease() {
         &admission.add_builder(0, "machine", reservation(), alloc).unwrap(),
         alloc,
     );
-    let config = ExecutionConfig {
-        work: blaze_dist::work::WorkConfig { grant_roots: 1, ..Default::default() },
-        ..Default::default()
-    };
-    let mut jobs = Jobs::new(admission, config, alloc);
+    let mut jobs = Jobs::new(admission, ExecutionConfig::default(), alloc);
     let mut out = Vec::new_in(alloc);
     let id = jobs.submit(0, &request(7), reservation(), &mut out).unwrap().execution;
     out.clear();
@@ -800,7 +796,6 @@ fn an_idle_builder_is_assigned_as_a_helper_and_both_workers_lease() {
         .unwrap()
     };
     join(&mut jobs, lead.as_str());
-    join(&mut jobs, helper.as_str());
     let lease = |jobs: &mut Jobs, who: &str| {
         jobs.lease(0, who, &WorkLeaseRequest { execution: id, attempt }, &mut Vec::new_in(alloc))
             .unwrap()
@@ -808,36 +803,107 @@ fn an_idle_builder_is_assigned_as_a_helper_and_both_workers_lease() {
             .unwrap()
     };
     let first = lease(&mut jobs, lead.as_str());
+    // The lead's first request may arrive before the assigned helper joins.
+    join(&mut jobs, helper.as_str());
     let second = lease(&mut jobs, helper.as_str());
     assert_eq!(first.roots.as_slice(), &[(0, 1)]);
     assert_eq!(second.roots.as_slice(), &[(1, 2)]);
-    for (who, grant, tag) in [(lead.as_str(), &first, 9u8), (helper.as_str(), &second, 10u8)] {
-        jobs.result(
-            0,
-            who,
-            &BatchResult {
-                lease: grant.lease.clone(),
-                seq: 1,
-                items: vec_in![
-                    alloc;
-                    ItemResult {
-                        name: WorkName([tag; 32]),
-                        outcome: ItemOutcome::Local(Why {
-                            why: WireString::from_str_in("fixture", alloc),
-                        }),
-                        found: Set::empty_in(alloc),
-                        unnamed: Set::empty_in(alloc),
-                    }
-                ],
-                packs: Vec::new_in(alloc),
-                returned_roots: Set::empty_in(alloc),
-                returned_names: Set::empty_in(alloc),
-            },
-            &mut Vec::new_in(alloc),
-        )
-        .unwrap();
+    for (who, grant) in [(lead.as_str(), &first), (helper.as_str(), &second)] {
+        jobs.result(0, who, &local_root_result(grant, alloc), &mut out).unwrap();
     }
     assert!(jobs.execution(id).unwrap().work().unwrap().is_done());
+}
+
+fn local_root_result(grant: &blaze_wire::Grant, alloc: WireAlloc) -> BatchResult {
+    let ranges = blaze_dist::Ranges::from_wire(&grant.roots, alloc).unwrap();
+    let items = Vec::from_iter_in(
+        ranges.indexes().map(|idx| ItemResult {
+            name: WorkName([u8::try_from(idx).unwrap(); 32]),
+            outcome: ItemOutcome::Local(Why { why: WireString::from_str_in("fixture", alloc) }),
+            found: Set::empty_in(alloc),
+            unnamed: Set::empty_in(alloc),
+        }),
+        alloc,
+    );
+    BatchResult {
+        lease: grant.lease.clone(),
+        seq: 1,
+        items,
+        packs: Vec::new_in(alloc),
+        returned_roots: Set::empty_in(alloc),
+        returned_names: Set::empty_in(alloc),
+    }
+}
+
+#[test]
+fn absent_assignments_and_an_expired_late_helper_do_not_strand_roots() {
+    let alloc = heap();
+    let mut config = ExecutionConfig::default();
+    config.work.lease_ms = 10;
+    config.completion = blaze_dist::jobs::CompletionMode::PublishedWork;
+    let mut log = Vec::new_in(alloc);
+    let mut e = Execution::new(
+        0,
+        ExecutionId(1),
+        JobContent([1; 32]),
+        Namespace::Main,
+        subscriber(1, 100_000),
+        config,
+        alloc,
+        &mut log,
+    );
+    e.assign(0, "lead", &["late", "absent-a", "absent-b", "absent-c"], &mut log).unwrap();
+    let attempt = e.attempt();
+    let join = WorkJoinRequest {
+        execution: e.id,
+        attempt,
+        roots: RootSet {
+            spec: [1; 32],
+            roots: [2; 32],
+            count: 12,
+            index: [3; 32],
+            inputs: [4; 32],
+        },
+        rejected: Set::empty_in(alloc),
+    };
+    let lease = WorkLeaseRequest { execution: e.id, attempt };
+    e.join(0, "lead", &join, &mut log).unwrap();
+
+    // Several reserved helpers never start. The lead can finish a substantial batch before
+    // any helper joins. A late holder gets its own part of the remaining work immediately.
+    let first = e.lease(0, "lead", &lease, &mut log).unwrap().grant.unwrap();
+    assert_eq!(first.roots.as_slice(), &[(0, 6)]);
+    e.result(1, "lead", &local_root_result(&first, alloc), &mut log).unwrap();
+    e.join(2, "late", &join, &mut log).unwrap();
+    let late = e.lease(2, "late", &lease, &mut log).unwrap().grant.unwrap();
+    assert_eq!(late.roots.as_slice(), &[(6, 8)]);
+    let mut committed = Vec::from_iter_in(0..6, alloc);
+    // Take everything available while the late holder is silent, then its expired roots.
+    for now in [5, 13] {
+        while let Some(grant) = e.lease(now, "lead", &lease, &mut log).unwrap().grant {
+            let roots = blaze_dist::Ranges::from_wire(&grant.roots, alloc).unwrap();
+            committed.extend(roots.indexes());
+            e.result(now, "lead", &local_root_result(&grant, alloc), &mut log).unwrap();
+        }
+        if now == 5 {
+            assert_eq!(committed.as_slice(), &[0, 1, 2, 3, 4, 5, 8, 9, 10, 11]);
+            assert!(e.commit_publication(now, "lead", attempt, &[], &mut log).is_err());
+        }
+    }
+    committed.sort_unstable();
+    assert!(committed.into_iter().eq(0..12));
+    assert_eq!(
+        e.result(13, "late", &local_root_result(&late, alloc), &mut log),
+        Err(blaze_dist::Refusal::DeadLease),
+    );
+    e.commit_publication(13, "lead", attempt, &[], &mut log).unwrap();
+    e.commit_publication(13, "lead", attempt, &[], &mut log).unwrap();
+    assert_eq!(
+        e.stages().iter().filter(|(stage, _)| *stage == blaze_wire::Stage::Published).count(),
+        1
+    );
+    e.deliver_publication(14, &[], &mut log).unwrap();
+    assert_eq!(e.state(), ExecState::Ended(Outcome::Passed));
 }
 
 /// Execution ids seeded from a daemon epoch: two daemons never issue the same first
@@ -971,6 +1037,37 @@ mod claim {
         if let Some(second) = second {
             assert_ne!(first.as_str(), second.0, "one claimant per executor");
         }
+    }
+
+    #[test]
+    fn pull_workers_reuse_an_unstarted_reservation_but_acknowledge_claimed_stops() {
+        let alloc = heap();
+        let (jobs, first) = started(3, alloc);
+        let mut jobs = jobs.start_on_claim();
+        let mut out = Vec::new_in(alloc);
+        let (lead, attempt) = jobs.claim(1, first, [1; 32], &mut out).unwrap().unwrap();
+        let lead = WireString::from_str_in(lead, alloc);
+        let token = super::AssignmentToken { execution: first, attempt };
+        jobs.tick(1, &mut out);
+        let direct = jobs.execution(first).unwrap().executors().find(|&e| e != lead.as_str()).unwrap();
+        let direct = WireString::from_str_in(direct, alloc);
+        let heartbeat = super::WorkersEventsRequest { execution: first, attempt, events: Vec::new_in(alloc) };
+        jobs.worker_events(1, direct.as_str(), &heartbeat, &mut out).unwrap();
+        let subscriber = jobs.execution(first).unwrap().subscribers().next().unwrap().id;
+        jobs.unsubscribe(2, first, subscriber, &mut out).unwrap();
+        let need = Reservation { memory: 1, cpus: 1, disk: 1 };
+        let next = jobs.submit(3, &super::request(7), need, &mut out).unwrap().execution;
+        let (other, _) =
+            jobs.claim(3, next, [2; 32], &mut out).unwrap().expect("unstarted helper was released");
+        let other = WireString::from_str_in(other, alloc);
+        assert_ne!(other, lead);
+        assert_ne!(other, direct);
+        assert!(!jobs.killed(3, other.as_str(), token, true));
+        assert!(jobs.claim(3, next, [3; 32], &mut out).unwrap().is_none());
+        assert!(jobs.killed(4, lead.as_str(), token, true));
+        assert_eq!(jobs.claim(4, next, [3; 32], &mut out).unwrap().unwrap().0, lead.as_str());
+        assert!(!jobs.killed(5, lead.as_str(), token, true));
+        assert!(jobs.killed(5, direct.as_str(), token, true));
     }
 
     #[test]
