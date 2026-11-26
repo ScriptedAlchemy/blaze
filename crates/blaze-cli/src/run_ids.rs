@@ -120,6 +120,7 @@ const TOOLCHAIN_FACT_DOMAIN: &str = "blaze-cli run ids toolchain fact 1";
 const TOOLCHAIN_BODY_DOMAIN: &str = "blaze-cli run ids toolchain body 1";
 const LOCKED_FACT_DOMAIN: &str = "blaze-cli run ids locked crate fact 1";
 const LOCKED_DIGEST_DOMAIN: &str = "blaze-cli run ids locked crate digest 1";
+pub(crate) const CHECKOUT_DEP_DIGEST_DOMAIN: &str = "blaze-cli run ids checkout dep digest 1";
 const LOCKED_BODY_DOMAIN: &str = "blaze-cli run ids locked body 1";
 const DRIVE_FACT_DOMAIN: &str = "blaze-cli run ids drive read 1";
 const DRIVE_CELL_FACT_DOMAIN: &str = "blaze-cli run ids drive cell read 1";
@@ -132,6 +133,16 @@ const BODY_PROOF_DIGEST_DOMAIN: &str = "blaze-cli run ids body proof digest 1";
 /// locked body's key holds each one's tool, so a changed checker is another key (rule 21), as
 /// it is for a workspace body through its `BodyCheck` task key.
 const CHECK_KINDS: [Kind; 5] = [Kind::BodyCheck, Kind::Signature, Kind::CrateScope, Kind::Expansion, Kind::MacroModule];
+
+/// The check's producers digest (`CHECK_KINDS`' tools), shared by `RunIds::build_scoped` and
+/// `RunIds::matches_build` (rule 30).
+fn producers_of(tools: &[Tool; blaze_drive::key::KINDS]) -> ContentId {
+    let mut h = Hasher::new(PRODUCERS_DOMAIN);
+    for kind in CHECK_KINDS {
+        h.update(&[kind as u8]).id(&tools[kind.index()].0);
+    }
+    h.finish()
+}
 
 /// The one fact a toolchain body reads: the toolchain. Its digest today is the toolchain's id.
 pub(crate) fn toolchain_fact() -> [u8; 32] {
@@ -161,8 +172,11 @@ fn prefix_of(item: ItemKey) -> [u8; 8] {
 pub(crate) enum Place {
     /// A toolchain crate, its root in a pack on the toolchain's shelf.
     Toolchain,
-    /// Its root is in the checkout (tree 0).
+    /// A workspace member crate, its root in the checkout (tree 0).
     Checkout,
+    /// A non-member dependency whose root is in the checkout (tree 0), such as a `[patch.crates-io]`
+    /// vendor crate: no `BodyCheck` rows, keyed coarsely by its `CrateScope` and observed file digests.
+    CheckoutDep,
     /// Its root is in a fetched package's pack: the sources store's key and its files' BLAKE3.
     Fetched { source: ContentId, files: [u8; 32] },
     /// None of those: `why`.
@@ -195,8 +209,11 @@ impl<'n> CrateTable<'n> for CrateList<'n> {
         CrateGraph::name(self, at)
     }
     fn place(&self, at: usize) -> Place {
-        if self.member(at) || self.root(at).starts_with("/0/") {
+        if self.member(at) {
             return Place::Checkout;
+        }
+        if self.root(at).starts_with("/0/") {
+            return Place::CheckoutDep;
         }
         let Some(k) = tree_of(self.root(at)) else { return Place::Unplaced { why: "its root names no tree (`/<k>/...`)" } };
         let Some(tree) = self.tree(k) else { return Place::Unplaced { why: "its root's tree is not in the crate list's tree table" } };
@@ -557,6 +574,13 @@ pub(crate) trait Answer: Today {
         known: Option<(ContentId, Name)>,
         out: &mut BodyScratch<'_>,
     ) -> Result<Option<BodyFacts>, RunIdsError<'static>>;
+
+    /// The content digest of a non-member checkout crate's inputs (`CrateScope` out plus the
+    /// `WHOLE`/`DATA` digests of every file and observation its `CrateScope` row recorded), for
+    /// [`Place::CheckoutDep`]. `Ok(None)`: the command does not know `scope` today.
+    fn checkout_dep_digest(&self, _scope: Name, _alloc: Alloc<'_>) -> Result<Option<[u8; 32]>, RunIdsError<'static>> {
+        Ok(None)
+    }
 }
 
 /// The record of `name` at store key `at`, opened whole and handed to `seen` part by part, then
@@ -584,12 +608,26 @@ pub(crate) fn open_record(
     }
 }
 
+/// Tells the incremental `RunIds` walk which names' rows and records are proven bit-for-bit
+/// identical to `previous` (e.g., their engine answer page key in `prev_root` equals `curr_root`,
+/// and for a `FileItems` name its `Answer::skipped` flag is unchanged too).
+///
+/// Returning `false` is always sound (causes `name` to be queried fresh from `answer`).
+/// Returning `true` when any input of `name` moved is a soundness bug (rule 21).
+pub(crate) trait ReuseOracle {
+    fn unchanged(&self, name: Name) -> bool;
+}
+
 /// The workspace bodies of the answer, each a [`WorkspaceBody`], and the tree walked to find
 /// them (the edges [`RunIds`] keeps, so the next forward walk crosses what it did not reach).
 pub(crate) struct Walked<'a> {
     pub(crate) bodies: AVec<'a, WorkspaceBody>,
     /// Sorted, one each ([`Edge`]'s order is the FORM's row order).
     pub(crate) edges: AVec<'a, Edge>,
+    /// Parallel to `bodies`: the `(key, checked)` already fetched from `Answer::body` (or copied
+    /// from `previous`) during the walk, so [`RunIds::from_walked`] avoids opening every
+    /// `BodyCheck`/`Signature` record a second time.
+    pub(crate) facts: AVec<'a, (ContentId, Checked)>,
 }
 
 /// One edge of the walked tree (finding 12): a record the walk crossed, or a part its record
@@ -655,12 +693,13 @@ pub(crate) struct UnitRoot {
 }
 
 /// Every member unit of `list` (its root in the checkout, tree 0) as a [`UnitRoot`], in the
-/// list's order, in `alloc`. A member whose root is not a checkout path (`/0/...`) is refused by
-/// name ([`RunIdsError::UnitRootOutside`]), never given another file.
-pub(crate) fn unit_roots<'n, 'a>(list: &CrateList<'n>, alloc: Alloc<'a>) -> Result<AVec<'a, UnitRoot>, RunIdsError<'n>> {
+/// list's order, in `alloc`. When `scoped` is `Some`, only active member units in that closure
+/// are returned. A member whose root is not a checkout path (`/0/...`) is refused by name
+/// ([`RunIdsError::UnitRootOutside`]), never given another file.
+pub(crate) fn unit_roots_scoped<'n, 'a>(list: &CrateList<'n>, scoped: Option<&crate::engine_check::ScopedUnits>, alloc: Alloc<'a>) -> Result<AVec<'a, UnitRoot>, RunIdsError<'n>> {
     let mut units: AVec<'a, UnitRoot> = Vec::new_in(alloc);
     for at in 0..CrateGraph::len(list) {
-        if !list.member(at) {
+        if !list.member(at) || scoped.is_some_and(|s| !s.allows(at)) {
             continue;
         }
         let root = list.root(at);
@@ -669,6 +708,11 @@ pub(crate) fn unit_roots<'n, 'a>(list: &CrateList<'n>, alloc: Alloc<'a>) -> Resu
         units.push(UnitRoot { root: Name::file(path.as_bytes()), view: crate::engine_body_plan::unit_view(list, at), prefix: key.prefix() });
     }
     Ok(units)
+}
+
+/// Every member unit of `list` (whole workspace).
+pub(crate) fn unit_roots<'n, 'a>(list: &CrateList<'n>, alloc: Alloc<'a>) -> Result<AVec<'a, UnitRoot>, RunIdsError<'n>> {
+    unit_roots_scoped(list, None, alloc)
 }
 
 /// The parts `edges` (sorted) list under the walked record `parent`.
@@ -775,14 +819,29 @@ fn views_of<'a>(edges: &[Edge], units: &[UnitRoot], alloc: Alloc<'a>) -> AVec<'a
 /// (O(names log names)); a record it does not know is a binary search of `previous`'s edges.
 /// The views: one point read of the answer per (body, unit reaching its file) ([`views_of`]),
 /// a store get for each that has a row.
+/// Which roots [`workspace_of_scoped`] starts its walk from: whole-workspace starts at
+/// `Name::units()`, scoped starts directly at the active member units' crate roots.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WalkFrom {
+    Workspace,
+    UnitRoots,
+}
+
 pub(crate) fn workspace_of<'a>(cx: &Cx, answer: &mut dyn Answer, tool: Tool, units: &[UnitRoot], previous: Option<&RunIds<'_>>, alloc: Alloc<'a>) -> Result<Walked<'a>, RunIdsError<'static>> {
+    workspace_of_scoped(cx, answer, tool, units, WalkFrom::Workspace, previous, alloc)
+}
+
+pub(crate) fn workspace_of_scoped<'a>(cx: &Cx, answer: &mut dyn Answer, tool: Tool, units: &[UnitRoot], from: WalkFrom, previous: Option<&RunIds<'_>>, alloc: Alloc<'a>) -> Result<Walked<'a>, RunIdsError<'static>> {
     let _cx = cx.span("run ids: the workspace bodies of the answer");
     let mut edges: AVec<'a, Edge> = Vec::new_in(alloc);
     let mut visited: AVec<'a, Name> = Vec::new_in(alloc);
     let mut frontier: AVec<'a, Name> = Vec::new_in(alloc);
     let mut next: AVec<'a, Name> = Vec::new_in(alloc);
     let mut checks: AVec<'a, Name> = Vec::new_in(alloc);
-    frontier.push(Name::units());
+    match from {
+        WalkFrom::Workspace => frontier.push(Name::units()),
+        WalkFrom::UnitRoots => frontier.extend(units.iter().map(|unit| unit.root)),
+    }
     while !frontier.is_empty() {
         frontier.sort_unstable();
         frontier.dedup();
@@ -838,25 +897,45 @@ pub(crate) fn workspace_of<'a>(cx: &Cx, answer: &mut dyn Answer, tool: Tool, uni
 
     // Each check's rows: its payload's keys, or `previous`'s rows of it.
     let mut bodies: AVec<'a, WorkspaceBody> = Vec::new_in(alloc);
-    let mut carried: Option<AVec<'a, WorkspaceBody>> = None;
+    let mut facts: AVec<'a, (ContentId, Checked)> = Vec::new_in(alloc);
+    let mut carried: Option<AVec<'a, BodyRow>> = None;
     let mut scratch = BodyScratch::new(alloc);
     for check in checks.iter().copied() {
         if let Some(held) = answer.body(cx, check, tool, None, &mut scratch)? {
             for item in scratch.covers.iter().copied() {
+                if from == WalkFrom::UnitRoots && !units.iter().any(|unit| unit.prefix == prefix_of(item)) {
+                    // Under a scoped walk, a plain row reused from a whole-workspace answer may
+                    // cover an out-of-scope holder of the same file (e.g. a non-test bin unit when
+                    // running `blaze test --bin`); skip keys outside the active member units.
+                    continue;
+                }
                 bodies.push(WorkspaceBody { item, check, text: held.text, file: held.file });
+                facts.push((held.key, held.checked));
             }
+            continue;
+        }
+        if from == WalkFrom::UnitRoots && check.kind == Kind::BodyCheck && previous.is_none() {
+            // Under a scoped check, cfg-aware planning (D191 `plan_views`) plans zero rows for a
+            // body cut by every active unit reaching its file (e.g. an inline `#[cfg(test)]` fn in
+            // a library dependency whose test harness is out of scope). Omitting it here is
+            // fail-closed: any call to an unlisted body is refused at runtime (`NotRunnable::NoRow`).
             continue;
         }
         let Some(previous) = previous else { return Err(RunIdsError::NotWalked { name: check }) };
         // `previous`'s rows by check, made once, on the first check this walk did not reach.
         let by_check = carried.get_or_insert_with(|| {
-            let mut rows = previous.workspace_rows(alloc);
+            let mut rows = previous.body_rows(alloc);
             rows.sort_unstable_by_key(|row| (row.check, row.item));
             rows
         });
-        let from = by_check.partition_point(|row| row.check < check);
-        let to = by_check.partition_point(|row| row.check <= check);
-        bodies.extend_from_slice(&by_check[from..to]);
+        let lo = by_check.partition_point(|row| row.check < check);
+        let hi = by_check.partition_point(|row| row.check <= check);
+        if let Some(slice) = by_check.get(lo..hi) {
+            for row in slice {
+                bodies.push(WorkspaceBody { item: row.item, check: row.check, text: row.text, file: row.file });
+                facts.push((row.key, row.checked));
+            }
+        }
     }
 
     // Each unit's rows at its view (D191; the doc's second half).
@@ -868,21 +947,233 @@ pub(crate) fn workspace_of<'a>(cx: &Cx, answer: &mut dyn Answer, tool: Tool, uni
                     return Err(RunIdsError::ViewOfAnotherUnit { check: view, unit: prefix, covered });
                 }
                 bodies.push(WorkspaceBody { item, check: view, text: held.text, file: held.file });
+                facts.push((held.key, held.checked));
             }
             continue;
         }
         // Not known today: the last table's rows under this view's name stand, if it has any.
         let Some(previous) = previous else { continue };
         let by_check = carried.get_or_insert_with(|| {
-            let mut rows = previous.workspace_rows(alloc);
+            let mut rows = previous.body_rows(alloc);
             rows.sort_unstable_by_key(|row| (row.check, row.item));
             rows
         });
-        let from = by_check.partition_point(|row| row.check < view);
-        let to = by_check.partition_point(|row| row.check <= view);
-        bodies.extend_from_slice(&by_check[from..to]);
+        let lo = by_check.partition_point(|row| row.check < view);
+        let hi = by_check.partition_point(|row| row.check <= view);
+        if let Some(slice) = by_check.get(lo..hi) {
+            for row in slice {
+                bodies.push(WorkspaceBody { item: row.item, check: row.check, text: row.text, file: row.file });
+                facts.push((row.key, row.checked));
+            }
+        }
     }
-    Ok(Walked { bodies, edges })
+    Ok(Walked { bodies, edges, facts })
+}
+
+/// Incremental delta walk over a complete standing `answer` when a prior `RunIds` (`previous`,
+/// built for the exact same `from`, `units`, `toolchain`, and `tools`) and a [`ReuseOracle`] are
+/// available:
+/// - Any `Units` / `FileItems` record proven unchanged by `reuse` AND walked in `previous` reuses
+///   `previous.children(parent)` directly without opening its CAS record.
+/// - Any plain `BodyCheck` / `Signature` check or unit view proven unchanged by `reuse` AND
+///   present in `previous`'s walked edges/views reuses its `BodyRow`s verbatim from
+///   `previous.bodies` (including 0-row checks such as `fn`/`trait` signatures or failed checks)
+///   without calling `Answer::body` or opening its CAS record.
+/// - Every changed or newly-reached record/check is queried fresh from `answer` with the exact
+///   same rules as [`workspace_of_scoped`] with `previous = None`, guaranteeing byte-identical
+///   `RunIds` output (rules 21, 25, 26).
+#[expect(clippy::too_many_arguments, reason = "incremental delta walk takes the standing answer, prior table, and reuse oracle")]
+pub(crate) fn workspace_of_delta<'a>(
+    cx: &Cx,
+    answer: &mut dyn Answer,
+    tool: Tool,
+    units: &[UnitRoot],
+    from: WalkFrom,
+    previous: &RunIds<'_>,
+    reuse: &dyn ReuseOracle,
+    alloc: Alloc<'a>,
+) -> Result<Walked<'a>, RunIdsError<'static>> {
+    let _cx = cx.span("run ids: incremental workspace bodies delta");
+    let mut edges: AVec<'a, Edge> = Vec::new_in(alloc);
+    let mut visited: AVec<'a, Name> = Vec::new_in(alloc);
+    let mut frontier: AVec<'a, Name> = Vec::new_in(alloc);
+    let mut next: AVec<'a, Name> = Vec::new_in(alloc);
+    let mut checks: AVec<'a, Name> = Vec::new_in(alloc);
+    match from {
+        WalkFrom::Workspace => frontier.push(Name::units()),
+        WalkFrom::UnitRoots => frontier.extend(units.iter().map(|unit| unit.root)),
+    }
+    while !frontier.is_empty() {
+        frontier.sort_unstable();
+        frontier.dedup();
+        frontier.retain(|name| visited.binary_search(name).is_err());
+        frontier.retain(|name| !(name.kind == Kind::FileItems && answer.skipped(*name)));
+        if visited.len() + frontier.len() > MOST_WALKED {
+            return Err(RunIdsError::TooManyWalked { most: MOST_WALKED });
+        }
+        for parent in frontier.iter().copied() {
+            edges.push(Edge::Walked(parent));
+            let mut child = |name: Name, edges: &mut AVec<'a, Edge>| match name.kind {
+                Kind::Units | Kind::FileItems => {
+                    edges.push(Edge::of_pair((parent, name)));
+                    next.push(name);
+                }
+                Kind::BodyCheck | Kind::Signature => {
+                    edges.push(Edge::of_pair((parent, name)));
+                    checks.push(name);
+                }
+                _ => {}
+            };
+            if reuse.unchanged(parent)
+                && let Some(children) = previous.children(parent)
+            {
+                for name in children {
+                    child(name, &mut edges);
+                }
+                continue;
+            }
+            let known = answer.open(cx, parent, &mut |seen| {
+                if let Seen::Part(part) = seen
+                    && !matches!(part.locate, blaze_drive::Locate::File { edition: blaze_drive::record::DATA_FILE })
+                {
+                    child(part.name, &mut edges);
+                }
+                Ok(())
+            })?;
+            if !known {
+                return Err(RunIdsError::NotWalked { name: parent });
+            }
+        }
+        visited.extend(frontier.iter().copied());
+        visited.sort_unstable();
+        core::mem::swap(&mut frontier, &mut next);
+        next.clear();
+    }
+    edges.sort_unstable();
+    edges.dedup();
+    checks.sort_unstable();
+    checks.dedup();
+
+    let views = views_of(&edges, units, alloc);
+    let same_edges = edges.as_slice() == previous.edges;
+    let mut bodies: AVec<'a, WorkspaceBody> = Vec::with_capacity_in(previous.bodies.len() / BODY_ROW, alloc);
+    let mut facts: AVec<'a, (ContentId, Checked)> = Vec::with_capacity_in(previous.bodies.len() / BODY_ROW, alloc);
+    let mut scratch = BodyScratch::new(alloc);
+
+    if same_edges {
+        // Common 1-line body edit: module/item tree is identical to `previous`, so every plain
+        // check and every unit view was already walked by `previous`. Copy every standing row
+        // directly from `previous.bodies` and query `answer.body` ONLY for changed checks.
+        for check in checks.iter().copied() {
+            if reuse.unchanged(check) {
+                continue;
+            }
+            if let Some(held) = answer.body(cx, check, tool, None, &mut scratch)? {
+                for item in scratch.covers.iter().copied() {
+                    if from == WalkFrom::UnitRoots && !units.iter().any(|unit| unit.prefix == prefix_of(item)) {
+                        continue;
+                    }
+                    bodies.push(WorkspaceBody { item, check, text: held.text, file: held.file });
+                    facts.push((held.key, held.checked));
+                }
+                continue;
+            }
+            if from == WalkFrom::UnitRoots && check.kind == Kind::BodyCheck {
+                continue;
+            }
+            return Err(RunIdsError::NotWalked { name: check });
+        }
+        for (view, prefix) in views.iter().copied() {
+            if reuse.unchanged(view) {
+                continue;
+            }
+            if let Some(held) = answer.body(cx, view, tool, None, &mut scratch)? {
+                for item in scratch.covers.iter().copied() {
+                    let covered = prefix_of(item);
+                    if covered != prefix {
+                        return Err(RunIdsError::ViewOfAnotherUnit { check: view, unit: prefix, covered });
+                    }
+                    bodies.push(WorkspaceBody { item, check: view, text: held.text, file: held.file });
+                    facts.push((held.key, held.checked));
+                }
+            }
+        }
+        for (b, checked) in previous.bodies.chunks_exact(BODY_ROW).zip(previous.verdicts.iter().copied()) {
+            let row = body_row(b, checked);
+            if reuse.unchanged(row.check)
+                && (checks.binary_search(&row.check).is_ok()
+                    || views.binary_search_by_key(&row.check, |(v, _)| *v).is_ok())
+            {
+                bodies.push(WorkspaceBody { item: row.item, check: row.check, text: row.text, file: row.file });
+                facts.push((row.key, row.checked));
+            }
+        }
+    } else {
+        // Tree changed (item or module added/removed, or `PLACE_SKIPPED` toggled): reuse a check
+        // only when BOTH `reuse.unchanged(check)` AND `previous` actually walked that exact check
+        // or `(view, prefix)`.
+        let mut prev_plain_checks: AVec<'a, Name> = Vec::new_in(alloc);
+        for edge in previous.edges.iter().copied() {
+            if let Edge::Part { child, .. } = edge
+                && matches!(child.kind, Kind::BodyCheck | Kind::Signature)
+            {
+                prev_plain_checks.push(child);
+            }
+        }
+        prev_plain_checks.sort_unstable();
+        prev_plain_checks.dedup();
+        let prev_views = views_of(previous.edges, units, alloc);
+        let mut reused_checks: AVec<'a, Name> = Vec::new_in(alloc);
+
+        for check in checks.iter().copied() {
+            if reuse.unchanged(check) && prev_plain_checks.binary_search(&check).is_ok() {
+                reused_checks.push(check);
+                continue;
+            }
+            if let Some(held) = answer.body(cx, check, tool, None, &mut scratch)? {
+                for item in scratch.covers.iter().copied() {
+                    if from == WalkFrom::UnitRoots && !units.iter().any(|unit| unit.prefix == prefix_of(item)) {
+                        continue;
+                    }
+                    bodies.push(WorkspaceBody { item, check, text: held.text, file: held.file });
+                    facts.push((held.key, held.checked));
+                }
+                continue;
+            }
+            if from == WalkFrom::UnitRoots && check.kind == Kind::BodyCheck {
+                continue;
+            }
+            return Err(RunIdsError::NotWalked { name: check });
+        }
+        for (view, prefix) in views.iter().copied() {
+            if reuse.unchanged(view) && prev_views.binary_search(&(view, prefix)).is_ok() {
+                reused_checks.push(view);
+                continue;
+            }
+            if let Some(held) = answer.body(cx, view, tool, None, &mut scratch)? {
+                for item in scratch.covers.iter().copied() {
+                    let covered = prefix_of(item);
+                    if covered != prefix {
+                        return Err(RunIdsError::ViewOfAnotherUnit { check: view, unit: prefix, covered });
+                    }
+                    bodies.push(WorkspaceBody { item, check: view, text: held.text, file: held.file });
+                    facts.push((held.key, held.checked));
+                }
+            }
+        }
+        reused_checks.sort_unstable();
+        reused_checks.dedup();
+        if !reused_checks.is_empty() {
+            for (b, checked) in previous.bodies.chunks_exact(BODY_ROW).zip(previous.verdicts.iter().copied()) {
+                let row = body_row(b, checked);
+                if reused_checks.binary_search(&row.check).is_ok() {
+                    bodies.push(WorkspaceBody { item: row.item, check: row.check, text: row.text, file: row.file });
+                    facts.push((row.key, row.checked));
+                }
+            }
+        }
+    }
+    Ok(Walked { bodies, edges, facts })
 }
 
 /// Why a workspace body has no record valid today (its `BodyId` has no reads).
@@ -1611,6 +1902,49 @@ fn read_at(b: &[u8]) -> Read {
     Read { fact: word_at(b, 0), digest: word_at(b, 32) }
 }
 
+/// Read-only `Send + Sync` projection of [`RunIds`] holding only the immutable crate/body byte
+/// tables needed by off-thread code workers (`engine_body_record.rs` `SnapshotTyped`) to resolve
+/// a body's grain and `BodyCheck` name without touching `OnceCell` proof slots.
+#[derive(Clone, Copy)]
+pub(crate) struct IdsLookup<'a> {
+    crates: &'a [u8],
+    grains: &'a [GrainTag],
+    bodies: &'a [u8],
+}
+
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<IdsLookup<'static>>();
+};
+
+impl IdsLookup<'_> {
+    /// The grain `item`'s body is keyed at; `None`: its key's prefix is of no crate of the list.
+    pub(crate) fn grain(&self, item: ItemKey) -> Option<Grain> {
+        let prefix = prefix_of(item);
+        let n = self.crates.len() / CRATE_ROW;
+        let at = search(n, |i| {
+            let row = self.crates.get(i * CRATE_ROW..i * CRATE_ROW + 8).unwrap_or(&[]);
+            row.cmp(&prefix[..])
+        })?;
+        Some(match *self.grains.get(at)? {
+            GrainTag::Toolchain => Grain::Toolchain,
+            GrainTag::Locked => Grain::Dependency,
+            GrainTag::Workspace | GrainTag::WorkspaceNone => Grain::Workspace,
+        })
+    }
+
+    /// The `BodyCheck` (or `Signature`) task of the workspace body `item`'s row; `None`: no row.
+    pub(crate) fn check_of(&self, item: ItemKey) -> Option<Name> {
+        let n = self.bodies.len() / BODY_ROW;
+        let at = search(n, |i| {
+            let row = self.bodies.get(i * BODY_ROW..(i + 1) * BODY_ROW).unwrap_or(&[]);
+            body_item(row).cmp(&item)
+        })?;
+        let row = self.bodies.get(at * BODY_ROW..(at + 1) * BODY_ROW)?;
+        Some(row_check(row))
+    }
+}
+
 /// The command's body ids for `blaze run` (the module doc). Its crate and body rows are the
 /// table record's bytes ([`RunIds::read`]: the store's, in place, on a certificate hit; the
 /// builder's, on a walk); today's table (the crates' facts, one per crate) is one copy in the
@@ -1679,40 +2013,117 @@ impl<'a> RunIds<'a> {
         most: Most,
         bump: Bump<'a>,
     ) -> Result<RunIds<'a>, RunIdsError<'n>> {
+        RunIds::new_scoped(cx, toolchain, crates, None, tools, workspace, edges, answer, previous, most, bump)
+    }
+
+    /// [`RunIds::new`], optionally restricted to the transitive unit closure `scoped`. When
+    /// `scoped` is `Some`, out-of-scope crates are excluded from crate rows, locked closure
+    /// digests, and validation so unrelated workspace crates (such as a locked crate patched
+    /// onto a vendored checkout crate outside the target's closure) never block a scoped start.
+    #[expect(clippy::too_many_arguments, reason = "the seam's edge: each argument one input the command already holds")]
+    pub(crate) fn new_scoped<'n, C: CrateTable<'n> + ?Sized>(
+        cx: &Cx,
+        toolchain: ToolchainId,
+        crates: &C,
+        scoped: Option<&crate::engine_check::ScopedUnits>,
+        tools: &[Tool; blaze_drive::key::KINDS],
+        workspace: &[WorkspaceBody],
+        edges: &[Edge],
+        answer: &mut dyn Answer,
+        previous: Option<&RunIds<'_>>,
+        most: Most,
+        bump: Bump<'a>,
+    ) -> Result<RunIds<'a>, RunIdsError<'n>> {
+        RunIds::build_scoped(cx, toolchain, crates, scoped, tools, workspace, edges, None, answer, previous, None, most, bump)
+    }
+
+    /// Builds [`RunIds`] directly from a [`Walked`] result whose `facts` already hold each
+    /// workspace body's `(key, checked)`, eliminating the duplicate `Answer::body` store reads.
+    /// When `delta` is `Some((previous, reuse))`, unchanged workspace crates also reuse their
+    /// `CrateScope` read from `previous` without touching `answer.out`.
+    #[expect(clippy::too_many_arguments, reason = "the seam's edge: each argument one input the command already holds")]
+    pub(crate) fn from_walked<'n, C: CrateTable<'n> + ?Sized>(
+        cx: &Cx,
+        toolchain: ToolchainId,
+        crates: &C,
+        scoped: Option<&crate::engine_check::ScopedUnits>,
+        tools: &[Tool; blaze_drive::key::KINDS],
+        walk: &Walked<'_>,
+        answer: &mut dyn Answer,
+        delta: Option<(&RunIds<'_>, &dyn ReuseOracle)>,
+        most: Most,
+        bump: Bump<'a>,
+    ) -> Result<RunIds<'a>, RunIdsError<'n>> {
+        let (previous, reuse) = match delta {
+            Some((prev, oracle)) => (Some(prev), Some(oracle)),
+            None => (None, None),
+        };
+        let resolved = (walk.facts.len() == walk.bodies.len()).then_some(walk.facts.as_slice());
+        RunIds::build_scoped(cx, toolchain, crates, scoped, tools, &walk.bodies, &walk.edges, resolved, answer, previous, reuse, most, bump)
+    }
+
+    /// Whether this table was built under the exact same `toolchain` and `CHECK_KINDS` producers
+    /// as `tools` (the precondition for reusing its rows in an incremental delta build).
+    pub(crate) fn matches_build(&self, toolchain: ToolchainId, tools: &[Tool; blaze_drive::key::KINDS]) -> bool {
+        self.toolchain == toolchain && self.producers == producers_of(tools)
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "shared builder for fresh and incremental RunIds construction")]
+    fn build_scoped<'n, C: CrateTable<'n> + ?Sized>(
+        cx: &Cx,
+        toolchain: ToolchainId,
+        crates: &C,
+        scoped: Option<&crate::engine_check::ScopedUnits>,
+        tools: &[Tool; blaze_drive::key::KINDS],
+        workspace: &[WorkspaceBody],
+        edges: &[Edge],
+        resolved: Option<&[(ContentId, Checked)]>,
+        answer: &mut dyn Answer,
+        previous: Option<&RunIds<'_>>,
+        reuse: Option<&dyn ReuseOracle>,
+        most: Most,
+        bump: Bump<'a>,
+    ) -> Result<RunIds<'a>, RunIdsError<'n>> {
         let _cx = cx.span("run ids: the body ids of the program's crates");
         let alloc = bump.alloc();
-        let producers = {
-            let mut h = Hasher::new(PRODUCERS_DOMAIN);
-            for kind in CHECK_KINDS {
-                h.update(&[kind as u8]).id(&tools[kind.index()].0);
-            }
-            h.finish()
-        };
+        let producers = producers_of(tools);
         let toolchain_read = Read { fact: toolchain_fact(), digest: toolchain.0 };
         let mut facts: Vec<Read, Bump<'a>> = Vec::new_in(bump);
         facts.push(toolchain_read);
 
         // The crates' grains, and each locked crate's closure digest.
         let n = crates.len();
-        let digests = locked_digests(crates, toolchain, alloc)?;
+        let digests = locked_digests(crates, toolchain, scoped, answer, alloc)?;
         let mut rows: AVec<'a, CrateRow> = Vec::with_capacity_in(n, alloc);
         for at in 0..n {
+            if scoped.is_some_and(|s| !s.allows(at)) {
+                continue;
+            }
             let key = crates.key(at);
             let grain = match crates.place(at) {
                 Place::Toolchain => CrateGrain::Toolchain,
-                Place::Fetched { .. } => {
-                    let read = Read { fact: locked_fact(key), digest: digests[at] };
+                Place::Fetched { .. } | Place::CheckoutDep => {
+                    let digest = digests.get(at).copied().unwrap_or(ABSENT.0);
+                    let read = Read { fact: locked_fact(key), digest };
                     facts.push(read);
                     CrateGrain::Locked(read)
                 }
                 Place::Checkout => {
                     let scope = blaze_drive::key::crate_scope_name(&key);
-                    let read = answer.out(scope).map(|out| Read { fact: fact_of(scope), digest: out.0 });
-                    // Not reached this walk: the last answer's read stands (`previous`, above).
-                    let read = read.or_else(|| match previous?.crate_by_key(key)?.grain {
-                        CrateGrain::Workspace(read) => read,
-                        _ => None,
-                    });
+                    let read = match (previous, reuse) {
+                        (Some(prev), Some(oracle)) if oracle.unchanged(scope) => match prev.crate_by_key(key) {
+                            Some(CrateRow { grain: CrateGrain::Workspace(read), .. }) => read,
+                            _ => answer.out(scope).map(|out| Read { fact: fact_of(scope), digest: out.0 }),
+                        },
+                        _ => {
+                            let read = answer.out(scope).map(|out| Read { fact: fact_of(scope), digest: out.0 });
+                            // Not reached this walk: the last answer's read stands (`previous`, above).
+                            read.or_else(|| match previous?.crate_by_key(key)?.grain {
+                                CrateGrain::Workspace(read) => read,
+                                _ => None,
+                            })
+                        }
+                    };
                     facts.extend(read);
                     CrateGrain::Workspace(read)
                 }
@@ -1727,12 +2138,15 @@ impl<'a> RunIds<'a> {
         }
 
         // The cap, before any row is made (rule 18): the crate with the most rows is named.
-        if workspace.len() > most.bodies as usize {
+        let max_bodies = usize::try_from(most.bodies).unwrap_or(usize::MAX);
+        if workspace.len() > max_bodies {
             let mut per: AVec<'a, usize> = Vec::with_capacity_in(rows.len(), alloc);
             per.resize(rows.len(), 0);
             for body in workspace {
-                if let Ok(at) = rows.binary_search_by_key(&prefix_of(body.item), |row| row.prefix) {
-                    per[at] += 1;
+                if let Ok(at) = rows.binary_search_by_key(&prefix_of(body.item), |row| row.prefix)
+                    && let Some(slot) = per.get_mut(at)
+                {
+                    *slot += 1;
                 }
             }
             let (at, most_rows) = per.iter().copied().enumerate().max_by_key(|(_, count)| *count).unwrap_or((0, 0));
@@ -1740,38 +2154,53 @@ impl<'a> RunIds<'a> {
             return Err(RunIdsError::TooManyBodies { krate, rows: most_rows, count: workspace.len(), most: most.bodies });
         }
 
-        // Each workspace body: its key and verdict as the answer holds them ([`Answer::body`]).
+        // Each workspace body: its key and verdict as the answer holds them ([`Answer::body`]),
+        // or already resolved during `workspace_of_scoped` / `workspace_of_delta` (`resolved`).
         // Its reads are not asked: its check's proof is read by need ([`RunIds::reading`]).
         let tool = tools[Kind::BodyCheck.index()];
         let mut bodies: AVec<'a, BodyRow> = Vec::with_capacity_in(workspace.len(), alloc);
-        let mut scratch = BodyScratch::new(alloc);
-        for body in workspace {
-            let item = body.item;
-            let crate_row = rows.binary_search_by_key(&prefix_of(item), |row| row.prefix).ok().map(|at| rows[at]);
-            if !matches!(crate_row, Some(CrateRow { grain: CrateGrain::Workspace(_), .. })) {
-                return Err(RunIdsError::NotWorkspace { item });
+        if let Some(pre) = resolved {
+            for (body, &(key, checked)) in workspace.iter().zip(pre.iter()) {
+                let item = body.item;
+                let crate_row = rows.binary_search_by_key(&prefix_of(item), |row| row.prefix).ok().and_then(|at| rows.get(at).copied());
+                if !matches!(crate_row, Some(CrateRow { grain: CrateGrain::Workspace(_), .. })) {
+                    return Err(RunIdsError::NotWorkspace { item });
+                }
+                if !matches!(body.check.kind, Kind::BodyCheck | Kind::Signature) {
+                    return Err(RunIdsError::NotABodyCheck { item, name: body.check });
+                }
+                bodies.push(BodyRow { item, key, checked, check: body.check, text: body.text, file: body.file });
             }
-            if check_kind(body.check.kind as u8).is_none() {
-                return Err(RunIdsError::NotABodyCheck { item, name: body.check });
+        } else {
+            let mut scratch = BodyScratch::new(alloc);
+            for body in workspace {
+                let item = body.item;
+                let crate_row = rows.binary_search_by_key(&prefix_of(item), |row| row.prefix).ok().and_then(|at| rows.get(at).copied());
+                if !matches!(crate_row, Some(CrateRow { grain: CrateGrain::Workspace(_), .. })) {
+                    return Err(RunIdsError::NotWorkspace { item });
+                }
+                if !matches!(body.check.kind, Kind::BodyCheck | Kind::Signature) {
+                    return Err(RunIdsError::NotABodyCheck { item, name: body.check });
+                }
+                let held = answer.body(cx, body.check, tool, Some((body.text, body.file)), &mut scratch)?;
+                // The answer does not know the check today: only the last answer's row can stand.
+                let (key, checked) = match held {
+                    Some(held) => (held.key, held.checked),
+                    None => match previous.and_then(|previous| previous.body(item)) {
+                        Some(_) => (ABSENT, Checked::Absent(Missing::NotToday { name: body.check })),
+                        None => return Err(RunIdsError::NotWalked { name: body.check }),
+                    },
+                };
+                // Not reached this walk: the last answer's row stands, key and verdict (`new`'s doc,
+                // `previous`); its proof is read by need like any other's.
+                if let (Checked::Absent(Missing::NotToday { .. }), Some(previous)) = (checked, previous)
+                    && let Some(row) = previous.body(item)
+                {
+                    bodies.push(BodyRow { item, key: row.key, checked: row.checked, check: body.check, text: body.text, file: body.file });
+                    continue;
+                }
+                bodies.push(BodyRow { item, key, checked, check: body.check, text: body.text, file: body.file });
             }
-            let held = answer.body(cx, body.check, tool, Some((body.text, body.file)), &mut scratch)?;
-            // The answer does not know the check today: only the last answer's row can stand.
-            let (key, checked) = match held {
-                Some(held) => (held.key, held.checked),
-                None => match previous.and_then(|previous| previous.body(item)) {
-                    Some(_) => (ABSENT, Checked::Absent(Missing::NotToday { name: body.check })),
-                    None => return Err(RunIdsError::NotWalked { name: body.check }),
-                },
-            };
-            // Not reached this walk: the last answer's row stands, key and verdict (`new`'s doc,
-            // `previous`); its proof is read by need like any other's.
-            if let (Checked::Absent(Missing::NotToday { .. }), Some(previous)) = (checked, previous)
-                && let Some(row) = previous.body(item)
-            {
-                bodies.push(BodyRow { item, key: row.key, checked: row.checked, check: body.check, text: body.text, file: body.file });
-                continue;
-            }
-            bodies.push(BodyRow { item, key, checked, check: body.check, text: body.text, file: body.file });
         }
         bodies.sort_unstable_by_key(|row| row.item);
         if let Some(pair) = bodies.windows(2).find(|pair| pair[0].item == pair[1].item) {
@@ -1835,6 +2264,33 @@ impl<'a> RunIds<'a> {
     /// The table's workspace body rows.
     pub(crate) fn rows(&self) -> u32 {
         u32::try_from(self.bodies.len() / BODY_ROW).unwrap_or(u32::MAX)
+    }
+
+    /// The pinned toolchain this table was built under.
+    pub(crate) fn toolchain(&self) -> ToolchainId {
+        self.toolchain
+    }
+
+    /// The check producers digest (`CHECK_KINDS`' tools) this table was built under.
+    pub(crate) fn producers(&self) -> ContentId {
+        self.producers
+    }
+
+    /// Raw `CRATE_ROW` slice for the crate whose 8-byte prefix is `prefix`, or `None`.
+    pub(crate) fn crate_row_bytes(&self, prefix: [u8; 8]) -> Option<&'a [u8]> {
+        let n = self.crates.len() / CRATE_ROW;
+        let at = search(n, |i| self.crates.get(i * CRATE_ROW..i * CRATE_ROW + 8).unwrap_or(&[]).cmp(&prefix[..]))?;
+        self.crates.get(at * CRATE_ROW..(at + 1) * CRATE_ROW)
+    }
+
+    /// Contiguous raw `BODY_ROW` byte slice for every workspace body row whose item key starts
+    /// with `prefix` (already sorted ascending by `ItemKey`, zero allocations, zero store reads).
+    pub(crate) fn crate_bodies_bytes(&self, prefix: [u8; 8]) -> &'a [u8] {
+        let n = self.bodies.len() / BODY_ROW;
+        let at = |i: usize| self.bodies.get(i * BODY_ROW..(i + 1) * BODY_ROW).map_or(ItemKey(0), body_item);
+        let from = partition(n, |i| prefix_of(at(i)) < prefix);
+        let to = partition(n, |i| prefix_of(at(i)) <= prefix);
+        self.bodies.get(from * BODY_ROW..to * BODY_ROW).unwrap_or(&[])
     }
 
     /// The bytes of the table's record ([`RunIds::write`]'s length), without writing it.
@@ -2027,6 +2483,15 @@ impl<'a> RunIds<'a> {
         rows
     }
 
+    /// Every workspace body row with its key and verdict, in `alloc`.
+    fn body_rows<'b>(&self, alloc: Alloc<'b>) -> AVec<'b, BodyRow> {
+        let mut rows: AVec<'b, BodyRow> = Vec::with_capacity_in(self.bodies.len() / BODY_ROW, alloc);
+        for (b, checked) in self.bodies.chunks_exact(BODY_ROW).zip(self.verdicts.iter().copied()) {
+            rows.push(body_row(b, checked));
+        }
+        rows
+    }
+
     /// The table written as the record of the command whose certificate is `cert`
     /// ([`table_key`]), through the one store every answer record goes through (`Store::put`).
     /// A key already holding equal bytes stands (rule 25); other bytes are the store's refusal.
@@ -2067,13 +2532,15 @@ impl<'a> RunIds<'a> {
         }
     }
 
+    /// Read-only `Send + Sync` view over this table's immutable crate/body lookup slices for
+    /// parallel code workers (`engine_body_record.rs` `SnapshotTyped`).
+    pub(crate) fn lookup(&self) -> IdsLookup<'a> {
+        IdsLookup { crates: self.crates, grains: self.grains, bodies: self.bodies }
+    }
+
     /// The grain `item`'s body is keyed at; `None`: its key's prefix is of no crate of the list.
     pub(crate) fn grain(&self, item: ItemKey) -> Option<Grain> {
-        Some(match self.crate_of(item)?.grain {
-            CrateGrain::Toolchain => Grain::Toolchain,
-            CrateGrain::Locked(_) => Grain::Dependency,
-            CrateGrain::Workspace(_) => Grain::Workspace,
-        })
+        self.lookup().grain(item)
     }
 
     /// What the store holds of the workspace body `item`'s check today; `None`: `item` is no
@@ -2088,7 +2555,7 @@ impl<'a> RunIds<'a> {
     /// body's typed record (engine_body_record.rs `StoreTyped`). `None`: no body row (a
     /// toolchain or dependency body, or one the command did not name).
     pub(crate) fn check_of(&self, item: ItemKey) -> Option<Name> {
-        self.body(item).map(|row| row.check)
+        self.lookup().check_of(item)
     }
 
     /// THE GATE, asked at the call (states.md item 13): the proof that the fn `item` may run,
@@ -2207,7 +2674,13 @@ pub(crate) fn cell_fact(name: Name, cell: Cell) -> [u8; 32] {
 /// its pack and its dependencies' digests; a toolchain crate's the toolchain's id; a checkout
 /// crate's [`ABSENT`] (never read: its bodies are keyed by their checks). Iterative, each crate
 /// hashed once: O(crates + dependency edges).
-fn locked_digests<'n, 'a, C: CrateTable<'n> + ?Sized>(crates: &C, toolchain: ToolchainId, alloc: Alloc<'a>) -> Result<AVec<'a, [u8; 32]>, RunIdsError<'n>> {
+fn locked_digests<'n, 'a, C: CrateTable<'n> + ?Sized>(
+    crates: &C,
+    toolchain: ToolchainId,
+    scoped: Option<&crate::engine_check::ScopedUnits>,
+    answer: &dyn Answer,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, [u8; 32]>, RunIdsError<'n>> {
     const UNSEEN: u8 = 0;
     const OPEN: u8 = 1;
     const DONE: u8 = 2;
@@ -2220,53 +2693,99 @@ fn locked_digests<'n, 'a, C: CrateTable<'n> + ?Sized>(crates: &C, toolchain: Too
     // (row, its dependencies pushed)
     let mut stack: AVec<'a, (usize, bool)> = Vec::new_in(alloc);
     for root in 0..n {
-        if !matches!(crates.place(root), Place::Fetched { .. }) || state[root] == DONE {
+        if scoped.is_some_and(|s| !s.allows(root))
+            || !matches!(crates.place(root), Place::Fetched { .. } | Place::CheckoutDep)
+            || state.get(root).copied() == Some(DONE)
+        {
             continue;
         }
         stack.push((root, false));
         while let Some((at, expanded)) = stack.pop() {
-            if state[at] == DONE {
-                continue;
-            }
-            let Place::Fetched { source, files } = crates.place(at) else {
-                // Only a locked crate is pushed (its dependencies are checked below).
-                state[at] = DONE;
+            let Some(&at_state) = state.get(at) else {
                 continue;
             };
+            if at_state == DONE {
+                continue;
+            }
+            let place = crates.place(at);
+            if !matches!(place, Place::Fetched { .. } | Place::CheckoutDep) {
+                // Only a locked or checkout-dep crate is pushed (its dependencies are checked below).
+                if let Some(slot) = state.get_mut(at) {
+                    *slot = DONE;
+                }
+                continue;
+            }
             deps.clear();
             crates.each_dep(at, &mut |dep| deps.push(dep));
             if !expanded {
-                if state[at] == OPEN {
+                if at_state == OPEN {
                     return Err(RunIdsError::Cycle { krate: crates.name(at) });
                 }
-                state[at] = OPEN;
+                if let Some(slot) = state.get_mut(at) {
+                    *slot = OPEN;
+                }
                 stack.push((at, true));
                 for dep in deps.iter().copied() {
-                    if dep >= n {
+                    let Some(&dep_state) = state.get(dep) else {
                         return Err(RunIdsError::NoRow { krate: crates.name(at), dep });
-                    }
+                    };
                     match crates.place(dep) {
                         Place::Toolchain => {
-                            digests[dep] = toolchain.0;
-                            state[dep] = DONE;
+                            if let Some(slot) = digests.get_mut(dep) {
+                                *slot = toolchain.0;
+                            }
+                            if let Some(slot) = state.get_mut(dep) {
+                                *slot = DONE;
+                            }
                         }
                         Place::Checkout => return Err(RunIdsError::LockedReadsWorkspace { krate: crates.name(at), dep: crates.name(dep) }),
                         Place::Unplaced { why } => return Err(RunIdsError::Unplaced { krate: crates.name(dep), why }),
-                        Place::Fetched { .. } if state[dep] == OPEN => return Err(RunIdsError::Cycle { krate: crates.name(dep) }),
-                        Place::Fetched { .. } if state[dep] == UNSEEN => stack.push((dep, false)),
-                        Place::Fetched { .. } => {}
+                        Place::Fetched { .. } | Place::CheckoutDep if dep_state == OPEN => return Err(RunIdsError::Cycle { krate: crates.name(dep) }),
+                        Place::Fetched { .. } | Place::CheckoutDep if dep_state == UNSEEN => stack.push((dep, false)),
+                        Place::Fetched { .. } | Place::CheckoutDep => {}
                     }
                 }
                 continue;
             }
-            let mut h = Hasher::new(LOCKED_DIGEST_DOMAIN);
-            h.id(&crates.key(at).0).id(&source).update(&files);
-            h.update(&(deps.len() as u64).to_le_bytes());
-            for dep in deps.iter().copied() {
-                h.update(&digests[dep]);
+            let dep_count = u64::try_from(deps.len()).unwrap_or(u64::MAX).to_le_bytes();
+            let digest = match place {
+                Place::Fetched { source, files } => {
+                    let mut h = Hasher::new(LOCKED_DIGEST_DOMAIN);
+                    h.id(&crates.key(at).0).id(&source).update(&files);
+                    h.update(&dep_count);
+                    for dep in deps.iter().copied() {
+                        if let Some(dep_digest) = digests.get(dep) {
+                            h.update(dep_digest);
+                        }
+                    }
+                    h.finish().0
+                }
+                Place::CheckoutDep => {
+                    let scope = blaze_drive::key::crate_scope_name(&crates.key(at));
+                    let Some(dep_digest) = answer.checkout_dep_digest(scope, alloc)? else {
+                        return Err(RunIdsError::Unplaced {
+                            krate: crates.name(at),
+                            why: "a non-member checkout crate whose `CrateScope` inputs are not known today",
+                        });
+                    };
+                    let mut h = Hasher::new(CHECKOUT_DEP_DIGEST_DOMAIN);
+                    h.id(&crates.key(at).0).update(&dep_digest);
+                    h.update(&dep_count);
+                    for dep in deps.iter().copied() {
+                        if let Some(dep_digest) = digests.get(dep) {
+                            h.update(dep_digest);
+                        }
+                    }
+                    h.finish().0
+                }
+                _ => ABSENT.0,
+            };
+            if let Some(slot) = digests.get_mut(at) {
+                *slot = digest;
             }
-            digests[at] = h.finish().0;
-            state[at] = DONE;
+            if let Some(slot) = state.get_mut(at) {
+                *slot = DONE;
+            }
         }
     }
     Ok(digests)
@@ -2328,5 +2847,338 @@ impl BodyIds for RunIds<'_> {
             Some(CrateGrain::Toolchain) => CodeClass::Toolchain,
             _ => CodeClass::Program,
         }
+    }
+}
+
+#[cfg(test)]
+mod delta_tests {
+    use super::*;
+    use core::cell::Cell as CoreCell;
+
+    const CORE_B: u8 = 0x11;
+    const DEP_B: u8 = 0x21;
+    const CRATE_A: u8 = 0x31;
+    const CRATE_A_TEST: u8 = 0x32;
+    const CRATE_B: u8 = 0x33;
+
+    struct CrateDef {
+        byte: u8,
+        name: &'static str,
+        place: Place,
+        deps: &'static [usize],
+    }
+
+    struct MemCrates<'a>(&'a [CrateDef]);
+
+    impl CrateTable<'static> for MemCrates<'_> {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn key(&self, at: usize) -> CrateItemKey {
+            let byte = self.0.get(at).map_or(0, |row| row.byte);
+            CrateItemKey(ContentId([byte; 32]))
+        }
+        fn name(&self, at: usize) -> &'static str {
+            self.0.get(at).map_or("", |row| row.name)
+        }
+        fn place(&self, at: usize) -> Place {
+            self.0.get(at).map_or(Place::Toolchain, |row| row.place)
+        }
+        fn each_dep(&self, at: usize, each: &mut dyn FnMut(usize)) {
+            if let Some(row) = self.0.get(at) {
+                for &dep in row.deps {
+                    each(dep);
+                }
+            }
+        }
+    }
+
+    const CRATES: [CrateDef; 5] = [
+        CrateDef { byte: CORE_B, name: "core", place: Place::Toolchain, deps: &[] },
+        CrateDef { byte: DEP_B, name: "dep", place: Place::Fetched { source: ContentId([DEP_B; 32]), files: [0xee; 32] }, deps: &[0] },
+        CrateDef { byte: CRATE_A, name: "crate_a", place: Place::Checkout, deps: &[1, 0] },
+        CrateDef { byte: CRATE_A_TEST, name: "crate_a_test", place: Place::Checkout, deps: &[1, 0] },
+        CrateDef { byte: CRATE_B, name: "crate_b", place: Place::Checkout, deps: &[2, 0] },
+    ];
+
+    fn item_key(byte: u8, low: u64) -> ItemKey {
+        let mut b = [byte; 16];
+        if let Some(tail) = b.get_mut(8..16) {
+            tail.copy_from_slice(&low.to_be_bytes());
+        }
+        ItemKey(u128::from_be_bytes(b))
+    }
+
+    fn test_tools() -> [Tool; blaze_drive::key::KINDS] {
+        core::array::from_fn(|at| Tool(ContentId([u8::try_from(at).unwrap_or(u8::MAX); 32])))
+    }
+
+    fn part(name: Name, locate: blaze_drive::Locate) -> blaze_drive::Part {
+        blaze_drive::Part { name, locate, place: 0 }
+    }
+
+    struct CheckEntry<'a> {
+        name: Name,
+        facts: BodyFacts,
+        covers: AVec<'a, ItemKey>,
+    }
+
+    struct TreeEntry<'a> {
+        name: Name,
+        parts: AVec<'a, blaze_drive::Part>,
+    }
+
+    struct SpyAnswer<'a> {
+        trees: AVec<'a, TreeEntry<'a>>,
+        checks: AVec<'a, CheckEntry<'a>>,
+        outs: AVec<'a, (Name, ContentId)>,
+        skipped: AVec<'a, Name>,
+        opens: CoreCell<usize>,
+        body_reads: CoreCell<usize>,
+        out_reads: CoreCell<usize>,
+    }
+
+    impl<'a> SpyAnswer<'a> {
+        fn new(alloc: Alloc<'a>) -> Self {
+            Self {
+                trees: Vec::new_in(alloc),
+                checks: Vec::new_in(alloc),
+                outs: Vec::new_in(alloc),
+                skipped: Vec::new_in(alloc),
+                opens: CoreCell::new(0),
+                body_reads: CoreCell::new(0),
+                out_reads: CoreCell::new(0),
+            }
+        }
+
+        fn reset_counts(&self) {
+            self.opens.set(0);
+            self.body_reads.set(0);
+            self.out_reads.set(0);
+        }
+
+        fn set_tree(&mut self, name: Name, parts: &[blaze_drive::Part], alloc: Alloc<'a>) {
+            let mut list = Vec::with_capacity_in(parts.len(), alloc);
+            list.extend_from_slice(parts);
+            if let Some(entry) = self.trees.iter_mut().find(|entry| entry.name == name) {
+                entry.parts = list;
+            } else {
+                self.trees.push(TreeEntry { name, parts: list });
+            }
+        }
+
+        fn set_check(&mut self, name: Name, facts: BodyFacts, covers: &[ItemKey], alloc: Alloc<'a>) {
+            let mut list = Vec::with_capacity_in(covers.len(), alloc);
+            list.extend_from_slice(covers);
+            if let Some(entry) = self.checks.iter_mut().find(|entry| entry.name == name) {
+                entry.facts = facts;
+                entry.covers = list;
+            } else {
+                self.checks.push(CheckEntry { name, facts, covers: list });
+            }
+        }
+
+        fn remove_check(&mut self, name: Name) {
+            self.checks.retain(|entry| entry.name != name);
+        }
+
+        fn set_out(&mut self, name: Name, out: ContentId) {
+            if let Some((_, slot)) = self.outs.iter_mut().find(|(n, _)| *n == name) {
+                *slot = out;
+            } else {
+                self.outs.push((name, out));
+            }
+        }
+    }
+
+    impl Today for SpyAnswer<'_> {
+        fn out(&self, name: Name) -> Option<ContentId> {
+            self.out_reads.set(self.out_reads.get().saturating_add(1));
+            self.outs.iter().find(|(n, _)| *n == name).map(|(_, out)| *out)
+        }
+        fn cell(&self, _name: Name, _cell: Cell) -> Option<ContentId> {
+            None
+        }
+    }
+
+    impl Answer for SpyAnswer<'_> {
+        fn open(&mut self, _cx: &Cx, name: Name, seen: &mut dyn FnMut(Seen<'_>) -> Result<(), RunIdsError<'static>>) -> Result<bool, RunIdsError<'static>> {
+            self.opens.set(self.opens.get().saturating_add(1));
+            let Some(entry) = self.trees.iter().find(|entry| entry.name == name) else { return Ok(false) };
+            for p in entry.parts.iter().copied() {
+                seen(Seen::Part(p))?;
+            }
+            seen(Seen::Payload(&[]))?;
+            Ok(true)
+        }
+        fn skipped(&self, file: Name) -> bool {
+            self.skipped.contains(&file)
+        }
+        fn body(
+            &mut self,
+            _cx: &Cx,
+            check: Name,
+            _tool: Tool,
+            _known: Option<(ContentId, Name)>,
+            out: &mut BodyScratch<'_>,
+        ) -> Result<Option<BodyFacts>, RunIdsError<'static>> {
+            self.body_reads.set(self.body_reads.get().saturating_add(1));
+            out.clear();
+            let Some(entry) = self.checks.iter().find(|entry| entry.name == check) else { return Ok(None) };
+            out.covers.extend_from_slice(entry.covers.as_slice());
+            Ok(Some(entry.facts))
+        }
+    }
+
+    struct ChangedList<'a>(&'a [Name]);
+
+    impl ReuseOracle for ChangedList<'_> {
+        fn unchanged(&self, name: Name) -> bool {
+            !self.0.contains(&name)
+        }
+    }
+
+    fn unit_root(byte: u8, root: Name, is_test: bool) -> UnitRoot {
+        UnitRoot {
+            root,
+            view: ViewKey::of_member(&[byte], b"pkg", is_test),
+            prefix: CrateItemKey(ContentId([byte; 32])).prefix(),
+        }
+    }
+
+    /// 1-line body edit in a multi-crate workspace with views, 0-cover `Signature` tasks,
+    /// constructor `Signature` tasks, and failed checks: `workspace_of_delta` + `RunIds::from_walked`
+    /// opens ZERO unchanged files/checks/crate-scopes and writes 100% byte-identical `BZRI` bytes
+    /// to a fresh full `workspace_of_scoped` + `RunIds::new_scoped` build.
+    #[test]
+    fn incremental_run_ids_delta_is_byte_identical_and_skips_unchanged_records() {
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(3, bstd::io::Limits::USUAL));
+        let Ok(cx) = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME) else { panic!("root context") };
+        let alloc = blaze_own::testing::heap().alloc();
+        let tools = test_tools();
+        let body_tool = tools[Kind::BodyCheck.index()];
+        let toolchain = ToolchainId([0x77; 32]);
+        let crates = MemCrates(&CRATES);
+
+        let rust = blaze_drive::Locate::File { edition: 2 };
+        let src = blaze_drive::Locate::Source(ContentId([0x40; 32]));
+        let pkg_a = Name::manifest(b"a/Cargo.toml");
+        let pkg_b = Name::manifest(b"b/Cargo.toml");
+        let a_lib = Name::file(b"a/src/lib.rs");
+        let b_lib = Name::file(b"b/src/lib.rs");
+        let b_extra = Name::file(b"b/src/extra.rs");
+        let chk_a1 = Name::new(Kind::BodyCheck, ContentId([0x51; 32]));
+        let sig_a_fn = Name::new(Kind::Signature, ContentId([0x52; 32])); // 0 covers (fn head)
+        let sig_a_ctor = Name::new(Kind::Signature, ContentId([0x53; 32])); // constructor head
+        let chk_b1 = Name::new(Kind::BodyCheck, ContentId([0x54; 32]));
+        let chk_b_fail = Name::new(Kind::BodyCheck, ContentId([0x55; 32])); // failed check (0 covers)
+        let chk_extra = Name::new(Kind::BodyCheck, ContentId([0x56; 32]));
+        let chk_a_added = Name::new(Kind::BodyCheck, ContentId([0x57; 32]));
+
+        let unit_a = unit_root(CRATE_A, a_lib, false);
+        let unit_a_test = unit_root(CRATE_A_TEST, a_lib, true);
+        let unit_b = unit_root(CRATE_B, b_lib, false);
+        let units = [unit_a, unit_a_test, unit_b];
+        let chk_a1_test = at_view(chk_a1, UnitView::At(unit_a_test.view));
+        let scope_a = blaze_drive::key::crate_scope_name(&CrateItemKey(ContentId([CRATE_A; 32])));
+        let scope_a_test = blaze_drive::key::crate_scope_name(&CrateItemKey(ContentId([CRATE_A_TEST; 32])));
+        let scope_b = blaze_drive::key::crate_scope_name(&CrateItemKey(ContentId([CRATE_B; 32])));
+
+        let mut ans = SpyAnswer::new(alloc);
+        ans.set_tree(Name::units(), &[part(pkg_a, src), part(pkg_b, src)], alloc);
+        ans.set_tree(pkg_a, &[part(a_lib, rust)], alloc);
+        ans.set_tree(pkg_b, &[part(b_lib, rust)], alloc);
+        ans.set_tree(a_lib, &[part(chk_a1, src), part(sig_a_fn, src), part(sig_a_ctor, src)], alloc);
+        ans.set_tree(b_lib, &[part(chk_b1, src), part(chk_b_fail, src)], alloc);
+        // `b_extra` exists in store already, NOT linked by `b_lib` yet.
+        ans.set_tree(b_extra, &[part(chk_extra, src)], alloc);
+
+        ans.set_check(chk_a1, BodyFacts { key: ContentId([0xa1; 32]), checked: Checked::Clean, text: ContentId([0xb1; 32]), file: a_lib }, &[item_key(CRATE_A, 1), item_key(CRATE_A, 2)], alloc);
+        ans.set_check(chk_a1_test, BodyFacts { key: ContentId([0xa2; 32]), checked: Checked::Clean, text: ContentId([0xb1; 32]), file: a_lib }, &[item_key(CRATE_A_TEST, 1)], alloc);
+        ans.set_check(sig_a_fn, BodyFacts { key: ContentId([0xa3; 32]), checked: Checked::Clean, text: ContentId([0xb2; 32]), file: a_lib }, &[], alloc);
+        ans.set_check(sig_a_ctor, BodyFacts { key: ContentId([0xa4; 32]), checked: Checked::Clean, text: ContentId([0xb3; 32]), file: a_lib }, &[item_key(CRATE_A, 9), item_key(CRATE_A_TEST, 9)], alloc);
+        ans.set_check(chk_b1, BodyFacts { key: ContentId([0xa5; 32]), checked: Checked::Clean, text: ContentId([0xb4; 32]), file: b_lib }, &[item_key(CRATE_B, 1)], alloc);
+        ans.set_check(chk_b_fail, BodyFacts { key: ContentId([0xa6; 32]), checked: Checked::Errors { errors: NonZeroU32::MIN, first: 12 }, text: ContentId([0xb5; 32]), file: b_lib }, &[], alloc);
+        ans.set_check(chk_extra, BodyFacts { key: ContentId([0xa7; 32]), checked: Checked::Clean, text: ContentId([0xb6; 32]), file: b_extra }, &[item_key(CRATE_B, 2)], alloc);
+
+        ans.set_out(scope_a, ContentId([0xc1; 32]));
+        ans.set_out(scope_a_test, ContentId([0xc2; 32]));
+        ans.set_out(scope_b, ContentId([0xc3; 32]));
+
+        // Initial baseline build.
+        let Ok(base_walk) = workspace_of_scoped(&cx, &mut ans, body_tool, &units, WalkFrom::Workspace, None, alloc) else { panic!("base walk") };
+        let Ok(prev_ids) = RunIds::new_scoped(&cx, toolchain, &crates, None, &tools, &base_walk.bodies, &base_walk.edges, &mut ans, None, Most::USUAL, blaze_own::testing::bump()) else { panic!("base RunIds") };
+        assert!(prev_ids.matches_build(toolchain, &tools));
+
+        // 1. 1-line body edit in `crate_a`: `chk_a1` and `scope_a` moved; `crate_b`, `sig_a_fn`,
+        // `sig_a_ctor`, and `chk_a1_test` are unchanged (same edges).
+        ans.set_check(
+            chk_a1,
+            BodyFacts { key: ContentId([0xd1; 32]), checked: Checked::Incomplete { rule: 99 }, text: ContentId([0xe1; 32]), file: a_lib },
+            &[item_key(CRATE_A, 1)],
+            alloc,
+        );
+        ans.set_out(scope_a, ContentId([0xf1; 32]));
+
+        let changed = [chk_a1, scope_a];
+        let oracle = ChangedList(&changed);
+        ans.reset_counts();
+        let Ok(delta_walk) = workspace_of_delta(&cx, &mut ans, body_tool, &units, WalkFrom::Workspace, &prev_ids, &oracle, alloc) else { panic!("delta walk 1") };
+        let Ok(delta_ids) = RunIds::from_walked(&cx, toolchain, &crates, None, &tools, &delta_walk, &mut ans, Some((&prev_ids, &oracle)), Most::USUAL, blaze_own::testing::bump()) else { panic!("delta RunIds 1") };
+        assert_eq!(ans.opens.get(), 0, "1-line body edit with unchanged files must open 0 tree records");
+        assert_eq!(ans.body_reads.get(), 1, "only the 1 changed check is read, once (no duplicate read in from_walked)");
+        assert_eq!(ans.out_reads.get(), 1, "only the 1 changed CrateScope out is read");
+
+        let Ok(fresh_walk) = workspace_of_scoped(&cx, &mut ans, body_tool, &units, WalkFrom::Workspace, None, alloc) else { panic!("fresh walk 1") };
+        let Ok(fresh_ids) = RunIds::new_scoped(&cx, toolchain, &crates, None, &tools, &fresh_walk.bodies, &fresh_walk.edges, &mut ans, None, Most::USUAL, blaze_own::testing::bump()) else { panic!("fresh RunIds 1") };
+        assert_eq!(delta_ids.write(alloc).as_slice(), fresh_ids.write(alloc).as_slice(), "1-line body edit delta must be 100% byte-identical to fresh RunIds");
+
+        // 2. Structural edit (`same_edges == false`):
+        // - `a_lib` adds `chk_a_added` and removes `sig_a_fn`.
+        // - `b_lib` adds `mod extra;` pointing to `b_extra` whose own page is UNCHANGED (tests
+        //   that newly reached unchanged files/checks are still opened and queried fresh!).
+        ans.set_tree(a_lib, &[part(chk_a1, src), part(sig_a_ctor, src), part(chk_a_added, src)], alloc);
+        ans.set_tree(b_lib, &[part(chk_b1, src), part(chk_b_fail, src), part(b_extra, rust)], alloc);
+        ans.set_check(chk_a_added, BodyFacts { key: ContentId([0xd2; 32]), checked: Checked::Clean, text: ContentId([0xe2; 32]), file: a_lib }, &[item_key(CRATE_A, 42)], alloc);
+
+        let changed2 = [a_lib, b_lib, chk_a_added];
+        let oracle2 = ChangedList(&changed2);
+        ans.reset_counts();
+        let Ok(delta_walk2) = workspace_of_delta(&cx, &mut ans, body_tool, &units, WalkFrom::Workspace, &delta_ids, &oracle2, alloc) else { panic!("delta walk 2") };
+        let Ok(delta_ids2) = RunIds::from_walked(&cx, toolchain, &crates, None, &tools, &delta_walk2, &mut ans, Some((&delta_ids, &oracle2)), Most::USUAL, blaze_own::testing::bump()) else { panic!("delta RunIds 2") };
+        // Opened: `a_lib`, `b_lib`, and newly reached `b_extra` (3); `Units`, `pkg_a`, `pkg_b` skipped!
+        assert_eq!(ans.opens.get(), 3, "only changed files + newly reached file opened");
+        // Body reads: 2 new plain (`chk_a_added`, `chk_extra`) + 3 new views (2 for `chk_a_added`,
+        // 1 for `chk_extra`) = 5; all 8 unchanged plain & view checks are skipped!
+        assert_eq!(ans.body_reads.get(), 5, "unchanged checks skipped even on structural edit");
+        assert_eq!(ans.out_reads.get(), 0, "all CrateScopes unchanged");
+
+        let Ok(fresh_walk2) = workspace_of_scoped(&cx, &mut ans, body_tool, &units, WalkFrom::Workspace, None, alloc) else { panic!("fresh walk 2") };
+        let Ok(fresh_ids2) = RunIds::new_scoped(&cx, toolchain, &crates, None, &tools, &fresh_walk2.bodies, &fresh_walk2.edges, &mut ans, None, Most::USUAL, blaze_own::testing::bump()) else { panic!("fresh RunIds 2") };
+        assert_eq!(delta_ids2.write(alloc).as_slice(), fresh_ids2.write(alloc).as_slice(), "structural edit delta must be 100% byte-identical to fresh RunIds");
+
+        // 3. `PLACE_SKIPPED` toggle on `b_extra`: `b_extra`'s body must disappear from delta too.
+        ans.skipped.push(b_extra);
+        let changed3 = [b_extra];
+        let oracle3 = ChangedList(&changed3);
+        let Ok(delta_walk3) = workspace_of_delta(&cx, &mut ans, body_tool, &units, WalkFrom::Workspace, &delta_ids2, &oracle3, alloc) else { panic!("delta walk 3") };
+        let Ok(delta_ids3) = RunIds::from_walked(&cx, toolchain, &crates, None, &tools, &delta_walk3, &mut ans, Some((&delta_ids2, &oracle3)), Most::USUAL, blaze_own::testing::bump()) else { panic!("delta RunIds 3") };
+        let Ok(fresh_walk3) = workspace_of_scoped(&cx, &mut ans, body_tool, &units, WalkFrom::Workspace, None, alloc) else { panic!("fresh walk 3") };
+        let Ok(fresh_ids3) = RunIds::new_scoped(&cx, toolchain, &crates, None, &tools, &fresh_walk3.bodies, &fresh_walk3.edges, &mut ans, None, Most::USUAL, blaze_own::testing::bump()) else { panic!("fresh RunIds 3") };
+        assert_eq!(delta_ids3.write(alloc).as_slice(), fresh_ids3.write(alloc).as_slice(), "PLACE_SKIPPED toggle delta must be 100% byte-identical to fresh RunIds");
+
+        // 4. Scoped `WalkFrom::UnitRoots`: a changed `BodyCheck` that becomes `#[cfg(false)]`-cut
+        // (`Answer::body` returns `Ok(None)`) drops its old row instead of carrying stale bytes.
+        let scoped_units = [unit_a];
+        let Ok(sc_base_walk) = workspace_of_scoped(&cx, &mut ans, body_tool, &scoped_units, WalkFrom::UnitRoots, None, alloc) else { panic!("scoped base walk") };
+        let Ok(sc_prev_ids) = RunIds::new_scoped(&cx, toolchain, &crates, None, &tools, &sc_base_walk.bodies, &sc_base_walk.edges, &mut ans, None, Most::USUAL, blaze_own::testing::bump()) else { panic!("scoped base RunIds") };
+        ans.remove_check(chk_a_added);
+        let changed4 = [chk_a_added];
+        let oracle4 = ChangedList(&changed4);
+        let Ok(sc_delta_walk) = workspace_of_delta(&cx, &mut ans, body_tool, &scoped_units, WalkFrom::UnitRoots, &sc_prev_ids, &oracle4, alloc) else { panic!("scoped delta walk") };
+        let Ok(sc_delta_ids) = RunIds::from_walked(&cx, toolchain, &crates, None, &tools, &sc_delta_walk, &mut ans, Some((&sc_prev_ids, &oracle4)), Most::USUAL, blaze_own::testing::bump()) else { panic!("scoped delta RunIds") };
+        let Ok(sc_fresh_walk) = workspace_of_scoped(&cx, &mut ans, body_tool, &scoped_units, WalkFrom::UnitRoots, None, alloc) else { panic!("scoped fresh walk") };
+        let Ok(sc_fresh_ids) = RunIds::new_scoped(&cx, toolchain, &crates, None, &tools, &sc_fresh_walk.bodies, &sc_fresh_walk.edges, &mut ans, None, Most::USUAL, blaze_own::testing::bump()) else { panic!("scoped fresh RunIds") };
+        assert_eq!(sc_delta_ids.write(alloc).as_slice(), sc_fresh_ids.write(alloc).as_slice(), "scoped cfg-cut delta must drop stale row and match fresh RunIds");
     }
 }

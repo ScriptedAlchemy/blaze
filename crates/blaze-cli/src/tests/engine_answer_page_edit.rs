@@ -30,7 +30,8 @@ fn file(group: u32) -> Name {
 fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
     let io = Io::simulated(SimWorld::new(31, Limits::USUAL));
     let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
-    let home = crate::store::Home::of(&cx, &io.need_fs().expect("filesystem"), Some("/h")).expect("home");
+    let fs = io.need_fs().expect("filesystem");
+    let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
     let heap = blaze_own::testing::heap();
     let alloc = heap.shared();
     let frame = cx.frame();
@@ -39,7 +40,7 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
     let err = io.need_err().expect("stderr");
     let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 31 }, heap.alloc()).expect("store");
     let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock.clone(), &err, erased.handle()).expect("command store");
-    let journal = crate::journal_sweep::take(&cx, home.dir(), home.dir(), &clock, crate::journal_sweep::Stored::NONE, frame).expect("journal");
+    let journal = crate::journal_sweep::take(&cx, &fs, home.dir(), home.dir(), &clock, crate::journal_sweep::Stored::NONE, frame).expect("journal");
     let lines = crate::engine_lines::Lines::new_in(alloc).record();
     let leaves = Rows::new_in(frame);
     let tools = Tools([Tool(ContentId([3; 32])); blaze_drive::key::KINDS]);
@@ -62,7 +63,7 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
         let phase = if i == ROWS - 1 {
             reads.push((observed, blaze_drive::key::ABSENT));
             by_cell.push(0);
-            cold.answer.readers.entry(observed).or_insert_with(|| blaze_own::BTreeSet::new_in(alloc)).insert(name);
+            cold.answer.readers.insert(observed, name);
             Phase::new(Stage::Units, 1)
         } else {
             phase
@@ -80,7 +81,7 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
         names.sort_unstable();
     }
     let saved = save_edit(&cx, &mut store, &lent, "answer", toolchain, &tools, &cold, Printed::default(), (lines.0, &lines.1),
-        None, &leaves, &journal, alloc, frame, &[], (None, core::num::NonZeroU32::MIN)).expect("save all rows");
+        None, &leaves, &journal, alloc, frame, &[], (None, core::num::NonZeroU32::MIN), crate::engine_answer::SaveBase::Keep).expect("save all rows");
     assert_eq!(saved.rekeyed.whole, Some(WhyWhole::NoLast), "a first commit keys every page");
     assert!(saved.new_pages > 1, "the answer spans multiple pages");
     lent.commit().expect("commit original answer");
@@ -117,7 +118,7 @@ fn editing_one_of_fifty_thousand_rows_reads_only_its_file_and_row_pages() {
     payloads.insert(plan.name, after);
     let changed = Kept::after(BTreeMap::new_in(alloc), finished.answer, &finished.causes, payloads);
     let saved = save_edit(&cx, &mut store, &lent, "answer", toolchain, &tools, &changed, Printed::default(), (lines.0, &lines.1),
-        Some(&stored), &leaves, &journal, alloc, frame, &[], (Some(pointer.root), core::num::NonZeroU32::MIN)).expect("publish edit");
+        Some(&stored), &leaves, &journal, alloc, frame, &[], (Some(pointer.root), core::num::NonZeroU32::MIN), crate::engine_answer::SaveBase::Keep).expect("publish edit");
     assert_eq!(stored.pages_read(), 2, "planning, merging and publication read the file plan and the changed row");
     assert!((1..=2).contains(&saved.new_pages), "only the edited row and file plan can require a new page");
     lent.commit().expect("commit edited answer");

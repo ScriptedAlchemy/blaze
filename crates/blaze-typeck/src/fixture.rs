@@ -1362,6 +1362,10 @@ impl Bb {
         self.e(Expr::Return { value })
     }
 
+    pub fn become_(&mut self, value: ExprId) -> ExprId {
+        self.e(Expr::Become { value })
+    }
+
     /// `e?` as rustc lowers it (blaze-lower's `try_op`):
     /// `match Try::branch(e) { ControlFlow::Break(r) => return FromResidual::from_residual(r),
     /// ControlFlow::Continue(v) => v }`. Returns the match.
@@ -1491,7 +1495,7 @@ impl Bb {
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
             record_expr_schemas: &[],
-            closure_static_params: &[],
+            closure_param_regions: &[],
         }
     }
 

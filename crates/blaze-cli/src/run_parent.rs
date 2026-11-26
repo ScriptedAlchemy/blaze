@@ -56,7 +56,7 @@ use core::fmt;
 
 use blaze_code::record::Symbol as CodeSymbol;
 use blaze_emit::{Isa, Os};
-use blaze_hash::ByHash;
+use blaze_hash::{BuildKeyHasher, ByHash, Set, SetOpts};
 use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_ladder::body_ids::{self, BodyIds, DeclaredList, Form, How, Make, RowKind, Scratch, Unkeyed, Walk, WalkError};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeRecordError, CodeStore, EntryError, NotEmitting, Settings, StoreError, TierName, content_key};
@@ -78,6 +78,14 @@ use bstd::procs::Exit;
 use crate::run_bytes::{Kept, Sent, SentWhy};
 use crate::run_ids::{NotRunnable, RunIds, Runnable};
 use crate::start_list::{self, Row, TodayGroup, TodayRows};
+
+/// Wire output buffer type accepted by `Down::encode` and `run.send`.
+pub(crate) type WireOut<A> = std::vec::Vec<u8, A>;
+
+/// Allocates an empty wire output buffer in `alloc`.
+pub(crate) fn wire_out<A: Allocator>(alloc: A) -> WireOut<A> {
+    WireOut::new_in(alloc)
+}
 
 /// How long the parent waits for the program's next message before it looks at the child
 /// again (the launcher's own tick is 250 ms: `blaze_launch_rt::run_mode::TICK_MS`).
@@ -500,11 +508,16 @@ pub(crate) fn launch_env<'e, A: Allocator>(
 ) {
     // BLAZE_LAUNCH_NATIVE and BLAZE_LAUNCH_TELEMETRY are the parent's word alone: one of the
     // command's own is never passed on.
-    const OURS: [&str; 7] = [
+    const OURS: [&str; 12] = [
         "BLAZE_LAUNCH_FD",
         "BLAZE_LAUNCH_STORE",
         "BLAZE_LAUNCH_ENTRY",
         "BLAZE_LAUNCH_NATIVE",
+        "BLAZE_LAUNCH_UNWOUND_FILE",
+        "BLAZE_LAUNCH_SANDBOX_TEMP",
+        "BLAZE_LAUNCH_BINS_DIR",
+        "BLAZE_LAUNCH_BINS_SOCK_DIR",
+        "BLAZE_LAUNCH_BIN_MAP",
         blaze_launch::grants::VAR,
         blaze_launch::telemetry::VAR,
         "BLAZE_LAUNCH_EXPLORE",
@@ -594,6 +607,16 @@ pub(crate) trait Resolve {
     #[cfg(test)]
     fn publication(&mut self, symbol: &Symbol, _values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
         self.resolve(symbol)
+    }
+    /// Resolves a publication and sets `*needs_native = true` when the record or any accompanying
+    /// datum requires the suite's lazily-armed native library before placement.
+    fn publication_with_native(
+        &mut self,
+        symbol: &Symbol,
+        values: &mut AVec<'_, u8>,
+        _needs_native: &mut bool,
+    ) -> Result<Resolved<'_>, ParentError> {
+        self.publication(symbol, values)
     }
     /// The sink the run's events go to (blaze-screen [`Watch`]): the loop tells it when the
     /// program starts and when a need is answered. [`Unwatched`] unless the resolver has one.
@@ -865,13 +888,7 @@ impl Publication for CommandFront<'_, '_, '_> {
     }
 }
 
-impl Publication for crate::test_drive::TestFront<'_, '_, '_> {
-    fn for_publication(&mut self, symbol: [u8; 32], record: &[u8], no_personality: bool, values: &mut AVec<'_, u8>) -> Result<bool, ParentError> {
-        record_publication(symbol, record, no_personality, values, || Ok(self.names))
-    }
-}
-
-fn record_publication<'h>(
+pub(crate) fn record_publication<'h>(
     symbol: [u8; 32], record: &[u8], no_personality: bool, values: &mut AVec<'_, u8>,
     names: impl FnOnce() -> Result<NamesRecords<'h>, ParentError>,
 ) -> Result<bool, ParentError> {
@@ -1151,9 +1168,9 @@ pub(crate) struct Lazy<'r, 'a, F: Front, D: Folder> {
     /// The rows stepped walking forward from the roots to reach a callee no placed row led to
     /// (answer (c)): not handed to the program yet, so each is served when the program asks.
     ahead: AVec<'a, Ahead<'a>>,
-    /// The statics told (or being told in the answer at hand), by symbol, sorted: each is sent
+    /// The statics told (or being told in the answer at hand), by symbol: each is sent
     /// once a run, with the first record that reaches it.
-    told: AVec<'a, [u8; 32]>,
+    told: Set<[u8; 32], BuildKeyHasher, Alloc<'a>>,
     /// The last record's statics not told before, handed out in [`Resolved::Record`].
     data: AVec<'a, Datum>,
     /// The static rows of the answer at hand still to serve (a work list: a static's value may
@@ -1287,7 +1304,7 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
             placed: Vec::new_in(alloc),
             declares: Vec::new_in(alloc),
             ahead: Vec::new_in(alloc),
-            told: Vec::new_in(alloc),
+            told: Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None }),
             data: Vec::new_in(alloc),
             statics: Vec::new_in(alloc),
             named: Vec::new_in(alloc),
@@ -1457,9 +1474,7 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
             self.placed.push((group.code().symbol.0, Runnable::listed(group)));
             rows += 1;
             for datum in group.view().data() {
-                if let Err(at) = self.told.binary_search(&datum.symbol.0) {
-                    self.told.insert(at, datum.symbol.0);
-                }
+                self.told.insert(datum.symbol.0);
                 rows += 1;
             }
         }
@@ -1662,7 +1677,7 @@ fn ready<'a, F: Front>(
     builder: &Builder,
     asked: &mut Option<Asked>,
     ahead: &mut AVec<'a, Ahead<'a>>,
-    told: &[[u8; 32]],
+    told: &Set<[u8; 32], BuildKeyHasher, Alloc<'a>>,
     readying: &mut AVec<'_, usize>,
     row: usize,
     alloc: Alloc<'a>,
@@ -1684,7 +1699,7 @@ fn ready<'a, F: Front>(
         for &callee in started.walk.declared(at) {
             let callee = callee as usize;
             if matches!(started.walk.kind(callee), RowKind::Static | RowKind::ThreadLocal)
-                && told.binary_search(&started.walk.symbol(callee).0).is_err()
+                && !told.contains(&started.walk.symbol(callee).0)
                 && !readying.contains(&callee)
             {
                 readying.push(callee);
@@ -1708,7 +1723,7 @@ fn entry_of<'e>(served: &'e Served<'_>, store: &'e dyn CodeStore, scratch: &'e S
 /// The rows `row`'s entry declares, split by kind: an instance's symbol onto `declares` (its
 /// slot is told before the record is published); a static not told yet onto `statics`, and
 /// into `told` at once (so a cycle of statics is one batch, each once).
-fn callees(walk: &Walk<'_>, row: usize, declares: &mut AVec<'_, Symbol>, told: &mut AVec<'_, [u8; 32]>, statics: &mut AVec<'_, usize>) {
+fn callees(walk: &Walk<'_>, row: usize, declares: &mut AVec<'_, Symbol>, told: &mut Set<[u8; 32], BuildKeyHasher, Alloc<'_>>, statics: &mut AVec<'_, usize>) {
     for &callee in walk.declared(row) {
         let callee = callee as usize;
         let symbol = walk.symbol(callee).0;
@@ -1716,8 +1731,7 @@ fn callees(walk: &Walk<'_>, row: usize, declares: &mut AVec<'_, Symbol>, told: &
             RowKind::Instance => declares.push(Symbol(symbol)),
             // A thread-local's row is its template's datum, sent as a static's is.
             RowKind::Static | RowKind::ThreadLocal => {
-                if let Err(at) = told.binary_search(&symbol) {
-                    told.insert(at, symbol);
+                if told.insert(symbol) {
                     statics.push(callee);
                 }
             }
@@ -1863,7 +1877,7 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
         }
         // Under `Pooled`, nothing is made below: the row and the statics its answer tells are
         // stepped first, each kept ahead, and a row begun waits for its code.
-        if codes == Codes::Pooled && !ready(cx, front, started, &mut **store, &builder, asked, ahead, told.as_slice(), readying, row, *alloc)? {
+        if codes == Codes::Pooled && !ready(cx, front, started, &mut **store, &builder, asked, ahead, told, readying, row, *alloc)? {
             return Ok(Resolved::Waiting);
         }
         // A row stepped ahead is served once, from what its step answered; any other row that is
@@ -1882,8 +1896,7 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
         // among the entry's declared rows, so their slots go in the `Declare` before it).
         let vtables = data.len();
         front.each_vtable(symbol.0, entry, &mut |vtable, datum| {
-            if let Err(at) = told.binary_search(&vtable.0) {
-                told.insert(at, vtable.0);
+            if told.insert(vtable.0) {
                 data.push(Datum { symbol: vtable, record: folder.file(datum)? });
             }
             Ok(())
@@ -1910,7 +1923,18 @@ impl<F: Front, D: Folder> Resolve for Lazy<'_, '_, F, D> {
             data.push(Datum { symbol: Symbol(static_), record: filed });
             front.statics_named(entry, named).map_err(|why| ParentError::Entry { symbol: static_, why })?;
             callees(&started.walk, at, declares, told, statics);
-            folder.kept(filed, stored(&served).map_or(Kept::Unkept, |under| Kept::Static { under }), &mut **store)?;
+            let svtables = data.len();
+            front.each_vtable(static_, entry, &mut |vtable, vdatum| {
+                if told.insert(vtable.0) {
+                    data.push(Datum { symbol: vtable, record: folder.file(vdatum)? });
+                }
+                Ok(())
+            })?;
+            let sunder = stored(&served);
+            folder.kept(filed, sunder.map_or(Kept::Unkept, |under| Kept::Static { under }), &mut **store)?;
+            for vdatum in data.iter().skip(svtables) {
+                folder.kept(vdatum.record, sunder.map_or(Kept::Unkept, |under| Kept::Vtable { under }), &mut **store)?;
+            }
             count(tally, &served);
         }
         named.sort_unstable();
@@ -1955,13 +1979,13 @@ pub(crate) fn ahead_of<'b, F: Front, D: Folder, A: Allocator>(
     let head = today.head();
     needs.name_personality(head.personality, out)?;
     let descriptor = blaze_ladder::symbols::tls_desc_symbol().0;
-    // The statics the groups kept so far send, sorted.
-    let mut on: AVec<'_, [u8; 32]> = Vec::new_in(lazy.alloc);
+    // The statics the groups kept so far send.
+    let mut on: Set<[u8; 32], BuildKeyHasher, Alloc<'_>> = Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: lazy.alloc, capacity: None });
     for group in today.groups() {
         let view = group.view();
         // Its names first: a group that does not stand is left out before any of its bytes
         // is looked for.
-        let stands = |symbol: &Symbol| symbol.0 == descriptor || on.binary_search(&symbol.0).is_ok() || view.data().any(|datum| datum.symbol == *symbol);
+        let stands = |symbol: &Symbol| symbol.0 == descriptor || on.contains(&symbol.0) || view.data().any(|datum| datum.symbol == *symbol);
         if !view.named().all(|symbol| stands(&symbol)) {
             continue;
         }
@@ -1984,9 +2008,7 @@ pub(crate) fn ahead_of<'b, F: Front, D: Folder, A: Allocator>(
         // The group's bytes on the wire before any frame names them (the one writer's).
         needs.send(folder.take(), out)?;
         for datum in view.data() {
-            if let Err(at) = on.binary_search(&datum.symbol.0) {
-                on.insert(at, datum.symbol.0);
-            }
+            on.insert(datum.symbol.0);
         }
         kept.push(group);
     }
@@ -2029,11 +2051,11 @@ pub(crate) struct Needs<'a> {
     pairs: AVec<'a, Declared>,
     /// The first answers with a record, in order, up to the start list's cap (the window).
     first: start_list::Rows<'a>,
-    /// The statics on the child (each in a `Data` sent), by symbol, sorted.
-    sent: AVec<'a, [u8; 32]>,
-    /// The records published, by id, sorted: every static each names was on the child before
+    /// The statics on the child (each in a `Data` sent), by symbol.
+    sent: Set<[u8; 32], BuildKeyHasher, Alloc<'a>>,
+    /// The records published, by id: every static each names was on the child before
     /// it, so publishing one again needs nothing more.
-    cleared: AVec<'a, [u8; 32]>,
+    cleared: Set<[u8; 32], BuildKeyHasher, Alloc<'a>>,
     /// The current run's values for records carrying source positions, kept until its last
     /// need so a repeat publication sends the same values. These groups cannot be replayed.
     positioned: ByHash<[u8; 32], AVec<'a, u8>, Alloc<'a>>,
@@ -2064,6 +2086,9 @@ pub(crate) struct Needs<'a> {
     /// Where the program struck, as its crash handler told it (`Up::Fault`): the first one
     /// read, said by name once the program has ended (run_fault.rs).
     fault: Option<blaze_launch::wire::fault::Fault>,
+    /// Native library armed for lazy mid-run delivery (`arm_lazy_native`): sent at most once,
+    /// before the first impure/foreign record or datum (or warm impure pre-publish batch).
+    pending_native: Option<(RecordId, &'a [Symbol])>,
 }
 
 /// What a `Publish` stands on ([`Needs::publish`]): how the statics its record names are on the
@@ -2086,8 +2111,8 @@ impl<'a> Needs<'a> {
             slots: Vec::new_in(alloc),
             pairs: Vec::new_in(alloc),
             first: start_list::Rows::new_in(alloc),
-            sent: Vec::new_in(alloc),
-            cleared: Vec::new_in(alloc),
+            sent: Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None }),
+            cleared: Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None }),
             positioned: ByHash::new_in(alloc),
             batch: Vec::new_in(alloc),
             next_id: 0,
@@ -2103,6 +2128,7 @@ impl<'a> Needs<'a> {
             answered: 0,
             resolved: 0,
             fault: None,
+            pending_native: None,
         }
     }
 
@@ -2131,8 +2157,7 @@ impl<'a> Needs<'a> {
             Stands::Answered { named, data } => {
                 self.batch.clear();
                 for datum in data {
-                    if let Err(at) = self.sent.binary_search(&datum.symbol.0) {
-                        self.sent.insert(at, datum.symbol.0);
+                    if self.sent.insert(datum.symbol.0) {
                         self.batch.push(*datum);
                     }
                 }
@@ -2144,27 +2169,22 @@ impl<'a> Needs<'a> {
                 // that process): named once, with the key's destructor, before the first record
                 // naming it (wire/thread_locals.rs). Each thread-local's template went in `data`.
                 let descriptor = blaze_ladder::symbols::tls_desc_symbol().0;
-                if named.iter().any(|it| it.0 == descriptor)
-                    && let Err(at) = self.sent.binary_search(&descriptor)
-                {
-                    self.sent.insert(at, descriptor);
+                if named.iter().any(|it| it.0 == descriptor) && self.sent.insert(descriptor) {
                     let id = self.id();
                     let ender = Symbol(blaze_ladder::tls_index::tls_ender_symbol().0);
                     Down::ThreadLocals { descriptor: Symbol(descriptor), ender }.encode(id, out)?;
                 }
                 for static_ in named {
-                    if self.sent.binary_search(&static_.0).is_err() {
+                    if !self.sent.contains(&static_.0) {
                         let instance = self.slots.get(slot.0 as usize).map(|s| s.0);
                         let touches_tls = named.iter().any(|it| it.0 == descriptor);
                         return Err(ParentError::StaticUnsent { record: record.0, symbol: static_.0, instance, touches_tls });
                     }
                 }
-                if let Err(at) = self.cleared.binary_search(&record.0) {
-                    self.cleared.insert(at, record.0);
-                }
+                self.cleared.insert(record.0);
             }
             Stands::Again => {
-                if self.cleared.binary_search(&record.0).is_err() {
+                if !self.cleared.contains(&record.0) {
                     return Err(ParentError::NotCleared { record: record.0 });
                 }
             }
@@ -2178,23 +2198,72 @@ impl<'a> Needs<'a> {
         Ok(())
     }
 
+    /// Wire output buffer type shared with `Down::encode` and `run.send`.
     /// THE ONE WRITER OF `Bytes` (run schema 6, blaze-launch wire/bytes.rs): each record
     /// `sent` carries, whole, in consecutive parts of at most `BYTES_PART_MOST`, BEFORE any
     /// frame that names it (the folder hands them over first: [`Folder::take`]). Each record in
     /// `sent` is 1 byte to `BYTES_RECORD_MOST` long (run_bytes.rs refuses any other by name), so
     /// every part has the shape the child's decode takes; the child checks the rest (the order,
     /// the sum, the digest) and refuses a breach by name.
-    pub(crate) fn send<A: Allocator>(&mut self, sent: Sent<'_>, out: &mut std::vec::Vec<u8, A>) -> Result<(), ParentError> {
+    pub(crate) fn send<A: Allocator>(&mut self, sent: Sent<'_>, out: &mut WireOut<A>) -> Result<(), ParentError> {
         for (record, bytes) in sent.each() {
-            let total = bytes.len() as u64;
-            let mut at = 0u64;
-            for part in bytes.chunks(BYTES_PART_MOST as usize) {
-                let id = self.id();
-                Down::Bytes { record, at, total, part }.encode(id, out)?;
-                at += part.len() as u64;
-            }
+            self.send_one(record, bytes, out)?;
         }
         Ok(())
+    }
+
+    fn send_one<A: Allocator>(&mut self, record: RecordId, bytes: &[u8], out: &mut WireOut<A>) -> Result<(), ParentError> {
+        let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let chunk = usize::try_from(BYTES_PART_MOST).unwrap_or(usize::MAX);
+        let mut at = 0u64;
+        for part in bytes.chunks(chunk) {
+            let id = self.id();
+            Down::Bytes { record, at, total, part }.encode(id, out)?;
+            at += u64::try_from(part.len()).unwrap_or(u64::MAX);
+        }
+        Ok(())
+    }
+
+    /// Whether `symbol` has already been published (or settled unknown) for this child.
+    pub(crate) fn is_settled(&self, symbol: &Symbol) -> bool {
+        matches!(self.met.get(&symbol.0), Some(Met::Published { .. } | Met::Unknown { .. }))
+    }
+
+    /// Publishes one already-resolved record proactively into `out` (batch pre-publishing for
+    /// `blaze test` suites): frames inline `inline_bytes` first, records any source-position
+    /// `values`, declares `symbol` and every callee in `declares`, enters `Met::Published`, and
+    /// emits `Data`/`ThreadLocals`/`Publish`/`Positioned` through the one writer ([`Self::publish`]).
+    /// Returns `Ok(false)` without emitting anything if `symbol` is already settled.
+    #[expect(clippy::too_many_arguments, reason = "each slice is one pre-resolved part of a publication")]
+    pub(crate) fn publish_precomputed<A: Allocator>(
+        &mut self,
+        symbol: Symbol,
+        record: RecordId,
+        declares: &[Symbol],
+        data: &[Datum],
+        named: &[Symbol],
+        values: &[u8],
+        inline_bytes: &[(RecordId, &[u8])],
+        out: &mut WireOut<A>,
+    ) -> Result<bool, ParentError> {
+        if self.is_settled(&symbol) {
+            return Ok(false);
+        }
+        for &(rec, bytes) in inline_bytes {
+            self.send_one(rec, bytes, out)?;
+        }
+        if !values.is_empty() {
+            self.positioned.insert(record.0, Vec::from_slice_in(values, self.alloc));
+        }
+        let slot = self.slot_of(symbol)?;
+        for &each in declares {
+            self.slot_of(each)?;
+        }
+        self.enter(symbol, Met::Published { slot, record })?;
+        self.publish(slot, record, Stands::Answered { named, data }, out)?;
+        self.placed += 1;
+        self.placed_data += self.batch.len();
+        Ok(true)
     }
 
     /// THE ORDER OF C NAMES (D175): every C name the program itself defines (a C unit's global
@@ -2323,6 +2392,43 @@ impl<'a> Needs<'a> {
         Ok(())
     }
 
+    /// Arms a lazy native library to be delivered on demand ([`Self::flush_pending_native`])
+    /// before the first foreign/impure publication, instead of eagerly at start.
+    pub(crate) fn arm_lazy_native(&mut self, library: RecordId, words: &'a [Symbol]) {
+        self.pending_native = Some((library, words));
+    }
+
+    /// Sends `Down::Native` lazily mid-run (after slots have already been numbered) before
+    /// publishing a foreign record or datum. Flushes any pending `Declare` pairs first, assigns
+    /// or reuses each word's slot in word order, and encodes `Down::Native` carrying all
+    /// `words.len()` pairs. Any newly numbered word slots are declared by `Down::Native` itself.
+    pub(crate) fn tell_native_lazy<A: Allocator>(
+        &mut self,
+        library: RecordId,
+        words: &[Symbol],
+        out: &mut WireOut<A>,
+    ) -> Result<(), ParentError> {
+        self.declare(out)?;
+        let mut all: AVec<'_, Declared> = Vec::with_capacity_in(words.len(), self.alloc);
+        for &symbol in words {
+            let slot = self.slot_of(symbol)?;
+            all.push(Declared { symbol, slot });
+        }
+        let id = self.id();
+        Down::Native { library, words: List::of(all.as_slice()) }.encode(id, out)?;
+        // Newly numbered word slots were declared in `Down::Native`: not again in the next `Declare`.
+        self.pairs.clear();
+        Ok(())
+    }
+
+    /// Sends the armed lazy native library if not yet sent; a no-op once sent or when unarmed.
+    pub(crate) fn flush_pending_native<A: Allocator>(&mut self, out: &mut WireOut<A>) -> Result<(), ParentError> {
+        let Some((library, words)) = self.pending_native.take() else {
+            return Ok(());
+        };
+        self.tell_native_lazy(library, words, out)
+    }
+
     /// The program's personality routine named before anything is published (UNWIND.md 3.3,
     /// piece P3; blaze-launch wire/personality.rs): its symbol's slot numbered and told in a
     /// `Declare`, then `Down::Personality` naming that slot, once. The symbol is NOT resolved:
@@ -2429,7 +2535,8 @@ impl<'a> Needs<'a> {
             Some(Met::Unknown { .. }) => self.failed(need, out).map(|()| true),
             Some(Met::Declared(_)) | None => {
                 let mut values = Vec::new_in(self.alloc);
-                match resolve.publication(&symbol, &mut values)? {
+                let mut needs_native = false;
+                match resolve.publication_with_native(&symbol, &mut values, &mut needs_native)? {
                     Resolved::Waiting => Ok(false),
                     Resolved::Unknown => {
                         self.resolved += 1;
@@ -2437,6 +2544,10 @@ impl<'a> Needs<'a> {
                         self.failed(need, out).map(|()| true)
                     }
                     Resolved::Record { key, record, declares, data, named, sent } => {
+                        // Lazy native library first: must load before any foreign `Data`/`Publish`.
+                        if needs_native {
+                            self.flush_pending_native(out)?;
+                        }
                         // The bytes first: nothing may name a record before its bytes.
                         self.send(sent, out)?;
                         self.resolved += 1;

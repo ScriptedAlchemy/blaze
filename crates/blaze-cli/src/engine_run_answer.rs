@@ -35,7 +35,7 @@ use crate::store::Store;
 const REFUSED: &str = "a page of the stored answer is refused";
 
 /// Where the record of a row is: the key the driver put it under.
-pub(crate) trait Records {
+pub(crate) trait Records: Sync {
     /// `name`'s record key; `Ok(None)`: the row has none (or there is no row). `Err`: the stored
     /// answer refused the page that holds it.
     fn record(&self, name: Name) -> Result<Option<Key>, &'static str>;
@@ -180,6 +180,43 @@ impl Answer for EngineAnswer<'_, '_, '_, '_> {
         // Its reads are not copied here: its check's proof is read by need at the call
         // (`BodyReads` below, run_ids.rs `RunIds::runnable`).
         Ok(Some(BodyFacts { checked, ..held }))
+    }
+
+    fn checkout_dep_digest(&self, scope: Name, alloc: blaze_own::Alloc<'_>) -> Result<Option<[u8; 32]>, RunIdsError<'static>> {
+        let row = match self.answer.row_facts(scope) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                self.refused(scope)?;
+                return Ok(None);
+            }
+            Err(_) => return Err(RunIdsError::EngineAnswer { name: scope, what: REFUSED }),
+        };
+        let seen = match self.answer.observations(scope) {
+            Ok(Some(seen)) => seen,
+            Ok(None) => {
+                self.refused(scope)?;
+                return Ok(None);
+            }
+            Err(_) => return Err(RunIdsError::EngineAnswer { name: scope, what: REFUSED }),
+        };
+        let mut rows: blaze_own::Vec<(Name, Cell, ContentId), _> = blaze_own::Vec::with_capacity_in(seen.len(), alloc);
+        for (id, saw) in seen {
+            rows.push((id.of, id.cell, saw));
+        }
+        rows.sort_unstable();
+        let mut h = blaze_ids::Hasher::new(crate::run_ids::CHECKOUT_DEP_DIGEST_DOMAIN);
+        h.id(&row.out);
+        h.update(&u64::try_from(rows.len()).unwrap_or(u64::MAX).to_le_bytes());
+        for (of, cell, saw) in rows {
+            h.part(of.kind.name().as_bytes()).id(&of.subject).update(&cell.0).id(&saw);
+            if of.kind == blaze_drive::Kind::FileItems {
+                let whole = self.out(of).unwrap_or(blaze_drive::key::ABSENT);
+                let data = self.cell(of, crate::engine_tasks::DATA).unwrap_or(blaze_drive::key::ABSENT);
+                h.id(&whole).id(&data);
+            }
+        }
+        self.refused(scope)?;
+        Ok(Some(h.finish().0))
     }
 }
 

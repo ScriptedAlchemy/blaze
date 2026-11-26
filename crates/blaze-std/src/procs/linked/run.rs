@@ -28,7 +28,7 @@ use alloc::{string::String, vec::Vec};
 use core::{alloc::Allocator, fmt, time::Duration};
 
 pub use blaze_core::linked::{
-    channel::{CHILD_FD, ChannelError, Message, PREFIX, Read, whole_messages},
+    channel::{CHILD_FD, ChannelError, ChannelReady, Message, PREFIX, Read, Write, whole_messages},
     run::{Input, Output, ParentDeath, Streams},
 };
 use blaze_core::{
@@ -66,6 +66,45 @@ pub struct RunSpec<'a> {
     pub streams: Streams,
     pub own_group: bool,
     pub parent_death: ParentDeath,
+}
+
+/// Descriptor inherited by `blaze-launcher` on Linux for the launcher-owned unwind channel
+/// (never exposed as a filesystem path; set `FD_CLOEXEC` by the launcher before guest code runs).
+#[cfg(target_os = "linux")]
+pub const UNWOUND_FD: u32 = 4;
+
+/// The Linux test sandbox configuration ([`Spawner::start_served_test`]; test.md, piece 9):
+/// the test's own `$TMPDIR` (the sole writable subtree beside `/dev/null`) and whether to attach
+/// a launcher-owned unwind channel on [`UNWOUND_FD`] (for harnessed tests).
+#[cfg(target_os = "linux")]
+pub struct TestSandbox<'a> {
+    pub temp: &'a str,
+    pub unwound_channel: bool,
+}
+
+/// Parent end of the launcher-owned unwind channel (`UNWOUND_FD`), checked after a harnessed
+/// test exits with status 101 to distinguish an uncaught Rust panic unwind from `exit(101)`.
+#[cfg(target_os = "linux")]
+pub struct UnwoundChannel {
+    channel: Channel,
+}
+
+#[cfg(target_os = "linux")]
+impl UnwoundChannel {
+    /// Returns `true` iff the launcher wrote the unwind sentinel (`b"1"`) before exiting.
+    pub fn did_unwind<A: Allocator>(&mut self, alloc: A) -> bool {
+        struct ZeroClock;
+        impl blaze_core::wait::Clock for ZeroClock {
+            fn now(&self) -> Duration {
+                Duration::ZERO
+            }
+        }
+        let mut buf: Vec<u8, A> = Vec::new_in(alloc);
+        matches!(
+            self.channel.recv_message(&mut buf, 16, Deadline::PASSED, &ZeroClock),
+            Ok(Message::Whole { .. }) if buf.get(PREFIX..) == Some(b"1")
+        )
+    }
 }
 
 /// What to start detached in a new session ([`Spawner::start_detached`]): the program, its
@@ -163,6 +202,22 @@ pub trait RunChild: Sized {
 
     /// `bytes`, whole messages, all written by `deadline`.
     fn send(&mut self, bytes: &[u8], deadline: Deadline) -> Result<(), RunError>;
+
+    /// Writes as many bytes from `bytes` (already whole-message framed by the caller) as fit
+    /// before `deadline` without blocking past the first partial write; returns [`Write::Deadline`]
+    /// if the channel stayed full. Default delegates to [`RunChild::send`] for simulated children.
+    fn send_some(&mut self, bytes: &[u8], deadline: Deadline) -> Result<Write, RunError> {
+        if bytes.is_empty() {
+            return Ok(Write::Bytes(0));
+        }
+        self.send(bytes, deadline).map(|()| Write::Bytes(bytes.len()))
+    }
+
+    /// Waits up to `deadline` for the channel to become readable and/or writable. Default reports
+    /// requested directions ready immediately for simulated children.
+    fn wait_ready(&mut self, want_read: bool, want_write: bool, _deadline: Deadline) -> Result<ChannelReady, RunError> {
+        Ok(ChannelReady { readable: want_read, writable: want_write })
+    }
 
     /// How it ended, by `deadline` (it is reaped, and only what it left is given), or the child
     /// back, still running. A wait that fails drops the child (native: killed and reaped).
@@ -305,6 +360,47 @@ impl Spawner {
         let Started { child: run, pipes } = self.start_with(cx, spec, &given, Some(confine))?;
         drop(child_end);
         Ok(Started { child: Served { run, channel: parent }, pipes })
+    }
+
+    /// `spec` started with its channel as [`CHILD_FD`] for a Linux sandboxed test.
+    ///
+    /// When `sandbox.unwound_channel` is true, also inherits a launcher-owned unwind channel on
+    /// [`UNWOUND_FD`] and returns its parent end. The launcher itself enters the Linux test
+    /// sandbox (`blaze_sys::linux::confine::enter_test_sandbox`: user/net/ipc/mount namespaces,
+    /// read-only root with writable `$TMPDIR`, capability drop, `RLIMIT_CORE=0`, Landlock ABI >= 6,
+    /// and seccomp) while single-threaded before starting its control thread or loading guest code
+    /// (`test.md`, piece 9). Refused steps fail closed; the test never runs unsandboxed (rule 9).
+    #[cfg(target_os = "linux")]
+    pub fn start_served_test(
+        &self,
+        cx: &Cx,
+        spec: &RunSpec<'_>,
+        sandbox: &TestSandbox<'_>,
+    ) -> Result<(Started<Served>, Option<UnwoundChannel>), RunError> {
+        let _ = sandbox.temp;
+        let refuse = |fault| RunError { step: RunStep::Start, proc: None, fault };
+        let (parent, child_end) = channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?;
+        let unwound_pair = if sandbox.unwound_channel {
+            Some(channel::pair().map_err(|error| refuse(RunFault::Channel(error)))?)
+        } else {
+            None
+        };
+        let Started { child: run, pipes } = match &unwound_pair {
+            Some((_, unwound_child)) => {
+                let given = [(child_end.fd(), CHILD_FD), (unwound_child.fd(), UNWOUND_FD)];
+                self.start_with(cx, spec, &given, None)?
+            }
+            None => {
+                let given = [(child_end.fd(), CHILD_FD)];
+                self.start_with(cx, spec, &given, None)?
+            }
+        };
+        drop(child_end);
+        let unwound = unwound_pair.map(|(u_parent, u_child)| {
+            drop(u_child);
+            UnwoundChannel { channel: u_parent }
+        });
+        Ok((Started { child: Served { run, channel: parent }, pipes }, unwound))
     }
 
     fn start_with(
@@ -459,6 +555,26 @@ impl RunChild for Served {
             Ok(()) => Ok(()),
             Err(ChannelError::WriteDeadline { .. }) if task_first => Err(rest.stopped(RunStep::Send, until)),
             Err(error) => Err(rest.error(RunStep::Send, RunFault::Channel(error))),
+        }
+    }
+
+    fn send_some(&mut self, bytes: &[u8], deadline: Deadline) -> Result<Write, RunError> {
+        let rest = &self.run.rest;
+        let (until, task_first) = rest.capped(deadline);
+        match self.channel.send_some(bytes, until, &DriverClock(&rest.io)) {
+            Ok(Write::Deadline) if task_first => Err(rest.stopped(RunStep::Send, until)),
+            Ok(write) => Ok(write),
+            Err(error) => Err(rest.error(RunStep::Send, RunFault::Channel(error))),
+        }
+    }
+
+    fn wait_ready(&mut self, want_read: bool, want_write: bool, deadline: Deadline) -> Result<ChannelReady, RunError> {
+        let rest = &self.run.rest;
+        let (until, task_first) = rest.capped(deadline);
+        match self.channel.wait_ready(want_read, want_write, until, &DriverClock(&rest.io)) {
+            Ok(ready) if !ready.readable && !ready.writable && task_first => Err(rest.stopped(RunStep::Recv, until)),
+            Ok(ready) => Ok(ready),
+            Err(error) => Err(rest.error(RunStep::Recv, RunFault::Channel(error))),
         }
     }
 

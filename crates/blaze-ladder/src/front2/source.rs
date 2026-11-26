@@ -54,6 +54,18 @@ pub struct FilePaths<'n> {
     pub shown: &'n str,
 }
 
+/// What [`NamesSource::each_member_matching`] needs for a member row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberWant {
+    /// Skip this member completely without reading its text.
+    Skip,
+    /// Yield this member's metadata (`key`, `name`, `kind`, `written_by`) with empty `text`
+    /// (avoiding file/expansion text lookup and FileItems verification for unused member text).
+    NameOnly,
+    /// Yield this member with its full current text.
+    WithText,
+}
+
 /// A member of a trait or an impl, as either source lists it (question 13).
 #[derive(Clone, Copy, Debug)]
 pub struct MemberOf<'n> {
@@ -261,6 +273,18 @@ pub trait NamesSource<'n>: Copy {
     /// text of an unrelated body.
     fn enclosing_keys(self, krate: usize, visit: impl FnMut(ItemKey) -> Result<(), crate::seam::PositionGap>) -> Result<(), crate::seam::PositionGap>;
 
+    /// Cached lookup of a written local item `wanted` inside crate `krate`, populating `krate`'s
+    /// per-crate index via `build` on the first miss. Returns `None` for sources that do not
+    /// maintain a per-crate written-local index (e.g. read-recording table views).
+    fn cached_local_start(
+        self,
+        _krate: usize,
+        _wanted: blaze_typeck::ItemKey,
+        _build: impl FnOnce(Alloc<'n>) -> Result<HashMap<blaze_typeck::ItemKey, Option<(ItemKey, u32)>, Alloc<'n>>, crate::seam::PositionGap>,
+    ) -> Option<Result<(ItemKey, u32), crate::seam::PositionGap>> {
+        None
+    }
+
     /// Question 10k: the whole text the expansion `call` of crate `krate` made (`None`: not
     /// served; over records the reason is in the log).
     fn expansion_text(self, krate: usize, call: ItemKey) -> Option<&'n str>;
@@ -308,6 +332,21 @@ pub trait NamesSource<'n>: Copy {
     /// Question 13: the members of the trait or impl `owner`, in declaration order, each given
     /// to `each`. `false`: the owner has no member row (a container with no member has none).
     fn each_member(self, owner: ItemKey, each: &mut dyn FnMut(MemberOf<'n>)) -> bool;
+
+    /// Filtered [`each_member`]: asks `want(kind, name)` on each member row before reading its
+    /// text, skipping `MemberWant::Skip` rows and avoiding text reads for `MemberWant::NameOnly`.
+    fn each_member_matching(
+        self,
+        owner: ItemKey,
+        want: &mut dyn FnMut(ItemKind, Option<&'n str>) -> MemberWant,
+        each: &mut dyn FnMut(MemberOf<'n>),
+    ) -> bool {
+        self.each_member(owner, &mut |m| {
+            if want(m.kind, m.name) != MemberWant::Skip {
+                each(m);
+            }
+        })
+    }
 
     /// The trait or impl a member is of, and the member's name (`Resolver::member_of`).
     fn member_owner(self, member: ItemKey) -> Option<(ItemKey, &'n str)>;
@@ -371,6 +410,17 @@ pub trait NamesSource<'n>: Copy {
     /// (blaze-typeck `World::asking`): a source that records its reads tells its recorder
     /// (front2 tables/recorder.rs `ReadSink::asking`); one that does not has nothing to tell.
     fn asking(self, _ask: Option<blaze_typeck::Asking>) {}
+
+    /// Starts capturing raw [`TableRead`]s emitted through this source for `SharedFacts` replay.
+    fn begin_read_tap(self) -> Option<usize> {
+        None
+    }
+
+    /// Ends a capture started at `mark` and hands the captured slice to `f`.
+    fn end_read_tap(self, _mark: usize, _f: &mut dyn FnMut(&[super::tables::recorder::TableRead])) {}
+
+    /// Replays previously captured [`TableRead`]s through this source's recorder.
+    fn replay_table_reads(self, _reads: &[super::tables::recorder::TableRead]) {}
 
     /// The impl `key` of crate `krate`, written in `module`, with its header's text: for the
     /// one impl a row does not file ([`NamesSource::each_impl_row`]'s reader). `None`: the
@@ -917,6 +967,11 @@ pub trait Load<'n> {
     fn names_verified(&self, _krate: usize) -> Option<Verified<'n>> {
         None
     }
+    /// An already-verified items record proof for crate `krate` (rule 74), avoiding redundant
+    /// `ItemsRecord::open` column and UTF-8 checks per job and stretch.
+    fn items_verified(&self, _krate: usize) -> Option<blaze_scope::items_record::VerifiedItems<'n>> {
+        None
+    }
     /// Whether crate `krate` is a proc-macro crate when known from the crate graph without
     /// opening its `ItemsRecord` (still recorded as `NameCell::Root` by `Tables::proc_macro`).
     fn proc_macro(&self, _krate: usize) -> Option<bool> {
@@ -1060,6 +1115,10 @@ impl<'n> LoadItems<'n> for Loader<'n> {
             self.log.put(SourceError::NoRecord { krate, name: self.log.name(krate), which: Which::Items });
         }
         bytes
+    }
+
+    fn load_verified(&self, krate: usize) -> Option<blaze_scope::items_record::VerifiedItems<'n>> {
+        self.load.items_verified(krate)
     }
 
     fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'n str> {
@@ -1216,6 +1275,13 @@ pub struct Records<'n> {
     /// segment and per lexical layer. Records are one thread's (they hold `RefCell`s), and a walk
     /// calls nothing that walks again, so the borrow is never contended.
     scratch: RefCell<ThroughScratch<'n>>,
+    /// Per-crate `#![blaze::...]` extension flags detected once from file 0 (`Records::blaze_extensions`),
+    /// avoiding repeated full scans of crate root files on every lowered item head.
+    extensions: AVec<'n, OnceCell<parser::Extensions>>,
+    /// Per-crate written-local item start cache (`local_position::in_source`), built lazily once
+    /// per crate on the first written-local source-position lookup so repeated publications do
+    /// not rescan every enclosing body in the crate.
+    local_starts: RefCell<HashMap<usize, Result<HashMap<blaze_typeck::ItemKey, Option<(ItemKey, u32)>, Alloc<'n>>, crate::seam::PositionGap>, Alloc<'n>>>,
     /// The allocator the records were opened with, the caller's: a walk's and a digest's
     /// scratch too.
     alloc: Alloc<'n>,
@@ -1232,6 +1298,10 @@ impl<'n> Records<'n> {
     pub fn new(keys: &'n [CrateItemKey], load: &'n dyn Load<'n>, log: &'n Log<'n>, frame: &'n blaze_mem::Frame, alloc: Alloc<'n>) -> Records<'n> {
         let origin_parts: ARc<'n, OriginParts<'n>> = ARc::new_in(RefCell::new(HashMap::new_in(alloc)), alloc);
         let bump = frame.alloc(Erased::new(frame)).bump();
+        let mut extensions = AVec::with_capacity_in(keys.len(), alloc);
+        for _ in 0..keys.len() {
+            extensions.push(OnceCell::new());
+        }
         Records {
             paths: VerifiedNames::new(keys, load, log, alloc),
             items: RecordItems::new(keys, Loader { load, log, origins: origin_parts.local_share() }, bump),
@@ -1251,6 +1321,8 @@ impl<'n> Records<'n> {
             marks: RefCell::new(HashMap::new_in(alloc)),
             origins_opened: Cell::new(0),
             scratch: RefCell::new(ThroughScratch::new_in(alloc)),
+            extensions,
+            local_starts: RefCell::new(HashMap::new_in(alloc)),
             alloc,
         }
     }
@@ -1685,6 +1757,17 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         Some(self.names_of(krate)?.crate_root().has_feature(name))
     }
 
+    fn blaze_extensions(self, krate: usize) -> parser::Extensions {
+        let Some(cell) = self.extensions.get(krate) else {
+            return parser::Extensions::NONE;
+        };
+        *cell.get_or_init(|| {
+            self.file_text(krate, 0)
+                .map(blaze_file_items::detect_blaze_extensions)
+                .unwrap_or(parser::Extensions::NONE)
+        })
+    }
+
     /// The link closure (linked.rs `Linked::closure`, the one work list) over what each
     /// crate's records hold of its links:
     /// - its extern prelude, the names record's crate-root `externs` (blaze-scope resolve.rs
@@ -1885,6 +1968,28 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         Ok(())
     }
 
+    fn cached_local_start(
+        self,
+        krate: usize,
+        wanted: blaze_typeck::ItemKey,
+        build: impl FnOnce(Alloc<'n>) -> Result<HashMap<blaze_typeck::ItemKey, Option<(ItemKey, u32)>, Alloc<'n>>, crate::seam::PositionGap>,
+    ) -> Option<Result<(ItemKey, u32), crate::seam::PositionGap>> {
+        use crate::seam::PositionGap;
+        if !self.local_starts.borrow().contains_key(&krate) {
+            let built = build(self.alloc);
+            self.local_starts.borrow_mut().insert(krate, built);
+        }
+        let guard = self.local_starts.borrow();
+        let entry = guard.get(&krate)?;
+        Some(match entry {
+            Ok(map) => match map.get(&wanted) {
+                Some(Some(hit)) => Ok(*hit),
+                Some(None) | None => Err(PositionGap::NoItem),
+            },
+            Err(e) => Err(*e),
+        })
+    }
+
     fn expansion_text(self, krate: usize, call: ItemKey) -> Option<&'n str> {
         self.whole_text(krate, blaze_scope::resolve::At::Expansion(call))
     }
@@ -2054,6 +2159,15 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     }
 
     fn each_member(self, owner: ItemKey, each: &mut dyn FnMut(MemberOf<'n>)) -> bool {
+        self.each_member_matching(owner, &mut |_, _| MemberWant::WithText, each)
+    }
+
+    fn each_member_matching(
+        self,
+        owner: ItemKey,
+        want: &mut dyn FnMut(ItemKind, Option<&'n str>) -> MemberWant,
+        each: &mut dyn FnMut(MemberOf<'n>),
+    ) -> bool {
         let Some(krate) = self.items.crate_of(owner) else { return false };
         if self.items_of(krate).is_none() {
             return false;
@@ -2063,8 +2177,16 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
             // A member whose row or text does not read is an error filed; the rest are still
             // given, and the log voids the result.
             let Some(row) = self.read(krate, row) else { continue };
-            // Its entry and text as they are now (item_grain.rs `member_now`).
-            let Some((item, text)) = self.member_now(krate, owner, &row) else { continue };
+            let need = want(row.kind, row.name);
+            let (item, text) = match need {
+                MemberWant::Skip => continue,
+                MemberWant::NameOnly => (row.outline, ""),
+                MemberWant::WithText => {
+                    // Its entry and text as they are now (item_grain.rs `member_now`).
+                    let Some(now) = self.member_now(krate, owner, &row) else { continue };
+                    now
+                }
+            };
             each(MemberOf {
                 key: row.key,
                 name: row.name,

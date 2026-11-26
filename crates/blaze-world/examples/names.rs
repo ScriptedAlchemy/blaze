@@ -1166,7 +1166,7 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
                         root: blaze_proc_macro::script_sandbox::ScriptRoot::member(dir).unwrap_or_else(|e| panic!("{}: {e}", c.package)),
                     },
                     blaze_world::Place::Path { dir } => blaze_proc_macro::sandbox::Files::Folder(root.join(dir)),
-                    blaze_world::Place::Pack { view, dir } => sandbox_files(PackageAt::Pack { view, dir }),
+                    blaze_world::Place::Pack { view, dir } => sandbox_files(PackageAt::Pack { view, dir, alloc: heap.shared() }),
                 };
                 env.push(("CARGO_MANIFEST_DIR".to_string(), files.seen().to_string()));
                 files
@@ -1406,8 +1406,10 @@ fn count(names: &blaze_scope::resolve::Names<'static>, inners: Option<&[blaze_sc
         n.macro_paths += d.calls.len();
     }
     for e in c.expansions.values() {
-        n.imports += e.decls.uses.len();
-        n.macro_paths += e.decls.calls.len();
+        if let Some(d) = e.decls() {
+            n.imports += d.uses.len();
+            n.macro_paths += d.calls.len();
+        }
     }
     for m in c.made.values() {
         n.imports += m.decls.uses.len();

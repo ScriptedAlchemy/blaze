@@ -61,6 +61,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         driver: crate::engine_ready_edit::Driver::Phases,
         ready_plant: crate::engine_ready_edit::CommitPlant::None,
         features: crate::graph::FeatureAsk::DEFAULT,
+        scope: crate::engine_check::CheckScope::Whole,
     }
 }
 
@@ -2273,15 +2274,15 @@ fn a_write_after_the_replay_is_seen_by_the_next() {
         taken.encode(&mut bytes);
         bytes
     };
-    let first = journal_sweep::take(&cx, &root, &home, &clock, journal_sweep::Stored::NONE, frame).expect("the replay");
+    let first = journal_sweep::take(&cx, &fs, &root, &home, &clock, journal_sweep::Stored::NONE, frame).expect("the replay");
     let first_bytes = saved(&first);
     // CONTROL: nothing written since the place.
     let stored = journal_sweep::Stored::of(&first_bytes).expect("the places read back whole");
-    let quiet = journal_sweep::take(&cx, &root, &home, &clock, stored, frame).expect("the replay");
+    let quiet = journal_sweep::take(&cx, &fs, &root, &home, &clock, stored, frame).expect("the replay");
     assert_eq!((quiet.journal.clone(), quiet.events), (journal_sweep::JournalUse::Used, 0), "nothing written: nothing named");
     // The write a request's reads would race: after the place, before the read.
     write(&io, "a/src/lib.rs", "pub fn one() -> u8 {\n    1\n}\n// late\n");
-    let next = journal_sweep::take(&cx, &root, &home, &clock, stored, frame).expect("the replay");
+    let next = journal_sweep::take(&cx, &fs, &root, &home, &clock, stored, frame).expect("the replay");
     println!("a write after the place: {} event(s)", next.events);
     assert_eq!(next.journal, journal_sweep::JournalUse::Used);
     assert!(next.events >= 1, "the late write is named by the next replay");
@@ -2432,4 +2433,340 @@ fn engine_why_reads_a_body_under_its_crates_edition() {
     let said = why(&io, "a/src/lib.rs::one");
     println!("why under 2024:\n{said}");
     assert!(said.contains("(read as edition 2024"), "why names the crate's edition, 2024: {said}");
+}
+
+/// SCOPED CHECK FOR `blaze test <member>` / `-p <pkg>`: checking only `a` (which depends on `dep`)
+/// skips unrelated broken sibling `b`, handles both an inline `#[cfg(test)]` body and a
+/// `#[cfg(test)] mod tests;` submodule in `dep` without ownerless bodies, hits its own scoped
+/// certificate on repeat, and never poisons the whole-workspace stored answer.
+#[test]
+fn engine_check_scoped_skips_unrelated_sibling_and_preserves_whole_answer() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    write(&io, "Cargo.toml", "[workspace]\nmembers = [\"dep\", \"a\", \"b\"]\nresolver = \"2\"\n");
+    write(&io, "dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io,
+        "dep/src/lib.rs",
+        "#[cfg(test)]\nmod tests;\n\npub fn one() -> u8 {\n    1\n}\n\n#[cfg(test)]\nfn dep_inline_test() {\n    let _ = one();\n}\n",
+    );
+    write(&io, "dep/src/tests.rs", "pub fn dep_submod_helper() -> u8 {\n    super::one()\n}\n");
+    write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n");
+    write(&io, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::one() + 1\n}\n");
+    write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io, "b/src/lib.rs", "pub fn wrong() -> u8 {\n    true\n}\n");
+
+    // Verify scoped_root_name keeps Whole, Test, and Bin root names disjoint.
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let whole_root = crate::engine_answer::scoped_root_name("ws", crate::engine_check::CheckScope::Whole, cx.frame());
+    let test_root = crate::engine_answer::scoped_root_name(
+        "ws",
+        crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] },
+        cx.frame(),
+    );
+    let bin_root = crate::engine_answer::scoped_root_name(
+        "ws",
+        crate::engine_check::CheckScope::Bin { package: "a", root: "a/src/main.rs" },
+        cx.frame(),
+    );
+    assert_ne!(whole_root.as_str(), test_root.as_str(), "Whole and Test roots must be disjoint");
+    assert_ne!(whole_root.as_str(), bin_root.as_str(), "Whole and Bin roots must be disjoint");
+    assert_ne!(test_root.as_str(), bin_root.as_str(), "Test and Bin roots must be disjoint");
+    let scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let features = crate::graph::FeatureAsk { features: &["enabled"], ..crate::graph::FeatureAsk::DEFAULT };
+    let selected = crate::engine_answer::scoped_root_name_for("ws", scope, features, cx.frame());
+    assert_ne!(selected.as_str(), test_root.as_str(), "feature selections must not share a scoped certificate");
+    assert_ne!(selected.as_str(), crate::engine_answer::root_name_for("ws", features, cx.frame()).as_str(), "feature selections preserve scope separation");
+    assert_eq!(test_root.as_str(), crate::engine_answer::scoped_root_name_for("ws", scope, crate::graph::FeatureAsk::DEFAULT, cx.frame()).as_str());
+
+    // 1. Scoped check on `a`: 0 findings (`b`'s type error is skipped), 0 ownerless bodies.
+    let mut scoped_opts = opts(&io, 2, false);
+    scoped_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (scoped_ids, scoped) = engine_opts(&io, scoped_opts);
+    assert!(scoped_ids.is_empty(), "scoped check on `a` must not report `b`'s error: {scoped_ids:?}");
+    let scoped_bodies = scoped.stages[blaze_engine::Stage::Bodies.index()].entered;
+    assert_eq!(scoped_bodies, 3, "only `dep::one` (lib) and `a::two` (lib + lib-test) should be checked; got {scoped_bodies}");
+
+    // 2. Repeated scoped check on `a` hits its own scoped certificate (0 tasks entered).
+    let mut scoped_again_opts = opts(&io, 2, false);
+    scoped_again_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (again_ids, again) = engine_opts(&io, scoped_again_opts);
+    assert!(again.certified, "repeated scoped check must hit its certificate");
+    assert_eq!(again.entered, 0, "certificate hit enters 0 tasks");
+    assert!(again_ids.is_empty(), "repeated scoped check still has 0 findings: {again_ids:?}");
+
+    // 3. Whole-workspace check right after scoped check was NOT poisoned and reports `b`'s error.
+    let (whole_ids, whole) = engine_from(&io, 2, false);
+    assert!(whole_ids.iter().any(|(code, _)| code == "types"), "whole-workspace check must report `b`'s types error: {whole_ids:?}");
+    let whole_bodies = whole.stages[blaze_engine::Stage::Bodies.index()].entered;
+    assert!(whole_bodies > scoped_bodies, "whole-workspace bodies ({whole_bodies}) must exceed scoped bodies ({scoped_bodies})");
+
+    // 4. Scoped check on `a` after whole-workspace check still hits its own clean certificate.
+    let mut after_whole_opts = opts(&io, 2, false);
+    after_whole_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (after_ids, after) = engine_opts(&io, after_whole_opts);
+    assert!(after.certified, "scoped certificate remains valid after whole-workspace check");
+    assert!(after_ids.is_empty(), "scoped check stays clean after whole-workspace check: {after_ids:?}");
+}
+
+/// A stored answer whose pointer, lines, and root directory exist in the store while one or more
+/// lazy task pages were pruned (reproducing the live `tempo` missing-page wedge) must NOT wedge
+/// the checkout with `rc=125`:
+/// - under `--driver=ready` (explicit ready-only mode) it still fails closed with an actionable
+///   `blaze clean` hint;
+/// - under the default driver (`Phases` / `Auto`) it reports the missing page visibly via
+///   `Unreadable::Pages(PagesError::Missing { .. })`, rebuilds cleanly in full once, overwrites
+///   the checkout's stored answer, and the very next check hits the certificate.
+#[test]
+fn missing_stored_answer_page_rebuilds_visibly_and_unwedges_checkout() {
+    use blaze_cas::plain::{LEASE_NS, ROOT_LIFE_NS, Settings};
+
+    let io = Io::simulated(SimWorld::new(37, Limits::USUAL));
+    three_crates(&io);
+    let (first_ids, first) = engine_from(&io, 2, false);
+    assert!(first.entered > 0, "cold check must enter tasks");
+
+    // Simulate a pruned task page while pointer + lines + root directory remain live:
+    // unroot `{root}.reach` (which pins task pages), keep `{root}` and `{root}.answer` pinned,
+    // advance past the lease window, and compact the store so the unpinned page records are swept.
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+    let frame = cx.frame();
+    let fs = io.need_fs().expect("fs");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let heap = blaze_own::testing::heap();
+    let answer_root = crate::engine_answer::root_name("ws", frame);
+    let reach_root = bstd::mem::format_in!(frame, "{}.{}", answer_root.as_str(), crate::engine_answer::REACH_ROOT);
+    let answer_index_root = bstd::mem::format_in!(frame, "{}.{}", answer_root.as_str(), crate::engine_answer::ANSWER_ROOT);
+    let store_home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+    {
+        let facts = crate::store::Facts { boot: Some(1), nonce: 37 };
+        let lent = store_home.open_store(&Settings::default(), facts, heap.alloc()).expect("open store");
+        assert!(lent.has_root(reach_root.as_str()), "cold check must have pinned reach root");
+        lent.unroot(reach_root.as_str());
+        for (name, _) in lent.roots() {
+            if name.starts_with("engine.bases.slot.") {
+                lent.unroot(name.as_str());
+            }
+        }
+        assert!(lent.renew_root(answer_root.as_str(), ROOT_LIFE_NS).is_live());
+        assert!(lent.renew_root(answer_index_root.as_str(), ROOT_LIFE_NS).is_live());
+        lent.commit().expect("commit unroot of reach");
+    }
+    // Advance past lease expiry so unpinned page records are eligible for compaction.
+    io.with_sim(|sim| sim.advance(core::time::Duration::from_nanos(LEASE_NS + 1_000_000))).expect("advance clock");
+    {
+        let facts = crate::store::Facts { boot: Some(1), nonce: 38 };
+        let lent = store_home.open_store(&Settings::default(), facts, heap.alloc()).expect("reopen for compact");
+        let _ = lent.compact_foreground(32).expect("compact");
+        lent.commit().expect("commit compact");
+    }
+
+    // Edit a body so the certificate does not short-circuit and `checking` reads a lazy page.
+    write(&io, "a/src/m.rs", "pub fn k() -> u8 {\n    let _ = 9u8;\n    2\n}\n");
+
+    // 1. Explicit `--driver=ready` must still fail closed with an actionable `blaze clean` hint.
+    let cx2 = io.cx(BUDGET, TASK_FRAME).expect("fresh context after clock advance");
+    let frame2 = cx2.frame();
+    let mut ready_opts = opts(&io, 2, false);
+    ready_opts.driver = crate::engine_ready_edit::Driver::Ready;
+    let ready_err = {
+        let root = fs.open_dir(&cx2, &Path::new("ws").expect("path")).expect("open");
+        let out = io.need_out().expect("out");
+        let err = io.need_err().expect("err");
+        let mut phases = boxed(|| Phases::new(io.need_clock().expect("clock")));
+        let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", frame2);
+        let args = io.args();
+        let net = io.net();
+        engine_check::check(&cx2, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, ready_opts, &mut shown, &mut phases, &out, &err)
+            .err()
+            .expect("explicit --driver=ready must fail closed when a stored page is missing")
+    };
+    let ready_msg = ready_err.to_string();
+    assert!(ready_msg.contains("is not in the store"), "expected missing-page error, got: {ready_msg}");
+    assert!(ready_msg.contains("blaze clean"), "expected actionable `blaze clean` hint, got: {ready_msg}");
+
+    // 2. `Driver::Auto` (the default CLI driver) hits `PagesError::Missing` on the lazy page read,
+    //    recovers cleanly once with a visible `Unreadable::Pages(Missing)` note, and overwrites the
+    //    checkout's stored answer with a complete one.
+    let before = stdout(&io).len();
+    let mut auto_opts = opts(&io, 2, false);
+    auto_opts.driver = crate::engine_ready_edit::Driver::Auto;
+    let (recovered_ids, recovered) = engine_opts(&io, auto_opts);
+    let printed = stdout(&io).split_off(before);
+    assert!(!recovered.from_last, "recovery pass must answer in full");
+    assert!(
+        matches!(recovered.unreadable, Some(crate::engine_answer::Unreadable::Pages(blaze_engine::pages::PagesError::Missing { .. }))),
+        "expected Unreadable::Pages(Missing), got {:?}",
+        recovered.unreadable
+    );
+    assert!(printed.contains("the stored engine answer is not read"), "visible note must be printed:\n{printed}");
+    assert!(printed.contains("is not in the store"), "note must name missing page:\n{printed}");
+    assert!(printed.contains("answering in full and writing it anew"), "note must explain full rebuild:\n{printed}");
+    assert_eq!(recovered_ids, first_ids, "recovered check must produce identical findings");
+
+    // 3. Subsequent check hits the freshly written certificate with no unreadable note.
+    let (_, after) = engine_from(&io, 2, false);
+    assert!(after.certified, "checkout must be unwedged and hit certificate on next check");
+    assert!(after.unreadable.is_none(), "no unreadable note after unwedging: {:?}", after.unreadable);
+}
+
+/// Whole-workspace `blaze check` followed by scoped `blaze test <pkg>`:
+/// 1. With 0 edits on a clean workspace: certifies directly from this checkout's `whole_root`
+///    (0 tasks entered, 0 Heads, 0 Bodies).
+/// 2. With 0 edits when an unrelated sibling crate `b` has a type error: scoped check on `a`
+///    skips `b`'s error AND enters 0 Heads and 0 Bodies (reusing `whole_root`'s `dep` rows).
+/// 3. After a 1-line body edit in `a` following whole `blaze check`: re-enters ONLY the edited
+///    body (0 Heads, 0 unrelated Bodies in `dep` or `a`), under both `Driver::Auto` and
+///    `Driver::Phases`.
+#[test]
+fn scoped_check_after_whole_reuses_heads_and_bodies() {
+    // --- Case 1: clean whole workspace -> 0-edit scoped test certifies directly ---
+    let io = Io::simulated(SimWorld::new(41, Limits::USUAL));
+    write(&io, "Cargo.toml", "[workspace]\nmembers = [\"dep\", \"a\", \"b\"]\nresolver = \"2\"\n");
+    write(&io, "dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io,
+        "dep/src/lib.rs",
+        "#[cfg(test)]\nmod tests;\n\npub fn one() -> u8 {\n    1\n}\n\npub fn helper() -> u8 {\n    one() + 1\n}\n\n#[cfg(test)]\nfn dep_inline_test() {\n    let _ = helper();\n}\n",
+    );
+    write(&io, "dep/src/tests.rs", "pub fn dep_submod_helper() -> u8 {\n    super::one()\n}\n");
+    write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n");
+    write(&io, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::helper() + 1\n}\n\npub fn untouched() -> u8 {\n    dep::one() + 2\n}\n");
+    write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io, "b/src/lib.rs", "pub fn other() -> u8 {\n    42\n}\n");
+
+    let (whole_ids, whole) = engine_from(&io, 2, false);
+    assert!(whole_ids.is_empty(), "clean whole workspace has 0 findings: {whole_ids:?}");
+    assert!(whole.entered > 0, "cold whole check enters tasks");
+
+    // 0-edit scoped test on `a` immediately after whole check:
+    let mut scoped_opts = opts(&io, 2, false);
+    scoped_opts.driver = crate::engine_ready_edit::Driver::Auto;
+    scoped_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (scoped_ids, scoped) = engine_opts(&io, scoped_opts);
+    assert!(scoped_ids.is_empty(), "scoped check must stay clean: {scoped_ids:?}");
+    assert!(scoped.certified, "0-edit scoped check after clean whole check must certify directly");
+    assert_eq!(scoped.entered, 0, "0-edit scoped check after clean whole check enters 0 tasks");
+    assert_eq!(scoped.stages[blaze_engine::Stage::Heads.index()].entered, 0, "0 Heads entered");
+    assert_eq!(scoped.stages[blaze_engine::Stage::Bodies.index()].entered, 0, "0 Bodies entered");
+
+    // --- Case 2: 1-line body edit in `a` right after whole check (Auto driver) ---
+    write(&io, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::helper() + 2\n}\n\npub fn untouched() -> u8 {\n    dep::one() + 2\n}\n");
+    let mut edit_auto = opts(&io, 2, false);
+    edit_auto.driver = crate::engine_ready_edit::Driver::Auto;
+    edit_auto.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (edit_ids, edit_checked) = engine_opts(&io, edit_auto);
+    assert!(edit_ids.is_empty(), "edited scoped check must stay clean: {edit_ids:?}");
+    assert_eq!(edit_checked.stages[blaze_engine::Stage::Heads.index()].entered, 0, "1-line body edit must enter 0 Heads");
+    // `a::two` has 2 rows (lib + lib-test); `dep::one`, `dep::helper`, `a::untouched` must all stand!
+    assert_eq!(edit_checked.stages[blaze_engine::Stage::Bodies.index()].entered, 2, "1-line body edit must enter ONLY `a::two` (lib + test), not unrelated dep/a bodies");
+
+    // --- Case 2b: stale scoped `answer_root` -> edit -> whole `check` -> 0-edit scoped `test` ---
+    // At this point `answer_root` for `a` exists. Edit `a/src/lib.rs`, run whole `check` (so
+    // `whole_root` is strictly fresher than `answer_root`), then run scoped `test -p a`: it must
+    // upgrade to `whole_root` and certify directly with 0 tasks entered.
+    write(&io, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::helper() + 4\n}\n\npub fn untouched() -> u8 {\n    dep::one() + 2\n}\n");
+    let (whole2_ids, _) = engine_from(&io, 2, false);
+    assert!(whole2_ids.is_empty(), "updated whole check must stay clean: {whole2_ids:?}");
+    let mut upgrade_opts = opts(&io, 2, false);
+    upgrade_opts.driver = crate::engine_ready_edit::Driver::Auto;
+    upgrade_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (upgrade_ids, upgrade) = engine_opts(&io, upgrade_opts);
+    assert!(upgrade_ids.is_empty(), "upgraded scoped check must stay clean: {upgrade_ids:?}");
+    assert!(upgrade.certified, "scoped check with stale answer_root must upgrade to fresh whole_root and certify");
+    assert_eq!(upgrade.entered, 0, "upgraded scoped check enters 0 tasks");
+
+    // --- Case 3: whole check with unrelated broken sibling `b`, then 0-edit scoped `a` (Phases) ---
+    let io2 = Io::simulated(SimWorld::new(43, Limits::USUAL));
+    write(&io2, "Cargo.toml", "[workspace]\nmembers = [\"dep\", \"a\", \"b\"]\nresolver = \"2\"\n");
+    write(&io2, "dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io2,
+        "dep/src/lib.rs",
+        "#[cfg(test)]\nmod tests;\n\npub fn one() -> u8 {\n    1\n}\n\npub fn helper() -> u8 {\n    one() + 1\n}\n\n#[cfg(test)]\nfn dep_inline_test() {\n    let _ = helper();\n}\n",
+    );
+    write(&io2, "dep/src/tests.rs", "pub fn dep_submod_helper() -> u8 {\n    super::one()\n}\n");
+    write(&io2, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n");
+    write(&io2, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::helper() + 1\n}\n\npub fn untouched() -> u8 {\n    dep::one() + 2\n}\n");
+    write(&io2, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io2, "b/src/lib.rs", "pub fn wrong() -> u8 {\n    true\n}\n");
+
+    let (w2_ids, _) = engine_from(&io2, 2, false);
+    assert!(w2_ids.iter().any(|(code, _)| code == "types"), "whole check reports `b`'s error: {w2_ids:?}");
+
+    // 0-edit scoped `a` (Phases driver) after whole check with broken `b`:
+    let mut s2_opts = opts(&io2, 2, false);
+    s2_opts.driver = crate::engine_ready_edit::Driver::Phases;
+    s2_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (s2_ids, s2) = engine_opts(&io2, s2_opts);
+    assert!(s2_ids.is_empty(), "scoped check on `a` must NOT report `b`'s error: {s2_ids:?}");
+    assert!(s2.certified, "0-edit scoped check after whole with unrelated broken `b` must certify directly by filtering whole_lines");
+    assert_eq!(s2.entered, 0, "0-edit scoped check enters 0 tasks");
+    assert_eq!(s2.stages[blaze_engine::Stage::Heads.index()].entered, 0, "0-edit Phases scoped check after whole must enter 0 Heads");
+    assert_eq!(s2.stages[blaze_engine::Stage::Bodies.index()].entered, 0, "0-edit Phases scoped check after whole must enter 0 Bodies");
+
+    // 1-line edit in `a` right after whole check with broken `b` (Phases driver, fresh io3):
+    let io3 = Io::simulated(SimWorld::new(45, Limits::USUAL));
+    write(&io3, "Cargo.toml", "[workspace]\nmembers = [\"dep\", \"a\", \"b\"]\nresolver = \"2\"\n");
+    write(&io3, "dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io3,
+        "dep/src/lib.rs",
+        "#[cfg(test)]\nmod tests;\n\npub fn one() -> u8 {\n    1\n}\n\npub fn helper() -> u8 {\n    one() + 1\n}\n\n#[cfg(test)]\nfn dep_inline_test() {\n    let _ = helper();\n}\n",
+    );
+    write(&io3, "dep/src/tests.rs", "pub fn dep_submod_helper() -> u8 {\n    super::one()\n}\n");
+    write(&io3, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n");
+    write(&io3, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::helper() + 1\n}\n\npub fn untouched() -> u8 {\n    dep::one() + 2\n}\n");
+    write(&io3, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io3, "b/src/lib.rs", "pub fn wrong() -> u8 {\n    true\n}\n");
+    let _ = engine_from(&io3, 2, false);
+    write(&io3, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::helper() + 3\n}\n\npub fn untouched() -> u8 {\n    dep::one() + 2\n}\n");
+    let mut s3_opts = opts(&io3, 2, false);
+    s3_opts.driver = crate::engine_ready_edit::Driver::Phases;
+    s3_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (s3_ids, s3) = engine_opts(&io3, s3_opts);
+    assert!(s3_ids.is_empty(), "edited scoped check on `a` must NOT report `b`'s error: {s3_ids:?}");
+    assert_eq!(s3.stages[blaze_engine::Stage::Heads.index()].entered, 0, "1-line edit Phases scoped check after whole must enter 0 Heads");
+    assert_eq!(s3.stages[blaze_engine::Stage::Bodies.index()].entered, 2, "1-line edit Phases scoped check after whole must enter ONLY `a::two` (lib + test)");
+
+    // --- Case 4: dep has a #[cfg(test)]-only error; scoped test on `a` must stay clean ---
+    let io4 = Io::simulated(SimWorld::new(47, Limits::USUAL));
+    write(&io4, "Cargo.toml", "[workspace]\nmembers = [\"dep\", \"a\"]\nresolver = \"2\"\n");
+    write(&io4, "dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io4,
+        "dep/src/lib.rs",
+        "pub fn one() -> u8 {\n    1\n}\n\n#[cfg(test)]\nfn broken_dep_test() -> u8 {\n    true\n}\n",
+    );
+    write(&io4, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n");
+    write(&io4, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::one() + 1\n}\n");
+    let (w4_ids, _) = engine_from(&io4, 2, false);
+    assert!(w4_ids.iter().any(|(code, _)| code == "types"), "whole check catches dep's #[cfg(test)] error: {w4_ids:?}");
+    let mut s4_opts = opts(&io4, 2, false);
+    s4_opts.driver = crate::engine_ready_edit::Driver::Auto;
+    s4_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (s4_ids, s4) = engine_opts(&io4, s4_opts);
+    assert!(s4_ids.is_empty(), "scoped test on `a` must NOT inherit dep's #[cfg(test)] error: {s4_ids:?}");
+    assert!(s4.certified, "0-edit scoped check narrowing away dep's #[cfg(test)] error must certify directly");
+    assert_eq!(s4.entered, 0, "0 tasks entered when narrowing away dep-test error");
+    assert_eq!(s4.stages[blaze_engine::Stage::Heads.index()].entered, 0, "0 Heads entered when narrowing away dep-test error");
+    assert_eq!(s4.stages[blaze_engine::Stage::Bodies.index()].entered, 0, "0 Bodies entered when narrowing away dep-test error");
+
+    // --- Case 5: dep has a shared-view body error (reached by both dep-lib and dep-test);
+    // 0-edit scoped test on `a` must certify directly AND report `dep`'s error ---
+    let io5 = Io::simulated(SimWorld::new(49, Limits::USUAL));
+    write(&io5, "Cargo.toml", "[workspace]\nmembers = [\"dep\", \"a\"]\nresolver = \"2\"\n");
+    write(&io5, "dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io5, "dep/src/lib.rs", "pub fn one() -> u8 {\n    true\n}\n");
+    write(&io5, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n");
+    write(&io5, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::one() + 1\n}\n");
+    let (w5_ids, _) = engine_from(&io5, 2, false);
+    assert!(w5_ids.iter().any(|(code, _)| code == "types"), "whole check catches dep::one error: {w5_ids:?}");
+    let mut s5_opts = opts(&io5, 2, false);
+    s5_opts.driver = crate::engine_ready_edit::Driver::Auto;
+    s5_opts.scope = crate::engine_check::CheckScope::Test { packages: &["a"], bin: None, bin_roots: &[] };
+    let (s5_ids, s5) = engine_opts(&io5, s5_opts);
+    assert!(s5_ids.iter().any(|(code, _)| code == "types"), "scoped test on `a` must still report dep::one error: {s5_ids:?}");
+    assert!(s5.certified, "0-edit scoped check with in-scope dep error must certify directly with filtered VIEW");
+    assert_eq!(s5.entered, 0, "0 tasks entered when certifying filtered VIEW error");
 }

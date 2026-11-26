@@ -413,21 +413,37 @@ struct ObjectTable {
     shape: ContentId,
 }
 
-/// Whether a trait's method has a slot (the Reference, "Trait objects": a method callable on
-/// the object): dyn-compatible by the checker's one rule ([`tc::dyn_compat::member_verdict`]),
-/// and not one of the explicitly non-dispatchable (`where Self: Sized`, a `self` receiver).
-/// Whether a trait's method has a slot in its vtables (the builder's `ObjectMethod::dispatch`):
+/// How a trait's method is dispatched in its vtables (the builder's `ObjectMethod::dispatch`):
 /// also the rule the reach walk reaches each table's slots by (reach/instances/slots.rs).
-pub(super) fn dispatchable(m: &tc::dyn_compat::MemberFacts, f: &tc::dyn_compat::FnFacts) -> bool {
-    !(f.where_self_sized || f.receiver == tc::dyn_compat::Receiver::Value) && tc::dyn_compat::member_verdict(m) == tc::dyn_compat::MemberVerdict::Compatible
+///
+/// `allow_by_value_self`: true for `#[lang = "fn_once"]` (and `#[lang = "async_fn_once"]`),
+/// whose `call_once(self, args)` / `async_call_once(self, args)` is dispatched through a
+/// `VTableShim` taking `*mut Self` (`Box<dyn FnOnce<Args>>::call_once` via `unsized_fn_params`).
+pub(super) fn method_dispatch(
+    m: &tc::dyn_compat::MemberFacts,
+    f: &tc::dyn_compat::FnFacts,
+    allow_by_value_self: bool,
+) -> blaze_build::vtable::MethodDispatch {
+    use blaze_build::vtable::MethodDispatch;
+    if f.where_self_sized || tc::dyn_compat::member_verdict(m) != tc::dyn_compat::MemberVerdict::Compatible {
+        return MethodDispatch::None;
+    }
+    if f.receiver == tc::dyn_compat::Receiver::Value {
+        if allow_by_value_self && f.own_non_lifetime_params == 0 && !f.self_outside_receiver && !f.is_async && !f.opaque_return {
+            return MethodDispatch::ByValueShim;
+        }
+        return MethodDispatch::None;
+    }
+    MethodDispatch::Direct
 }
 
 /// The most traits one program's objects reach, supertraits included (rule 18).
 const MOST_OBJECT_TRAITS: usize = 1024;
 
 /// The constants one ADT head may name before its row is given up on (reach.rs's
-/// `MOST_LENS`): a pattern type's ends, an array length.
-const MOST_ADT_LENS: u32 = 64;
+/// `MOST_LENS`): a pattern type's ends, an array length, or explicit enum discriminants
+/// (e.g. `nix::errno::consts::Errno` has >100 `= libc::E*` variants).
+const MOST_ADT_LENS: u32 = 1024;
 
 /// Every static `bodies` name, evaluated once ([`super::statics::static_values`]); one
 /// refused is named: in a survey filed in `left_out` and left out (each reader's build then
@@ -531,6 +547,43 @@ fn dyn_principals<'v>(views: impl Iterator<Item = PTys<'v>>) -> Vec<ItemKey, Glo
 }
 
 /// Each trait of `asked` not yet in `tables`, with every supertrait under it, made into
+/// Why ensuring a trait's head or members for [`object_tables`] failed.
+enum TraitWantError {
+    Const { key: LibKey, error: super::consts::ConstFail },
+    Head(super::heads::HeadError),
+}
+
+impl core::fmt::Display for TraitWantError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TraitWantError::Const { key, error } => write!(f, "the constant {key:x} its head names: {error:?}"),
+            TraitWantError::Head(e) => write!(f, "{e:?}"),
+        }
+    }
+}
+
+/// Ensures a trait head or member table (`Want::Head` or `Want::Members`), evaluating any
+/// constants its signature types name (`Why::NeedConst`, e.g. array lengths or const generic
+/// arguments in method signatures such as `BlobStore::get_cells`) up to [`MOST_ADT_LENS`] times.
+fn ensure_trait_want<'n, S: super::source::NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    want: super::heads::Want,
+) -> Result<(), TraitWantError> {
+    let mut lens = 0;
+    loop {
+        match r.store.ensure(r.names, r.keys, want) {
+            Err(super::heads::HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
+                lens += 1;
+                if let Err(error) = super::check::eval_len(r, c) {
+                    return Err(TraitWantError::Const { key: c, error });
+                }
+            }
+            Err(e) => return Err(TraitWantError::Head(e)),
+            Ok(()) => return Ok(()),
+        }
+    }
+}
+
 /// `tables` (the whole program passes an empty map once; the lazy program its own map, per
 /// body, so a trait is made once per command).
 fn object_tables<'n, S: super::source::NamesSource<'n>>(
@@ -552,8 +605,8 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
                 return Err(String::from("more traits under its objects than the most one program's objects reach"));
             }
             let lib = r.keys.library_in(r.names, k).ok_or_else(|| String::from("no library key"))?;
-            r.store.ensure(r.names, r.keys, super::heads::Want::Head(lib)).map_err(|e| format!("its head: {e:?}"))?;
-            r.store.ensure(r.names, r.keys, super::heads::Want::Members(lib)).map_err(|e| format!("its members: {e:?}"))?;
+            ensure_trait_want(r, super::heads::Want::Head(lib)).map_err(|e| format!("its head: {e}"))?;
+            ensure_trait_want(r, super::heads::Want::Members(lib)).map_err(|e| format!("its members: {e}"))?;
             let head = r.store.maps.traits.get(&lib).ok_or_else(|| String::from("made, but no head filed under its key"))?;
             let supers_written = r.store.maps.supers.get(&lib).ok_or_else(|| String::from("made, but no supertraits filed under its key"))?;
             let view = r.store.tys.view();
@@ -597,20 +650,27 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
             if waiting {
                 return Ok(None);
             }
+            let allow_by_value_self = r.index.lang("fn_once").is_some_and(|l| checker_of(l) == k)
+                || r.index.lang("async_fn_once").is_some_and(|l| checker_of(l) == k);
             let mut methods = Vec::with_capacity_in(head.members.len(), Global);
             for m in head.members.iter() {
                 let dispatch = match &m.shape {
-                    tc::dyn_compat::MemberShape::Fn(f) => dispatchable(m, f),
+                    tc::dyn_compat::MemberShape::Fn(f) => method_dispatch(m, f, allow_by_value_self),
                     tc::dyn_compat::MemberShape::Unread(u) => return Err(format!("a member the front end could not read ({u:?})")),
                     _ => continue,
                 };
                 let item = head.fns.iter().find(|(n, _)| *n == m.name).map(|(_, f)| *f).ok_or_else(|| String::from("a method with no fn filed under its name"))?;
                 methods.push(blaze_build::vtable::ObjectMethod { item, dispatch });
             }
-            let mut h = blaze_ids::Hasher::new("blaze-ladder front2 object trait 3");
+            let mut h = blaze_ids::Hasher::new("blaze-ladder front2 object trait 4");
             h.update(&k.0.to_le_bytes());
             for m in methods.iter() {
-                h.update(&m.item.0.to_le_bytes()).update(&[u8::from(m.dispatch)]);
+                let tag: u8 = match m.dispatch {
+                    blaze_build::vtable::MethodDispatch::None => 0,
+                    blaze_build::vtable::MethodDispatch::Direct => 1,
+                    blaze_build::vtable::MethodDispatch::ByValueShim => 2,
+                };
+                h.update(&m.item.0.to_le_bytes()).update(&[tag]);
             }
             let super_view = super_tys.as_ref().map_or(PTys::EMPTY, PortableTys::view);
             for s in supers.iter() {
@@ -838,6 +898,7 @@ impl<'n> Front2Program<'n> {
         let mut buckets = None;
         let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
         let prepared = Prepares::new_in(bump);
+        store.prepared = Some(prepared);
         let mut mains: Vec<Body<'n>, Global> = Vec::with_capacity_in(roots.len(), Global);
         let mut kept: Vec<LibKey, Global> = Vec::with_capacity_in(roots.len(), Global);
         // The records, with the program's one constant evaluator, are made BEFORE the roots
@@ -941,13 +1002,23 @@ impl<'n> Front2Program<'n> {
         // fn is a root of the walk, so it is tabled and in the test's reach.
         let mut shapes: Vec<Result<EntryShape, TestEntryRefusal>, Global> = Vec::new_in(Global);
         let mut also: Vec<ItemKey, Global> = Vec::new_in(Global);
+        let mut termination_report_fn: Option<ItemKey> = None;
         if tests {
+            let mut has_report = false;
             for (m, &lib) in mains.iter().zip(roots.iter()) {
                 let shape = super::test_entry::entry_shape(&mut records, lib, m.owner);
                 if let Ok(EntryShape::Report { report, .. }) = shape {
                     also.push(report);
+                    has_report = true;
                 }
                 shapes.push(shape);
+            }
+            if has_report
+                && let Some(term_lib) = records.index.lang(super::test_entry::TERMINATION_LANG)
+                && records.store.ensure(names, &mut records.keys, super::heads::Want::Members(term_lib)).is_ok()
+                && let Ok(term_key) = records.keys.item(term_lib)
+            {
+                termination_report_fn = records.keys.filed_member(term_key, MemberKind::Fn, "report");
             }
             also.sort_unstable();
             also.dedup();
@@ -1060,6 +1131,13 @@ impl<'n> Front2Program<'n> {
                     declared.push((item, super::row_path::row_path_of(&records, item)));
                 }
             }
+        }
+        // If any test of a suite is entered through the report shim, table `Termination::report`
+        // as a declared trait fn so whole-program builds can read its signature and ABI.
+        if let Some(report_fn) = termination_report_fn
+            && met.insert(report_fn, ()).is_none()
+        {
+            declared.push((report_fn, super::row_path::row_path_of(&records, report_fn)));
         }
         // Every ADT a type of the program names has its row before the build: the back half
         // lays out each type it meets (an impl's signature's `ControlFlow<..>` too, which no
@@ -1935,6 +2013,14 @@ impl FrontEnd for Front2Program<'_> {
         Ok(out)
     }
 
+    fn restore_checked(&mut self, checked: &mut [Option<Checked<'static>>]) {
+        for (f, c) in self.fns.iter_mut().zip(checked.iter_mut()) {
+            if f.checked.is_none() {
+                f.checked = c.take();
+            }
+        }
+    }
+
     /// D106: fn `key`'s body, checked in `new` (the whole reach, today), handed over once: the
     /// record walk's maker asks each key once a run. A stage: the lazy program (piece Y) checks
     /// only this body here, and this table goes when it is tested equal.
@@ -1947,10 +2033,10 @@ impl FrontEnd for Front2Program<'_> {
         self.front.index.fn_lang(l).map(checker_of)
     }
 
-    /// The `drop` lang trait and its `drop` fn (filed once the trait's head was made).
+    /// The `drop` lang trait and its `drop` fn (from its filed head or the library's member row).
     fn drop_trait(&self) -> Option<(ItemKey, Option<ItemKey>)> {
         let tr = self.made_lang(LangItem::Drop)?;
-        Some((tr, self.front.keys.filed_member(tr, MemberKind::Fn, "drop")))
+        Some((tr, self.lang_trait_fn(LangItem::Drop, "drop")))
     }
 
     /// The library item for `item`, by the one home the checker's world asks too
@@ -2015,6 +2101,17 @@ impl FrontEnd for Front2Program<'_> {
         let mut declared = false;
         super::source::NamesSource::each_member(names, lib, &mut |m| declared |= m.kind == blaze_surface::ItemKind::Function && m.name == Some(name));
         declared.then(|| super::keys::member_key_of(tr, MemberKind::Fn, name))
+    }
+
+    fn termination_report(&self) -> Option<ItemKey> {
+        let lib = self.front.index.lang(super::test_entry::TERMINATION_LANG)?;
+        let tr = checker_of(lib);
+        if let Some(filed) = self.front.keys.filed_member(tr, MemberKind::Fn, "report") {
+            return Some(filed);
+        }
+        let mut declared = false;
+        super::source::NamesSource::each_member(self.front.names, lib, &mut |m| declared |= m.kind == blaze_surface::ItemKind::Function && m.name == Some("report"));
+        declared.then(|| super::keys::member_key_of(tr, MemberKind::Fn, "report"))
     }
 
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
@@ -2129,7 +2226,7 @@ impl FrontEnd for Front2Program<'_> {
     /// a const block or a promoted borrow of a body (`Consts::body_value`, under its key over
     /// the owner's text: `ConstNeed::in_body`). The evaluator checks any body and makes any
     /// impl row the value needs.
-    fn const_at(&mut self, need: super::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], closures: &crate::run::ClosureTable) -> Result<DataRecord<Global>, super::const_at::ConstAtWhy> {
+    fn const_at(&mut self, need: super::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], build: super::const_at::BuildFacts<'_>) -> Result<DataRecord<Global>, super::const_at::ConstAtWhy> {
         let alloc = self.store.tys.alloc();
         let mut records = Records {
             names: self.front.names,
@@ -2143,14 +2240,14 @@ impl FrontEnd for Front2Program<'_> {
             consts: None,
         };
         let made = match need {
-            super::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, self.prepared, item, from, args, Some(closures), alloc),
+            super::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, self.prepared, item, from, args, Some(build), alloc),
             super::const_at::ConstNeed::Block { .. } | super::const_at::ConstNeed::Promoted { .. } => {
                 let owner = need.item();
                 let in_body = records.store.fns.get(&owner).and_then(|h| need.in_body(h.text));
                 let Some((owner, root, key)) = in_body else {
                     return Err(super::const_at::ConstAtWhy::Eval(super::consts::ConstFail::Body { item: owner, error: super::body::BodyError::NoHead(owner) }));
                 };
-                self.consts.body_value(&mut records, self.prepared, owner, root, key, from, args, Some(closures), alloc)
+                self.consts.body_value(&mut records, self.prepared, owner, root, key, from, args, Some(build), alloc)
             }
         };
         made.map(super::const_at::data_record).map_err(super::const_at::ConstAtWhy::Eval)
@@ -2160,6 +2257,10 @@ impl FrontEnd for Front2Program<'_> {
     /// instance (consts.rs `Consts::fn_instance`).
     fn const_fn_instance(&self, key: blaze_build::InstanceKey, ground: &mut tc::PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::Instance> {
         self.consts.fn_instance(key, ground, scratch)
+    }
+
+    fn const_vtable_ref(&self, key: blaze_build::vtable::VtableKey, ground: &mut tc::PortableTys<'_>, scratch: Alloc<'_>) -> Option<blaze_build::vtable::VtableRef> {
+        self.consts.vtable_ref(key, ground, scratch)
     }
 
     fn evaluates_at_args(&self) -> bool {
@@ -2211,7 +2312,7 @@ impl FrontEnd for Front2Program<'_> {
         let row = self.by_key.get(&owner).and_then(|&i| self.fns.get(i)).ok_or(not_live)?;
         let body = row.body.as_ref().ok_or(not_live)?;
         let anchor_owner = body.param_subst.as_ref().map_or(owner, |(orig, _)| *orig);
-        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, anchor_owner, body, expr)
+        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, &self.store, anchor_owner, body, expr, None)
     }
 
     /// By seam_rules.rs `def_site`, from the item's head and the names source.
@@ -2221,7 +2322,7 @@ impl FrontEnd for Front2Program<'_> {
             .iter()
             .find(|s| self.fns.get(s.row).is_some_and(|r| r.key == item))
             .map_or(item, |s| s.orig);
-        lazy::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, anchor)
+        lazy::seam_rules::def_site(self.front.names, &self.front.keys, &self.store, anchor, None)
     }
 
     fn expr_site(&self, owner: ItemKey, expr: ExprId) -> Option<u32> {
@@ -2233,7 +2334,7 @@ impl FrontEnd for Front2Program<'_> {
     /// item_grain.rs) and that text's line starts: an edit above the item moves the answer and
     /// no record (seam_rules.rs).
     fn source_position(&self, item: ItemKey, site: u32) -> Result<(u32, u32), crate::seam::PositionGap> {
-        lazy::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site)
+        lazy::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site, None)
     }
 
     /// A static the program reaches: its head's mutability and `#[thread_local]` (statics.rs).
@@ -2282,5 +2383,73 @@ impl FrontEnd for Front2Program<'_> {
 impl blaze_build::type_name::TypeNames for Front2Program<'_> {
     fn item_path(&self, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
         super::type_name::item_path(self.front.names, &self.front.keys, &self.store, item, out)
+    }
+
+    fn variant_name(&self, adt: ItemKey, variant: u32, out: &mut dyn FnMut(&str)) -> bool {
+        super::type_name::variant_name(self.front.names, &self.front.keys, adt, variant, out)
+    }
+}
+
+#[cfg(test)]
+mod object_const_tests {
+    use super::lazy::LazyProgram;
+    use crate::crates::{Inputs, UserCrate};
+    use crate::front2::keys::checker_of;
+    use crate::front2::stalled_goals::tests::fixture_toolchain;
+    use crate::refusal::SourceFile;
+    use crate::seam::FrontEnd;
+
+    /// `object_tables` must evaluate const expressions inside trait member signatures (such as
+    /// `BlobStore::get_cells` returning a fixed-size `[u8; BYTES_PER_CELL]` alias) instead of
+    /// refusing with `NeedConst`.
+    #[test]
+    fn object_trait_evaluates_const_lengths_in_trait_members() {
+        const SOURCE: &str = r#"
+const BYTES: usize = 32;
+type Cell = [u8; BYTES];
+
+pub trait BlobLike {
+    fn get_cell(&self) -> Cell;
+}
+
+struct Dummy;
+impl BlobLike for Dummy {
+    fn get_cell(&self) -> Cell {
+        [0u8; BYTES]
+    }
+}
+
+fn read(store: &dyn BlobLike) -> usize {
+    store.get_cell().len()
+}
+
+fn main() {
+    let d = Dummy;
+    let _ = read(&d);
+}
+"#;
+        let alloc = blaze_own::testing::heap().alloc();
+        let tc = fixture_toolchain();
+        let files = [("/obj_const/src/main.rs".to_owned(), SOURCE.to_owned())];
+        let user = UserCrate {
+            name: "obj_const", dir: "/obj_const/", root: "/obj_const/src/main.rs", files: &files,
+            edition: edition::PackageEdition::of_manifest("2024").expect("Rust 2024"), panic: blaze_build::Panic::Unwind,
+        };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture crate");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let trait_key = names
+            .items(0)
+            .find_map(|(item, _, _)| (names.item_text(item).and_then(|t| t.name) == Some("BlobLike")).then_some(checker_of(item)))
+            .expect("fixture `BlobLike`");
+        let mut lazy = LazyProgram::new(&names, &frame, &sources, None, alloc).expect("lazy program");
+        assert!(
+            lazy.object_table(trait_key).expect("trait object with const-sized member signature must build cleanly"),
+            "object_table must build and cache BlobLike"
+        );
+        assert!(lazy.object_trait(trait_key).is_some(), "BlobLike object trait must be available");
     }
 }

@@ -1498,3 +1498,87 @@ fn an_expansions_item_call_reads_its_dollar_crate_by_its_mark() {
     let (stats, records) = lower_items(&[plain, INNER_ITEM], "plain!{}");
     assert_eq!((stats.macro_calls_expanded, stats.macro_calls_failed), (2, 0), "{:#?}", records.0);
 }
+
+/// A macro called in statement position (`outer!();` or braced tail `outer! {}`) that expands to
+/// an unbraced inner macro call with no trailing semicolon (`inner!(...)`) stays in statement
+/// position (`Fragment::Stmts`), so `inner!` may expand to multiple statements (`let`, `unsafe`,
+/// assignments — the exact shape of `cmov`'s `cseleq64!` -> `cseleq!` -> `asm!`).
+/// NEGATIVE TWIN: an unbraced tail call directly in a block (`fn f() { inner!() }`) stays in
+/// expression position (`Fragment::Expr`) and refuses `let` with `DiagKind::Syntax`, matching
+/// rustc.
+#[test]
+fn nested_unbraced_call_in_macro_stmts_stays_in_statement_position() {
+    let cseleq = (
+        "cseleq",
+        "($eor:expr, $cmp:expr, $instruction:expr, $lhs:expr, $rhs:expr, $condition:expr, $dst:expr) => { \
+            let mut tmp = u16::from(*$dst); \
+            let condition = u16::from($condition); \
+            unsafe { \
+                builtin # asm($eor, $cmp, $instruction, out(reg) _, in(reg) *$lhs, in(reg) *$rhs, inlateout(reg) tmp, in(reg) condition, in(reg) tmp, options(pure, nomem, nostack)); \
+            }; \
+            *$dst = (tmp & 0xFF) as u8; \
+        }",
+    );
+    let cseleq64 = (
+        "cseleq64",
+        "($instruction:expr, $lhs:expr, $rhs:expr, $condition:expr, $dst:expr) => { \
+            cseleq!(\"eor {0:x}, {1:x}, {2:x}\", \"cmp {0:x}, 0\", $instruction, $lhs, $rhs, $condition, $dst) \
+        }",
+    );
+    let cmovne = r#"fn cmovne(a: &u64, rhs: &u64, input: u8, output: &mut u8) {
+        cseleq64!("csel {3:x}, {4:x}, {5:x}, NE", a, rhs, input, output);
+    }"#;
+    let l = expanding(&[cseleq, cseleq64], cmovne);
+    let (whys, dump) = outcome(&l);
+    assert!(whys.is_empty(), "{whys:?}\n{dump}");
+    assert!(l.view().diags.is_empty(), "diags: {:?}\n{dump}", l.view().diags);
+    assert!(dump.contains("(asm "), "{dump}");
+
+    // Braced tail outer call expanding to statements + unbraced inner call with a tail expression.
+    let inner_ret = ("inner_ret", "() => { let y = 2; y + 3 }");
+    let outer_ret = ("outer_ret", "() => { let x = 1; inner_ret!() }");
+    let l = expanding(&[inner_ret, outer_ret], "fn f() -> i32 { outer_ret! {} }");
+    let (whys, dump) = outcome(&l);
+    assert!(whys.is_empty(), "{whys:?}\n{dump}");
+    assert!(l.view().diags.is_empty(), "diags: {:?}\n{dump}", l.view().diags);
+    assert!(dump.contains("(tail (bin Add "), "{dump}");
+
+    // NEGATIVE TWIN: unbraced tail call directly inside a block (`STMT_LIST`) stays `Fragment::Expr`.
+    let inner_stmts = ("inner_stmts", "() => { let a = 1; let _ = a; }");
+    let l = expanding(&[inner_stmts], "fn f() { inner_stmts!() }");
+    assert!(
+        l.view().diags().filter_map(Result::ok).any(|d| d.kind == crate::DiagKind::Syntax),
+        "unbraced tail macro call in a block must be parsed as an expression: {:?}",
+        l.view().diags
+    );
+}
+
+/// An item-level `macro_rules!` expansion (like `blaze-sys`'s `cold!`): a call-site parameter
+/// `name: i32` (unmarked) MUST NOT shadow a def-site call `name(1)` (marked `SemiOpaque`),
+/// while an unmarked reference to `name` still resolves to the parameter and a marked `let x`
+/// still resolves to marked `x`.
+#[test]
+fn item_macro_call_site_param_does_not_shadow_def_site_call() {
+    let text = "fn confstr(name: i32) { let found = name(1); call(found, name); }";
+    let call_name_at = u32::try_from(text.find("name(1)").expect("def-site call")).expect("short");
+    let let_found_at = u32::try_from(text.find("found =").expect("def-site let")).expect("short");
+    let use_found_at = u32::try_from(text.find("found, ").expect("def-site use")).expect("short");
+    let call_at = u32::try_from(text.find("call(").expect("def-site fn")).expect("short");
+    let mut marked = vec![call_name_at, let_found_at, use_found_at, call_at];
+    marked.sort_unstable();
+    let l = expanding_marked(&[], text, &marked);
+    let (whys, dump) = outcome(&l);
+    assert!(whys.is_empty(), "{whys:?}\n{dump}");
+    // Def-site `name(1)` stays a module path, NOT local `name: i32`.
+    assert!(dump.contains("(call (path name)"), "def-site `name(1)` must stay a path:\n{dump}");
+    // Both `found` (def-site) and `name` in `call(found, name)` (call-site) resolve as locals.
+    let v = l.view();
+    let local_names: StdVec<&str> = locals(&v)
+        .into_iter()
+        .map(|p| {
+            let crate::Pat::Bind { name, .. } = v.pat(p).expect("bind") else { panic!("expected bind") };
+            v.name_text(name).expect("name")
+        })
+        .collect();
+    assert_eq!(local_names, vec!["found", "name"], "expected `found` then `name` locals:\n{dump}");
+}

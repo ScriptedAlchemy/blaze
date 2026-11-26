@@ -25,7 +25,7 @@ use blaze_typeck as tc;
 use core::alloc::Allocator;
 
 use super::body::Body;
-use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, clauses_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
+use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, assoc_copy_read, clauses_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
 use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, flow_of, nested_inner_first, nested_range, next_nested};
@@ -298,6 +298,7 @@ impl core::fmt::Display for BorrowRefused {
                     Some(External::Static) => "'static",
                     Some(External::OwnerParam(_)) => "owner param",
                     Some(External::Param(_)) => "type param",
+                    Some(External::DynPlaceholder(_)) => "dyn placeholder",
                     None => "hidden",
                 };
                 write!(f, "[{} -> {}] ", endpoint(*from), endpoint(*into))?;
@@ -449,6 +450,8 @@ pub struct BorrowLangs {
     pub fn_traits: [Option<tc::ItemKey>; 3],
     /// `Deref`: for [`Facts::deref_impl`].
     pub deref: Option<tc::ItemKey>,
+    /// `core::future::Future`, for [`Facts::is_future_trait`].
+    pub future: Option<tc::ItemKey>,
     /// Compiler-builtin traits whose associated types always have zero lifetimes:
     /// `DiscriminantKind::Discriminant` and `Pointee::Metadata`.
     pub discriminant_kind: Option<tc::ItemKey>,
@@ -470,6 +473,7 @@ impl BorrowLangs {
             relates_nothing: [lang("sized"), lang("meta_sized"), lang("pointee_sized"), lang("destruct")],
             fn_traits: [lang("fn"), lang("fn_mut"), lang("fn_once")],
             deref: lang("deref"),
+            future: lang("future_trait"),
             discriminant_kind,
             pointee,
         }
@@ -499,9 +503,20 @@ pub struct BorrowFacts<'a> {
     /// arguments' drop flags are in `drop_need` (borrow_fields.rs `drop_facts_of`; `Facts::drop_args`).
     drop_args: AVec<'a, (u128, u32, u32)>,
     drop_need: AVec<'a, bool>,
+    /// Per ADT whose strict-drop summary was read (RFC 1327 `#[may_dangle]`), sorted by checker
+    /// key: where its arguments' strict flags are in `drop_strict_need` (`Facts::drop_strict`).
+    drop_strict: AVec<'a, (u128, u32, u32)>,
+    drop_strict_need: AVec<'a, bool>,
+    /// Per ADT whose per-lifetime drop-liveness summary was read, sorted by checker key: where
+    /// its lifetime flags are in `drop_lt_need` (`Facts::drop_lifetimes`).
+    drop_lifetimes: AVec<'a, (u128, u32, u32)>,
+    drop_lt_need: AVec<'a, bool>,
     /// The body owner's type parameters bounded by `Copy` in its clauses (own and inherited:
     /// `Preds::clauses`), sorted, each once (`Facts::param_copy`).
     param_copy: AVec<'a, u32>,
+    /// `PNode::Alias` types in this body bounded by `Copy` (via their associated type's own
+    /// trait bounds or the body owner's `where` clauses), sorted by `PTy::0` (`Facts::alias_copy`).
+    alias_copy: AVec<'a, u32>,
     /// Per callee with a made head, sorted. Its signature regions are NOT here: the lowering
     /// reads them from the head records ([`BorrowFacts::read_by`], D148), each in place.
     callees: AVec<'a, (u128, CalleeFacts)>,
@@ -528,6 +543,9 @@ pub struct BorrowFacts<'a> {
     /// `Facts::trait_lifetimes` (the one call rule). The read: the names source files the
     /// trait's `Item` cell as it answers (tables/view.rs `declared_lifetimes`, D155).
     trait_counts: AVec<'a, (u128, Option<u32>)>,
+    /// Sorted checker keys of gathered traits marked `auto trait` (`TraitFlags::AUTO`), for
+    /// `blaze_flow_lower::Facts::is_auto_trait`.
+    auto_traits: AVec<'a, u128>,
     /// Each `<_ as trait_>::name` of those types, sorted, and its lifetime count (the trait's
     /// plus the associated type's own, `Arity::alias_lifetimes`), for `Facts::alias_lifetimes`;
     /// its reads the trait's `Item` and `Members` cells, filed by the names source likewise.
@@ -569,14 +587,20 @@ pub struct BorrowFacts<'a> {
     /// the toolchain's library (its key covers them).
     relates_nothing: [Option<tc::ItemKey>; 4],
     fn_traits: [Option<tc::ItemKey>; 3],
+    future_trait: Option<tc::ItemKey>,
+    into_future_trait: Option<tc::ItemKey>,
     discriminant_kind: Option<tc::ItemKey>,
     pointee: Option<tc::ItemKey>,
     /// Unique `Deref` impl per ADT, sorted by ADT key (`Facts::deref_impl`).
     deref_impls: AVec<'a, (u128, tc::ItemKey)>,
     /// `(trait_key, assoc_name, assoc_item)` sorted by `(trait_key, assoc_name)` (`Facts::assoc_item`).
     assoc_items: AVec<'a, (u128, tc::Name, tc::ItemKey)>,
-    /// Enclosing trait impl of `owner`, if `owner` is a method of `impl<..> Trait for SelfTy`.
-    owner_trait_impl: Option<blaze_flow_lower::OwnerTraitImpl>,
+    /// RPITIT opaques sorted by opaque key (`Facts::rpitit_opaque`).
+    rpitit_opaques: AVec<'a, (u128, blaze_flow_lower::RpititOpaque)>,
+    /// Trait-impl methods overriding RPITIT fns, sorted by `(imp, fn_name)` (`Facts::impl_fn`).
+    impl_fns: AVec<'a, (u128, tc::Name, tc::ItemKey)>,
+    /// Enclosing trait impl of `owner` and its `Self`-supertrait impls (when unique for `SelfTy`).
+    owner_trait_impls: AVec<'a, blaze_flow_lower::OwnerTraitImpl>,
 }
 
 /// The facts the lowering asks: a body's gathered [`BorrowFacts`] with the head records' region
@@ -624,7 +648,12 @@ impl<'a> BorrowFacts<'a> {
             copy_need: AVec::new_in(alloc),
             drop_args: AVec::new_in(alloc),
             drop_need: AVec::new_in(alloc),
+            drop_strict: AVec::new_in(alloc),
+            drop_strict_need: AVec::new_in(alloc),
+            drop_lifetimes: AVec::new_in(alloc),
+            drop_lt_need: AVec::new_in(alloc),
             param_copy: AVec::new_in(alloc),
+            alias_copy: AVec::new_in(alloc),
             callees: AVec::new_in(alloc),
             calls: super::call_generics::CallBoundsTable::new_in(alloc),
             ties: ties::TiesTable::new_in(alloc),
@@ -632,6 +661,7 @@ impl<'a> BorrowFacts<'a> {
             shape_refused: AVec::new_in(alloc),
             object_traits: AVec::new_in(alloc),
             trait_counts: AVec::new_in(alloc),
+            auto_traits: AVec::new_in(alloc),
             alias_counts: AVec::new_in(alloc),
             fn_binders: true,
             variance_at: AVec::new_in(alloc),
@@ -646,11 +676,15 @@ impl<'a> BorrowFacts<'a> {
             constant_initializer: false,
             relates_nothing: [None; 4],
             fn_traits: [None; 3],
+            future_trait: None,
+            into_future_trait: None,
             discriminant_kind: None,
             pointee: None,
             deref_impls: AVec::new_in(alloc),
             assoc_items: AVec::new_in(alloc),
-            owner_trait_impl: None,
+            rpitit_opaques: AVec::new_in(alloc),
+            impl_fns: AVec::new_in(alloc),
+            owner_trait_impls: AVec::new_in(alloc),
         }
     }
 
@@ -759,8 +793,25 @@ impl Facts for ReadBy<'_, '_> {
         let end = start.checked_add(usize::try_from(len).ok()?)?;
         self.facts.drop_need.get(start..end)
     }
+    fn drop_strict(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        let at = self.facts.drop_strict.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
+        let &(_, start, len) = self.facts.drop_strict.get(at)?;
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.facts.drop_strict_need.get(start..end)
+    }
+    fn drop_lifetimes(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        let at = self.facts.drop_lifetimes.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
+        let &(_, start, len) = self.facts.drop_lifetimes.get(at)?;
+        let start = usize::try_from(start).ok()?;
+        let end = start.checked_add(usize::try_from(len).ok()?)?;
+        self.facts.drop_lt_need.get(start..end)
+    }
     fn param_copy(&self, index: u32) -> bool {
         self.facts.param_copy.binary_search(&index).is_ok()
+    }
+    fn alias_copy(&self, alias: tc::PTy) -> bool {
+        self.facts.alias_copy.binary_search(&alias.0).is_ok()
     }
     fn shape(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Shape<'_>> {
         let at = self.facts.shapes.binary_search_by_key(&item.0, |(k, _)| *k).ok()?;
@@ -783,15 +834,24 @@ impl Facts for ReadBy<'_, '_> {
             || Some(trait_) == self.facts.discriminant_kind
             || Some(trait_) == self.facts.pointee
     }
+    fn is_auto_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.auto_traits.binary_search(&trait_.0).is_ok()
+    }
     fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.fn_traits.contains(&Some(trait_))
+    }
+    fn is_future_trait(&self, trait_: tc::ItemKey) -> bool {
+        Some(trait_) == self.facts.future_trait
+    }
+    fn is_into_future_trait(&self, trait_: tc::ItemKey) -> bool {
+        Some(trait_) == self.facts.into_future_trait
     }
     fn assoc_item(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<tc::ItemKey> {
         let at = self.facts.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, n, _)| (k, n)).ok()?;
         Some(self.facts.assoc_items[at].2)
     }
-    fn owner_trait_impl(&self) -> Option<blaze_flow_lower::OwnerTraitImpl> {
-        self.facts.owner_trait_impl
+    fn owner_trait_impl(&self, trait_: tc::ItemKey) -> Option<blaze_flow_lower::OwnerTraitImpl> {
+        self.facts.owner_trait_impls.iter().copied().find(|oti| oti.trait_ == trait_)
     }
     fn deref_impl(&self, adt: tc::ItemKey) -> Option<tc::ItemKey> {
         let at = self.facts.deref_impls.binary_search_by_key(&adt.0, |&(k, _)| k).ok()?;
@@ -800,6 +860,14 @@ impl Facts for ReadBy<'_, '_> {
     fn is_zero_slot_builtin_assoc(&self, trait_: tc::ItemKey, name: tc::Name) -> bool {
         (Some(trait_) == self.facts.discriminant_kind && name == tc::Name::of("Discriminant"))
             || (Some(trait_) == self.facts.pointee && name == tc::Name::of("Metadata"))
+    }
+    fn rpitit_opaque(&self, opaque: tc::ItemKey) -> Option<blaze_flow_lower::RpititOpaque> {
+        let at = self.facts.rpitit_opaques.binary_search_by_key(&opaque.0, |&(k, _)| k).ok()?;
+        self.facts.rpitit_opaques.get(at).map(|&(_, v)| v)
+    }
+    fn impl_fn(&self, imp: tc::ItemKey, fn_name: tc::Name) -> Option<tc::ItemKey> {
+        let at = self.facts.impl_fns.binary_search_by_key(&(imp.0, fn_name), |&(k, n, _)| (k, n)).ok()?;
+        self.facts.impl_fns.get(at).map(|&(_, _, v)| v)
     }
     fn adt_variances(&self, adt: tc::ItemKey) -> Option<&[blaze_flow_lower::Variance]> {
         let at = self.facts.variance_at.binary_search_by_key(&adt.0, |&(k, _, _)| k).ok()?;
@@ -839,6 +907,102 @@ impl Facts for ReadBy<'_, '_> {
 /// reference to a type parameter or to a type with no reference at its head, a type with no
 /// reference at its head, or not read (a projection, an opaque type or a trait object, which may
 /// stand for a reference; two references deep).
+/// Structural equality of two erased `PTy`s residing in different `PTys` tables (bounded,
+/// zero-allocation, used to match owner `where` clauses against body `PNode::Alias` types).
+fn pty_eq_across(ta: tc::PTys<'_>, a: tc::PTy, tb: tc::PTys<'_>, b: tc::PTy) -> bool {
+    let mut stack = [(tc::PTy(0), tc::PTy(0)); 64];
+    let mut sp = 1usize;
+    stack[0] = (a, b);
+    let mut steps = 0u32;
+    while sp > 0 {
+        steps += 1;
+        if steps > 256 {
+            return false;
+        }
+        sp -= 1;
+        let Some(&(x, y)) = stack.get(sp) else { return false };
+        let (Ok(nx), Ok(ny)) = (ta.node(x), tb.node(y)) else { return false };
+        let push_pair = |stack: &mut [(tc::PTy, tc::PTy); 64], sp: &mut usize, px: tc::PTy, py: tc::PTy| -> bool {
+            let Some(slot) = stack.get_mut(*sp) else { return false };
+            *slot = (px, py);
+            *sp += 1;
+            true
+        };
+        let push_lists = |stack: &mut [(tc::PTy, tc::PTy); 64], sp: &mut usize, lx: tc::List, ly: tc::List| -> bool {
+            let (Ok(sx), Ok(sy)) = (ta.list(lx), tb.list(ly)) else { return false };
+            if sx.len() != sy.len() {
+                return false;
+            }
+            for (&ex, &ey) in sx.iter().zip(sy.iter()) {
+                if !push_pair(stack, sp, ex, ey) {
+                    return false;
+                }
+            }
+            true
+        };
+        match (nx, ny) {
+            (tc::PNode::Bool, tc::PNode::Bool)
+            | (tc::PNode::Char, tc::PNode::Char)
+            | (tc::PNode::Str, tc::PNode::Str)
+            | (tc::PNode::Never, tc::PNode::Never) => {}
+            (tc::PNode::Int(i), tc::PNode::Int(j)) if i == j => {}
+            (tc::PNode::Uint(i), tc::PNode::Uint(j)) if i == j => {}
+            (tc::PNode::Float(i), tc::PNode::Float(j)) if i == j => {}
+            (tc::PNode::Param(i), tc::PNode::Param(j)) if i == j => {}
+            (tc::PNode::ConstParam(i), tc::PNode::ConstParam(j)) if i == j => {}
+            (tc::PNode::ConstValue { ty: tx, bits: vx }, tc::PNode::ConstValue { ty: ty, bits: vy }) if vx == vy => {
+                if !push_pair(&mut stack, &mut sp, tx, ty) {
+                    return false;
+                }
+            }
+            (tc::PNode::Ref(mx, ix), tc::PNode::Ref(my, iy)) | (tc::PNode::Ptr(mx, ix), tc::PNode::Ptr(my, iy)) if mx == my => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (tc::PNode::Slice(ix), tc::PNode::Slice(iy)) => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (tc::PNode::Array(ix, lx), tc::PNode::Array(iy, ly)) if lx == ly => {
+                if !push_pair(&mut stack, &mut sp, ix, iy) {
+                    return false;
+                }
+            }
+            (tc::PNode::Tuple(lx), tc::PNode::Tuple(ly))
+            | (tc::PNode::Union(lx), tc::PNode::Union(ly))
+            | (tc::PNode::Dynamic(lx), tc::PNode::Dynamic(ly)) => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (tc::PNode::Adt(kx, lx), tc::PNode::Adt(ky, ly))
+            | (tc::PNode::Opaque(kx, lx), tc::PNode::Opaque(ky, ly))
+            | (tc::PNode::FnDef(kx, lx), tc::PNode::FnDef(ky, ly))
+            | (tc::PNode::ExTrait(kx, lx), tc::PNode::ExTrait(ky, ly))
+                if kx == ky =>
+            {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (tc::PNode::FnPtr(lx, sx), tc::PNode::FnPtr(ly, sy)) if sx == sy => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            (tc::PNode::Alias { trait_: tx, name: nx, args: lx }, tc::PNode::Alias { trait_: ty, name: ny, args: ly }) if tx == ty && nx == ny => {
+                if !push_lists(&mut stack, &mut sp, lx, ly) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn field_lead(tys: tc::PTys<'_>, t: tc::PTy) -> FieldLead {
     let plain = |n: tc::PNode| {
         matches!(
@@ -1303,6 +1467,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     g.fn_binders = plant != FactsPlant::FnBindersFree;
     g.relates_nothing = langs.relates_nothing;
     g.fn_traits = langs.fn_traits;
+    g.future_trait = langs.future;
+    g.into_future_trait = super::langs::find(r.index, crate::resolve::Paths { names: r.names }, tc::LangItem::IntoFuture).ok().flatten().map(checker_of);
     g.discriminant_kind = langs.discriminant_kind;
     g.pointee = langs.pointee;
     // A `const` or `static` item's body (module-level, local in a fn/macro, associated, or
@@ -1429,6 +1595,14 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     for k in c.callees.column::<1>().iter() {
         items.push(k.0);
     }
+    let has_value_callable = c.types.view().nodes().any(|n| matches!(n, tc::PNode::FnPtr(..) | tc::PNode::Dynamic(_)));
+    if has_value_callable {
+        for d in c.expr_defs.column::<1>().iter() {
+            if let tc::Def::Static(k, _) | tc::Def::Const(k) = *d {
+                items.push(k.0);
+            }
+        }
+    }
     let mut opaques: AVec<'a, u128> = AVec::new_in(alloc);
     let mut traits: AVec<'a, u128> = AVec::new_in(alloc);
     for n in c.types.view().nodes() {
@@ -1490,10 +1664,10 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         if let Some(f) = r.store.fns.get(&key) {
             let tys = r.store.tys.view();
             let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
-            let callee = CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref };
+            let callee = CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref, c_variadic: f.c_variadic };
             g.callees.push((k, callee));
         } else if r.store.ctors.contains_key(&key) {
-            g.callees.push((k, CalleeFacts { writes_lifetimes: true, self_ref: false }));
+            g.callees.push((k, CalleeFacts { writes_lifetimes: true, self_ref: false, c_variadic: false }));
         } else {
             g.reads.push(head_read(k, HeadAnswer::NotMade));
         }
@@ -1504,16 +1678,62 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         && let Some(tr) = ih.trait_
     {
         let tys = r.store.tys.view();
-        let self_shape = match tys.node(ih.self_ty) {
-            Ok(tc::PNode::Adt(k, _)) => Some(blaze_flow_lower::SelfShape::Adt(k)),
-            Ok(tc::PNode::Ref(m, _)) => Some(blaze_flow_lower::SelfShape::Ref(m)),
-            Ok(tc::PNode::Tuple(l)) => tys.list(l).ok().and_then(|ks| u32::try_from(ks.len()).ok()).map(blaze_flow_lower::SelfShape::Tuple),
-            _ => None,
+        let (self_shape, tc_shape) = match tys.node(ih.self_ty) {
+            Ok(tc::PNode::Adt(k, _)) => (Some(blaze_flow_lower::SelfShape::Adt(k)), Some(tc::Shape::Adt(k))),
+            Ok(tc::PNode::Ref(m, _)) => (Some(blaze_flow_lower::SelfShape::Ref(m)), Some(tc::Shape::Ref(m))),
+            Ok(tc::PNode::Tuple(l)) => {
+                let n = tys.list(l).ok().and_then(|ks| u32::try_from(ks.len()).ok());
+                (n.map(blaze_flow_lower::SelfShape::Tuple), n.map(tc::Shape::Tuple))
+            }
+            _ => (None, None),
         };
-        if let Some(self_shape) = self_shape {
-            g.owner_trait_impl = Some(blaze_flow_lower::OwnerTraitImpl { imp: container, trait_: tr, generics: ih.generics, self_shape });
+        if let (Some(self_shape), Some(tc_shape)) = (self_shape, tc_shape) {
+            g.owner_trait_impls.push(blaze_flow_lower::OwnerTraitImpl { imp: container, trait_: tr, generics: ih.generics, self_shape });
             traits.push(tr.0);
             selected.push((container.0, None));
+            // Also record unique impls of `tr`'s `Self`-supertraits for `SelfTy` (e.g.
+            // `Cloned<I>: Iterator` inside `impl DoubleEndedIterator for Cloned<I>`).
+            let mut work: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            let mut seen: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+            work.push(tr);
+            seen.push(tr);
+            while let Some(cur) = work.pop() {
+                if seen.len() >= 32 {
+                    break;
+                }
+                if !r.store.trait_defs.contains_key(&cur)
+                    && let Some(lib) = r.keys.library_in(r.names, cur)
+                {
+                    ensure_one(r, Want::Members(lib));
+                }
+                let mut sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                if let Some(def) = r.store.trait_defs.get(&cur) {
+                    let tys = r.store.tys.view();
+                    for sc in def.supertraits.iter() {
+                        if let tc::PClause::Trait { trait_: sup, args } = *sc
+                            && let Ok(list) = tys.list(args)
+                            && list.first().is_some_and(|&a| matches!(tys.node(a), Ok(tc::PNode::Param(0))))
+                            && seen.scan_for(&sup).is_none()
+                        {
+                            seen.push(sup);
+                            sups.push(sup);
+                        }
+                    }
+                }
+                for &sup in sups.iter() {
+                    work.push(sup);
+                    if let Some(impls) = answer_impls(r, sup, tc_shape)
+                        && let &[imp] = &impls[..]
+                        && let Some(lib) = r.keys.library_in(r.names, imp)
+                        && container_head(r, lib, false)
+                        && let Some(sup_ih) = r.store.impls.get(&imp)
+                    {
+                        g.owner_trait_impls.push(blaze_flow_lower::OwnerTraitImpl { imp, trait_: sup, generics: sup_ih.generics, self_shape });
+                        traits.push(sup.0);
+                        selected.push((imp.0, None));
+                    }
+                }
+            }
         }
     }
     for p in c.selected.iter() {
@@ -1543,37 +1763,137 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             container_head(r, lib, false);
         }
     }
-    // Ensure trait heads transitively through supertraits so `regions.clauses(trait_)` is loaded
-    // for supertrait elaboration in `blaze-borrow`.
+    for &k in items.iter() {
+        if let Some(p) = r.store.preds.get(&tc::ItemKey(k)) {
+            for cl in p.clauses.iter() {
+                if let tc::PClause::Trait { trait_, .. } | tc::PClause::Projection { trait_, .. } = *cl {
+                    traits.push(trait_.0);
+                }
+            }
+        }
+    }
+    for &(k, _) in selected.iter() {
+        if let Some(p) = r.store.preds.get(&tc::ItemKey(k)) {
+            for cl in p.clauses.iter() {
+                if let tc::PClause::Trait { trait_, .. } | tc::PClause::Projection { trait_, .. } = *cl {
+                    traits.push(trait_.0);
+                }
+            }
+        }
+    }
+    // Ensure trait heads transitively through supertraits, trait where-clauses, associated-type
+    // item bounds, and nested alias traits so `regions.clauses` and `assoc_items` are loaded for
+    // supertrait elaboration in `blaze-borrow`.
     {
+        fn push_clause_traits(stys: tc::PTys<'_>, cl: &tc::PClause, traits: &mut AVec<'_, u128>) {
+            let (args, extra_ty) = match *cl {
+                tc::PClause::Trait { trait_: sup, args } => {
+                    if traits.scan_for(&sup.0).is_none() {
+                        traits.push(sup.0);
+                    }
+                    (Some(args), None)
+                }
+                tc::PClause::Projection { trait_: sup, args, term, .. } => {
+                    if traits.scan_for(&sup.0).is_none() {
+                        traits.push(sup.0);
+                    }
+                    (Some(args), Some(term))
+                }
+                _ => (None, None),
+            };
+            let mut st = [tc::PTy(0); 32];
+            let mut len = 0usize;
+            if let Some(args) = args
+                && let Ok(list) = stys.list(args)
+            {
+                for &t in list {
+                    if len < st.len() {
+                        st[len] = t;
+                        len += 1;
+                    }
+                }
+            }
+            if let Some(t) = extra_ty
+                && len < st.len()
+            {
+                st[len] = t;
+                len += 1;
+            }
+            let mut steps = 0u32;
+            while len > 0 && steps < 64 {
+                len -= 1;
+                steps += 1;
+                let Ok(node) = stys.node(st[len]) else { continue };
+                match node {
+                    tc::PNode::Alias { trait_: at, args: al, .. }
+                    | tc::PNode::ExProj { trait_: at, args: al, .. }
+                    | tc::PNode::ExTrait(at, al) => {
+                        if traits.scan_for(&at.0).is_none() {
+                            traits.push(at.0);
+                        }
+                        if let Ok(xs) = stys.list(al) {
+                            for &x in xs {
+                                if len < st.len() {
+                                    st[len] = x;
+                                    len += 1;
+                                }
+                            }
+                        }
+                    }
+                    tc::PNode::Adt(_, al)
+                    | tc::PNode::Tuple(al)
+                    | tc::PNode::Dynamic(al)
+                    | tc::PNode::Opaque(_, al) => {
+                        if let Ok(xs) = stys.list(al) {
+                            for &x in xs {
+                                if len < st.len() {
+                                    st[len] = x;
+                                    len += 1;
+                                }
+                            }
+                        }
+                    }
+                    tc::PNode::Ref(_, x)
+                    | tc::PNode::Ptr(_, x)
+                    | tc::PNode::Slice(x)
+                    | tc::PNode::Array(x, _) => {
+                        if len < st.len() {
+                            st[len] = x;
+                            len += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let mut ti = 0usize;
         traits.sort_unstable();
         traits.dedup();
-        while ti < traits.len() && traits.len() < 256 {
+        while ti < traits.len() && traits.len() < 1024 {
             let tk = tc::ItemKey(traits[ti]);
             ti += 1;
             if let Some(lib) = r.keys.library_in(r.names, tk)
                 && matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Trait))
             {
                 container_head(r, lib, true);
+                r.store.ensure_assoc_regions(r.names, r.keys, lib);
+            }
+            let stys = r.store.tys.view();
+            if let Some(p) = r.store.preds.get(&tk) {
+                for cl in p.clauses.iter() {
+                    push_clause_traits(stys, cl, &mut traits);
+                }
             }
             if let Some(def) = r.store.trait_defs.get(&tk) {
                 for sc in def.supertraits.iter() {
-                    if let tc::PClause::Trait { trait_: sup, .. } | tc::PClause::Projection { trait_: sup, .. } = *sc
-                        && traits.scan_for(&sup.0).is_none()
-                    {
-                        traits.push(sup.0);
-                    }
+                    push_clause_traits(stys, sc, &mut traits);
                 }
                 for a in def.assoc.iter() {
                     g.assoc_items.push((tk.0, a.name, a.item));
                     if let Some(ap) = r.store.preds.get(&a.item) {
                         for ac in ap.clauses.iter() {
-                            if let tc::PClause::Trait { trait_: sup, .. } | tc::PClause::Projection { trait_: sup, .. } = *ac
-                                && traits.scan_for(&sup.0).is_none()
-                            {
-                                traits.push(sup.0);
-                            }
+                            push_clause_traits(stys, ac, &mut traits);
                         }
                     }
                 }
@@ -1583,6 +1903,247 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         traits.dedup();
         g.assoc_items.sort_unstable_by_key(|&(k, n, _)| (k, n));
         g.assoc_items.dedup_by_key(|&mut (k, n, _)| (k, n));
+    }
+    // Check which `PNode::Alias` types in this body are bounded by `Copy` (either via their
+    // associated type item's own trait bounds `type At<'a>: Copy` / supertrait of `Copy`, or
+    // via the body owner's `where` clauses `M::At<'_>: Copy`).
+    if let Some(copy_tr) = langs.copy {
+        let mut visited: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        let mut stack: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        let mut direct: AVec<'a, u128> = AVec::new_in(alloc);
+        let mut recorded: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        let mut assoc_copy_cache: AVec<'a, (u128, bool)> = AVec::new_in(alloc);
+        let mut reaches_copy = |r: &mut Records<'_, 'n, S>, start: tc::ItemKey, reads: &mut AVec<'a, Read>| -> bool {
+            visited.clear();
+            stack.clear();
+            stack.push(start);
+            while let Some(t) = stack.pop() {
+                if t == copy_tr {
+                    return true;
+                }
+                if visited.scan_for(&t).is_some() || visited.len() >= 64 {
+                    continue;
+                }
+                visited.push(t);
+                if !r.store.trait_defs.contains_key(&t)
+                    && let Some(lib) = r.keys.library_in(r.names, t)
+                {
+                    ensure_one(r, Want::Members(lib));
+                }
+                direct.clear();
+                let mut self_static = false;
+                if let Some(def) = r.store.trait_defs.get(&t) {
+                    let tys = r.store.tys.view();
+                    for sc in def.supertraits.iter() {
+                        match *sc {
+                            tc::PClause::Trait { trait_: sup, args }
+                                if tys.list(args).ok().and_then(|l| l.first().copied()).is_some_and(|first| matches!(tys.node(first), Ok(tc::PNode::Param(0)))) =>
+                            {
+                                direct.push(sup.0);
+                            }
+                            tc::PClause::TypeOutlives { ty, region: tc::regions::Region::Static }
+                                if matches!(tys.node(ty), Ok(tc::PNode::Param(0))) =>
+                            {
+                                self_static = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    direct.sort_unstable();
+                    direct.dedup();
+                    if recorded.scan_for(&t).is_none() {
+                        recorded.push(t);
+                        reads.push(copy_supertrait_read(t.0, Some((&direct, self_static))));
+                    }
+                    for &sup in direct.iter() {
+                        stack.push(tc::ItemKey(sup));
+                    }
+                } else if recorded.scan_for(&t).is_none() {
+                    recorded.push(t);
+                    reads.push(copy_supertrait_read(t.0, None));
+                }
+            }
+            false
+        };
+        let body_tys = c.types.view();
+        for (idx, n) in body_tys.nodes().enumerate() {
+            let tc::PNode::Alias { trait_, name, .. } = *n else { continue };
+            let mut is_copy = false;
+            if let Ok(pos) = g.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, nm, _)| (k, nm))
+                && let Some(&(_, _, a_item)) = g.assoc_items.get(pos)
+            {
+                if let Some(&(_, cached)) = assoc_copy_cache.iter().find(|&&(k, _)| k == a_item.0) {
+                    is_copy = cached;
+                } else {
+                    let mut sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                    if let Some(ap) = r.store.preds.get(&a_item) {
+                        let stys = r.store.tys.view();
+                        for ac in ap.clauses.iter() {
+                            if let tc::PClause::Trait { trait_: sup, args } = *ac
+                                && let Ok(list) = stys.list(args)
+                                && let Some(&first) = list.first()
+                                && let Ok(tc::PNode::Alias { trait_: at, name: an, .. }) = stys.node(first)
+                                && at == trait_
+                                && an == name
+                            {
+                                sups.push(sup);
+                            }
+                        }
+                    }
+                    let mut found = false;
+                    for &sup in sups.iter() {
+                        if reaches_copy(r, sup, &mut g.reads) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    assoc_copy_cache.push((a_item.0, found));
+                    g.reads.push(assoc_copy_read(a_item.0, found));
+                    is_copy = found;
+                }
+            }
+            if !is_copy
+                && let Ok(pty_id) = u32::try_from(idx)
+            {
+                let mut owner_sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                if let Some(op) = r.store.preds.get(&owner) {
+                    let stys = r.store.tys.view();
+                    for oc in op.clauses.iter() {
+                        if let tc::PClause::Trait { trait_: sup, args } = *oc
+                            && let Ok(list) = stys.list(args)
+                            && let Some(&first) = list.first()
+                            && pty_eq_across(stys, first, body_tys, tc::PTy(pty_id))
+                        {
+                            owner_sups.push(sup);
+                        }
+                    }
+                }
+                for &sup in owner_sups.iter() {
+                    if reaches_copy(r, sup, &mut g.reads) {
+                        is_copy = true;
+                        break;
+                    }
+                }
+            }
+            if is_copy && let Ok(pty_id) = u32::try_from(idx) {
+                g.alias_copy.push(pty_id);
+            }
+        }
+        g.alias_copy.sort_unstable();
+        g.alias_copy.dedup();
+    }
+    // Gather RPITIT synthetic metadata (`rpitit_opaques`, overriding `impl_fns`, and `Twin`
+    // default opaque regions) before ADT/read collection so every overriding impl fn and Twin
+    // opaque participates in ADT variance/outlives, read tracking (Rule 21), and signature facts.
+    {
+        let mut extra_opaques: AVec<'a, u128> = AVec::new_in(alloc);
+        for &ok_u128 in opaques.iter() {
+            if let Some(twin) = r.store.rpitit_defaults.get(&tc::ItemKey(ok_u128)) {
+                extra_opaques.push(twin.source.0);
+            }
+        }
+        for &tk_u128 in traits.iter() {
+            let tk = tc::ItemKey(tk_u128);
+            ensure_rpitit_trait_rows(r, tk);
+            let Some(tr_rows) = r.store.rpitit_traits.get(&tk) else { continue };
+            let Some(trait_types) = r.keys.library_in(r.names, tk).and_then(|lib| r.store.maps.traits.get(&lib)).map(|th| th.generics) else {
+                continue;
+            };
+            for s in tr_rows.rows.iter() {
+                let default_twin = s.default.and_then(|d| match r.store.tys.view().node(d) {
+                    Ok(tc::PNode::Opaque(k, _)) => Some(k),
+                    _ => None,
+                });
+                g.rpitit_opaques.push((
+                    s.opaque.0,
+                    blaze_flow_lower::RpititOpaque {
+                        trait_: tk,
+                        name: s.name,
+                        fn_name: s.fn_name,
+                        trait_fn: s.trait_fn,
+                        trait_types,
+                        default_twin,
+                    },
+                ));
+                extra_opaques.push(s.opaque.0);
+                if let Some(tw) = default_twin {
+                    extra_opaques.push(tw.0);
+                }
+            }
+        }
+        let mut last_imp = None;
+        let mut new_impl_fns: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+        for &(imp_u128, _) in selected.iter() {
+            if last_imp == Some(imp_u128) {
+                continue;
+            }
+            last_imp = Some(imp_u128);
+            let imp_k = tc::ItemKey(imp_u128);
+            let Some(tr) = r.store.impls.get(&imp_k).and_then(|ih| ih.trait_) else { continue };
+            ensure_rpitit_trait_rows(r, tr);
+            let Some(ih) = r.store.impls.get(&imp_k) else { continue };
+            let Some(tr_rows) = r.store.rpitit_traits.get(&tr) else { continue };
+            for s in tr_rows.rows.iter() {
+                if let Some(&(_, impl_fn)) = ih.fns.iter().find(|&&(n, _)| n == s.fn_name) {
+                    g.impl_fns.push((imp_u128, s.fn_name, impl_fn));
+                    if items.scan_for(&impl_fn.0).is_none() && new_impl_fns.scan_for(&impl_fn).is_none() {
+                        new_impl_fns.push(impl_fn);
+                    }
+                }
+            }
+        }
+        for &impl_fn in new_impl_fns.iter() {
+            if !r.store.fns.contains_key(&impl_fn)
+                && let Some(w) = member_fn_want(r.names, &*r.keys, impl_fn)
+            {
+                ensure_one(r, w);
+            }
+            items.push(impl_fn.0);
+            if let Some(f) = r.store.fns.get(&impl_fn) {
+                let tys = r.store.tys.view();
+                let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
+                g.callees.push((impl_fn.0, CalleeFacts { writes_lifetimes: f.qualifiers.writes_lifetimes(), self_ref, c_variadic: f.c_variadic }));
+                let out = r.store.fn_output(impl_fn).unwrap_or(f.output);
+                let mut st: AVec<'a, tc::PTy> = AVec::new_in(alloc);
+                st.push(out);
+                let mut steps = 0u32;
+                while let Some(t) = st.pop() {
+                    steps += 1;
+                    if steps > 1024 {
+                        break;
+                    }
+                    let Ok(node) = tys.node(t) else { continue };
+                    if let tc::PNode::Opaque(ok, _) = node {
+                        extra_opaques.push(ok.0);
+                    }
+                    if let Ok((list, last)) = super::adt_variance::children(tys, t, node) {
+                        st.extend_from_slice(list);
+                        if let Some(ch) = last {
+                            st.push(ch);
+                        }
+                    }
+                }
+            } else {
+                g.reads.push(head_read(impl_fn.0, HeadAnswer::NotMade));
+            }
+        }
+        opaques.extend_from_slice(&extra_opaques);
+        opaques.sort_unstable();
+        opaques.dedup();
+        items.sort_unstable();
+        items.dedup();
+        g.callees.sort_unstable_by_key(|&(k, _)| k);
+        g.callees.dedup_by_key(|&mut (k, _)| k);
+        g.rpitit_opaques.sort_unstable_by_key(|&(k, _)| k);
+        g.rpitit_opaques.dedup_by_key(|&mut (k, _)| k);
+        g.impl_fns.sort_unstable_by_key(|&(imp, n, _)| (imp, n));
+        g.impl_fns.dedup_by_key(|&mut (imp, n, _)| (imp, n));
+        for &ok_u128 in opaques.iter() {
+            let ok = tc::ItemKey(ok_u128);
+            if r.store.rpitit_defaults.contains_key(&ok) && r.store.regions.made(ok).is_none() {
+                ensure_twin_opaque_regions(r, ok);
+            }
+        }
     }
     let mut adts: AVec<'a, u128> = AVec::new_in(alloc);
     for n in c.types.view().nodes() {
@@ -1754,8 +2315,11 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         // A `Copy` type has no `Drop` impl: the Reference, "Special types and traits", `Copy`:
         // "Copy cannot be implemented for types that implement Drop" (rustc E0184), so YES to
         // `Copy` is NO to `Drop` without asking (an unread candidate cannot be its `Drop`).
+        // Likewise, in a `#![no_core]` crate graph with no `#[lang = "drop"]` trait at all, no ADT
+        // can implement `Drop`.
         let drop_impl = match copy_state {
             Ok(CopyImpl::Positive) => Ok(false),
+            _ if langs.drop.is_none() => Ok(false),
             _ => has_impl(r, langs.drop, key),
         };
         if let Err(why) = copy_state {
@@ -1815,9 +2379,30 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let e = s.saturating_add(len as usize);
             g.copy_need.get(s..e).is_some_and(|need| need.iter().all(|&b| !b))
         });
-        let (needs_drop, drop_need) = fields::drop_facts_of(r, langs, key, drop_impl, adt_uncond_copy, &mut g.drop_need, &mut g.reads, alloc);
+        let drop_summary = fields::drop_facts_of(
+            r,
+            langs,
+            key,
+            drop_impl,
+            adt_uncond_copy,
+            &mut g.drop_need,
+            &mut g.drop_strict_need,
+            &mut g.drop_lt_need,
+            &mut g.reads,
+            alloc,
+        );
+        let needs_drop = drop_summary.needs_drop;
+        let drop_need = drop_summary.drop_args;
+        let drop_strict_span = drop_summary.drop_strict;
+        let drop_lt_span = drop_summary.drop_lifetimes;
         if let Some((start, len)) = drop_need {
             g.drop_args.push((k, start, len));
+        }
+        if let Some((start, len)) = drop_strict_span {
+            g.drop_strict.push((k, start, len));
+        }
+        if let Some((start, len)) = drop_lt_span {
+            g.drop_lifetimes.push((k, start, len));
         }
         let deref_impl = if let Some(deref_tr) = langs.deref
             && let Some(impls) = answer_impls(r, deref_tr, tc::Shape::Adt(key))
@@ -1853,6 +2438,16 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             let e = s.checked_add(usize::try_from(len).ok()?)?;
             g.drop_need.get(s..e)
         });
+        let drop_strict = drop_strict_span.and_then(|(start, len)| {
+            let s = usize::try_from(start).ok()?;
+            let e = s.checked_add(usize::try_from(len).ok()?)?;
+            g.drop_strict_need.get(s..e)
+        });
+        let drop_lifetimes = drop_lt_span.and_then(|(start, len)| {
+            let s = usize::try_from(start).ok()?;
+            let e = s.checked_add(usize::try_from(len).ok()?)?;
+            g.drop_lt_need.get(s..e)
+        });
         let variances = variances.and_then(|(lo, hi)| {
             let s = usize::try_from(lo).ok()?;
             let e = usize::try_from(hi).ok()?;
@@ -1879,6 +2474,8 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 region_list: &regions.list,
                 copy_args,
                 drop_args,
+                drop_strict,
+                drop_lifetimes,
                 deref_impl,
                 variances,
             },
@@ -2024,7 +2621,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         // blaze-flow-lower one_call.rs `clause_of`), whether or not such a node was interned
         // yet. The census (wave-1119): 54,907 `Count` refusals named an alias's lifetimes "not
         // filed". The count itself is the one read below (rule 21).
-        for n in c.types.view().nodes().chain(r.store.tys.view().nodes()) {
+        for n in c.types.view().nodes() {
             match n {
                 tc::PNode::ExTrait(t, _) => g.trait_counts.push((t.0, None)),
                 tc::PNode::Alias { trait_, name, .. } | tc::PNode::ExProj { trait_, name, .. } => {
@@ -2034,16 +2631,212 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
                 _ => {}
             }
         }
-        for &k in items.iter() {
-            let Some(p) = r.store.preds.get(&tc::ItemKey(k)) else { continue };
-            for cl in p.clauses.iter() {
-                match *cl {
-                    tc::PClause::Trait { trait_, .. } | tc::PClause::ForFields { trait_, .. } => g.trait_counts.push((trait_.0, None)),
-                    tc::PClause::Projection { trait_, name, .. } => {
-                        g.alias_counts.push((trait_.0, name, None));
-                        g.trait_counts.push((trait_.0, None));
+        // Walk only the `PTy`s in `r.store.tys` reachable from this body's gathered heads
+        // (`items`, `owner`'s container impl, `selected`, `opaques`, `traits`, `assoc_items`,
+        // and `roots` ADTs), never scanning unrelated heads in `r.store.tys`.
+        {
+            struct TyWalk<'a, 't> {
+                stys: tc::PTys<'t>,
+                seen: blaze_hash::Map<u32, (), blaze_hash::FixedState, Alloc<'a>>,
+                st: AVec<'a, tc::PTy>,
+            }
+            impl<'a> TyWalk<'a, '_> {
+                fn walk_ty(&mut self, root: tc::PTy, trait_counts: &mut AVec<'a, (u128, Option<u32>)>, alias_counts: &mut AVec<'a, (u128, tc::Name, Option<u32>)>) {
+                    if self.seen.insert(root.0, ()).is_some() {
+                        return;
                     }
-                    tc::PClause::Const { .. } | tc::PClause::TypeOutlives { .. } | tc::PClause::RegionOutlives { .. } => {}
+                    self.st.push(root);
+                    while let Some(t) = self.st.pop() {
+                        let Ok(node) = self.stys.node(t) else { continue };
+                        match node {
+                            tc::PNode::ExTrait(tr, _) => trait_counts.push((tr.0, None)),
+                            tc::PNode::Alias { trait_, name, .. } | tc::PNode::ExProj { trait_, name, .. } => {
+                                alias_counts.push((trait_.0, name, None));
+                                trait_counts.push((trait_.0, None));
+                            }
+                            _ => {}
+                        }
+                        if let Ok((list, last)) = super::adt_variance::children(self.stys, t, node) {
+                            for &ch in list {
+                                if self.seen.insert(ch.0, ()).is_none() {
+                                    self.st.push(ch);
+                                }
+                            }
+                            if let Some(ch) = last
+                                && self.seen.insert(ch.0, ()).is_none()
+                            {
+                                self.st.push(ch);
+                            }
+                        }
+                    }
+                }
+                fn walk_list(&mut self, list: tc::List, trait_counts: &mut AVec<'a, (u128, Option<u32>)>, alias_counts: &mut AVec<'a, (u128, tc::Name, Option<u32>)>) {
+                    if let Ok(items) = self.stys.list(list) {
+                        for &t in items {
+                            self.walk_ty(t, trait_counts, alias_counts);
+                        }
+                    }
+                }
+                fn walk_clause(&mut self, cl: &tc::PClause, trait_counts: &mut AVec<'a, (u128, Option<u32>)>, alias_counts: &mut AVec<'a, (u128, tc::Name, Option<u32>)>) {
+                    match *cl {
+                        tc::PClause::Trait { trait_, args } => {
+                            trait_counts.push((trait_.0, None));
+                            self.walk_list(args, trait_counts, alias_counts);
+                        }
+                        tc::PClause::ForFields { container, trait_, args } => {
+                            trait_counts.push((trait_.0, None));
+                            self.walk_ty(container, trait_counts, alias_counts);
+                            self.walk_list(args, trait_counts, alias_counts);
+                        }
+                        tc::PClause::Projection { trait_, args, name, term } => {
+                            alias_counts.push((trait_.0, name, None));
+                            trait_counts.push((trait_.0, None));
+                            self.walk_list(args, trait_counts, alias_counts);
+                            self.walk_ty(term, trait_counts, alias_counts);
+                        }
+                        tc::PClause::Const { args, .. } => self.walk_list(args, trait_counts, alias_counts),
+                        tc::PClause::TypeOutlives { ty, .. } => self.walk_ty(ty, trait_counts, alias_counts),
+                        tc::PClause::RegionOutlives { .. } => {}
+                    }
+                }
+            }
+            let mut walker = TyWalk {
+                stys: r.store.tys.view(),
+                seen: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
+                st: AVec::new_in(alloc),
+            };
+            for &k in items.iter() {
+                let ik = tc::ItemKey(k);
+                if let Ok(sig) = regions.sig(ik) {
+                    walker.walk_ty(sig.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(f) = r.store.fns.get(&ik) {
+                    for &t in f.inputs.iter() {
+                        walker.walk_ty(t, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                    walker.walk_ty(r.store.fn_output(ik).unwrap_or(f.output), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            if let Some(Origin::Member { container, .. }) = r.keys.origin(owner) {
+                let ik = *container;
+                if let Ok((self_col, trait_col)) = regions.impl_header(ik) {
+                    walker.walk_ty(self_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    if let Some(tc_col) = trait_col {
+                        walker.walk_ty(tc_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(ih) = r.store.impls.get(&ik) {
+                    walker.walk_ty(ih.self_ty, &mut g.trait_counts, &mut g.alias_counts);
+                    walker.walk_list(ih.trait_args.list(), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            let mut last_imp = None;
+            for &(k, name) in selected.iter() {
+                let ik = tc::ItemKey(k);
+                if let Some(n) = name
+                    && let Ok(v) = regions.impl_assoc(ik, n)
+                {
+                    walker.walk_ty(v.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                }
+                if last_imp == Some(k) {
+                    continue;
+                }
+                last_imp = Some(k);
+                if let Ok((self_col, trait_col)) = regions.impl_header(ik) {
+                    walker.walk_ty(self_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    if let Some(tc_col) = trait_col {
+                        walker.walk_ty(tc_col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(ih) = r.store.impls.get(&ik) {
+                    walker.walk_ty(ih.self_ty, &mut g.trait_counts, &mut g.alias_counts);
+                    walker.walk_list(ih.trait_args.list(), &mut g.trait_counts, &mut g.alias_counts);
+                    for &(an, v) in ih.assoc.iter() {
+                        walker.walk_ty(v, &mut g.trait_counts, &mut g.alias_counts);
+                        if let Ok(rv) = regions.impl_assoc(ik, an) {
+                            walker.walk_ty(rv.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                        }
+                    }
+                }
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &k in opaques.iter() {
+                let ik = tc::ItemKey(k);
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &k in traits.iter() {
+                let ik = tc::ItemKey(k);
+                if let Ok(cls) = regions.clauses(ik) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(def) = r.store.trait_defs.get(&ik) {
+                    for cl in def.supertraits.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&ik) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &(_, _, a_item) in g.assoc_items.iter() {
+                if let Ok(cls) = regions.clauses(a_item) {
+                    for cv in cls {
+                        walker.walk_ty(cv.col.ty(), &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+                if let Some(p) = r.store.preds.get(&a_item) {
+                    for cl in p.clauses.iter() {
+                        walker.walk_clause(cl, &mut g.trait_counts, &mut g.alias_counts);
+                    }
+                }
+            }
+            for &k in roots.iter() {
+                if let Some(row) = r.store.adts.get(&tc::ItemKey(k)) {
+                    for f in row.fields.iter() {
+                        walker.walk_ty(f.ty, &mut g.trait_counts, &mut g.alias_counts);
+                    }
                 }
             }
         }
@@ -2069,13 +2862,165 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         };
         for t in g.trait_counts.iter_mut() {
             t.1 = count(tc::regions::Arity::trait_lifetimes(&arity, tc::ItemKey(t.0)));
+            if r.keys
+                .library_in(r.names, tc::ItemKey(t.0))
+                .and_then(|lib| r.store.maps.traits.get(&lib))
+                .is_some_and(|td| td.flags.has(tc::TraitFlags::AUTO))
+            {
+                g.auto_traits.push(t.0);
+            }
         }
+        g.auto_traits.sort_unstable();
+        g.auto_traits.dedup();
         for a in g.alias_counts.iter_mut() {
             a.2 = count(tc::regions::Arity::alias_lifetimes(&arity, tc::ItemKey(a.0), a.1));
         }
     }
     g.items = items;
     g
+}
+
+/// Files `FiledRegions` for a provided trait fn's RPITIT `Twin` opaque (`rpitit::default_key`)
+/// by cloning its source opaque's regions and rewriting `Opaque(source, args)` to
+/// `Opaque(twin, args)` in each clause column root.
+fn ensure_twin_opaque_regions<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, twin_k: tc::ItemKey) {
+    let Some((source, owner)) = r.store.rpitit_defaults.get(&twin_k).map(|t| (t.source, t.owner)) else {
+        return;
+    };
+    if r.store.regions.made(twin_k).is_some() {
+        return;
+    }
+    if r.store.regions.made(source).is_none()
+        && let Some(w) = member_fn_want(r.names, &*r.keys, owner)
+    {
+        ensure_one(r, w);
+    }
+    let Some(src_filed) = r.store.regions.made(source) else {
+        return;
+    };
+    let alloc = r.store.tys.alloc();
+    let src = src_filed.regions();
+    let mut lifetimes = tc::regions::LifetimeParams::new_in(src.params.count(), alloc);
+    for i in 0..src.params.count() {
+        if src.params.is_late(i) == Ok(true) {
+            let _ = lifetimes.set_late(i);
+        }
+    }
+    for &(longer, shorter) in src.params.outlives() {
+        let _ = lifetimes.add_outlives(longer, shorter);
+    }
+    let mut hr = tc::region_facts::HeadRegions::new_in(lifetimes, alloc);
+    hr.opaque_captures = src.opaque_captures;
+    hr.outlives.extend_from_slice(&src.outlives);
+
+    struct TwinArity<'a> {
+        inner: &'a dyn tc::regions::Arity,
+        twin: tc::ItemKey,
+        source: tc::ItemKey,
+        captures: Option<u32>,
+    }
+    impl tc::regions::Arity for TwinArity<'_> {
+        fn adt_lifetimes(&self, adt: tc::ItemKey) -> tc::regions::Count {
+            self.inner.adt_lifetimes(adt)
+        }
+        fn opaque_captures(&self, opaque: tc::ItemKey) -> tc::regions::Count {
+            if opaque == self.twin {
+                match self.captures {
+                    Some(n) => tc::regions::Count::Known(n),
+                    None => self.inner.opaque_captures(self.source),
+                }
+            } else {
+                self.inner.opaque_captures(opaque)
+            }
+        }
+        fn alias_lifetimes(&self, trait_: tc::ItemKey, name: tc::Name) -> tc::regions::Count {
+            self.inner.alias_lifetimes(trait_, name)
+        }
+        fn trait_lifetimes(&self, trait_: tc::ItemKey) -> tc::regions::Count {
+            self.inner.trait_lifetimes(trait_)
+        }
+    }
+
+    let swap_one = |tys: &tc::PortableTys<'_>, t: tc::PTy| -> Option<tc::PTy> {
+        match tys.view().node(t).ok()? {
+            tc::PNode::Opaque(k, args) if k == source => tys.intern_shared(tc::PNode::Opaque(twin_k, args)).ok(),
+            _ => Some(t),
+        }
+    };
+    let swap_list = |tys: &tc::PortableTys<'_>, l: tc::List| -> Option<tc::List> {
+        let items = tys.view().list(l).ok()?;
+        let mut out: AVec<'static, tc::PTy> = AVec::with_capacity_in(items.len(), alloc);
+        let mut changed = false;
+        for &it in items {
+            let sw = swap_one(tys, it)?;
+            if sw != it {
+                changed = true;
+            }
+            out.push(sw);
+        }
+        if !changed {
+            return Some(l);
+        }
+        tys.intern_list_shared(&out).ok()
+    };
+
+    let arity = TwinArity { inner: src_filed.arity(), twin: twin_k, source, captures: src.opaque_captures };
+    for cl in src.clauses.iter() {
+        let root_ty = cl.col.ty();
+        let Ok(node) = r.store.tys.view().node(root_ty) else { continue };
+        let new_ty = match node {
+            tc::PNode::Opaque(k, args) if k == source => r.store.tys.intern_shared(tc::PNode::Opaque(twin_k, args)).ok(),
+            tc::PNode::ExTrait(tr, args) => swap_list(&r.store.tys, args).and_then(|a| r.store.tys.intern_shared(tc::PNode::ExTrait(tr, a)).ok()),
+            tc::PNode::ExProj { trait_, name, args, term } => swap_list(&r.store.tys, args).and_then(|a| {
+                let t = swap_one(&r.store.tys, term)?;
+                r.store.tys.intern_shared(tc::PNode::ExProj { trait_, name, args: a, term: t }).ok()
+            }),
+            _ => Some(root_ty),
+        };
+        let Some(new_ty) = new_ty else { continue };
+        if let Ok(col) = tc::regions::RegionCol::lay(r.store.tys.view(), new_ty, &arity, cl.col.as_slice(), alloc) {
+            hr.clauses.push(tc::region_facts::ClauseRegions { nth: cl.nth, binders: cl.binders, col });
+        }
+    }
+    if let Ok(filed) = super::head_record::FiledRegions::new(hr, &arity, r.store.tys.view(), alloc) {
+        r.store.regions.file(twin_k, filed);
+        if let Some(n) = src.opaque_captures {
+            r.store.maps.opaque_lifetimes.insert_absent(twin_k, n);
+        }
+    }
+}
+
+/// Populate `Store::rpitit_traits` for `trait_` if not already computed (e.g. when borrow
+/// checking runs against a warm cached `Checked` record without re-running typeck in this process).
+fn ensure_rpitit_trait_rows<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, trait_: tc::ItemKey) {
+    if r.store.rpitit_traits.contains_key(&trait_) {
+        return;
+    }
+    let Some(lib) = r.keys.library_in(r.names, trait_) else { return };
+    if !matches!(r.names.detail_of(lib), Some(blaze_surface::ItemDetail::Trait)) {
+        return;
+    }
+    container_head(r, lib, true);
+    if !r.store.maps.traits.get(&lib).is_some_and(super::rpitit::may_have_rows) {
+        return;
+    }
+    for _ in 0..256 {
+        let step = {
+            let Some(t) = r.store.maps.traits.get(&lib) else { return };
+            let Some(extra) = r.store.trait_defs.get(&trait_) else { return };
+            match super::rpitit::trait_rows(r.store, trait_, t, &extra.assoc) {
+                Ok(_) => None,
+                Err(super::rpitit::Need::Fn(fk)) => Some(fk),
+                Err(super::rpitit::Need::Refused(..)) => None,
+            }
+        };
+        let Some(fk) = step else { break };
+        if let Some(w) = member_fn_want(r.names, &*r.keys, fk) {
+            ensure_one(r, w);
+        } else {
+            break;
+        }
+    }
 }
 
 /// The variances of ADT `key`'s parameters, lifetimes first then its type and const
@@ -2395,7 +3340,7 @@ fn gap_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, callee: tc::ItemKey
 /// `FutureWitness` by `decide_stalled_goals`, never a pass (rule 3).
 pub(super) fn witness_and_decide<'n, 'a, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
-    body: &Body<'n>,
+    body: &Body<'_>,
     done: &tc::Checked<'_>,
     reads: &mut AVec<'a, Read>,
     alloc: Alloc<'a>,
@@ -2924,13 +3869,25 @@ macro_rules! byte {
     };
 }
 
-fn m(x: &u8, _y: byte!()) -> &u8 {
+fn m_macro(x: &u8, _y: byte!()) -> &u8 {
+    x
+}
+
+fn calls_macro_type() {
+    let a = 1u8;
+    let r = m_macro(&a, 2);
+    let _ = *r;
+}
+
+struct Def<T = &'static u8>(T);
+
+fn m(x: &u8, _y: Def) -> &u8 {
     x
 }
 
 fn calls_soft_refused() {
     let a = 1u8;
-    let r = m(&a, 2);
+    let r = m(&a, Def(&0));
     let _ = *r;
 }
 
@@ -3036,6 +3993,12 @@ fn main() {}
         std::println!("h: {h_text}");
         assert!(h_text.contains("E0106"), "h's own check reports its E0106: {h_text}");
 
+        // A callee whose signature contains a type macro (`m_macro` takes `byte!()`) has its
+        // expanded type's regions laid and its calls borrow-checked cleanly.
+        let (types, mac) = world.check_borrows(body("calls_macro_type"), alloc);
+        assert!(types.is_clean(), "calls_macro_type is typed: {types:?}");
+        assert!(mac.is_clean(), "calls_macro_type is clean: {mac:?}");
+
         // A head whose regions alone were refused: typed, and the call refused by its name.
         let (types, soft) = world.check_borrows(body("calls_soft_refused"), alloc);
         std::println!("calls_soft_refused: {types:?} {soft:?}");
@@ -3048,16 +4011,16 @@ fn main() {}
                 assert!(matches!(why, blaze_typeck::region_facts::UnreadWhy::Refused { .. }), "calls_soft_refused: why: {why:?}");
                 let named = item.and_then(|lib| names.item_text(lib)).and_then(|t| t.name);
                 assert_eq!(named, Some("m"), "calls_soft_refused names the callee");
-                // By its typed cause and part: `m`'s input 1 is `byte!()`, a type macro's
-                // expansion the region walk does not lay; the class is printed first and short
-                // (blaze-cli `first_refusal_class` keeps up to the first `] `).
+                // By its typed cause and part: `m`'s input 1 is `Def`, whose defaulted argument
+                // carries a lifetime the region walk does not lay; the class is printed first and
+                // short (blaze-cli `first_refusal_class` keeps up to the first `] `).
                 use crate::front2::head_record::Unlaid;
                 use crate::front2::types::{NotLaidWhy, SigPart};
-                assert_eq!(unlaid, Some(Unlaid::NotLaid { why: NotLaidWhy::TypeMacro, part: SigPart::Input(1) }), "calls_soft_refused: the typed kind");
+                assert_eq!(unlaid, Some(Unlaid::NotLaid { why: NotLaidWhy::DefaultArg, part: SigPart::Input(1) }), "calls_soft_refused: the typed kind");
                 let mut said = super::Words::EMPTY;
                 core::fmt::Write::write_fmt(&mut said, format_args!("{refused}")).unwrap();
                 let said = said.as_str();
-                assert!(said.starts_with("[NotLaid/TypeMacro/Input] "), "calls_soft_refused: the class is not first: {said}");
+                assert!(said.starts_with("[NotLaid/DefaultArg/Input] "), "calls_soft_refused: the class is not first: {said}");
                 assert!(said.contains("input 1"), "calls_soft_refused: the input is not named: {said}");
                 // CONTROL (rule 23): the same refusal with no typed kind prints the old class,
                 // so the bracket above is the kind's, not the text's.

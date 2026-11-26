@@ -53,7 +53,7 @@ pub use crate::{
     digest::{Algo, Blake3, Digest, DigestRefused, Hashed, Hashing},
     drive::{FetchIo, Reserved, Woke},
     fetch::{Effect, Failed, Limits, Machine, Method, NetFailure, Outcome, Reply, StoreFailure, Why},
-    pack::{File, Mode, PackRefused, PackView},
+    pack::{Codec, File, FileBytes, FileEntry, Mode, PackRefused, PackView},
     plan::{Plan, PlanRefused, Skip, SourceId, Unit},
     unpack::UnpackError,
 };
@@ -72,6 +72,8 @@ pub enum Plant {
     /// A git answer's commit is the first commit object of its pack, not the one whose id the
     /// lock pins: the server's word taken.
     CommitFromServer,
+    /// A git tree's submodule (`0o160000`) row is silently dropped while packing.
+    DropSubmodule,
 }
 
 #[cfg(test)]

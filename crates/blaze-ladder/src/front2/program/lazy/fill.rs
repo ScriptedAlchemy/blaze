@@ -145,6 +145,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             self.callee_row(callee)?;
         }
         self.async_rows(&made)?;
+        self.closure_rows(checked)?;
         self.fmt_rows(&made, fmt_owner, function)?;
         // Again after the callees' and async items' heads: their types name ADTs too (the
         // rounds over the store's table pick them up; nothing missing is nothing made).
@@ -259,6 +260,19 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         };
         self.start = Some(entry);
         Ok(())
+    }
+
+    /// Retargets a `MakerStart::Direct(_)` program to another direct test entry in the same
+    /// suite without rebuilding the program or any cached heads, bodies, or tables. Refuses
+    /// (`false`) if the program was started by rule (`Entry2::Rust`, `Hosted`, `CMain`) or has
+    /// no start decided yet.
+    pub fn set_direct_entry(&mut self, entry: Option<ItemKey>, direct: blaze_id::ItemKey) -> bool {
+        if !matches!(self.start, Some(crate::front2::start::Entry2::Direct(_))) {
+            return false;
+        }
+        self.entry_key = entry;
+        self.start = Some(crate::front2::start::Entry2::Direct(direct));
+        true
     }
 
     /// The seam's `head_row`: fn item `key`'s row from its head, made once, no body lowered or
@@ -499,6 +513,14 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         // `head_abi`, which tabled.rs `row` calls too): a fn's own head ("C" nounwind,
         // "C-unwind" not), or a foreign fn's block. An ABI with no reading is refused by name.
         let own = head_abi(self.front.names, &self.store, key, || Box::from(path.as_str())).map_err(&refuse)?;
+        let intrinsic = intrinsic.or_else(|| {
+            (kind == FnKind::Foreign)
+                .then(|| {
+                    let head = self.store.fns.get(&key)?;
+                    seam_rules::libm_float_intrinsic(own.abi, symbol, head, self.store.tys.view())
+                })
+                .flatten()
+        });
         // `#[rustc_nounwind]` makes any fn nounwind (core/src/panicking.rs:88-92), as tabled.rs.
         let build = BuildAbi { abi: own.abi, nounwind: own.nounwind || symbols.nounwind };
         Ok(self.push(key, kind, build, symbols.track_caller, symbols.fn_attrs, at, &path, symbol, symbols.export.as_deref(), intrinsic))
@@ -644,7 +666,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let place = names.place_of(lib)?;
         let blaze_scope::resolve::At::File(i) = place.at else { return None };
         let shown = names.file_shown(place.krate, i)?;
-        let (line, _) = super::seam_rules::source_position(names, keys, &self.store, outer, start).ok()?;
+        let (line, _) = {
+            let mut cache = self.site_cache.borrow_mut();
+            super::seam_rules::source_position(names, keys, &self.store, outer, start, Some(&mut cache)).ok()?
+        };
         // The text written at the range, when the range is the file's own (an expansion's row
         // is at its outermost call: the call's text).
         let written = names.item_start(lib).and_then(|(_, item_start)| {
@@ -677,18 +702,33 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// column today (seam_rules.rs, THE POSITION RULE). `None`: the item's text is in no file
     /// (a macro's expansion) or the names do not place it.
     pub fn site_shown(&self, item: ItemKey, site: u32) -> Option<(&'n str, u32, u32)> {
-        let file = super::seam_rules::item_file(self.front.names, &self.front.keys, &self.store, item)?;
-        let (line, column) = super::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site).ok()?;
+        let mut cache = self.site_cache.borrow_mut();
+        let file = super::seam_rules::item_file(self.front.names, &self.front.keys, &self.store, item, Some(&mut cache))?;
+        let (line, column) = super::seam_rules::source_position(self.front.names, &self.front.keys, &self.store, item, site, Some(&mut cache)).ok()?;
         Some((file, line, column))
     }
 
     /// The row of every ADT `checked`'s types and the heads' table name, in rounds as a row's
-    /// fields name more (make_from's loop, over ONE body).
+    /// fields name more (make_from's loop, over ONE body). Uses an append-only cursor into
+    /// `self.store.tys` so earlier bodies' head types are never rescanned.
     fn adt_rows(&mut self, checked: &Checked<'static>) -> Result<(), LazyRefusal> {
         for round in 0.. {
             let mut missing: AVec<'_, ItemKey> = AVec::new_in(self.alloc);
-            for v in [self.store.tys.view(), checked.types.view()] {
-                for n in v.nodes() {
+            {
+                let store_view = self.store.tys.view();
+                let total = store_view.len();
+                let start = self.adt_scanned_tys.min(total);
+                for n in store_view.nodes().skip(start) {
+                    if let tc::PNode::Adt(k, _) = n
+                        && !self.store.adts.contains_key(k)
+                    {
+                        missing.push(*k);
+                    }
+                }
+                self.adt_scanned_tys = total;
+            }
+            if round == 0 {
+                for n in checked.types.view().nodes() {
                     if let tc::PNode::Adt(k, _) = n
                         && !self.store.adts.contains_key(k)
                     {
@@ -789,6 +829,23 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         Ok(())
     }
 
+    /// For a body that declares closures, ensures the `Fn`, `FnMut`, and `FnOnce` trait heads and
+    /// their declared methods are filed so direct closure calls (`d(x)`) answer `nounwind` and
+    /// `track_caller` identically whether the body was checked here or read from its typed record.
+    fn closure_rows(&mut self, checked: &Checked<'static>) -> Result<(), LazyRefusal> {
+        if checked.closures.is_empty() {
+            return Ok(());
+        }
+        for name in ["fn", "fn_mut", "fn_once"] {
+            let Some(lib) = self.front.index.lang(name) else { continue };
+            let want = Want::Members(lib);
+            if !self.store.made(want) {
+                self.make_want(want, checker_of(lib), "closure_rows (Fn/FnMut/FnOnce trait members)")?;
+            }
+        }
+        Ok(())
+    }
+
     /// For each formatting trait the body's `format_args!` placeholders ask, core's
     /// `rt::Argument` constructor the builder calls (which no checked body names: the checker
     /// records no callee for a placeholder), asked by fmt_template.rs `argument_new` (the one
@@ -883,6 +940,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         if let Some(kind) = self.statics.kind(item) {
             Ok(kind)
         } else {
+            // Locate the static first so body-local statics (e.g. `static X: OnceLock<..>`
+            // inside a cached function whose enclosing body was not lowered in this run) are
+            // registered in `self.front.keys` before `one_static` evaluates them.
+            self.locate(item)?;
             let made = {
                 let mut r = self.records(true);
                 crate::front2::statics::one_static(&mut r, item)
@@ -937,7 +998,31 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// ([`Self::object_asked`], the seam's `object_table`), so no make depends on which bodies
     /// were checked before it (D194: a `dyn` only an instance's ground arguments hold).
     fn body_objects(&mut self, checked: &Checked<'static>, function: &str) -> Result<(), LazyRefusal> {
-        let asked = dyn_principals([self.store.tys.view(), checked.types.view()].into_iter());
+        let mut asked: Vec<ItemKey, Global> = Vec::new_in(Global);
+        {
+            let store_view = self.store.tys.view();
+            let total = store_view.len();
+            let start = self.object_scanned_tys.min(total);
+            for n in store_view.nodes().skip(start) {
+                if let tc::PNode::Dynamic(l) = *n
+                    && let Some(k) = tc::object_principal(store_view, l)
+                {
+                    asked.push(k);
+                }
+            }
+            self.object_scanned_tys = total;
+        }
+        let body_view = checked.types.view();
+        for n in body_view.nodes() {
+            if let tc::PNode::Dynamic(l) = *n
+                && let Some(k) = tc::object_principal(body_view, l)
+            {
+                asked.push(k);
+            }
+        }
+        asked.sort_unstable();
+        asked.dedup();
+        asked.reverse();
         self.objects_made(asked, function)
     }
 

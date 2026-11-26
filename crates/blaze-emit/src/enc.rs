@@ -193,6 +193,11 @@ pub(crate) const fn eor_lsr(rd: Reg, rn: Reg, rm: Reg, shift: u32) -> u32 {
     0xca40_0000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd
 }
 
+/// `eor xd, xn, xm, ror #shift` (`shift` in `0..=63`, C6.2.104).
+pub(crate) const fn eor_ror(rd: Reg, rn: Reg, rm: Reg, shift: u32) -> u32 {
+    0xcac0_0000 | (rm << 16) | ((shift & 63) << 10) | (rn << 5) | rd
+}
+
 /// `bic xd, xn, xm`: `xn & !xm` (C6.2.32).
 pub(crate) const fn bic(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x8a20_0000 | (rm << 16) | (rn << 5) | rd
@@ -293,6 +298,26 @@ pub(crate) const fn str_reg_scaled(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32
     0x3820_7800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
 }
 
+/// `ldr{b,h,,} rt, [rn, wm, uxtw]` (unscaled 32-bit unsigned-extended register-index load).
+pub(crate) const fn ldr_reg_uxtw(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3860_4800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `str{b,h,,} rt, [rn, wm, uxtw]` (unscaled 32-bit unsigned-extended register-index store).
+pub(crate) const fn str_reg_uxtw(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3820_4800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `ldr{b,h,,} rt, [rn, wm, uxtw #size]` (scaled 32-bit unsigned-extended register-index load).
+pub(crate) const fn ldr_reg_uxtw_scaled(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3860_5800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
+/// `str{b,h,,} rt, [rn, wm, uxtw #size]` (scaled 32-bit unsigned-extended register-index store).
+pub(crate) const fn str_reg_uxtw_scaled(size: Size, rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x3820_5800 | (size.bits() << 30) | (rm << 16) | (rn << 5) | rt
+}
+
 /// `ldrsw xt, [xn, xm, lsl #2]` (signed 32-bit scaled load for dense PC-relative jump tables).
 pub(crate) const fn ldrsw_reg_scaled(rt: Reg, rn: Reg, rm: Reg) -> u32 {
     0xb8a0_7800 | (rm << 16) | (rn << 5) | rt
@@ -327,6 +352,11 @@ pub(crate) const fn add_imm(rd: Reg, rn: Reg, imm12: u32, lsl12: bool) -> u32 {
 
 pub(crate) const fn sub_imm(rd: Reg, rn: Reg, imm12: u32, lsl12: bool) -> u32 {
     0xd100_0000 | ((lsl12 as u32) << 22) | (imm12 << 10) | (rn << 5) | rd
+}
+
+/// `subs xd, xn, #imm12{, lsl #12}` (C6.2.386).
+pub(crate) const fn subs_imm(rd: Reg, rn: Reg, imm12: u32, lsl12: bool) -> u32 {
+    0xf100_0000 | (bit(lsl12) << 22) | (imm12 << 10) | (rn << 5) | rd
 }
 
 /// `subs xzr, xn, #imm12`.
@@ -385,6 +415,34 @@ pub(crate) const fn sbfm(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
 
 pub(crate) const fn ubfm(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
     0xd340_0000 | (immr << 16) | (imms << 10) | (rn << 5) | rd
+}
+
+/// `ubfx xd/wd, xn/wn, #lsb, #width` (C6.2.417: alias of `ubfm` with `immr = lsb`, `imms = lsb + width - 1`).
+pub(crate) const fn ubfx(is64: bool, rd: Reg, rn: Reg, lsb: u32, width: u32) -> u32 {
+    if is64 {
+        ubfm(rd, rn, lsb & 63, (lsb + width - 1) & 63)
+    } else {
+        ubfm_w(rd, rn, lsb & 31, (lsb + width - 1) & 31)
+    }
+}
+
+/// `bfm xd, xn, #immr, #imms` (C6.2.30: 64-bit bitfield move; `N=1`).
+pub(crate) const fn bfm(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
+    0xb340_0000 | ((immr & 63) << 16) | ((imms & 63) << 10) | (rn << 5) | rd
+}
+
+/// `bfm wd, wn, #immr, #imms` (C6.2.30: 32-bit bitfield move; `N=0`).
+pub(crate) const fn bfm_w(rd: Reg, rn: Reg, immr: u32, imms: u32) -> u32 {
+    0x3300_0000 | ((immr & 31) << 16) | ((imms & 31) << 10) | (rn << 5) | rd
+}
+
+/// `bfxil xd/wd, xn/wn, #lsb, #width` (C6.2.31: alias of `bfm` with `immr = lsb`, `imms = lsb + width - 1`).
+pub(crate) const fn bfxil(is64: bool, rd: Reg, rn: Reg, lsb: u32, width: u32) -> u32 {
+    if is64 {
+        bfm(rd, rn, lsb & 63, (lsb + width - 1) & 63)
+    } else {
+        bfm_w(rd, rn, lsb & 31, (lsb + width - 1) & 31)
+    }
 }
 
 /// `sbfx xd, xn, #0, #bits`: the low `bits` (1..=63) sign-extended; `sxtb`/`sxth`/`sxtw` at
@@ -497,6 +555,11 @@ pub(crate) const fn ldp_post(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0xa8c0_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
+/// `stp xt, xt2, [rn], #off` (C6.2.288, 64-bit post-index), `off` a multiple of 8 in -512..=504.
+pub(crate) const fn stp_post(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    0xa880_0000 | (((off / 8).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
 /// `stp dt, dt2, [rn, #off]!` (C7.2.309, SIMD&FP 64-bit pre-index), `off` a multiple of 8 in -512..=504.
 pub(crate) const fn stp_pre_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0x6d80_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
@@ -505,6 +568,11 @@ pub(crate) const fn stp_pre_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
 /// `ldp dt, dt2, [rn], #off` (C7.2.155, SIMD&FP 64-bit post-index), `off` a multiple of 8 in -512..=504.
 pub(crate) const fn ldp_post_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
     0x6cc0_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+}
+
+/// `stp dt, dt2, [rn], #off` (C7.2.309, SIMD&FP 64-bit post-index), `off` a multiple of 8 in -512..=504.
+pub(crate) const fn stp_post_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
+    0x6c80_0000 | (((off / 8).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
 // PC-relative (C6.2.168, 10): `words` and `bytes` from this instruction.
@@ -1248,6 +1316,16 @@ pub(crate) const fn stp_q_off(rt1: Reg, rt2: Reg, rn: Reg, imm7: i32) -> u32 {
     0xad00_0000 | ((imm7.cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt1
 }
 
+/// `ldp qt1, qt2, [rn], #imm7 * 16` (C7.2.159, SIMD&FP 128-bit post-index pair = 32 bytes + advance).
+pub(crate) const fn ldp_q_post(rt1: Reg, rt2: Reg, rn: Reg, imm7: i32) -> u32 {
+    0xacc0_0000 | ((imm7.cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
+
+/// `stp qt1, qt2, [rn], #imm7 * 16` (C7.2.288, SIMD&FP 128-bit post-index pair = 32 bytes + advance).
+pub(crate) const fn stp_q_post(rt1: Reg, rt2: Reg, rn: Reg, imm7: i32) -> u32 {
+    0xac80_0000 | ((imm7.cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt1
+}
+
 /// `orr vd.16b, vn.16b, vm.16b` (`mov vd.16b, vn.16b` when `vn == vm`).
 pub(crate) const fn orr_v(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x4ea0_1c00 | (rm << 16) | (rn << 5) | rd
@@ -1293,6 +1371,11 @@ pub(crate) const fn mla_v(size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x4e20_9400 | (size << 22) | (rm << 16) | (rn << 5) | rd
 }
 
+/// `mls vd.T, vn.T, vm.T` (`vd -= vn * vm`, `Q=1`, `size = 0:16B, 1:8H, 2:4S`, C7.2.215).
+pub(crate) const fn mls_v(size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x6e20_9400 | (size << 22) | (rm << 16) | (rn << 5) | rd
+}
+
 /// `smin`/`smax`/`umin`/`umax` (`Q=1`, `size = 0:16B, 1:8H, 2:4S`).
 pub(crate) const fn minmax_v(unsigned: bool, is_min: bool, size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
     let base = 0x4e20_6400 | (bit(unsigned) << 29) | (bit(is_min) << 11);
@@ -1317,6 +1400,11 @@ pub(crate) const fn fmul_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
 /// `fmla vd.T, vn.T, vm.T` (`vd += vn * vm`, `Q=1`, `double ? 2D : 4S`).
 pub(crate) const fn fmla_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x4e20_cc00 | (bit(double) << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `fmls vd.T, vn.T, vm.T` (`vd -= vn * vm`, `Q=1`, `double ? 2D : 4S`, C7.2.111).
+pub(crate) const fn fmls_v(double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4ea0_cc00 | (bit(double) << 22) | (rm << 16) | (rn << 5) | rd
 }
 
 /// `addv d/s/h/b, vn.T` (`Q=1`, `size = 0:16B, 1:8H, 2:4S`).

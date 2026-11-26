@@ -151,6 +151,30 @@ pub enum Which {
     /// block): the 128 bits of [`crate::instance::type_id_hash`], laid out as `TypeId`'s two
     /// `data` words; the constant evaluator and the builder both make it from that function.
     TypeId,
+    /// `type_id_type_of(id)` (`#[rustc_comptime]`): `core::mem::type_info::Type` for `id`.
+    TypeIdTypeOf,
+    /// `type_id_variants(id)` (`#[rustc_comptime]`): variant count (enum's, or 1 for struct/union/tuple).
+    TypeIdVariants,
+    /// `type_id_fields(id, variant)` (`#[rustc_comptime]`): field count of `variant`.
+    TypeIdFields,
+    /// `type_id_field_representing_type(id, variant, field)` (`#[rustc_comptime]`): `FieldId`'s `TypeId`.
+    TypeIdFieldRepresentingType,
+    /// `field_representing_type_actual_type_id(frt)` (`#[rustc_comptime]`): `TypeId` of a field's type.
+    FieldRepresentingTypeActualTypeId,
+    /// `field_representing_type_offset(frt)` (`#[rustc_comptime]`): byte offset of a field.
+    FieldRepresentingTypeOffset,
+    /// `type_id_is_signed(id)` (`#[rustc_comptime]`): whether `id` is a signed integer.
+    TypeIdIsSigned,
+    /// `type_id_array_len(id)` (`#[rustc_comptime]`): array length, or 0 for non-arrays.
+    TypeIdArrayLen,
+    /// `type_id_element_ty(id)` (`#[rustc_comptime]`): `Option<TypeId>` of array/slice element.
+    TypeIdElementTy,
+    /// `type_id_size_of(id)` (`#[rustc_comptime]`): `Option<usize>` byte size (`None` if unsized).
+    TypeIdSizeOf,
+    /// `type_id_points_to(id)` (`#[rustc_comptime]`): `Option<TypeId>` pointee of ref/raw ptr.
+    TypeIdPointsTo,
+    /// `type_id_points_mutably(id)` (`#[rustc_comptime]`): whether ref/raw ptr is mutable.
+    TypeIdPointsMutably,
     /// `float_to_int_unchecked::<F, I>(value)`: `fptosi`/`fptoui` by `I`'s signedness.
     FloatToIntUnchecked,
     /// core's `ub_checks()`: `true` in a constant (blaze-consteval machine.rs `intrinsic`); at
@@ -163,6 +187,10 @@ pub enum Which {
     OverflowChecks,
     /// `ptr_mask::<T>(ptr, mask)`: the address `and` the mask, the provenance kept.
     PtrMask,
+    /// `variant_count::<T>()`: the number of variants of an enum type (0 for any other type).
+    VariantCount,
+    /// `va_arg::<T>(ap: &mut VaList<'_>) -> T`: reads the next C-variadic argument and advances `ap`.
+    VaArg,
     /// `raw_eq::<T>(a, b)`: whether the `size_of::<T>()` bytes behind both are equal
     /// ([`byte_order`] the rule the constant evaluator computes).
     RawEq,
@@ -173,12 +201,23 @@ pub enum Which {
     BlazeFieldCount,
     /// blaze's `blaze_int_cast::<S, D>(x)`: `x as D` ([`int_cast_bits`] the rule).
     BlazeIntCast,
+    /// blaze's `blaze_is_enum::<T>() -> bool`: whether `T` is an `enum` ADT ([`is_enum`] the rule).
+    BlazeIsEnum,
+    /// blaze's `blaze_is_unit_enum::<T>() -> bool`: whether `T` is a fieldless `enum` ADT
+    /// ([`is_unit_enum`] the rule).
+    BlazeIsUnitEnum,
     /// blaze's `blaze_record_schema_id::<T>() -> u64`: canonical structural schema hash of a
     /// record (`0` for non-records; [`record_schema_id`] the rule).
     BlazeRecordSchemaId,
     /// blaze's `blaze_records_disjoint::<A, B>() -> bool`: whether two structural record types
     /// share zero field names ([`records_disjoint`] the rule).
     BlazeRecordsDisjoint,
+    /// blaze's `blaze_variant_count::<T>() -> usize`: number of declared variants of an `enum`
+    /// ADT (`0` for non-enums; [`variant_count`] the rule).
+    BlazeVariantCount,
+    /// blaze's `blaze_variant_name::<T>(idx: usize) -> &'static str`: display name of variant
+    /// `idx` of enum `T` (`""` if out of range or non-enum; consteval-only like `type_name`).
+    BlazeVariantName,
     /// A `simd_*` intrinsic: its rows and its build are intrinsics/simd.rs's.
     Simd(simd::SimdOp),
 }
@@ -234,8 +273,12 @@ pub const TABLE: &[Entry] = &[
     e("black_box", Which::BlackBox, "See documentation of [`std::hint::black_box`] for details.", "its argument"),
     e("blaze_field_count", Which::BlazeFieldCount, "blaze: compile-time field count of a structural record, tuple, or struct (`0` for enums, unions, and other types).", "a constant `usize` from `field_count`"),
     e("blaze_int_cast", Which::BlazeIntCast, "blaze: `x as D` between two integer types of any width, the standard ones and those of `#![blaze::arbitrary_ints]` (`u3`, `i24`): it truncates to `D`'s width, or extends by `S`'s sign, and never panics.", "`trunc`, or `sext`/`zext` by `S`'s sign, or the value itself at one width (`int_cast_bits` the rule)"),
+    e("blaze_is_enum", Which::BlazeIsEnum, "blaze: compile-time check whether `T` is an `enum` ADT.", "a constant `bool` from `is_enum`"),
+    e("blaze_is_unit_enum", Which::BlazeIsUnitEnum, "blaze: compile-time check whether `T` is a fieldless `enum` ADT.", "a constant `bool` from `is_unit_enum`"),
     e("blaze_record_schema_id", Which::BlazeRecordSchemaId, "blaze: canonical compile-time 64-bit structural schema ID of a record (`0` for non-records).", "a constant `u64` from `record_schema_id`"),
     e("blaze_records_disjoint", Which::BlazeRecordsDisjoint, "blaze: compile-time check that two structural record types share zero field names.", "a constant `bool` from `records_disjoint`"),
+    e("blaze_variant_count", Which::BlazeVariantCount, "blaze: compile-time variant count of an `enum` ADT (`0` for non-enums).", "a constant `usize` from `variant_count`"),
+    e("blaze_variant_name", Which::BlazeVariantName, "blaze: compile-time display name of variant `idx` of an `enum` ADT (`\"\"` when out of range or non-enum).", "a constant `&'static str` evaluated in `blaze-consteval`"),
     e("bswap", Which::Bswap, "Reverses the bytes in an integer type `T`.", "`bswap` (a byte: itself)"),
     e("caller_location", Which::CallerLocation, "Gets a reference to a static `Location` indicating where it was called.", "the address of a data row of the site's `Location`, or the location a `#[track_caller]` fn was passed"),
     e("catch_unwind", Which::CatchUnwind, "Rust's \"try catch\" construct for unwinding.", "an `invoke` of `try_fn` whose `catch` landing block calls `catch_fn` (walk/unwind.rs); under `panic = abort` a call and `false`"),
@@ -251,6 +294,8 @@ pub const TABLE: &[Entry] = &[
     e("cttz_nonzero", Which::CttzNonzero, "Like `cttz`, but extra-unsafe as it returns `undef` when given an `x` with value `0`.", "`ctz nonzero`, to `u32`"),
     e("discriminant_value", Which::DiscriminantValue, "Returns the value of the discriminant for the variant in 'v'; if `T` has no discriminant, returns `0`.", "the tag loaded and decoded by the layout's encoding, mapped to the discriminant"),
     e("exact_div", Which::ExactDiv, "Performs an exact division, resulting in undefined behavior where `x % y != 0` or `y == 0` or `x == T::MIN && y == -1`", "`sdiv`/`udiv exact`"),
+    e("field_representing_type_actual_type_id", Which::FieldRepresentingTypeActualTypeId, "Gets the `TypeId` of the actual field type represented by a `FieldRepresentingType`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns the field's `TypeId`"),
+    e("field_representing_type_offset", Which::FieldRepresentingTypeOffset, "Gets the byte offset of the field represented by a `FieldRepresentingType`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns the layout field offset"),
     e("float_to_int_unchecked", Which::FloatToIntUnchecked, "Converts with LLVM’s fptoui/fptosi, which may return undef for values out of range (<https://github.com/rust-lang/rust/issues/10184>). Stabilized as [`f32::to_int_unchecked`] and [`f64::to_int_unchecked`]: the value must not be `NaN` or infinite, and must be representable in the return type once truncated, else the behavior is undefined.", "`fptosi`/`fptoui` by the integer's signedness (saturating: a defined value where Rust's is undefined)"),
     e("forget", Which::Forget, "Moves a value out of scope without running drop glue.", "nothing"),
     e("likely", Which::Likely, "Hints to the compiler that branch condition is likely to be true. Returns the value passed to it.", "its argument"),
@@ -277,6 +322,16 @@ pub const TABLE: &[Entry] = &[
     e("transmute", Which::Transmute, "Reinterprets the bits of a value of one type as another type.", "the bits kept (`expose`/`from_exposed`/`bitcast` between scalar kinds); an aggregate through memory"),
     e("transmute_unchecked", Which::TransmuteUnchecked, "Like [`transmute`], but even less checked at compile-time: rather than giving an error for `size_of::<Src>() != size_of::<Dst>()`, it's **Undefined Behavior** at runtime.", "as `transmute`; sizes must still agree here"),
     e("type_id", Which::TypeId, "Gets an identifier which is globally unique to the specified type. This function will return the same value for a type regardless of whichever crate it is invoked in.", "the 128 bits of `instance::type_id_hash` (the type's ground tree, lifetimes erased) as `TypeId`'s two words, little-endian; blaze-consteval makes the same bytes from the same function"),
+    e("type_id_array_len", Which::TypeIdArrayLen, "Gets the length of the array represented by this `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns the array length or 0"),
+    e("type_id_element_ty", Which::TypeIdElementTy, "Gets the element `TypeId` of an array or slice represented by this `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns `Option<TypeId>`"),
+    e("type_id_field_representing_type", Which::TypeIdFieldRepresentingType, "Gets the `FieldRepresentingType` `TypeId` for a variant and field index.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval records and returns the field's `TypeId`"),
+    e("type_id_fields", Which::TypeIdFields, "Gets the number of fields at the given `variant_index` represented by this `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns the variant's field count"),
+    e("type_id_is_signed", Which::TypeIdIsSigned, "Returns whether the type represented by this `TypeId` is a signed integer.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns `bool`"),
+    e("type_id_points_mutably", Which::TypeIdPointsMutably, "Returns whether the pointer or reference represented by this `TypeId` is mutable.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns `bool`"),
+    e("type_id_points_to", Which::TypeIdPointsTo, "Returns the pointee `TypeId` of a pointer or reference represented by this `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns `Option<TypeId>`"),
+    e("type_id_size_of", Which::TypeIdSizeOf, "Returns the byte size of the type represented by this `TypeId`, or `None` if unsized.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns `Option<usize>`"),
+    e("type_id_type_of", Which::TypeIdTypeOf, "Computes the compile-time `core::mem::type_info::Type` of a concrete `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval constructs `Type`"),
+    e("type_id_variants", Which::TypeIdVariants, "Gets the number of variants of the type represented by this `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns the variant count"),
     e("type_name", Which::TypeName, "Gets a static string slice containing the name of a type.", "nothing at run time (\"can only be called at compile-time\"): blaze-consteval evaluates it to the text of type_name.rs"),
     e("ub_checks", Which::UbChecks, "Returns whether we should perform some UB-checking at runtime.", "the building profile's `debug-assertions`, a constant; `true` in a constant"),
     e("unaligned_volatile_load", Which::UnalignedVolatileLoad, "Performs a volatile load from the `src` pointer The pointer is not required to be aligned.", "`load volatile`, alignment 1"),
@@ -290,6 +345,8 @@ pub const TABLE: &[Entry] = &[
     e("unchecked_sub", Which::UncheckedSub, "Returns the result of an unchecked subtraction, resulting in undefined behavior when `x - y > T::MAX` or `x - y < T::MIN`.", "`sub nsw`/`sub nuw`"),
     e("unlikely", Which::Unlikely, "Hints to the compiler that branch condition is likely to be false. Returns the value passed to it.", "its argument"),
     e("unreachable", Which::Unreachable, "Informs the optimizer that this point in the code is not reachable, enabling further optimizations.", "`unreachable`"),
+    e("va_arg", Which::VaArg, "Reads the next argument from a C variable argument list (`VaList`) and advances the cursor.", "loads the `VaList` pointer, advances it by 8 bytes (16 aligned for 128-bit), stores back, and loads `T`"),
+    e("variant_count", Which::VariantCount, "Returns the number of variants of the type `T`, or `0` if `T` is not an enum.", "a constant from the ADT's variants"),
     e("volatile_copy_memory", Which::VolatileCopyMemory, "Equivalent to the appropriate `llvm.memmove.p0i8.0i8.*` intrinsic, with a size of `count * size_of::<T>()` and an alignment of `align_of::<T>()`.", "`memmove volatile`"),
     e("volatile_copy_nonoverlapping_memory", Which::VolatileCopyNonoverlappingMemory, "Equivalent to the appropriate `llvm.memcpy.p0i8.0i8.*` intrinsic, with a size of `count` * `size_of::<T>()` and an alignment of `align_of::<T>()`.", "`memcpy volatile`"),
     e("volatile_load", Which::VolatileLoad, "Performs a volatile load from the `src` pointer.", "`load volatile`; an aggregate as `load volatile`s of its alignment's width (at most 8 bytes, a pointer's word as a pointer), at most 512, into a temporary"),
@@ -544,6 +601,44 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             let l = *s.cx.layouts.get(id);
             let v = if c.which == W::SizeOf { l.size } else { l.align_bytes() };
             Out::Scalar(s.usize(v))
+        }
+        W::VariantCount => {
+            let t = t0.ok_or_else(need_t)?;
+            let count = variant_count(t, s.cx.cx.ground.view(), s.cx.cx.facts).map_err(|e| match e {
+                FieldCountError::MissingType => s.shape("a type argument not in the ground table"),
+                FieldCountError::NoAdt(adt) => IntrinsicError::Layout(LayoutError { ty: t, why: crate::layout::Refusal::NoAdt(adt) }),
+            })?;
+            Out::Scalar(s.usize(count))
+        }
+        W::VaArg => {
+            let t = t0.ok_or_else(need_t)?;
+            let ap = scalar(0).ok_or_else(shape)?;
+            let id = s.layout(t)?;
+            let l = *s.cx.layouts.get(id);
+            let Some(sc) = l.scalar else {
+                return Err(IntrinsicError::Unsupported { which: c.which, why: "a non-scalar `va_arg` type" });
+            };
+            if !matches!(l.size, 4 | 8 | 16) || matches!(sc.prim, Prim::F32 | Prim::F16) {
+                return Err(IntrinsicError::Unsupported { which: c.which, why: "an unpromoted or unsupported scalar `va_arg` type" });
+            }
+            let (tty, _) = lir(sc.prim);
+            let mut cur = s.b.load(Ty::PTR, Flags::NONE, ap, 0, MemAttrs::aligned(3));
+            let step = if l.size == 16 {
+                let addr = s.b.convert(Op::Expose, Flags::NONE, Ty::I64, cur);
+                let fifteen = s.b.iconst(Ty::I64, 15);
+                let mask = s.b.iconst(Ty::I64, u128::from(!15u64));
+                let bumped = s.b.binary(Op::Add, Flags::NONE, addr, fifteen);
+                let aligned = s.b.binary(Op::And, Flags::NONE, bumped, mask);
+                cur = s.b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, aligned);
+                16u128
+            } else {
+                8u128
+            };
+            let step_val = s.b.iconst(Ty::I64, step);
+            let next = s.b.ptr_add(Flags::NONE, cur, step_val);
+            s.b.store(Flags::NONE, next, ap, 0, MemAttrs::aligned(3));
+            let val = s.b.load(tty, Flags::NONE, cur, 0, MemAttrs::aligned(l.align));
+            Out::Scalar(val)
         }
         W::SizeOfVal | W::AlignOfVal => {
             let id = s.layout(t0.ok_or_else(need_t)?)?;
@@ -1012,6 +1107,20 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         // core/src/intrinsics/mod.rs: "this can only be called at compile-time as backends do
         // not have an implementation for it"; core's `type_name` wraps it in a `const` block.
         W::TypeName => return Err(s.shape("`type_name` reached the intrinsic builder: it is evaluated in its `const` block (blaze-consteval)")),
+        W::TypeIdTypeOf
+        | W::TypeIdVariants
+        | W::TypeIdFields
+        | W::TypeIdFieldRepresentingType
+        | W::FieldRepresentingTypeActualTypeId
+        | W::FieldRepresentingTypeOffset
+        | W::TypeIdIsSigned
+        | W::TypeIdArrayLen
+        | W::TypeIdElementTy
+        | W::TypeIdSizeOf
+        | W::TypeIdPointsTo
+        | W::TypeIdPointsMutably => {
+            return Err(s.shape("a `#[rustc_comptime]` reflection intrinsic reached the intrinsic builder: it is evaluated at compile time (blaze-consteval)"));
+        }
         // core reaches it in `TypeId::of`'s `const` block (blaze-consteval); a run-time call is
         // built from the same function, so it is the same 16 bytes.
         W::TypeId => {
@@ -1148,6 +1257,31 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             let id = record_schema_id(t, s.cx.cx.ground.view()).ok_or(s.shape("a type argument not in the ground table"))?;
             Out::Scalar(s.b.iconst(Ty::I64, u128::from(id)))
         }
+        W::BlazeIsEnum => {
+            let t = t0.ok_or_else(need_t)?;
+            let yes = is_enum(t, s.cx.cx.ground.view(), s.cx.cx.facts).map_err(|e| match e {
+                FieldCountError::MissingType => s.shape("a type argument not in the ground table"),
+                FieldCountError::NoAdt(adt) => IntrinsicError::Layout(LayoutError { ty: t, why: crate::layout::Refusal::NoAdt(adt) }),
+            })?;
+            Out::Scalar(s.b.iconst(Ty::I8, u128::from(yes)))
+        }
+        W::BlazeIsUnitEnum => {
+            let t = t0.ok_or_else(need_t)?;
+            let yes = is_unit_enum(t, s.cx.cx.ground.view(), s.cx.cx.facts).map_err(|e| match e {
+                FieldCountError::MissingType => s.shape("a type argument not in the ground table"),
+                FieldCountError::NoAdt(adt) => IntrinsicError::Layout(LayoutError { ty: t, why: crate::layout::Refusal::NoAdt(adt) }),
+            })?;
+            Out::Scalar(s.b.iconst(Ty::I8, u128::from(yes)))
+        }
+        W::BlazeVariantCount => {
+            let t = t0.ok_or_else(need_t)?;
+            let count = variant_count(t, s.cx.cx.ground.view(), s.cx.cx.facts).map_err(|e| match e {
+                FieldCountError::MissingType => s.shape("a type argument not in the ground table"),
+                FieldCountError::NoAdt(adt) => IntrinsicError::Layout(LayoutError { ty: t, why: crate::layout::Refusal::NoAdt(adt) }),
+            })?;
+            Out::Scalar(s.usize(count))
+        }
+        W::BlazeVariantName => return Err(s.shape("`blaze_variant_name` reached the intrinsic builder: evaluate it in a `const` / `where const` context (blaze-consteval)")),
     };
     Ok(out)
 }
@@ -1288,6 +1422,48 @@ pub fn record_schema_id(ty: PTy, tys: PTys<'_>) -> Option<u64> {
         PNode::Record(schema, _) => schema.0,
         _ => 0,
     })
+}
+
+/// `blaze_is_enum::<T>()`'s rule: `true` iff `T` is an `AdtKind::Enum`.
+pub fn is_enum(ty: PTy, tys: PTys<'_>, facts: &dyn LayoutFacts) -> Result<bool, FieldCountError> {
+    let node = tys.get(ty).copied().ok_or(FieldCountError::MissingType)?;
+    match node {
+        PNode::Adt(adt_key, _) => {
+            let adt = facts.adt(adt_key).ok_or(FieldCountError::NoAdt(adt_key))?;
+            Ok(adt.kind == AdtKind::Enum)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// `blaze_is_unit_enum::<T>()`'s rule: `true` iff `T` is an `AdtKind::Enum` whose variants are all
+/// unit variants (`CtorKind::Unit`).
+pub fn is_unit_enum(ty: PTy, tys: PTys<'_>, facts: &dyn LayoutFacts) -> Result<bool, FieldCountError> {
+    let node = tys.get(ty).copied().ok_or(FieldCountError::MissingType)?;
+    match node {
+        PNode::Adt(adt_key, _) => {
+            let adt = facts.adt(adt_key).ok_or(FieldCountError::NoAdt(adt_key))?;
+            Ok(adt.kind == AdtKind::Enum && adt.variants.iter().all(|v| v.ctor == blaze_typeck::CtorKind::Unit))
+        }
+        _ => Ok(false),
+    }
+}
+
+/// `blaze_variant_count::<T>()`'s rule: number of declared variants if `T` is an `AdtKind::Enum`,
+/// else `0`.
+pub fn variant_count(ty: PTy, tys: PTys<'_>, facts: &dyn LayoutFacts) -> Result<u64, FieldCountError> {
+    let node = tys.get(ty).copied().ok_or(FieldCountError::MissingType)?;
+    match node {
+        PNode::Adt(adt_key, _) => {
+            let adt = facts.adt(adt_key).ok_or(FieldCountError::NoAdt(adt_key))?;
+            if adt.kind == AdtKind::Enum {
+                Ok(u64::try_from(adt.variants.len()).unwrap_or(0))
+            } else {
+                Ok(0)
+            }
+        }
+        _ => Ok(0),
+    }
 }
 
 /// `discriminant_value::<T>(v)`: the tag at `v` decoded by `T`'s encoding, as the call's type.

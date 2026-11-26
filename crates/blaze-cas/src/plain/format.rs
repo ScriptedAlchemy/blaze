@@ -27,9 +27,12 @@ use blaze_keyed::{
 /// row's flag 4, sealed ([`Segment::sealed`]), which format 3 refused as a row no commit
 /// writes; format 5 gives each root an expiry ([`Root::expires_ns`]) and adds the leases a
 /// running command holds ([`Lease`], counted in the header's last word, which format 4 kept
-/// zero), and a segment row's touch ([`Segment::touched`], a u64 at its end). A head or a manifest of another format is refused naming both; there is no
-/// migration: the store is rebuilt from what made it.
-pub const FORMAT: u32 = 5;
+/// zero), and a segment row's touch ([`Segment::touched`], a u64 at its end); format 6 extends
+/// each lease row from 32 to 48 bytes with the holder's machine boot (`boot: u64`) and OS
+/// process id (`pid: u32`, reserved `u32 = 0`) so same-boot GC can immediately reclaim leases
+/// of provably dead processes without waiting `LEASE_NS`. A head or a manifest of another format
+/// is refused naming both; there is no migration: the store is rebuilt from what made it.
+pub const FORMAT: u32 = 6;
 
 /// The format of a plain segment, which outlives any one store (a published segment is shared
 /// through a bucket): its own number, so a change to the store's own files never changes a
@@ -54,7 +57,7 @@ pub const SEGMENT_FORMAT: u32 = 3;
 pub const FORMS: [(u8, u32); 2] = [(b'f', FORMAT), (b's', SEGMENT_FORMAT)];
 
 /// The name of a store's folder of one set of [`FORMS`]: each form's letter and its number in
-/// decimal, in order: `f5s3` for this blaze. Why letters and numbers, not a digest of them: the
+/// decimal, in order: `f6s3` for this blaze. Why letters and numbers, not a digest of them: the
 /// name says to a person (and to the note that lists other folders) which forms a folder holds,
 /// a newer one sorts after an older one of the same width, and the forms are few (a digest would
 /// hide them for nothing: the name is no key, and nothing is shared by it).
@@ -381,7 +384,7 @@ pub(crate) const SEGMENT_MAGIC: [u8; 4] = *b"BLPS";
 pub(crate) const FOOTER_MAGIC: [u8; 4] = *b"BLPE";
 
 /// The BLAKE3 domain of a segment's digest: its name in a bucket, what a signed statement binds.
-pub(crate) const SEGMENT_DIGEST: &str = "blaze plain store segment 1";
+pub const SEGMENT_DIGEST: &str = "blaze plain store segment 1";
 
 /// What a segment's header and footer say, read and checked ([`check_segment`]), or read by
 /// range and not yet checked ([`describe`]).
@@ -447,11 +450,72 @@ pub(crate) struct Sealed {
     pub len: u64,
 }
 
+/// Batches small slices into 8 KiB (`8 * CHUNK_LEN`) aligned flushes so `blaze_blake3::Hasher`
+/// runs its 8-lane SIMD wide-tree compressor instead of scalar single-chunk updates, while
+/// passing already-large slices through directly without copying. Bit-for-bit identical to
+/// calling `blaze_ids::Hasher::update` on each slice directly (Rule 25).
+struct BufferedHasher {
+    hasher: blaze_ids::Hasher,
+    buf: [u8; 8192],
+    fill: usize,
+}
+
+impl BufferedHasher {
+    fn new(domain: &'static str) -> BufferedHasher {
+        BufferedHasher { hasher: blaze_ids::Hasher::new(domain), buf: [0u8; 8192], fill: 0 }
+    }
+
+    #[inline]
+    fn update(&mut self, mut bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.fill > 0 {
+            let space = self.buf.len().saturating_sub(self.fill);
+            if bytes.len() < space {
+                if let Some(dst) = self.buf.get_mut(self.fill..self.fill + bytes.len()) {
+                    dst.copy_from_slice(bytes);
+                }
+                self.fill += bytes.len();
+                return;
+            }
+            if let (Some(dst), Some(src)) = (self.buf.get_mut(self.fill..), bytes.get(..space)) {
+                dst.copy_from_slice(src);
+            }
+            self.hasher.update(&self.buf);
+            self.fill = 0;
+            bytes = bytes.get(space..).unwrap_or(&[]);
+        }
+        let bulk = bytes.len() & !8191usize;
+        if bulk > 0
+            && let Some(head) = bytes.get(..bulk)
+        {
+            self.hasher.update(head);
+            bytes = bytes.get(bulk..).unwrap_or(&[]);
+        }
+        if !bytes.is_empty() {
+            if let Some(dst) = self.buf.get_mut(..bytes.len()) {
+                dst.copy_from_slice(bytes);
+            }
+            self.fill = bytes.len();
+        }
+    }
+
+    fn finish(mut self) -> ContentId {
+        if self.fill > 0
+            && let Some(tail) = self.buf.get(..self.fill)
+        {
+            self.hasher.update(tail);
+        }
+        self.hasher.finish()
+    }
+}
+
 pub(crate) fn seal_parts<'p>(namespace: Namespace, run: &[u8], index_at: u64, payloads: impl IntoIterator<Item = &'p [u8]>) -> Sealed {
     let count = (run.len() / ENTRY) as u32;
     let header = header(namespace, run, index_at);
     let foot = footer_head(count, index_at);
-    let mut hasher = blaze_ids::Hasher::new(SEGMENT_DIGEST);
+    let mut hasher = BufferedHasher::new(SEGMENT_DIGEST);
     hasher.update(&header);
     let mut at = HEADER as u64;
     for bytes in payloads {
@@ -466,6 +530,48 @@ pub(crate) fn seal_parts<'p>(namespace: Namespace, run: &[u8], index_at: u64, pa
     footer[..16].copy_from_slice(&foot);
     footer[16..].copy_from_slice(&digest.0);
     let len = index_at + run.len() as u64 + FOOTER as u64;
+    Sealed { header, footer, described: Described { namespace, count, index_at, digest }, len }
+}
+
+/// Zero-allocation twin of [`seal_parts`] for streamed commits: hashes the segment header,
+/// each `(payload, zero_pad_len)` in place, each sorted [`Entry`] through a stack `[u8; ENTRY]`,
+/// and the footer head, producing the exact same [`Sealed`] digest and header/footer without
+/// materializing either payload pieces or the encoded index run upfront.
+pub(crate) fn seal_entries<'p>(
+    namespace: Namespace,
+    entries: &[Entry],
+    index_at: u64,
+    payloads: impl IntoIterator<Item = (&'p [u8], u8)>,
+) -> Sealed {
+    let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+    let lowest = entries.first().map_or(ContentId([0; 32]), |it| it.key);
+    let highest = entries.last().map_or(ContentId([0; 32]), |it| it.key);
+    let header = header_of(namespace, count, lowest, highest, index_at);
+    let foot = footer_head(count, index_at);
+    let mut hasher = BufferedHasher::new(SEGMENT_DIGEST);
+    hasher.update(&header);
+    let mut at = u64::try_from(HEADER).unwrap_or(0);
+    for (bytes, pad_len) in payloads {
+        hasher.update(bytes);
+        let pad = usize::from(pad_len);
+        if pad > 0
+            && let Some(z) = ZEROS.get(..pad)
+        {
+            hasher.update(z);
+        }
+        at = at.saturating_add(u64::try_from(bytes.len()).unwrap_or(0)).saturating_add(u64::from(pad_len));
+    }
+    debug_assert_eq!(at, index_at, "the index follows the payloads");
+    for entry in entries {
+        hasher.update(&entry.encode_array());
+    }
+    hasher.update(&foot);
+    let digest: ContentId = hasher.finish();
+    let mut footer = [0u8; FOOTER];
+    footer[..16].copy_from_slice(&foot);
+    footer[16..].copy_from_slice(&digest.0);
+    let entry_bytes = u64::from(count).saturating_mul(u64::try_from(ENTRY).unwrap_or(48));
+    let len = index_at.saturating_add(entry_bytes).saturating_add(u64::try_from(FOOTER).unwrap_or(48));
     Sealed { header, footer, described: Described { namespace, count, index_at, digest }, len }
 }
 
@@ -974,8 +1080,9 @@ pub(crate) const NEVER: u64 = u64::MAX;
 
 /// What a running command holds while its records are not yet named by a root: every segment
 /// of generation `since` or newer is kept whole, and no file retired after `opened_ns` (less
-/// the grace) is unlinked, until `expires_ns`. Set by the holder's commits, let go by its last;
-/// a process that dies holding one is let go of by the clock.
+/// the grace) is unlinked, until `expires_ns` (or until same-boot GC proves `pid` dead). Set by
+/// the holder's commits, let go by its last; a process that dies holding one is reclaimed on the
+/// same boot by PID liveness check, or otherwise let go of by the clock.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Lease {
     /// The holder's [`super::core::PlainConfig::nonce`].
@@ -985,6 +1092,10 @@ pub(crate) struct Lease {
     /// The wall clock at the holder's open.
     pub opened_ns: u64,
     pub expires_ns: u64,
+    /// The machine boot the holder opened in (`PlainConfig::boot`); `0` when unknown.
+    pub boot: u64,
+    /// The holder's OS process id (`Plain::pid`), or `0` when unknown/unprobed.
+    pub pid: u32,
 }
 
 /// What one generation holds: its segments (oldest first), its roots, its leases, its retired
@@ -998,18 +1109,18 @@ pub(crate) struct Manifest {
     pub retired: Vec<Retired>,
 }
 
-/// One lease row: holder u64, since u64, opened ns u64, expires ns u64.
-const LEASE_ROW: usize = 32;
+/// One lease row: holder u64, since u64, opened ns u64, expires ns u64, boot u64, pid u32, zero u32.
+const LEASE_ROW: usize = 48;
 
 impl Manifest {
     /// Bytes 0..4 magic `BLPM`, 4..8 format, 8..16 generation, 16..20 segments `s`, 20..24
     /// retired `r`, 24..28 roots `t`, 28..32 leases `l`; then `s` x 88 (digest 32, length u64,
     /// index offset u64, entries u32, flags u32 (1 here, 2 published, 4 sealed), namespace u64,
     /// generation u64, boot u64, touched u64), `r` x 24 (id u64, 1 for a log u32, the mark u32
-    /// ([`LostMark::encode`]: zero for none, never set on a log), since ns u64), `l` x 32
-    /// ([`Lease`]: holder, since, opened ns, expires ns, each u64), and `t` roots, each 32 key,
-    /// 8 generation, 8 expiry ns, 2 name length, the name's UTF-8, zeros to a multiple of 8.
-    /// Little-endian.
+    /// ([`LostMark::encode`]: zero for none, never set on a log), since ns u64), `l` x 48
+    /// ([`Lease`]: holder, since, opened ns, expires ns, boot each u64; pid u32; zero u32), and
+    /// `t` roots, each 32 key, 8 generation, 8 expiry ns, 2 name length, the name's UTF-8, zeros
+    /// to a multiple of 8. Little-endian.
     ///
     /// Each segment row is written through [`Row::new`], the check [`Manifest::decode`] reads
     /// it through, in a store whose segments are at most `most` bytes: a row the open would
@@ -1040,6 +1151,9 @@ impl Manifest {
             out.extend_from_slice(&it.since.to_le_bytes());
             out.extend_from_slice(&it.opened_ns.to_le_bytes());
             out.extend_from_slice(&it.expires_ns.to_le_bytes());
+            out.extend_from_slice(&it.boot.to_le_bytes());
+            out.extend_from_slice(&it.pid.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
         }
         for root in &self.roots {
             out.extend_from_slice(&root.key.0);
@@ -1103,7 +1217,17 @@ impl Manifest {
         let mut leases = Vec::with_capacity_in(l, Global);
         for i in 0..l {
             let at = rows + LEASE_ROW * i;
-            let it = Lease { holder: u64_at(bytes, at), since: u64_at(bytes, at + 8), opened_ns: u64_at(bytes, at + 16), expires_ns: u64_at(bytes, at + 24) };
+            if u32_at(bytes, at + 44) != 0 {
+                return Err(bad("a lease row has non-zero reserved bits", at + 44));
+            }
+            let it = Lease {
+                holder: u64_at(bytes, at),
+                since: u64_at(bytes, at + 8),
+                opened_ns: u64_at(bytes, at + 16),
+                expires_ns: u64_at(bytes, at + 24),
+                boot: u64_at(bytes, at + 32),
+                pid: u32_at(bytes, at + 40),
+            };
             if it.since > generation || leases.iter().any(|other: &Lease| other.holder == it.holder) {
                 return Err(bad("a lease row is not one a flip writes (its generation newer than the manifest's, or a second lease of one holder)", at));
             }
@@ -1151,13 +1275,19 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub fn encode_into<A: core::alloc::Allocator>(&self, out: &mut Vec<u8, A>) {
+    pub fn encode_array(&self) -> [u8; ENTRY] {
         debug_assert!(self.at.is_multiple_of(ALIGN) && self.at < OFFSET_MOST);
         let place = (self.at / ALIGN) | (u64::from(self.tag.0) << 40);
-        out.extend_from_slice(&self.key.0);
-        out.extend_from_slice(&place.to_le_bytes());
-        out.extend_from_slice(&self.len.to_le_bytes());
-        out.extend_from_slice(&self.crc.to_le_bytes());
+        let mut out = [0u8; ENTRY];
+        out[0..32].copy_from_slice(&self.key.0);
+        out[32..40].copy_from_slice(&place.to_le_bytes());
+        out[40..44].copy_from_slice(&self.len.to_le_bytes());
+        out[44..48].copy_from_slice(&self.crc.to_le_bytes());
+        out
+    }
+
+    pub fn encode_into<A: core::alloc::Allocator>(&self, out: &mut Vec<u8, A>) {
+        out.extend_from_slice(&self.encode_array());
     }
 
     /// The entry at `bytes[..ENTRY]`, its reserved bits checked (bits 56..64 of its place): what

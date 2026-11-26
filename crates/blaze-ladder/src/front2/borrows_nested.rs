@@ -221,6 +221,9 @@ impl Facts for NestedFacts<'_, '_> {
     fn param_copy(&self, index: u32) -> bool {
         self.facts.param_copy(index)
     }
+    fn alias_copy(&self, alias: tc::PTy) -> bool {
+        self.facts.alias_copy(alias)
+    }
     fn shape(&self, item: tc::ItemKey) -> Option<Shape<'_>> {
         self.facts.shape(item)
     }
@@ -247,20 +250,35 @@ impl Facts for NestedFacts<'_, '_> {
     fn trait_relates_nothing(&self, trait_: tc::ItemKey) -> bool {
         self.facts.trait_relates_nothing(trait_)
     }
+    fn is_auto_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.is_auto_trait(trait_)
+    }
     fn is_fn_trait(&self, trait_: tc::ItemKey) -> bool {
         self.facts.is_fn_trait(trait_)
+    }
+    fn is_future_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.is_future_trait(trait_)
+    }
+    fn is_into_future_trait(&self, trait_: tc::ItemKey) -> bool {
+        self.facts.is_into_future_trait(trait_)
     }
     fn assoc_item(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<tc::ItemKey> {
         self.facts.assoc_item(trait_, name)
     }
-    fn owner_trait_impl(&self) -> Option<blaze_flow_lower::OwnerTraitImpl> {
-        self.facts.owner_trait_impl()
+    fn owner_trait_impl(&self, trait_: tc::ItemKey) -> Option<blaze_flow_lower::OwnerTraitImpl> {
+        self.facts.owner_trait_impl(trait_)
     }
     fn deref_impl(&self, adt: tc::ItemKey) -> Option<tc::ItemKey> {
         self.facts.deref_impl(adt)
     }
     fn is_zero_slot_builtin_assoc(&self, trait_: tc::ItemKey, name: tc::Name) -> bool {
         self.facts.is_zero_slot_builtin_assoc(trait_, name)
+    }
+    fn rpitit_opaque(&self, opaque: tc::ItemKey) -> Option<blaze_flow_lower::RpititOpaque> {
+        self.facts.rpitit_opaque(opaque)
+    }
+    fn impl_fn(&self, imp: tc::ItemKey, fn_name: tc::Name) -> Option<tc::ItemKey> {
+        self.facts.impl_fn(imp, fn_name)
     }
     // Every fact the body's facts answer, forwarded (a nested flow asks what the owner's does).
     fn ties(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Ties<'_>> {
@@ -286,6 +304,12 @@ impl Facts for NestedFacts<'_, '_> {
     }
     fn drop_args(&self, adt: tc::ItemKey) -> Option<&[bool]> {
         self.facts.drop_args(adt)
+    }
+    fn drop_strict(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        self.facts.drop_strict(adt)
+    }
+    fn drop_lifetimes(&self, adt: tc::ItemKey) -> Option<&[bool]> {
+        self.facts.drop_lifetimes(adt)
     }
     fn closure_requirements(&self, closure: tc::ExprId) -> &[Requirement] {
         let (lo, hi) = run_of(self.closures, closure);

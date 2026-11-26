@@ -244,6 +244,17 @@ pub(crate) fn snapshot_get<'s, A: Allocator>(snapshot: &'s Snapshot<A>, key: Key
     }))
 }
 
+/// Reads `key`'s bytes with the store's proof inside `f` without lending them past the call
+/// (never pins an uncommitted shared arena, and hands `Checked` to readers that skip re-hashing
+/// bytes the store already proved, rule 74).
+pub(crate) fn lent_with_checked<D: Driver, R>(
+    lent: &Lent<D, StoreAlloc>,
+    key: Key,
+    f: impl FnOnce(&[u8], Checked<'_>) -> R,
+) -> Result<Option<R>, PlaceError> {
+    Ok(lent.with_bytes(&CasKey(key.0), |_tag, _ns, bytes| f(bytes, Checked { _private: PhantomData }))?)
+}
+
 /// A record lent in place for `'m`, the life of the [`Lent`] borrowed.
 #[derive(Clone, Copy, Debug)]
 pub struct Held<'m> {
@@ -322,6 +333,11 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         PlainPlace { lent, public_writer, plant, commits: 0, segments_written: 0, aging_since: None }
     }
 
+    /// Whether this machine is a trusted builder that may write [`Namespace::PUBLIC`].
+    pub fn is_public_writer(&self) -> bool {
+        self.public_writer
+    }
+
     /// The record's namespace (drive.md ruling 2): `PUBLIC` only when every name in it is
     /// public AND this machine is a trusted builder; else `LOCAL`.
     pub fn namespace(&self, all_names_public: bool) -> Namespace {
@@ -339,6 +355,48 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     pub fn get(&self, key: Key) -> Result<Option<Held<'m>>, PlaceError> {
         let lent: &'m Lent<D, StoreAlloc> = self.lent;
         Ok(lent.get(&CasKey(key.0))?.map(|lend| Held { bytes: lend.bytes, proof: Checked { _private: PhantomData }, place: lend.in_place() }))
+    }
+
+    /// Committed-only in-place lookup: borrows a committed segment for `'m` without pinning any
+    /// uncommitted arena; returns [`CommittedLend::InArena`] when the record is an uncommitted put.
+    pub fn get_committed(&self, key: Key) -> Result<super::Committed<'m>, PlaceError> {
+        let lent: &'m Lent<D, StoreAlloc> = self.lent;
+        Ok(match lent.get_committed(&CasKey(key.0))? {
+            blaze_cas::plain::CommittedLend::Found(lend) => {
+                super::Committed::Found(Held { bytes: lend.bytes, proof: Checked { _private: PhantomData }, place: lend.in_place() })
+            }
+            blaze_cas::plain::CommittedLend::InArena => super::Committed::InArena,
+            blaze_cas::plain::CommittedLend::Absent => super::Committed::Absent,
+        })
+    }
+
+    /// Non-lending existence check (uncommitted puts or committed segments); never pins an arena.
+    pub fn contains(&self, key: Key) -> Result<bool, PlaceError> {
+        Ok(self.lent.tag_of(&CasKey(key.0))?.is_some())
+    }
+
+    /// Reads `key`'s bytes inside `f` without lending them past the call; never pins an arena.
+    pub fn with_bytes<R>(&self, key: Key, f: impl FnOnce(&[u8]) -> R) -> Result<Option<R>, PlaceError> {
+        Ok(self.lent.with_bytes(&CasKey(key.0), |_tag, _ns, bytes| f(bytes))?)
+    }
+
+    /// Commits any uncommitted puts immediately (even below `COMMIT_BYTES`) so the current shared
+    /// arena is freed and later stages read from file-backed segment mappings with zero pinning.
+    pub fn flush_puts(&mut self) -> Result<(), PlaceError> {
+        if self.lent.uncommitted_bytes() > 0 {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Number of commits completed through this handle so far.
+    pub fn commits(&self) -> u32 {
+        self.commits
+    }
+
+    /// Number of shared arenas pinned past commit on the underlying `Lent`.
+    pub fn kept_arenas(&self) -> usize {
+        self.lent.kept_arenas()
     }
 
     /// `bytes` under `key`, copied once into the arena. A key held with equal bytes is left as
@@ -452,7 +510,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// its tag): `None` when `owner` was put with no records beside it.
     pub(crate) fn beside(&self, owner: Key) -> Result<Option<CasKey>, PlaceError> {
         let key = blaze_cas::plain::beside_key(CasKey(owner.0));
-        Ok(self.lent.get(&key)?.filter(|held| ReservedTag::Index.is(held.tag)).map(|_| key))
+        Ok(self.lent.tag_of(&key)?.filter(|tag| ReservedTag::Index.is(*tag)).map(|_| key))
     }
 
     /// The store's owner, for a class root of store/roots.rs written beside the engine's
@@ -592,31 +650,29 @@ pub fn after_answer<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32)
 /// caller's class on every exit.
 pub(crate) fn after_answer_at<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32, qos: AfterAnswerQos) -> Result<AfterAnswer, PlaceError> {
     let called_at = qos_now()?;
-    #[cfg(target_os = "macos")]
-    let _held = if slices > 0 {
-        match qos {
-            AfterAnswerQos::Scoped => {
-                Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
-            }
-            AfterAnswerQos::AsCalled => None,
-        }
-    } else {
-        None
-    };
-    #[cfg(not(target_os = "macos"))]
-    let (AfterAnswerQos::AsCalled | AfterAnswerQos::Scoped) = qos;
-    let mut done = after_answer_steps(cx, lent, slices)?;
-    done.qos = QosSeen { called_at, ran_at: qos_now()? };
+    let lower_scoped = slices > 0 && qos == AfterAnswerQos::Scoped;
+    let (mut done, ran_at) = after_answer_steps(cx, lent, slices, lower_scoped)?;
+    done.qos = QosSeen { called_at, ran_at };
     Ok(done)
 }
 
-/// [`after_answer`]'s steps, on the calling thread at the class it has.
-fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32) -> Result<AfterAnswer, PlaceError> {
+/// [`after_answer`]'s steps: keeps `lent.commit()` at caller QoS (P-cores), while scoping
+/// inline cleanup (`fold_slice`, `clean_on`) and exit-tail sealing (`seal`) to `AFTER_ANSWER`
+/// when `lower_scoped` is true.
+fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u32, lower_scoped: bool) -> Result<(AfterAnswer, u32), PlaceError> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = lower_scoped;
     let cx = cx.span("store after answer");
     // The put path's tally up to here: the phases' commits and every copy before the answer.
     let before = lent.put_tally();
     if slices > 0 {
         let _cx = cx.span("store after answer: fold a cleanup slice (map, merge copy hashed whole)");
+        #[cfg(target_os = "macos")]
+        let _fold_qos = if lower_scoped {
+            Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
+        } else {
+            None
+        };
         lent.fold_slice()?;
     }
     lent.release_lease();
@@ -625,6 +681,12 @@ fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u3
         lent.commit()?
     };
     let first = lent.take_sliced();
+    #[cfg(target_os = "macos")]
+    let _tail_qos = if lower_scoped {
+        Some(blaze_core::threads::qos::Lowered::at_most(blaze_core::threads::qos::AFTER_ANSWER).map_err(PlaceError::Qos)?)
+    } else {
+        None
+    };
     let (slice, swept) = if slices > 0 {
         let _cx = cx.span("store after answer: more cleanup slices (each a merge copy hashed whole, a flip)");
         lent.clean_on(first)?
@@ -643,6 +705,7 @@ fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u3
     } else {
         false
     };
+    let ran_at = qos_now()?;
     let mut cleanup = {
         let _cx = cx.span("store after answer: the cleanup line");
         super::roots::CleanupLine::of(lent, slice)
@@ -651,13 +714,16 @@ fn after_answer_steps<D: Driver>(cx: &Cx, lent: &Lent<D, StoreAlloc>, slices: u3
         cleanup.slices = swept;
     }
     cleanup.put = super::roots::PutLine { before_answer: before, after_answer: lent.put_tally().since(before) };
-    Ok(AfterAnswer {
-        segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX),
-        sealed,
-        compaction_slices: cleanup.slices,
-        cleanup,
-        qos: QosSeen::default(),
-    })
+    Ok((
+        AfterAnswer {
+            segments_written: u32::try_from(committed.segments.len()).unwrap_or(u32::MAX),
+            sealed,
+            compaction_slices: cleanup.slices,
+            cleanup,
+            qos: QosSeen::default(),
+        },
+        ran_at,
+    ))
 }
 
 /// The tests' context for [`after_answer`] (its spans): a simulated world's root, its own

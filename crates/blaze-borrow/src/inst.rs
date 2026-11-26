@@ -56,14 +56,16 @@ pub enum ClauseIn<'c> {
     /// `T: Trait<A..>` as a head's clause column lays it (blaze-ladder heads_regions.rs): one
     /// `ExTrait(Trait, [T, A..])` node, the subject its FIRST argument, its column the trait's
     /// lifetime arguments then `T`'s slots then each `A`'s: the form of [`ImplHead::trait_ref`]
-    /// too. Tied as [`ClauseIn::Trait`] is, the subject read off the node (relate.rs `tie_of`).
-    TraitOf { trait_ref: Typed<'c> },
+    /// too. `binders` is `ClauseView::binders` (how many `for<..>` lifetimes at `binder: 0` the
+    /// clause itself quantifies). Tied as [`ClauseIn::Trait`] is, the subject read off the node
+    /// (relate.rs `tie_of`).
+    TraitOf { trait_ref: Typed<'c>, binders: u32 },
     /// `<T as Trait<A..>>::N == U` as a head's clause column lays it: one `ExProj { Trait, N,
     /// [T, A..], U }` node, its column EMPTY (a projection clause that writes a region is
-    /// refused by the caller by name). Related by relate.rs `proj_of`: nothing where `U` names
-    /// no region of the call (its parent `T: Trait<A..>` clause, laid apart, ties the rest);
-    /// else refused by name ([`NotSelected::WhereProjection`]).
-    ProjOf { proj: Typed<'c> },
+    /// refused by the caller by name). `binders` is `ClauseView::binders`. Related by relate.rs
+    /// `proj_of`: nothing where `U` names no region of the call (its parent `T: Trait<A..>`
+    /// clause, laid apart, ties the rest); else refused by name ([`NotSelected::WhereProjection`]).
+    ProjOf { proj: Typed<'c>, binders: u32 },
 }
 
 /// A fn item's signature as its head record lays it (D148 `SigRegions`, split by
@@ -162,6 +164,9 @@ pub enum Slots<'c> {
     /// A caller-table type (in `types`, e.g. a closure's `FnPtr` signature), its regions read
     /// through environment `env`.
     CallerEnv { col: &'c [Region], env: EnvId },
+    /// A caller-table type (in `types`, e.g. an anonymous `async { .. }` block's `Future::Output`)
+    /// whose `len` slots are fresh existential origins bound at `Param(start..start + len)` in `env`.
+    CallerFresh { env: EnvId, start: u32, len: SlotCount },
 }
 
 impl<'c> Slots<'c> {
@@ -170,6 +175,7 @@ impl<'c> Slots<'c> {
         match self {
             Slots::Caller(r) => Some(r.count()),
             Slots::Sig { col, .. } | Slots::CallerEnv { col, .. } => SlotCount::of_len(col.len()),
+            Slots::CallerFresh { len, .. } => Some(len),
         }
     }
 
@@ -190,6 +196,14 @@ impl<'c> Slots<'c> {
                 }
                 let (a, b) = col.split_at(n.len());
                 Some((Slots::CallerEnv { col: a, env }, Slots::CallerEnv { col: b, env }))
+            }
+            Slots::CallerFresh { env, start, len } => {
+                if n.get() > len.get() {
+                    return None;
+                }
+                let mid = start.checked_add(n.get())?;
+                let rem = SlotCount::new(len.get() - n.get());
+                Some((Slots::CallerFresh { env, start, len: n }, Slots::CallerFresh { env, start: mid, len: rem }))
             }
         }
     }
@@ -220,9 +234,9 @@ pub enum Clause<'c> {
     /// proves it.
     Trait { subject: Side<'c>, trait_ref: Side<'c> },
     /// [`ClauseIn::TraitOf`]: the subject is `trait_ref`'s first argument.
-    TraitOf { trait_ref: Side<'c> },
+    TraitOf { trait_ref: Side<'c>, binders: u32 },
     /// [`ClauseIn::ProjOf`].
-    ProjOf { proj: Side<'c> },
+    ProjOf { proj: Side<'c>, binders: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -281,7 +295,7 @@ impl<'c, A: Allocator + Copy> Envs<'c, A> {
         if self.envs.len() >= MOST_ENVS {
             return None;
         }
-        let id = EnvId(self.envs.len() as u32);
+        let id = EnvId(u32::try_from(self.envs.len()).ok()?);
         self.envs.push(Env { mode, regs, late: Vec::new_in(self.alloc), types });
         Some(id)
     }
@@ -310,6 +324,40 @@ impl<'c, A: Allocator + Copy> Envs<'c, A> {
         self.push(Mode::Owner { binder: None }, regs, tys)
     }
 
+    /// Clones `base` with its clause-level `for<..>` binder (`binder: 0`, variables `0..binders`)
+    /// Skolemized to fresh origins produced by `make`. Inner binders (`binder >= 1`, e.g. `fn(..)`
+    /// or `dyn`) remain `Reg::Bound`.
+    pub(crate) fn skolemize_clause(&mut self, base: EnvId, binders: u32, mut make: impl FnMut() -> Origin) -> Option<EnvId> {
+        if binders == 0 {
+            return Some(base);
+        }
+        if self.envs.len() >= MOST_ENVS {
+            return None;
+        }
+        let src = self.envs.get(usize::try_from(base.0).ok()?)?;
+        let mode = match src.mode {
+            Mode::Item { bindable, gat_base } => Mode::Item { bindable, gat_base },
+            Mode::Owner { binder } => Mode::Owner { binder: binder.or(Some(0)) },
+        };
+        let mut regs = Vec::with_capacity_in(src.regs.len(), self.alloc);
+        regs.extend_from_slice(&src.regs);
+        let mut types = Vec::with_capacity_in(src.types.len(), self.alloc);
+        types.extend_from_slice(&src.types);
+        let extra = usize::try_from(binders).ok()?;
+        let mut late = Vec::with_capacity_in(src.late.len().checked_add(extra)?, self.alloc);
+        for &entry in src.late.iter() {
+            if entry.0 != 0 {
+                late.push(entry);
+            }
+        }
+        for var in 0..binders {
+            late.push((0, var, make()));
+        }
+        let id = EnvId(u32::try_from(self.envs.len()).ok()?);
+        self.envs.push(Env { mode, regs, late, types });
+        Some(id)
+    }
+
     fn env(&self, e: EnvId) -> Result<&Env<'c, A>, Bad> {
         self.envs.get(e.0 as usize).ok_or(Bad::StepBound)
     }
@@ -334,7 +382,13 @@ impl<'c, A: Allocator + Copy> Envs<'c, A> {
                     None => return Err(Bad::LifetimePast { index: idx }),
                 }
             }
-            (Mode::Item { .. }, Region::Late { binder, var }) => RegAt::Known(Reg::Bound { binder, var }),
+            (Mode::Item { .. }, Region::Late { binder, var }) => {
+                if let Some(&(_, _, o)) = env.late.iter().find(|&&(x, v, _)| x == binder && v == var) {
+                    RegAt::Known(Reg::Origin(o))
+                } else {
+                    RegAt::Known(Reg::Bound { binder, var })
+                }
+            }
             (Mode::Owner { .. }, Region::Param(i)) => RegAt::Known(Reg::Owner(Region::Param(i))),
             (Mode::Owner { binder: Some(b) }, Region::Late { binder, var }) if binder == b => {
                 match env.late.iter().find(|&&(x, v, _)| x == binder && v == var) {
@@ -497,8 +551,8 @@ pub fn instantiate<'c, A: Allocator + Copy>(
             ClauseIn::TypeOutlives { subject, region } => Clause::TypeOutlives { subject: sig_side(subject), region: known(&envs, region)? },
             ClauseIn::RegionOutlives { long, short } => Clause::Outlives { long: known(&envs, long)?, short: known(&envs, short)?, at: output.ty },
             ClauseIn::Trait { subject, trait_ref } => Clause::Trait { subject: sig_side(subject), trait_ref: sig_side(trait_ref) },
-            ClauseIn::TraitOf { trait_ref } => Clause::TraitOf { trait_ref: sig_side(trait_ref) },
-            ClauseIn::ProjOf { proj } => Clause::ProjOf { proj: sig_side(proj) },
+            ClauseIn::TraitOf { trait_ref, binders } => Clause::TraitOf { trait_ref: sig_side(trait_ref), binders },
+            ClauseIn::ProjOf { proj, binders } => Clause::ProjOf { proj: sig_side(proj), binders },
         });
     }
     Ok(Inst { item, inputs: ins, output: sig_side(output), clauses, envs })
@@ -684,6 +738,27 @@ impl AskArgs for Unkeyed {
     }
 }
 
+/// Normalization target of a trait fn's RPITIT opaque (`Opaque(op_key, ..)`) at a concrete
+/// call site (RFC 3425).
+#[derive(Clone, Copy, Debug)]
+pub enum RpititTarget<'s> {
+    /// The selected impl inherits the trait's provided fn (`rpitit::Twin`): identical captured
+    /// lifetimes and type arguments, with `Opaque(twin, ..)` replacing `Opaque(op_key, ..)`.
+    Twin { twin: ItemKey },
+    /// The selected impl overrides the fn with `impl_fn`: bind `impl_fn`'s environment from
+    /// `head`, `impl_col` vs `trait_col` inputs, and take the return subtree at `op_key`'s place
+    /// inside `impl_col`'s output.
+    ImplFn {
+        trait_: ItemKey,
+        head: ImplHead<'s>,
+        trait_types: u32,
+        impl_fn: ItemKey,
+        impl_params: ParamsView<'s>,
+        impl_col: ColView<'s>,
+        trait_col: ColView<'s>,
+    },
+}
+
 /// The answer to an [`Ask`].
 #[derive(Clone, Copy, Debug)]
 pub enum Selection<'s> {
@@ -725,6 +800,14 @@ pub trait Selected {
         let _ = trait_;
         false
     }
+    /// Whether `trait_` is an `auto trait` (`Send`, `Sync`, `Unpin`, `Freeze`, etc.). When
+    /// `blaze-typeck` proved `T: AutoTrait` structurally or from an opaque/generic bound (never a
+    /// manual `impl` with extra `where` clauses, which returns `Selection::Impl`), the proof
+    /// relates no region.
+    fn is_auto_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
     /// Whether `<T as trait_>::name` is a compiler-builtin associated type whose normalized value
     /// always carries zero lifetimes (`DiscriminantKind::Discriminant`, `Pointee::Metadata`).
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
@@ -733,6 +816,16 @@ pub trait Selected {
     }
     /// Whether `trait_` is one of the `Fn` / `FnMut` / `FnOnce` language traits.
     fn is_fn_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is `core::future::Future`.
+    fn is_future_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is `core::future::IntoFuture`.
+    fn is_into_future_trait(&self, trait_: ItemKey) -> bool {
         let _ = trait_;
         false
     }
@@ -758,6 +851,12 @@ pub trait Selected {
     /// along with its defining item's lifetime parameter count (`regions.lifetime_params(opaque).count()`).
     fn opaque_clauses(&self, opaque: ItemKey) -> Option<(u32, &[ClauseView<'_>])> {
         let _ = opaque;
+        None
+    }
+    /// If `opaque` is an RPITIT opaque of a trait fn whose impl was selected at this call
+    /// (`args` = `[Self, trait_args.., fn_args..]`), returns its concrete normalization target.
+    fn rpitit_target(&self, opaque: ItemKey, args: &dyn AskArgs) -> Option<RpititTarget<'_>> {
+        let _ = (opaque, args);
         None
     }
 }

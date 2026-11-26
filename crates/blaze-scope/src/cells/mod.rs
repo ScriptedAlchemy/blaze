@@ -424,6 +424,40 @@ struct Frag<'a, N> {
     /// The fragment and position of the call it is the expansion of; `None` for a module's text.
     up: Option<(FragId, u32)>,
     slots: AVec<'a, (u32, Slot<N>)>,
+    /// Lazily-populated path-compressed previous live slot index (1-based: 0 means no live slot
+    /// at or before this index; `i + 1` means slot `i` may still contribute a `Slot::Rules`, a
+    /// `#[macro_use]` `Slot::Mod`, or an ungrown/non-empty `Slot::Call`). Monotonic because
+    /// `slots` is immutable after creation and `Item::grown` only transitions `false -> true`.
+    prev_live: AVec<'a, u32>,
+    /// Permanently `true` once every slot in `slots` is known to contribute neither a
+    /// `Slot::Rules`, nor a `#[macro_use]` `Slot::Mod`, nor an ungrown `Slot::Call`.
+    textual_empty: bool,
+    /// Epoch for which `guess_prev_live` holds a transient path-compressed skip table skipping
+    /// permanently dead slots AND ungrown `Slot::Call(j)` present in the active `Guess::items`.
+    guess_skip_epoch: u32,
+    guess_prev_live: AVec<'a, u32>,
+}
+
+/// Path-halving lookup in `prev_live` (1-based cursor `k`: `0` = exhausted, `1..=len` = slot `k - 1`).
+#[inline]
+fn live_at(prev_live: &mut [u32], mut k: usize) -> usize {
+    while let Some(idx) = k.checked_sub(1) {
+        let Some(&p32) = prev_live.get(idx) else {
+            return 0;
+        };
+        let p = usize::try_from(p32).unwrap_or(0);
+        if p == k {
+            return k;
+        }
+        if let Some(p_idx) = p.checked_sub(1)
+            && let Some(&gp) = prev_live.get(p_idx)
+            && let Some(slot) = prev_live.get_mut(idx)
+        {
+            *slot = gp;
+        }
+        k = p;
+    }
+    0
 }
 
 /// Where a call is written.
@@ -775,13 +809,20 @@ pub(crate) struct Cells<'a, N> {
     frags: AVec<'a, Frag<'a, N>>,
     /// Reusable traversal stack for [`Cells::textual`], avoiding per-call bump allocations.
     textual_stack: AVec<'a, (FragId, usize)>,
+    /// Reusable working buffers for `globs_value`, `quiet_point`, `fixpoint`, `stall_with_calls`
+    /// and `weak_guess` so repeated quiet points and glob evaluations do not leak bump memory
+    /// (rule 11).
+    scratch: SolverScratch<'a, N>,
+    /// Monotonic epoch stamped on `Guess` instances for transient `Frag::guess_prev_live` skips.
+    guess_epoch: u32,
     cell_queue: ABTreeSet<'a, CellId>,
     item_queue: ABTreeSet<'a, ItemId>,
     /// Calls resolved and not expanded yet.
     expand_queue: ABTreeSet<'a, ItemId>,
     /// Inputs a group's fixed point met outside the group (a node reads the second): edges the
-    /// quiet point adds to the wait graph, so the group is not taken for a sink again.
-    extra: ABTreeSet<'a, (Node, Node)>,
+    /// quiet point adds to the wait graph, indexed by reader, so each quiet point looks up a
+    /// node's discovered edges in O(log K) instead of scanning all edges across the crate.
+    extra: ABTreeMap<'a, Node, AVec<'a, Node>>,
     outer: Outer<'a, N>,
     /// The crate's tool namespaces (`rustfmt`, `clippy`, `blaze`, the root's `register_tool`s),
     /// from its root record: an attribute whose path starts with one is inert.
@@ -898,6 +939,7 @@ enum Read {
     Wait(CellId),
 }
 
+#[derive(Clone, Copy)]
 enum Step<T> {
     Done(T),
     Wait(Node),
@@ -911,9 +953,274 @@ enum GuessStep {
     Item(Option<Outcome>),
 }
 
+/// Sparse-touched dense table keyed by `u32` (`CellId` / `ItemId`): O(1) array lookup,
+/// O(|inserted|) `clear()`, and zero bump growth after warmup across thousands of small sinks.
+struct DenseMap<'a, V: Copy> {
+    slots: AVec<'a, Option<V>>,
+    touched: AVec<'a, u32>,
+}
+
+impl<'a, V: Copy> DenseMap<'a, V> {
+    fn new_in(alloc: Alloc<'a>) -> Self {
+        DenseMap {
+            slots: AVec::new_in(alloc),
+            touched: AVec::new_in(alloc),
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: &u32) -> Option<&V> {
+        let i = usize::try_from(*key).ok()?;
+        self.slots.get(i).and_then(Option::as_ref)
+    }
+
+    #[inline]
+    fn contains_key(&self, key: &u32) -> bool {
+        usize::try_from(*key).ok().and_then(|i| self.slots.get(i)).is_some_and(Option::is_some)
+    }
+
+    #[inline]
+    fn insert(&mut self, key: u32, value: V) -> Option<V> {
+        let Ok(i) = usize::try_from(key) else { return None };
+        if i >= self.slots.len() {
+            self.slots.resize(i + 1, None);
+        }
+        let slot = self.slots.get_mut(i)?;
+        let prev = slot.replace(value);
+        if prev.is_none() {
+            self.touched.push(key);
+        }
+        prev
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.touched.is_empty()
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        for &key in self.touched.iter() {
+            if let Ok(i) = usize::try_from(key)
+                && let Some(slot) = self.slots.get_mut(i)
+            {
+                *slot = None;
+            }
+        }
+        self.touched.clear();
+    }
+}
+
 struct Guess<'a> {
-    cells: ABTreeMap<'a, CellId, Option<Value>>,
-    items: ABTreeMap<'a, ItemId, Option<Outcome>>,
+    cells: DenseMap<'a, Option<Value>>,
+    items: DenseMap<'a, Option<Outcome>>,
+    /// Non-zero monotonic epoch assigned when this guess is active for `Frag::guess_prev_live`.
+    epoch: u32,
+}
+
+impl<'a> Guess<'a> {
+    fn new_in(alloc: Alloc<'a>) -> Guess<'a> {
+        Guess {
+            cells: DenseMap::new_in(alloc),
+            items: DenseMap::new_in(alloc),
+            epoch: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.cells.clear();
+        self.items.clear();
+        self.epoch = 0;
+    }
+}
+
+/// A vertex in the on-demand quiet-point Tarjan walk: an undecided cell/item, or a module's
+/// growth hub standing for all un-grown undecided calls of that module.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QuietVertex {
+    Node(Node),
+    Hub(ModId),
+}
+
+/// Active frame on the iterative on-demand Tarjan walk in [`Cells::run_quiet_point`].
+#[derive(Clone, Copy, Debug)]
+struct QuietFrame {
+    vid: u32,
+    stack_pos: u32,
+    edge_cursor: u32,
+    edge_end: u32,
+}
+
+/// Reusable scratch buffers for [`Cells::quiet_point`]: generation-stamped arrays for O(1)
+/// quiet-point setup and on-demand dynamic Tarjan SCC discovery with incremental Round-1 closure.
+struct QuietScratch<'a> {
+    /// Persistent cursors over `cells` and `items` so finding the next undecided vertex is O(1)
+    /// amortized (decided nodes never become undecided during `run`; `decide::unsolve` resets).
+    scan_cell: usize,
+    scan_item: usize,
+    /// Generation stamp for `visited_gen`, `on_stack_gen`, and `passed_r1_gen` (avoids O(V) clear).
+    epoch: u32,
+    visited_gen: AVec<'a, u32>,
+    on_stack_gen: AVec<'a, u32>,
+    passed_r1_gen: AVec<'a, u32>,
+    index: AVec<'a, u32>,
+    low: AVec<'a, u32>,
+    stack: AVec<'a, QuietVertex>,
+    frames: AVec<'a, QuietFrame>,
+    adj: AVec<'a, QuietVertex>,
+    buf: AVec<'a, Node>,
+    srcs: AVec<'a, ModId>,
+    discovered: AVec<'a, Node>,
+    sink_members: AVec<'a, Node>,
+    /// Incremental bottom (`None`) guess for Phase-A closure checks on the active stack suffix
+    /// `stack[guess_start..guess_end]`.
+    base_guess: Guess<'a>,
+    guess_start: Option<usize>,
+    guess_end: usize,
+}
+
+impl<'a> QuietScratch<'a> {
+    fn new_in(alloc: Alloc<'a>) -> QuietScratch<'a> {
+        QuietScratch {
+            scan_cell: 0,
+            scan_item: 0,
+            epoch: 0,
+            visited_gen: AVec::new_in(alloc),
+            on_stack_gen: AVec::new_in(alloc),
+            passed_r1_gen: AVec::new_in(alloc),
+            index: AVec::new_in(alloc),
+            low: AVec::new_in(alloc),
+            stack: AVec::new_in(alloc),
+            frames: AVec::new_in(alloc),
+            adj: AVec::new_in(alloc),
+            buf: AVec::new_in(alloc),
+            srcs: AVec::new_in(alloc),
+            discovered: AVec::new_in(alloc),
+            sink_members: AVec::new_in(alloc),
+            base_guess: Guess::new_in(alloc),
+            guess_start: None,
+            guess_end: 0,
+        }
+    }
+
+    pub(super) fn reset_cursors(&mut self) {
+        self.scan_cell = 0;
+        self.scan_item = 0;
+    }
+
+    fn next_epoch(&mut self, verts: usize) -> u32 {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.visited_gen.fill(0);
+            self.on_stack_gen.fill(0);
+            self.passed_r1_gen.fill(0);
+            self.epoch = 1;
+        }
+        if self.visited_gen.len() < verts {
+            self.visited_gen.resize(verts, 0);
+            self.on_stack_gen.resize(verts, 0);
+            self.passed_r1_gen.resize(verts, 0);
+            self.index.resize(verts, 0);
+            self.low.resize(verts, 0);
+        }
+        self.epoch
+    }
+}
+
+/// Reusable scratch buffers for [`Cells::stall_with_calls`].
+struct StallScratch<'a, N> {
+    calls: Guess<'a>,
+    picked: AVec<'a, (ItemId, Outcome)>,
+    kept: AVec<'a, (ItemId, Taken<N>)>,
+    spared: AVec<'a, ItemId>,
+    spared_set: DenseMap<'a, ()>,
+    blocking: AVec<'a, ItemId>,
+}
+
+impl<'a, N> StallScratch<'a, N> {
+    fn new_in(alloc: Alloc<'a>) -> StallScratch<'a, N> {
+        StallScratch {
+            calls: Guess::new_in(alloc),
+            picked: AVec::new_in(alloc),
+            kept: AVec::new_in(alloc),
+            spared: AVec::new_in(alloc),
+            spared_set: DenseMap::new_in(alloc),
+            blocking: AVec::new_in(alloc),
+        }
+    }
+}
+
+/// Reusable scratch buffers for [`Cells::weak_guess`].
+struct WeakScratch<'a> {
+    view: Guess<'a>,
+    todo: AVec<'a, CellId>,
+    srcs: AVec<'a, ModId>,
+    members: AVec<'a, CellId>,
+}
+
+impl<'a> WeakScratch<'a> {
+    fn new_in(alloc: Alloc<'a>) -> WeakScratch<'a> {
+        WeakScratch {
+            view: Guess::new_in(alloc),
+            todo: AVec::new_in(alloc),
+            srcs: AVec::new_in(alloc),
+            members: AVec::new_in(alloc),
+        }
+    }
+}
+
+/// Per-stall memoization of [`Cells::weak_view`] and [`Cells::weak_globs`]: while
+/// [`Cells::stall_with_calls_in`] evaluates stalled calls, no cell value, glob edge, or item
+/// outcome changes, so repeated calls for the same `(module, ns, name)` share one weak fixed point.
+struct WeakCache<'a, N> {
+    active: bool,
+    views: ABTreeMap<'a, (ModId, Namespace, N), Step<(Value, From)>>,
+    globs: ABTreeMap<'a, (ModId, Namespace, N), Step<Value>>,
+}
+
+impl<'a, N: crate::Name> WeakCache<'a, N> {
+    fn new_in(alloc: Alloc<'a>) -> WeakCache<'a, N> {
+        WeakCache {
+            active: false,
+            views: ABTreeMap::new_in(alloc),
+            globs: ABTreeMap::new_in(alloc),
+        }
+    }
+
+    fn begin(&mut self) {
+        self.views.clear();
+        self.globs.clear();
+        self.active = true;
+    }
+
+    fn end(&mut self) {
+        self.active = false;
+        self.views.clear();
+        self.globs.clear();
+    }
+}
+
+/// Reusable per-solver scratch buffers kept across evaluations and quiet points.
+struct SolverScratch<'a, N> {
+    edges: AVec<'a, (ModId, Visibility)>,
+    quiet: QuietScratch<'a>,
+    fixpoint: Guess<'a>,
+    stall: StallScratch<'a, N>,
+    weak: WeakScratch<'a>,
+    weak_cache: WeakCache<'a, N>,
+}
+
+impl<'a, N: crate::Name> SolverScratch<'a, N> {
+    fn new_in(alloc: Alloc<'a>) -> SolverScratch<'a, N> {
+        SolverScratch {
+            edges: AVec::new_in(alloc),
+            quiet: QuietScratch::new_in(alloc),
+            fixpoint: Guess::new_in(alloc),
+            stall: StallScratch::new_in(alloc),
+            weak: WeakScratch::new_in(alloc),
+            weak_cache: WeakCache::new_in(alloc),
+        }
+    }
 }
 
 impl<'a, N: crate::Name> Cells<'a, N> {
@@ -1030,10 +1337,12 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             items: AVec::new_in(alloc),
             frags: AVec::new_in(alloc),
             textual_stack: AVec::new_in(alloc),
+            scratch: SolverScratch::new_in(alloc),
+            guess_epoch: 0,
             cell_queue: ABTreeSet::new_in(alloc),
             item_queue: ABTreeSet::new_in(alloc),
             expand_queue: ABTreeSet::new_in(alloc),
-            extra: ABTreeSet::new_in(alloc),
+            extra: ABTreeMap::new_in(alloc),
             outer: Outer {
                 externs: AVec::new_in(alloc),
                 added: ABTreeMap::new_in(alloc),
@@ -1086,13 +1395,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         };
         // The dependencies by name before any text is read: an `extern crate` of any module
         // names one.
-        {
-            let r = facts.crate_root(info.krate).map_err(|error| CellError::Facts { module: root, error })?;
-            cells.dep_roots.extend(r.deps.iter().map(|d| (d.name, d.root)));
-            cells.tools.extend(r.tools.iter().copied());
-            cells.builtin_attrs.extend(r.builtin_attrs.iter().copied());
-            cells.arbitrary_ints = r.head.arbitrary_ints;
-        }
+        facts
+            .with_crate_root(info.krate, |r| {
+                cells.dep_roots.extend(r.deps.iter().map(|d| (d.name, d.root)));
+                cells.tools.extend(r.tools.iter().copied());
+                cells.builtin_attrs.extend(r.builtin_attrs.iter().copied());
+                cells.arbitrary_ints = r.head.arbitrary_ints;
+            })
+            .map_err(|error| CellError::Facts { module: root, error })?;
         Ok(cells)
     }
 
@@ -1124,8 +1434,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 lines.insert(m, own);
                 continue;
             }
-            let d = match facts.decls(m) {
-                Ok(d) => d,
+            match facts.with_decls(m, |d| {
+                own.reserve(d.mods.len());
+                for c in d.mods.iter() {
+                    if extent == Extent::Subtrees {
+                        todo.push(c.module);
+                    }
+                    own.push((c.module, c.macro_use));
+                }
+            }) {
+                Ok(()) => {}
                 // A `mod` line of a module the facts hold no text of: bound, its inside unknown.
                 Err(SurfaceError::NoRecord { .. })
                     if self.plant != CellPlant::UnreadModuleRefuses && !(self.modules.is_empty() && tops.first() == Some(&m)) =>
@@ -1135,13 +1453,6 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     continue;
                 }
                 Err(error) => return Err(CellError::Facts { module: m, error }),
-            };
-            own.reserve(d.mods.len());
-            for c in d.mods.iter() {
-                if extent == Extent::Subtrees {
-                    todo.push(c.module);
-                }
-                own.push((c.module, c.macro_use));
             }
             lines.insert(m, own);
         }
@@ -1416,21 +1727,26 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// Reads module `m`'s own text.
     fn read_text<F: ScopeFacts<Name = N>>(&mut self, facts: &F, m: ModId) -> Result<(), CellError> {
         let key = self.modules[m as usize].key;
-        let d = facts.decls(key).map_err(|error| CellError::Facts { module: key, error })?;
         if m == self.root {
             // `#[macro_export]` macros are public names of the crate root in the macro namespace
             // (Reference `macros.by-example.export`).
-            let r = facts.crate_root(self.krate).map_err(|error| CellError::Facts { module: key, error })?;
-            for &(name, def, shapes) in r.macro_exports.iter() {
-                // The root's text fragment is the next one made (`read_fragment` below).
-                let text = self.frags.len() as FragId;
-                let entry = (Def { key: def, kind: DefKind::Macro(shapes) }, Visibility::Public, Origin::MacroExport, text);
-                self.add_explicit(m, Namespace::Macros, name, entry)?;
-                self.stats.names_declared += 1;
-            }
+            facts
+                .with_crate_root(self.krate, |r| -> Result<(), CellError> {
+                    for &(name, def, shapes) in r.macro_exports.iter() {
+                        // The root's text fragment is the next one made (`read_fragment` below).
+                        let text = self.frags.len() as FragId;
+                        let entry = (Def { key: def, kind: DefKind::Macro(shapes) }, Visibility::Public, Origin::MacroExport, text);
+                        self.add_explicit(m, Namespace::Macros, name, entry)?;
+                        self.stats.names_declared += 1;
+                    }
+                    Ok(())
+                })
+                .map_err(|error| CellError::Facts { module: key, error })??;
             self.read_outer(facts, m)?;
         }
-        let f = self.read_fragment(m, &d, None)?;
+        let f = facts
+            .with_decls(key, |d| self.read_fragment(m, d, None))
+            .map_err(|error| CellError::Facts { module: key, error })??;
         self.modules[m as usize].text = f;
         Ok(())
     }
@@ -1439,31 +1755,36 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// the root's text is (a one-group solve whose group the root is not in).
     fn read_outer<F: ScopeFacts<Name = N>>(&mut self, facts: &F, m: ModId) -> Result<(), CellError> {
         let key = self.modules[m as usize].key;
-        {
-            let r = facts.crate_root(self.krate).map_err(|error| CellError::Facts { module: key, error })?;
-            // The outer scopes (R6, R8): sorted already by the record's rule.
-            self.outer.externs.extend_from_slice(&r.extern_prelude);
-            self.outer.macro_use = !r.macro_use.is_empty();
-            self.macro_use.extend_from_slice(&r.macro_use);
-            self.edition = r.head.edition;
-            if let Some(p) = r.head.prelude {
-                // A standard prelude of a dependency is read like any module of it.
-                let prelude = match self.by_key.get(&p) {
-                    Some(&local) => Some(local),
-                    None => self.foreign(p),
-                };
-                match prelude {
-                    Some(m) => self.outer.local = Some(m),
-                    None => {
-                        let pd = facts.decls(p).map_err(|error| CellError::Facts { module: p, error })?;
-                        for it in pd.items.iter() {
-                            self.outer.foreign.entry((it.ns, it.name)).or_insert(it.def);
-                        }
-                        for c in pd.mods.iter() {
-                            self.outer.foreign.entry((Namespace::Types, c.name)).or_insert(Def::module(c.module));
-                        }
-                        self.outer.foreign_open = !pd.uses.is_empty() || !pd.calls.is_empty();
-                    }
+        let prelude_key = facts
+            .with_crate_root(self.krate, |r| {
+                // The outer scopes (R6, R8): sorted already by the record's rule.
+                self.outer.externs.extend_from_slice(&r.extern_prelude);
+                self.outer.macro_use = !r.macro_use.is_empty();
+                self.macro_use.extend_from_slice(&r.macro_use);
+                self.edition = r.head.edition;
+                r.head.prelude
+            })
+            .map_err(|error| CellError::Facts { module: key, error })?;
+        if let Some(p) = prelude_key {
+            // A standard prelude of a dependency is read like any module of it.
+            let prelude = match self.by_key.get(&p) {
+                Some(&local) => Some(local),
+                None => self.foreign(p),
+            };
+            match prelude {
+                Some(m) => self.outer.local = Some(m),
+                None => {
+                    facts
+                        .with_decls(p, |pd| {
+                            for it in pd.items.iter() {
+                                self.outer.foreign.entry((it.ns, it.name)).or_insert(it.def);
+                            }
+                            for c in pd.mods.iter() {
+                                self.outer.foreign.entry((Namespace::Types, c.name)).or_insert(Def::module(c.module));
+                            }
+                            self.outer.foreign_open = !pd.uses.is_empty() || !pd.calls.is_empty();
+                        })
+                        .map_err(|error| CellError::Facts { module: p, error })?;
                 }
             }
         }
@@ -1621,7 +1942,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         // Positions are unique in a fragment: no sort order is left open.
         slots.sort_unstable_by_key(|s| s.0);
-        self.frags.push(Frag { module: m, up, slots });
+        let textual_empty = !slots.iter().any(|(_, s)| !matches!(s, Slot::Mod(_, false)));
+        self.frags.push(Frag {
+            module: m,
+            up,
+            slots,
+            prev_live: AVec::new_in(self.alloc),
+            textual_empty,
+            guess_skip_epoch: 0,
+            guess_prev_live: AVec::new_in(self.alloc),
+        });
         for (k, u) in d.uses.iter().enumerate() {
             let vis = self.import_vis(m, &u.vis, vis::VisAt { module: m, frag: fid, ord: (vis::ORD_USE, k as u32) })?;
             let (glob, binds) = match u.leaf {
@@ -1776,17 +2106,25 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             self.helpers.insert(def.key, names);
         }
         expand(at.key, def);
-        let d = match facts.expansion(at.key) {
-            Ok(Some(d)) => d,
+        let mut tops: AVec<'a, ItemKey> = AVec::new_in(self.alloc);
+        match facts.with_expansion(at.key, |opt| {
+            let Some(d) = opt else { return false };
+            tops.reserve(d.mods.len());
+            for c in d.mods.iter() {
+                tops.push(c.module);
+            }
+            true
+        }) {
+            Ok(true) => {}
+            Ok(false) => return Err(CellError::NotExpanded { call: at.key }),
+            Err(error) => return Err(CellError::Expansion { call: at.key, error }),
+        }
+        let made = self.make_modules(facts, &tops)?;
+        let f = match facts.with_expansion(at.key, |opt| opt.map(|d| self.read_fragment(m, d, Some((at.frag, at.pos))))) {
+            Ok(Some(res)) => res?,
             Ok(None) => return Err(CellError::NotExpanded { call: at.key }),
             Err(error) => return Err(CellError::Expansion { call: at.key, error }),
         };
-        let mut tops: AVec<'a, ItemKey> = AVec::new_in(self.alloc);
-        for c in d.mods.iter() {
-            tops.push(c.module);
-        }
-        let made = self.make_modules(facts, &tops)?;
-        let f = self.read_fragment(m, &d, Some((at.frag, at.pos)))?;
         for &n in made.iter() {
             self.read_text(facts, n)?;
         }
@@ -2211,7 +2549,25 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 }
                 // The glob edges by use index: the resolved ones, and under a guess the group's
                 // pending globs as guessed (one at the bottom brings nothing yet).
-                let mut edges: AVec<'a, (ModId, Visibility)> = AVec::new_in(self.alloc);
+                let mut edges = core::mem::replace(&mut self.scratch.edges, AVec::new_in(self.alloc));
+                edges.clear();
+                let res = self.globs_value_with(c, m, ns, name, guess, skip, &mut edges);
+                self.scratch.edges = edges;
+                res
+            }
+        }
+    }
+
+    fn globs_value_with(
+        &mut self,
+        _c: CellId,
+        m: ModId,
+        ns: Namespace,
+        name: N,
+        guess: Option<&Guess<'a>>,
+        skip: Skip,
+        edges: &mut AVec<'a, (ModId, Visibility)>,
+    ) -> Step<Value> {
                 {
                     let module = &self.modules[m as usize];
                     let (mut r, mut p) = (module.edges.iter().peekable(), module.glob_items.iter().peekable());
@@ -2314,8 +2670,6 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     }
                 }
                 Step::Done(acc.unwrap_or(if outside { Value::Outside } else { Value::NotFound }))
-            }
-        }
     }
 
     /// A cell's value: decided, or a member's guess (the bottom is not found); `None` while it is
@@ -2815,60 +3169,86 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// A pending named import of `name` in `m` or in a module those globs reach holds the view
     /// (`Step::Wait`): it may bind the name, and nothing is taken before it is decided.
     fn weak_view(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId) -> Step<(Value, From)> {
-        match self.weak_guess(m, ns, name, me) {
-            Step::Done(view) => self.own_view(m, ns, name, me, Skip::Weak, Some(&view)),
-            Step::Wait(n) => Step::Wait(n),
+        let cacheable = self.scratch.weak_cache.active && self.decide_log.is_none();
+        if cacheable
+            && let Some(&hit) = self.scratch.weak_cache.views.get(&(m, ns, name))
+        {
+            return hit;
         }
+        let mut w = core::mem::replace(&mut self.scratch.weak, WeakScratch::new_in(self.alloc));
+        let res = match self.weak_guess_into(m, ns, name, me, &mut w) {
+            Step::Done(()) => self.own_view(m, ns, name, me, Skip::Weak, Some(&w.view)),
+            Step::Wait(n) => Step::Wait(n),
+        };
+        self.scratch.weak = w;
+        if cacheable && self.weak_error.is_none() {
+            self.scratch.weak_cache.views.insert((m, ns, name), res);
+        }
+        res
     }
 
     /// What `m`'s globs bring of `name` in `ns` now, by the weak view's rule.
     fn weak_globs(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId) -> Step<Value> {
-        match self.weak_guess(m, ns, name, me) {
-            Step::Done(view) => {
+        let cacheable = self.scratch.weak_cache.active && self.decide_log.is_none();
+        if cacheable
+            && let Some(&hit) = self.scratch.weak_cache.globs.get(&(m, ns, name))
+        {
+            return hit;
+        }
+        let mut w = core::mem::replace(&mut self.scratch.weak, WeakScratch::new_in(self.alloc));
+        let res = match self.weak_guess_into(m, ns, name, me, &mut w) {
+            Step::Done(()) => {
                 let g = self.cell(m, ns, name, Layer::Globs);
-                self.cell_value(g, Some(&view), Skip::Weak)
+                self.cell_value(g, Some(&w.view), Skip::Weak)
             }
             Step::Wait(n) => Step::Wait(n),
+        };
+        self.scratch.weak = w;
+        if cacheable && self.weak_error.is_none() {
+            self.scratch.weak_cache.globs.insert((m, ns, name), res);
         }
+        res
     }
 
     /// The weak view's cells: every undecided cell of `name` in `ns` that `m`'s `Globs` cell
-    /// reaches through resolved glob imports, each with its value at their least fixed point.
-    fn weak_guess(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId) -> Step<Guess<'a>> {
-        let alloc = self.alloc;
-        let mut view = Guess { cells: ABTreeMap::new_in(alloc), items: ABTreeMap::new_in(alloc) };
-        let mut todo: AVec<'a, CellId> = AVec::new_in(alloc);
-        todo.push(self.cell(m, ns, name, Layer::Globs));
-        let mut srcs: AVec<'a, ModId> = AVec::new_in(alloc);
-        while let Some(c) = todo.pop() {
-            if self.cells[c as usize].value.is_some() || view.cells.insert(c, None).is_some() {
+    /// reaches through resolved glob imports, each with its value at their least fixed point,
+    /// computed inside the reusable scratch `w`.
+    fn weak_guess_into(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId, w: &mut WeakScratch<'a>) -> Step<()> {
+        w.view.clear();
+        w.todo.clear();
+        w.srcs.clear();
+        w.members.clear();
+        w.todo.push(self.cell(m, ns, name, Layer::Globs));
+        while let Some(c) = w.todo.pop() {
+            if self.cells[c as usize].value.is_some() || w.view.cells.insert(c, None).is_some() {
                 continue;
             }
+            w.members.push(c);
             let Cell { module, layer, .. } = self.cells[c as usize];
             match layer {
-                Layer::Full => todo.push(self.cell(module, ns, name, Layer::Globs)),
+                Layer::Full => w.todo.push(self.cell(module, ns, name, Layer::Globs)),
                 Layer::Globs => {
-                    srcs.clear();
-                    srcs.extend(self.modules[module as usize].edges.values().map(|x| x.0));
-                    for &src in srcs.iter() {
-                        todo.push(self.cell(src, ns, name, Layer::Full));
+                    w.srcs.clear();
+                    w.srcs.extend(self.modules[module as usize].edges.values().map(|x| x.0));
+                    for &src in w.srcs.iter() {
+                        w.todo.push(self.cell(src, ns, name, Layer::Full));
                     }
                 }
             }
         }
+        // Sorted by CellId for deterministic iteration order identical to ABTreeMap::keys().
+        w.members.sort_unstable();
         // Each value only rises (as in `fixpoint`), so the rounds are bounded.
-        let mut members: AVec<'a, CellId> = AVec::new_in(alloc);
-        members.extend(view.cells.keys().copied());
-        let bound = 4 * members.len() + 4;
+        let bound = 4 * w.members.len() + 4;
         let mut rounds = 0;
         loop {
             let mut changed = false;
-            for &c in members.iter() {
-                let v = match self.cell_value(c, Some(&view), Skip::Weak) {
+            for &c in w.members.iter() {
+                let v = match self.cell_value(c, Some(&w.view), Skip::Weak) {
                     Step::Done(v) => Some(v).filter(|v| *v != Value::NotFound),
                     Step::Wait(on) => return Step::Wait(on),
                 };
-                if view.cells.insert(c, v) != Some(v) {
+                if w.view.cells.insert(c, v) != Some(v) {
                     changed = true;
                 }
             }
@@ -2877,11 +3257,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
             rounds += 1;
             if rounds > bound {
-                self.weak_error = Some(CellError::NoFixpoint { module: self.modules[m as usize].key, cells: members.len() });
+                self.weak_error = Some(CellError::NoFixpoint { module: self.modules[m as usize].key, cells: w.members.len() });
                 return Step::Wait(Node::Item(me));
             }
         }
-        Step::Done(view)
+        Step::Done(())
     }
 
     /// The first call of `m` not grown yet that may still write (not `me`, not one of a group
@@ -3413,6 +3793,88 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         self.frags[self.modules[m as usize].text as usize].slots.iter().any(|s| matches!(s.1, Slot::Rules(n, ..) if n == name))
     }
 
+    /// Ensures `self.frags[f].prev_live` is initialized for `textual` skip compression.
+    #[inline]
+    fn ensure_prev_live(&mut self, f: FragId) {
+        let Some(frag) = usize::try_from(f).ok().and_then(|ix| self.frags.get_mut(ix)) else {
+            return;
+        };
+        if !frag.prev_live.is_empty() || frag.slots.is_empty() {
+            return;
+        }
+        frag.prev_live.reserve(frag.slots.len());
+        let mut last = 0u32;
+        for (i, (_, slot)) in frag.slots.iter().enumerate() {
+            if !matches!(slot, Slot::Mod(_, false)) {
+                last = u32::try_from(i.saturating_add(1)).unwrap_or(u32::MAX);
+            }
+            frag.prev_live.push(last);
+        }
+        if last == 0 {
+            frag.textual_empty = true;
+        }
+    }
+
+    /// Allocates a fresh non-zero epoch for `Guess::epoch` and `Frag::guess_prev_live`.
+    fn next_guess_epoch(&mut self) -> u32 {
+        self.guess_epoch = self.guess_epoch.wrapping_add(1);
+        if self.guess_epoch == 0 {
+            for frag in self.frags.iter_mut() {
+                frag.guess_skip_epoch = 0;
+            }
+            self.guess_epoch = 1;
+        }
+        self.guess_epoch
+    }
+
+    /// Ensures `self.frags[f].guess_prev_live` is synced from `prev_live` for `epoch`.
+    #[inline]
+    fn ensure_guess_prev_live(&mut self, f: FragId, epoch: u32) {
+        self.ensure_prev_live(f);
+        let Some(frag) = usize::try_from(f).ok().and_then(|ix| self.frags.get_mut(ix)) else {
+            return;
+        };
+        if frag.guess_skip_epoch != epoch {
+            frag.guess_prev_live.clear();
+            frag.guess_prev_live.extend_from_slice(&frag.prev_live);
+            frag.guess_skip_epoch = epoch;
+        }
+    }
+
+    /// Marks slot `idx` of `f` skipped in `guess_prev_live` for the active `epoch`.
+    #[inline]
+    fn mark_guess_slot_dead(&mut self, f: FragId, idx: usize, epoch: u32) {
+        let Some(frag) = usize::try_from(f).ok().and_then(|ix| self.frags.get_mut(ix)) else {
+            return;
+        };
+        if frag.guess_skip_epoch != epoch {
+            return;
+        }
+        let before = idx.checked_sub(1).and_then(|j| frag.guess_prev_live.get(j).copied()).unwrap_or(0);
+        if let Some(slot) = frag.guess_prev_live.get_mut(idx) {
+            *slot = before;
+        }
+    }
+
+    /// Marks slot `idx` of `f` permanently dead in `prev_live` (e.g. a grown `Slot::Call` whose
+    /// expansion is absent or `textual_empty`), and mirrors the skip into `guess_prev_live` if active.
+    #[inline]
+    fn mark_slot_dead(&mut self, f: FragId, idx: usize) {
+        let Some(frag) = usize::try_from(f).ok().and_then(|ix| self.frags.get_mut(ix)) else {
+            return;
+        };
+        let before = idx.checked_sub(1).and_then(|j| frag.prev_live.get(j).copied()).unwrap_or(0);
+        if let Some(slot) = frag.prev_live.get_mut(idx) {
+            *slot = before;
+        }
+        if frag.guess_skip_epoch != 0 && frag.guess_prev_live.len() == frag.prev_live.len() {
+            let gbefore = idx.checked_sub(1).and_then(|j| frag.guess_prev_live.get(j).copied()).unwrap_or(0);
+            if let Some(slot) = frag.guess_prev_live.get_mut(idx) {
+                *slot = gbefore;
+            }
+        }
+    }
+
     /// `name!` by the textual scope just before `pos` of fragment `frag` (Reference
     /// `macros.by-example.scope`): backward through the text, the latest definition first, into
     /// `#[macro_use]` modules and expansions met on the way, then out to the enclosing text at
@@ -3422,31 +3884,71 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// for an import, which takes any.
     fn textual(&mut self, frag: FragId, pos: u32, name: N, sub: Option<CallShape>, guess: Option<&Guess<'a>>) -> Step<Option<Def>> {
         self.stats.textual_reads += 1;
+        let guess_epoch = guess.map_or(0, |g| g.epoch);
         let (mut f, mut end) = (frag, pos);
         self.textual_stack.clear();
         loop {
-            let below = self.frags[f as usize].slots.partition_point(|s| s.0 < end);
-            self.textual_stack.push((f, below));
             // Every fragment the walk reads, its slots before the cut or all of them (one it
             // finds empty there is read too): groups.rs's textual cells.
             if let Some(log) = self.textual_log.as_mut() {
                 log.push(f);
             }
-            while let Some(top) = self.textual_stack.last_mut() {
-                if top.1 == 0 {
+            if let Some(cur) = usize::try_from(f).ok().and_then(|ix| self.frags.get(ix))
+                && !cur.textual_empty
+            {
+                let below = cur.slots.partition_point(|s| s.0 < end);
+                if below > 0 {
+                    if guess_epoch != 0 {
+                        self.ensure_guess_prev_live(f, guess_epoch);
+                    } else {
+                        self.ensure_prev_live(f);
+                    }
+                    self.textual_stack.push((f, below));
+                }
+            }
+            while let Some(&(top_f, cursor)) = self.textual_stack.last() {
+                let top_ix = usize::try_from(top_f).unwrap_or(usize::MAX);
+                let next_k = match self.frags.get_mut(top_ix) {
+                    Some(cur) if !cur.textual_empty => {
+                        if guess_epoch != 0 && cur.guess_skip_epoch == guess_epoch {
+                            live_at(&mut cur.guess_prev_live, cursor)
+                        } else {
+                            live_at(&mut cur.prev_live, cursor)
+                        }
+                    }
+                    _ => 0,
+                };
+                if next_k == 0 {
                     self.textual_stack.pop();
+                    // If we scanned the entire fragment down to 0 and its last slot is dead,
+                    // every slot in `top_f` is permanently dead.
+                    if let Some(cur) = self.frags.get_mut(top_ix) {
+                        let len = cur.slots.len();
+                        if len > 0 && !cur.textual_empty && live_at(&mut cur.prev_live, len) == 0 {
+                            cur.textual_empty = true;
+                        }
+                    }
                     continue;
                 }
-                top.1 -= 1;
-                let (top_f, top_i) = *top;
-                let (_, slot) = self.frags[top_f as usize].slots[top_i];
+                let top_i = next_k - 1;
+                if let Some(top) = self.textual_stack.last_mut() {
+                    top.1 = top_i;
+                }
+                let Some(&(_, slot)) = self.frags.get(top_ix).and_then(|cur| cur.slots.get(top_i)) else {
+                    continue;
+                };
                 match slot {
                     Slot::Rules(n, def, _) if n == name && (self.plant == CellPlant::SubNamespaceIgnored || sub.is_none_or(|s| same_sub(def, s))) => {
                         return Step::Done(Some(def));
                     }
-                    Slot::Rules(..) | Slot::Mod(_, false) => {}
+                    Slot::Rules(..) => {}
+                    Slot::Mod(_, false) => {
+                        self.mark_slot_dead(top_f, top_i);
+                    }
                     Slot::Mod(child, true) => {
-                        let t = self.modules[child as usize].text;
+                        let Some(t) = usize::try_from(child).ok().and_then(|ix| self.modules.get(ix)).map(|m| m.text) else {
+                            continue;
+                        };
                         if t == FragId::MAX {
                             // A `#[macro_use]` child outside the group: its textual sequence
                             // from its record; one not held is refused (rule 3: never skipped).
@@ -3460,22 +3962,54 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                             }
                             continue;
                         }
-                        self.textual_stack.push((t, self.frags[t as usize].slots.len()));
                         if let Some(log) = self.textual_log.as_mut() {
                             log.push(t);
                         }
+                        if let Some(target) = usize::try_from(t).ok().and_then(|ix| self.frags.get(ix))
+                            && !target.textual_empty
+                        {
+                            let len = target.slots.len();
+                            if guess_epoch != 0 {
+                                self.ensure_guess_prev_live(t, guess_epoch);
+                            } else {
+                                self.ensure_prev_live(t);
+                            }
+                            self.textual_stack.push((t, len));
+                        }
                     }
                     Slot::Call(j) => {
-                        let it = &self.items[j as usize];
+                        let Some(it) = usize::try_from(j).ok().and_then(|ix| self.items.get(ix)) else {
+                            continue;
+                        };
                         if it.grown {
-                            if let Some(x) = it.expansion {
-                                self.textual_stack.push((x, self.frags[x as usize].slots.len()));
-                                if let Some(log) = self.textual_log.as_mut() {
-                                    log.push(x);
+                            match it.expansion {
+                                None => {
+                                    self.mark_slot_dead(top_f, top_i);
+                                }
+                                Some(x) => {
+                                    let exp_info = usize::try_from(x).ok().and_then(|ix| self.frags.get(ix)).map(|fr| (fr.textual_empty, fr.slots.len()));
+                                    match exp_info {
+                                        Some((true, _)) | None => {
+                                            self.mark_slot_dead(top_f, top_i);
+                                        }
+                                        Some((false, len)) => {
+                                            if let Some(log) = self.textual_log.as_mut() {
+                                                log.push(x);
+                                            }
+                                            if guess_epoch != 0 {
+                                                self.ensure_guess_prev_live(x, guess_epoch);
+                                            } else {
+                                                self.ensure_prev_live(x);
+                                            }
+                                            self.textual_stack.push((x, len));
+                                        }
+                                    }
                                 }
                             }
                         } else if !guess.is_some_and(|g| g.items.contains_key(&j)) {
                             return Step::Wait(Node::Item(j));
+                        } else if guess_epoch != 0 {
+                            self.mark_guess_slot_dead(top_f, top_i, guess_epoch);
                         }
                     }
                 }
@@ -3966,161 +4500,389 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// Condenses the undecided nodes; decides the sinks of cells alone (glob cycles), else
     /// fails the items of the sinks (stalls). `false` when nothing is undecided.
     fn quiet_point(&mut self) -> Result<bool, CellError> {
-        let alloc = self.alloc;
-        let mut nodes: AVec<'a, Node> = AVec::new_in(alloc);
-        for c in 0..self.cells.len() as CellId {
-            if self.cells[c as usize].value.is_none() {
-                nodes.push(Node::Cell(c));
-            }
+        let mut q = core::mem::replace(&mut self.scratch.quiet, QuietScratch::new_in(self.alloc));
+        let res = self.run_quiet_point(&mut q);
+        self.scratch.quiet = q;
+        res
+    }
+
+    #[inline]
+    fn vertex_id(v: QuietVertex, cells_len: usize, items_len: usize) -> Option<usize> {
+        match v {
+            QuietVertex::Node(Node::Cell(c)) => usize::try_from(c).ok().filter(|&i| i < cells_len),
+            QuietVertex::Node(Node::Item(i)) => usize::try_from(i).ok().filter(|&x| x < items_len).map(|x| cells_len + x),
+            QuietVertex::Hub(m) => usize::try_from(m).ok().map(|x| cells_len + items_len + x),
         }
-        for i in 0..self.items.len() as ItemId {
-            if self.items[i as usize].outcome.is_none() && !self.items[i as usize].deep {
-                nodes.push(Node::Item(i));
-            }
+    }
+
+    #[inline]
+    fn is_undecided_node(&self, n: Node, cells_len: usize, items_len: usize) -> bool {
+        match n {
+            Node::Cell(c) => usize::try_from(c).ok().is_some_and(|i| i < cells_len && self.cells[i].value.is_none()),
+            Node::Item(i) => usize::try_from(i).ok().is_some_and(|x| x < items_len && self.items[x].outcome.is_none() && !self.items[x].deep),
         }
-        if nodes.is_empty() {
-            return Ok(false);
-        }
-        self.stats.quiet_points += 1;
-        self.stats.quiet_nodes += nodes.len() as u64;
-        // Each undecided node's index, dense by node (cells, then items): one load per edge,
-        // where the ordered map it replaces was a tree walk (core: 324k nodes over 331 quiet
-        // points).
-        let cells_len = self.cells.len();
-        let mut dense: AVec<'a, u32> = AVec::new_in(alloc);
-        dense.resize(cells_len + self.items.len(), u32::MAX);
-        for (k, &n) in nodes.iter().enumerate() {
-            match n {
-                Node::Cell(c) => dense[c as usize] = k as u32,
-                Node::Item(i) => dense[cells_len + i as usize] = k as u32,
-            }
-        }
-        let index_of = |n: &Node| -> Option<u32> {
-            let at = match *n {
-                Node::Cell(c) => c as usize,
-                Node::Item(i) => cells_len + i as usize,
-            };
-            dense.get(at).copied().filter(|&k| k != u32::MAX)
-        };
-        // Adjacency, by node index, flat (`off[k]..off[k + 1]` in `to`). A module's growth is one
-        // hub node after the real ones, made when first read, with an edge to each call of the
-        // module not grown and not decided: a hub only joins cells to calls, so every real
-        // node's group and every group's closedness are those of the direct edges. A hub with
-        // no such call gets no edge in (it would be a node with nothing to wait on).
-        const NO_HUB: u32 = u32::MAX;
-        const EMPTY_HUB: u32 = u32::MAX - 1;
-        let real = nodes.len();
-        let mut hub_of: AVec<'a, u32> = AVec::new_in(alloc);
-        hub_of.resize(self.modules.len(), NO_HUB);
-        let mut hub_rows: AVec<'a, u32> = AVec::new_in(alloc);
-        let mut hub_off: AVec<'a, u32> = AVec::new_in(alloc);
-        hub_off.push(0);
-        let mut off: AVec<'a, u32> = AVec::new_in(alloc);
-        let mut to: AVec<'a, u32> = AVec::new_in(alloc);
-        off.push(0);
-        let mut buf: AVec<'a, Node> = AVec::new_in(alloc);
-        let mut srcs: AVec<'a, ModId> = AVec::new_in(alloc);
-        let mut growth = None;
-        // The fixed points' outside edges, in node order like `nodes`: one ordered walk.
-        let extra = core::mem::replace(&mut self.extra, ABTreeSet::new_in(alloc));
-        let mut more = extra.iter().peekable();
-        for k in 0..real {
-            let n = nodes[k];
-            self.inputs(n, &mut buf, &mut srcs, &mut growth);
-            while let Some(&&(from, x)) = more.peek() {
-                if from > n {
-                    break;
+    }
+
+    /// Records an outside dependency `(from, on)` discovered while probing a candidate sink SCC
+    /// and registers `from` as a waiter on `on`.
+    fn record_extra(&mut self, from: Node, on: Node) {
+        let list = self.extra.entry(from).or_insert_with(|| AVec::new_in(self.alloc));
+        if let Err(at) = list.binary_search(&on) {
+            list.insert(at, on);
+            match on {
+                Node::Cell(d) => {
+                    if let Ok(ix) = usize::try_from(d)
+                        && let Some(cell) = self.cells.get_mut(ix)
+                    {
+                        self.stats.waiters += 1;
+                        cell.waiters.push(from);
+                    }
                 }
-                if from == n {
-                    buf.push(x);
-                }
-                more.next();
-            }
-            for x in buf.iter() {
-                if let Some(j) = index_of(x) {
-                    to.push(j);
+                Node::Item(j) => {
+                    if let Ok(ix) = usize::try_from(j)
+                        && let Some(item) = self.items.get_mut(ix)
+                    {
+                        self.stats.waiters += 1;
+                        item.waiters.push(from);
+                    }
                 }
             }
-            if let Some(m) = growth {
-                if hub_of[m as usize] == NO_HUB {
-                    let start = hub_rows.len();
-                    for &j in self.modules[m as usize].calls.iter() {
-                        if !self.items[j as usize].grown
-                            && let Some(x) = index_of(&Node::Item(j))
-                        {
-                            hub_rows.push(x);
+        }
+    }
+
+    /// Visits `v` in the on-demand Tarjan walk, pushing its frame and undecided outgoing edges
+    /// into `q`. Returns `true` when `self.inputs` created a new cell in `cell_queue` (the caller
+    /// yields back to `turn()` so `drain_cells()` decides it first).
+    fn visit_quiet_vertex(
+        &mut self,
+        v: QuietVertex,
+        vid: usize,
+        epoch: u32,
+        next_idx: &mut u32,
+        cells_len: usize,
+        items_len: usize,
+        q: &mut QuietScratch<'a>,
+    ) -> bool {
+        q.visited_gen[vid] = epoch;
+        let idx = *next_idx;
+        *next_idx = idx.saturating_add(1);
+        q.index[vid] = idx;
+        q.low[vid] = idx;
+        q.on_stack_gen[vid] = epoch;
+        let stack_pos = u32::try_from(q.stack.len()).unwrap_or(u32::MAX);
+        q.stack.push(v);
+        let edge_start = u32::try_from(q.adj.len()).unwrap_or(u32::MAX);
+        match v {
+            QuietVertex::Node(n) => {
+                self.stats.quiet_nodes += 1;
+                let mut growth = None;
+                self.inputs(n, &mut q.buf, &mut q.srcs, &mut growth);
+                if !self.cell_queue.is_empty() {
+                    return true;
+                }
+                for &x in q.buf.iter() {
+                    if self.is_undecided_node(x, cells_len, items_len) {
+                        q.adj.push(QuietVertex::Node(x));
+                    }
+                }
+                if let Some(more) = self.extra.get(&n) {
+                    for &x in more.iter() {
+                        if self.is_undecided_node(x, cells_len, items_len) {
+                            q.adj.push(QuietVertex::Node(x));
                         }
                     }
-                    if hub_rows.len() == start {
-                        hub_of[m as usize] = EMPTY_HUB;
-                    } else {
-                        hub_of[m as usize] = (real + hub_off.len() - 1) as u32;
-                        hub_off.push(hub_rows.len() as u32);
+                }
+                if let Some(m) = growth
+                    && let Ok(mi) = usize::try_from(m)
+                    && let Some(module) = self.modules.get(mi)
+                {
+                    let has_call = module.calls.iter().any(|&j| {
+                        usize::try_from(j).ok().is_some_and(|ix| {
+                            ix < items_len && !self.items[ix].grown && self.items[ix].outcome.is_none() && !self.items[ix].deep
+                        })
+                    });
+                    if has_call {
+                        q.adj.push(QuietVertex::Hub(m));
                     }
                 }
-                if hub_of[m as usize] != EMPTY_HUB {
-                    to.push(hub_of[m as usize]);
+            }
+            QuietVertex::Hub(m) => {
+                if let Ok(mi) = usize::try_from(m)
+                    && let Some(module) = self.modules.get(mi)
+                {
+                    for &j in module.calls.iter() {
+                        if let Ok(ix) = usize::try_from(j)
+                            && ix < items_len
+                            && !self.items[ix].grown
+                            && self.items[ix].outcome.is_none()
+                            && !self.items[ix].deep
+                        {
+                            q.adj.push(QuietVertex::Node(Node::Item(j)));
+                        }
+                    }
                 }
             }
-            off.push(to.len() as u32);
         }
-        drop(more);
-        self.extra = extra;
-        for h in 0..hub_off.len() - 1 {
-            to.extend_from_slice(&hub_rows[hub_off[h] as usize..hub_off[h + 1] as usize]);
-            off.push(to.len() as u32);
+        let edge_end = u32::try_from(q.adj.len()).unwrap_or(u32::MAX);
+        let vid_u32 = u32::try_from(vid).unwrap_or(u32::MAX);
+        q.frames.push(QuietFrame { vid: vid_u32, stack_pos, edge_cursor: edge_start, edge_end });
+        false
+    }
+
+    /// Finds the next undecided cell or item using `q`'s monotonic cursors.
+    fn next_undecided(&self, q: &mut QuietScratch<'a>) -> Option<Node> {
+        while q.scan_cell < self.cells.len() {
+            let at = q.scan_cell;
+            if self.cells[at].value.is_none() {
+                return u32::try_from(at).ok().map(Node::Cell);
+            }
+            q.scan_cell += 1;
         }
-        // Reading the inputs made a cell no evaluation had made yet: it is tried first, and the
-        // graph is drawn again with it (a cell is made once, so this ends).
-        if !self.cell_queue.is_empty() {
+        while q.scan_item < self.items.len() {
+            let at = q.scan_item;
+            if self.items[at].outcome.is_none() && !self.items[at].deep {
+                return u32::try_from(at).ok().map(Node::Item);
+            }
+            q.scan_item += 1;
+        }
+        None
+    }
+
+    /// Ensures `q.base_guess` contains every real node of `q.stack[stack_pos..]` mapped to `None`,
+    /// reusing existing entries when the active SCC grows monotonically.
+    fn sync_base_guess(&mut self, q: &mut QuietScratch<'a>, stack_pos: usize) {
+        let end = q.stack.len();
+        let insert_range = |guess: &mut Guess<'a>, slice: &[QuietVertex]| {
+            for &v in slice {
+                match v {
+                    QuietVertex::Node(Node::Cell(c)) => {
+                        guess.cells.insert(c, None);
+                    }
+                    QuietVertex::Node(Node::Item(i)) => {
+                        guess.items.insert(i, None);
+                    }
+                    QuietVertex::Hub(_) => {}
+                }
+            }
+        };
+        match q.guess_start {
+            Some(prev) if prev == stack_pos && q.guess_end <= end => {
+                insert_range(&mut q.base_guess, &q.stack[q.guess_end..end]);
+            }
+            Some(prev) if stack_pos < prev && q.guess_end <= end => {
+                insert_range(&mut q.base_guess, &q.stack[stack_pos..prev]);
+                insert_range(&mut q.base_guess, &q.stack[q.guess_end..end]);
+            }
+            _ => {
+                q.base_guess.clear();
+                insert_range(&mut q.base_guess, &q.stack[stack_pos..end]);
+            }
+        }
+        if q.base_guess.epoch == 0 {
+            q.base_guess.epoch = self.next_guess_epoch();
+        }
+        q.guess_start = Some(stack_pos);
+        q.guess_end = end;
+    }
+
+    /// Feeds newly discovered outside waits (`q.discovered`) back into the live Tarjan frame `vid`,
+    /// avoiding any restart of the quiet point. Returns:
+    /// - `Ok(Feed::Yield)` when a wait refers to a newly created or already-decided node,
+    /// - `Ok(Feed::Explore)` when unvisited neighbors were queued on the top frame,
+    /// - `Ok(Feed::Ancestors)` when all waits were ancestors already on the Tarjan stack (`low < index`),
+    /// - `Err(NoFixpoint)` defensively if a wait somehow pointed back inside the active SCC.
+    fn feed_discovered(
+        &self,
+        vid: usize,
+        epoch: u32,
+        cells_len: usize,
+        items_len: usize,
+        stack_pos: usize,
+        q: &mut QuietScratch<'a>,
+    ) -> Result<FeedOutcome, CellError> {
+        let new_start = u32::try_from(q.adj.len()).unwrap_or(u32::MAX);
+        for &on in q.discovered.iter() {
+            if !self.is_undecided_node(on, cells_len, items_len) {
+                q.discovered.clear();
+                return Ok(FeedOutcome::Yield);
+            }
+            let on_v = QuietVertex::Node(on);
+            let Some(on_vid) = Self::vertex_id(on_v, cells_len, items_len) else {
+                q.discovered.clear();
+                return Ok(FeedOutcome::Yield);
+            };
+            if q.visited_gen[on_vid] != epoch {
+                q.adj.push(on_v);
+            } else if q.on_stack_gen[on_vid] == epoch {
+                q.low[vid] = q.low[vid].min(q.index[on_vid]);
+            }
+        }
+        q.discovered.clear();
+        let new_end = u32::try_from(q.adj.len()).unwrap_or(u32::MAX);
+        if new_end > new_start {
+            if let Some(frame) = q.frames.last_mut() {
+                frame.edge_cursor = new_start;
+                frame.edge_end = new_end;
+            }
+            return Ok(FeedOutcome::Explore);
+        }
+        if q.low[vid] == q.index[vid] {
+            let module = q.stack[stack_pos..].iter().find_map(|v| match *v {
+                QuietVertex::Node(Node::Cell(c)) => usize::try_from(c).ok().and_then(|i| self.cells.get(i)).map(|c| self.modules[c.module as usize].key),
+                QuietVertex::Node(Node::Item(i)) => usize::try_from(i).ok().and_then(|x| self.items.get(x)).map(|it| self.modules[it.module as usize].key),
+                QuietVertex::Hub(m) => usize::try_from(m).ok().and_then(|x| self.modules.get(x)).map(|md| md.key),
+            }).unwrap_or_else(|| self.modules[self.root as usize].key);
+            return Err(CellError::NoFixpoint { module, cells: q.stack.len().saturating_sub(stack_pos) });
+        }
+        Ok(FeedOutcome::Ancestors)
+    }
+
+    fn run_quiet_point(&mut self, q: &mut QuietScratch<'a>) -> Result<bool, CellError> {
+        let Some(start) = self.next_undecided(q) else {
+            return Ok(false);
+        };
+        self.stats.quiet_points += 1;
+        let cells_len = self.cells.len();
+        let items_len = self.items.len();
+        let total_verts = cells_len + items_len + self.modules.len();
+        let epoch = q.next_epoch(total_verts);
+        q.stack.clear();
+        q.frames.clear();
+        q.adj.clear();
+        q.discovered.clear();
+        q.sink_members.clear();
+        q.guess_start = None;
+        q.guess_end = 0;
+
+        let start_v = QuietVertex::Node(start);
+        let Some(start_vid) = Self::vertex_id(start_v, cells_len, items_len) else {
+            return Ok(false);
+        };
+        let mut next_idx = 0u32;
+        if self.visit_quiet_vertex(start_v, start_vid, epoch, &mut next_idx, cells_len, items_len, q) {
             return Ok(true);
         }
-        let comp = tarjan(&off, &to, alloc);
-        let count = comp.iter().copied().max().map_or(0, |c| c as usize + 1);
-        let mut sink: AVec<'a, bool> = AVec::new_in(alloc);
-        sink.resize(count, true);
-        for k in 0..off.len() - 1 {
-            for &j in to[off[k] as usize..off[k + 1] as usize].iter() {
-                if comp[k] != comp[j as usize] {
-                    sink[comp[k] as usize] = false;
+
+        while let Some(top) = q.frames.last_mut() {
+            if top.edge_cursor < top.edge_end {
+                let cursor = usize::try_from(top.edge_cursor).unwrap_or(q.adj.len());
+                top.edge_cursor += 1;
+                let cur_vid = usize::try_from(top.vid).unwrap_or(0);
+                let Some(&w) = q.adj.get(cursor) else { continue };
+                let Some(w_vid) = Self::vertex_id(w, cells_len, items_len) else { continue };
+                if q.visited_gen[w_vid] != epoch {
+                    if self.visit_quiet_vertex(w, w_vid, epoch, &mut next_idx, cells_len, items_len, q) {
+                        return Ok(true);
+                    }
+                } else if q.on_stack_gen[w_vid] == epoch {
+                    q.low[cur_vid] = q.low[cur_vid].min(q.index[w_vid]);
                 }
-            }
-        }
-        let mut has_item: AVec<'a, bool> = AVec::new_in(alloc);
-        has_item.resize(count, false);
-        for (k, n) in nodes.iter().enumerate() {
-            if let Node::Item(_) = n {
-                has_item[comp[k] as usize] = true;
-            }
-        }
-        if self.plant == CellPlant::StallFailsAll && (0..count).any(|s| sink[s] && has_item[s]) {
-            // The planted R5 bug: a stall fails every undecided item.
-            self.stats.stalls += 1;
-            for n in nodes.iter() {
-                if let Node::Item(i) = *n {
-                    self.stats.stalled_items += 1;
-                    self.settle(i, Outcome::Failed(Unresolved::NotFound));
-                }
-            }
-            return Ok(true);
-        }
-        // Every sink waits on itself alone: nothing outside it can change it any more, so it is
-        // decided as its least fixed point (R3); a member that reaches nothing from outside the
-        // group is not found (R5, the stall rule). Sinks share no edge, so their order is moot.
-        for s in 0..count {
-            if !sink[s] {
                 continue;
             }
-            let mut members: AVec<'a, Node> = AVec::new_in(alloc);
-            for (k, &n) in nodes.iter().enumerate() {
-                if comp[k] as usize == s {
-                    members.push(n);
+            let vid = usize::try_from(top.vid).unwrap_or(0);
+            let stack_pos = usize::try_from(top.stack_pos).unwrap_or(0);
+            if q.low[vid] == q.index[vid] {
+                // Candidate sink SCC: because no SCC has been popped yet in this quiet point, every
+                // visited vertex is still on `q.stack`, so any newly discovered outside wait is
+                // either unvisited or an ancestor already on `q.stack`.
+                //
+                // Phase A: incremental Round-1 closure check at bottom (`None`). A node that
+                // passed Round 1 on `S` read nothing outside `S` and stays closed for any superset
+                // `S' >= S` at bottom `None`, so each node is checked at most once per quiet point.
+                self.sync_base_guess(q, stack_pos);
+                q.discovered.clear();
+                for idx in stack_pos..q.stack.len() {
+                    let QuietVertex::Node(n) = q.stack[idx] else { continue };
+                    let Some(n_vid) = Self::vertex_id(QuietVertex::Node(n), cells_len, items_len) else { continue };
+                    if q.passed_r1_gen[n_vid] == epoch {
+                        continue;
+                    }
+                    match self.member_step(n, &q.base_guess) {
+                        Step::Done(_) => {
+                            if !self.cell_queue.is_empty() {
+                                return Ok(true);
+                            }
+                            q.passed_r1_gen[n_vid] = epoch;
+                        }
+                        Step::Wait(on) => {
+                            self.record_extra(n, on);
+                            if !self.cell_queue.is_empty() {
+                                return Ok(true);
+                            }
+                            q.discovered.push(on);
+                        }
+                    }
+                }
+                if !q.discovered.is_empty() {
+                    match self.feed_discovered(vid, epoch, cells_len, items_len, stack_pos, q)? {
+                        FeedOutcome::Yield => return Ok(true),
+                        FeedOutcome::Explore => continue,
+                        FeedOutcome::Ancestors => {}
+                    }
+                } else {
+                    // Phase B: all nodes in this candidate sink SCC passed Round 1 with zero
+                    // outside waits. Run the full least fixed point and conclude.
+                    q.sink_members.clear();
+                    for &v in &q.stack[stack_pos..] {
+                        if let QuietVertex::Node(n) = v {
+                            q.sink_members.push(n);
+                        }
+                    }
+                    if q.sink_members.is_empty() {
+                        q.frames.pop();
+                        continue;
+                    }
+                    if self.plant == CellPlant::StallFailsAll
+                        && q.sink_members.iter().any(|n| matches!(n, Node::Item(_)))
+                    {
+                        // The planted R5 bug: a stall fails every undecided item.
+                        self.stats.stalls += 1;
+                        for i in 0..self.items.len() {
+                            if self.items[i].outcome.is_none() && !self.items[i].deep
+                                && let Ok(id) = u32::try_from(i)
+                            {
+                                self.stats.stalled_items += 1;
+                                self.settle(id, Outcome::Failed(Unresolved::NotFound));
+                            }
+                        }
+                        return Ok(true);
+                    }
+                    let mut guess = core::mem::replace(&mut self.scratch.fixpoint, Guess::new_in(self.alloc));
+                    let fp = self.fixpoint_step(&q.sink_members, &mut guess);
+                    let res = match fp {
+                        Ok(FixpointStep::Converged) => {
+                            let concluded = self.conclude(&q.sink_members, &guess);
+                            self.scratch.fixpoint = guess;
+                            concluded?;
+                            return Ok(true);
+                        }
+                        Ok(FixpointStep::Outside(n, on)) => {
+                            self.scratch.fixpoint = guess;
+                            self.record_extra(n, on);
+                            if !self.cell_queue.is_empty() {
+                                return Ok(true);
+                            }
+                            q.discovered.clear();
+                            q.discovered.push(on);
+                            self.feed_discovered(vid, epoch, cells_len, items_len, stack_pos, q)
+                        }
+                        Err(e) => {
+                            self.scratch.fixpoint = guess;
+                            return Err(e);
+                        }
+                    }?;
+                    match res {
+                        FeedOutcome::Yield => return Ok(true),
+                        FeedOutcome::Explore => continue,
+                        FeedOutcome::Ancestors => {}
+                    }
                 }
             }
-            if members.is_empty() {
-                continue;
+            q.frames.pop();
+            if let Some(parent) = q.frames.last() {
+                let p_vid = usize::try_from(parent.vid).unwrap_or(0);
+                q.low[p_vid] = q.low[p_vid].min(q.low[vid]);
             }
-            self.fixpoint(&members)?;
         }
         Ok(true)
     }
@@ -4140,9 +4902,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
     }
 
-    /// Decides a sink of cells together as the least fixed point of their candidates (R3).
-    fn fixpoint(&mut self, members: &[Node]) -> Result<(), CellError> {
-        let mut guess = Guess { cells: ABTreeMap::new_in(self.alloc), items: ABTreeMap::new_in(self.alloc) };
+    /// Computes the least fixed point of `members` inside `guess`, stopping immediately if a
+    /// member reads an undecided node outside `members` (e.g. a glob edge that rose in round 2+).
+    fn fixpoint_step(&mut self, members: &[Node], guess: &mut Guess<'a>) -> Result<FixpointStep, CellError> {
+        guess.clear();
         for &n in members {
             match n {
                 Node::Cell(c) => {
@@ -4153,6 +4916,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 }
             }
         }
+        guess.epoch = self.next_guess_epoch();
         // Each value only rises (nothing, found with a wider visibility, ambiguous), so the
         // rounds are bounded by a few per member.
         let bound = 4 * members.len() + 4;
@@ -4160,7 +4924,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         loop {
             let mut changed = false;
             for &n in members {
-                let step = self.member_step(n, &guess);
+                let step = self.member_step(n, guess);
                 let on = match step {
                     Step::Wait(on) => on,
                     Step::Done(GuessStep::Cell(v)) => {
@@ -4180,23 +4944,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         continue;
                     }
                 };
-                // The group read a node outside it that is not decided: it was no sink. The edge
-                // is kept so the next quiet point sees it, and the reader is woken by it.
-                self.extra.insert((n, on));
-                match (on, n) {
-                    (Node::Cell(d), _) => {
-                        self.stats.waiters += 1;
-                        self.cells[d as usize].waiters.push(n);
-                    }
-                    (Node::Item(j), _) => {
-                        self.stats.waiters += 1;
-                        self.items[j as usize].waiters.push(n);
-                    }
-                }
-                return Ok(());
+                return Ok(FixpointStep::Outside(n, on));
             }
             if !changed {
-                break;
+                return Ok(FixpointStep::Converged);
             }
             rounds += 1;
             if rounds > bound {
@@ -4207,7 +4958,6 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 return Err(CellError::NoFixpoint { module, cells: members.len() });
             }
         }
-        self.conclude(members, &guess)
     }
 
     /// A group at its least fixed point `guess` is decided: a stall with calls, or every member
@@ -4319,28 +5069,37 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// round: the earlier call fails first), every import takes its guess,
     /// and the cells are decided only when no call was spared (a spared call may still write).
     fn stall_with_calls(&mut self, members: &[Node], guess: &Guess<'a>) -> Result<(), CellError> {
+        let mut s = core::mem::replace(&mut self.scratch.stall, StallScratch::new_in(self.alloc));
+        let res = self.stall_with_calls_in(members, guess, &mut s);
+        self.scratch.stall = s;
+        res
+    }
+
+    fn stall_with_calls_in(&mut self, members: &[Node], guess: &Guess<'a>, s: &mut StallScratch<'a, N>) -> Result<(), CellError> {
         let alloc = self.alloc;
         // Calls are never decided from a guess: R5 fails them (the reference's sinks), and one
         // resolving under the guess would expand before an earlier call failed.
-        let mut picked: AVec<'a, (ItemId, Outcome)> = AVec::new_in(alloc);
+        s.picked.clear();
         // The group's calls, adding nothing: what a stalled call is asked under.
-        let mut calls = Guess { cells: ABTreeMap::new_in(alloc), items: ABTreeMap::new_in(alloc) };
+        s.calls.clear();
         for &n in members {
             if let Node::Item(i) = n
                 && self.items[i as usize].call.is_some()
             {
-                calls.items.insert(i, None);
+                s.calls.items.insert(i, None);
             }
         }
+        s.calls.epoch = self.next_guess_epoch();
         // What the picked calls took: kept with them (`taken` is one call's at a time).
-        let mut kept: AVec<'a, (ItemId, Taken<N>)> = AVec::new_in(alloc);
+        s.kept.clear();
         let queued = self.cell_queue.len();
+        self.scratch.weak_cache.begin();
         for &n in members {
             let Node::Item(i) = n else { continue };
             if self.items[i as usize].call.is_none() {
                 // An import: R5 as in `fixpoint`, its guess when the guess resolves it.
                 if let Some(&Some(o @ (Outcome::Named(_) | Outcome::Glob(_) | Outcome::Outside))) = guess.items.get(&i) {
-                    picked.push((i, o));
+                    s.picked.push((i, o));
                 }
                 continue;
             }
@@ -4349,27 +5108,28 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             // `#[derive(Clone)]` in a module whose globs wait on its own derives takes the
             // standard prelude's; `cfg_select!` there is unknown, never failed), and nothing
             // else is guessed: every later segment is read from a decided cell.
-            if let Step::Done(o @ (Outcome::Called(_) | Outcome::Inert | Outcome::Outside)) = self.stalled_call(i, &calls) {
-                picked.push((i, o));
+            if let Step::Done(o @ (Outcome::Called(_) | Outcome::Inert | Outcome::Outside)) = self.stalled_call(i, &s.calls) {
+                s.picked.push((i, o));
                 for k in 0..self.taken.len() {
-                    kept.push((i, self.taken[k]));
+                    s.kept.push((i, self.taken[k]));
                 }
             }
         }
+        self.scratch.weak_cache.end();
         self.taken.clear();
         if let Some(e) = self.weak_error.take() {
             return Err(e);
         }
-        if !picked.is_empty() {
+        if !s.picked.is_empty() {
             self.stats.stalls += 1;
-            for &(i, t) in kept.iter() {
+            for &(i, t) in s.kept.iter() {
                 match t {
                     Taken::Watch(m, ns, name, def, kind) => self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(alloc)).push((i, def, kind)),
                     Taken::Globs(g, def, globbed) => self.speculated.push((i, g, def, globbed)),
                     Taken::Error(e) => self.r6_error(i, e),
                 }
             }
-            for &(i, o) in picked.iter() {
+            for &(i, o) in s.picked.iter() {
                 self.settle(i, o);
             }
             return Ok(());
@@ -4379,8 +5139,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             // first, and the group is asked again (a cell is made once, so this ends).
             return Ok(());
         }
-        let mut spared: AVec<'a, ItemId> = AVec::new_in(alloc);
-        let mut blocking: AVec<'a, ItemId> = AVec::new_in(alloc);
+        s.spared.clear();
+        s.spared_set.clear();
+        s.blocking.clear();
         if self.plant != CellPlant::StallSparesNone {
             for &n in members {
                 let Node::Item(i) = n else { continue };
@@ -4389,33 +5150,38 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     continue;
                 }
                 let name = self.items[i as usize].segments[0];
-                if let Step::Wait(w) = self.textual(at.frag, at.pos, name, Some(at.shape), None)
-                    && members.contains(&w)
-                {
-                    spared.push(i);
-                    if let Node::Item(j) = w {
-                        blocking.push(j);
+                if let Step::Wait(w) = self.textual(at.frag, at.pos, name, Some(at.shape), None) {
+                    let in_members = match w {
+                        Node::Item(j) => guess.items.contains_key(&j),
+                        Node::Cell(c) => guess.cells.contains_key(&c),
+                    };
+                    if in_members {
+                        s.spared.push(i);
+                        s.spared_set.insert(i, ());
+                        if let Node::Item(j) = w {
+                            s.blocking.push(j);
+                        }
                     }
                 }
             }
         }
         // R5 (2026-11-16): a round that spares a call fails only the calls the spared calls'
         // textual reads wait on; every other member is tried again with the facts.
-        if !spared.is_empty() {
-            blocking.retain(|j| !spared.contains(j));
-            blocking.sort_unstable();
-            blocking.dedup();
-            if !blocking.is_empty() {
+        if !s.spared.is_empty() {
+            s.blocking.retain(|j| !s.spared_set.contains_key(j));
+            s.blocking.sort_unstable();
+            s.blocking.dedup();
+            if !s.blocking.is_empty() {
                 self.stats.stalls += 1;
-                self.stats.spared += spared.len() as u64;
-                for &j in blocking.iter() {
+                self.stats.spared += s.spared.len() as u64;
+                for &j in s.blocking.iter() {
                     self.stats.stalled_items += 1;
                     self.settle(j, Outcome::Failed(Unresolved::NotFound));
                 }
                 return Ok(());
             }
         }
-        let failing = members.iter().filter(|n| matches!(n, Node::Item(i) if !spared.contains(i))).count();
+        let failing = members.iter().filter(|n| matches!(n, Node::Item(i) if !s.spared_set.contains_key(i))).count();
         if failing == 0 {
             let module = match members[0] {
                 Node::Cell(c) => self.modules[self.cells[c as usize].module as usize].key,
@@ -4424,8 +5190,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             return Err(CellError::AllSpared { module });
         }
         self.stats.stalls += 1;
-        self.stats.spared += spared.len() as u64;
-        if spared.is_empty() {
+        self.stats.spared += s.spared.len() as u64;
+        if s.spared.is_empty() {
             for &n in members {
                 if let Node::Cell(c) = n {
                     let v = guess.cells.get(&c).copied().flatten().unwrap_or(Value::NotFound);
@@ -4435,7 +5201,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         for &n in members {
             let Node::Item(i) = n else { continue };
-            if spared.contains(&i) {
+            if s.spared_set.contains_key(&i) {
                 continue;
             }
             let o = if self.items[i as usize].call.is_some() {
@@ -4452,67 +5218,17 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     }
 }
 
-/// Strongly connected components of `adj`, iteratively (Tarjan): each node's component number.
-fn tarjan<'a>(off: &[u32], to: &[u32], alloc: Alloc<'a>) -> AVec<'a, u32> {
-    const NONE: u32 = u32::MAX;
-    let n = off.len() - 1;
-    let row = |v: usize| &to[off[v] as usize..off[v + 1] as usize];
-    let mut index: AVec<'a, u32> = AVec::new_in(alloc);
-    index.resize(n, NONE);
-    let mut low: AVec<'a, u32> = AVec::new_in(alloc);
-    low.resize(n, 0);
-    let mut on_stack: AVec<'a, bool> = AVec::new_in(alloc);
-    on_stack.resize(n, false);
-    let mut comp: AVec<'a, u32> = AVec::new_in(alloc);
-    comp.resize(n, NONE);
-    let mut stack: AVec<'a, u32> = AVec::new_in(alloc);
-    // (node, next edge to look at)
-    let mut calls: AVec<'a, (u32, u32)> = AVec::new_in(alloc);
-    let (mut next, mut comps) = (0u32, 0u32);
-    for start in 0..n as u32 {
-        if index[start as usize] != NONE {
-            continue;
-        }
-        calls.push((start, 0));
-        index[start as usize] = next;
-        low[start as usize] = next;
-        next += 1;
-        stack.push(start);
-        on_stack[start as usize] = true;
-        while let Some(&(v, e)) = calls.last() {
-            let vi = v as usize;
-            if (e as usize) < row(vi).len() {
-                let last = calls.len() - 1;
-                calls[last].1 += 1;
-                let w = row(vi)[e as usize];
-                let wi = w as usize;
-                if index[wi] == NONE {
-                    index[wi] = next;
-                    low[wi] = next;
-                    next += 1;
-                    stack.push(w);
-                    on_stack[wi] = true;
-                    calls.push((w, 0));
-                } else if on_stack[wi] {
-                    low[vi] = low[vi].min(index[wi]);
-                }
-                continue;
-            }
-            calls.pop();
-            if let Some(&(p, _)) = calls.last() {
-                low[p as usize] = low[p as usize].min(low[vi]);
-            }
-            if low[vi] == index[vi] {
-                while let Some(w) = stack.pop() {
-                    on_stack[w as usize] = false;
-                    comp[w as usize] = comps;
-                    if w == v {
-                        break;
-                    }
-                }
-                comps += 1;
-            }
-        }
-    }
-    comp
+/// Outcome of feeding newly discovered outside waits back into the live Tarjan walk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FeedOutcome {
+    Yield,
+    Explore,
+    Ancestors,
+}
+
+/// Outcome of [`Cells::fixpoint_step`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FixpointStep {
+    Converged,
+    Outside(Node, Node),
 }

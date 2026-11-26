@@ -146,11 +146,11 @@ fn program(message: std::string::String, r: Range) -> Why {
 /// arguments before it put in (the Reference, "Generic parameters": `Vec<u8>` is
 /// `Vec<u8, Global>`; "Type aliases": a type alias's parameters are generic parameters too).
 /// The one home of default filling for a type path.
-pub(super) fn with_defaults(tys: &mut PortableTys<'_>, kids: &[PTy], g: u32, defaults: &[Option<PTy>], shown: &str, r: Range) -> Result<Vec<PTy, Global>, Why> {
+pub(super) fn with_defaults<'a>(tys: &mut PortableTys<'a>, kids: &[PTy], g: u32, defaults: &[Option<PTy>], shown: &str, r: Range) -> Result<blaze_own::Vec<PTy, Alloc<'a>>, Why> {
     if kids.len() > g as usize {
         return Err(program(format!("`{shown}` is written with {} type arguments; it takes {g}", kids.len()), r));
     }
-    let mut args = Vec::with_capacity_in(g as usize, Global);
+    let mut args = blaze_own::Vec::with_capacity_in(g as usize, tys.alloc());
     args.extend_from_slice(kids);
     for i in kids.len()..g as usize {
         let Some(d) = defaults.get(i).copied().flatten() else {
@@ -225,6 +225,16 @@ pub fn intern_list(tys: &mut PortableTys<'_>, l: &[PTy]) -> Result<List, Why> {
     tys.intern_list(l).map_err(|_| table_full())
 }
 
+/// A supertrait associated-type equality on `Self` (`trait Sub: Sup<Item = T>`),
+/// over the declaring trait's own parameters (`Self` = `Param(0)`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuperProj {
+    pub trait_: ItemKey,
+    pub name: Name,
+    pub args: List,
+    pub term: PTy,
+}
+
 /// The heads the type builder reads: an item's generics, a trait's defaults and associated
 /// types, by library key; `None` when not lowered yet.
 pub trait Heads {
@@ -295,6 +305,9 @@ pub trait Heads {
     /// The trait's supertraits written on its header (`: FnMut<Args>`), each with its
     /// arguments (`Self` first) over the trait's own parameters (`Self` = `Param(0)`).
     fn trait_supers(&self, trait_: LibKey) -> Option<&[(LibKey, List)]>;
+    /// The trait's supertrait associated-type equalities on `Self` (`: Sup<Item = T>`),
+    /// filed with its members alongside [`Heads::trait_supers`].
+    fn trait_super_projs(&self, trait_: LibKey) -> Option<&[SuperProj]>;
     /// Whether the trait is an `auto trait` (from its own head).
     fn trait_auto(&self, trait_: LibKey) -> Option<bool>;
     /// Whether the trait declares a `Self: 'static` bound (e.g. `core::any::Any`).
@@ -427,10 +440,10 @@ pub struct TraitAliasHead {
     pub generics: u32,
     /// Its bounds on `Self` and its where clauses, as clauses (trait clauses and the
     /// projections of `Name = T`); no implied `Sized` on its own parameters.
-    pub clauses: Vec<PClause, Global>,
+    pub clauses: blaze_own::Vec<PClause, Alloc<'static>>,
     /// Its trait clauses on `Self` by library key (what `T::X` is looked up through, as a
     /// [`ParamBound`]), with their arguments over the same parameters.
-    pub traits: Vec<(LibKey, List), Global>,
+    pub traits: blaze_own::Vec<(LibKey, List), Alloc<'static>>,
 }
 
 /// The refusal of a `Self` written where the [`Env`] has no `Self` ([`SelfTy::None`]): one
@@ -518,18 +531,107 @@ pub(super) const PRIMS: [(&str, PNode); 19] = [
     ("f64", PNode::Float(tc::FloatTy::F64)),
 ];
 
+/// Inline-backed small buffer for path segments and texts (nearly all Rust paths have `<= 8`
+/// segments), avoiding two heap allocations per path resolution.
+#[derive(Clone, Debug)]
+pub struct SmallPath<T: Copy, const N: usize = 8> {
+    inline: [T; N],
+    len: usize,
+    spill: Option<Vec<T, Global>>,
+}
+
+impl<T: Copy, const N: usize> SmallPath<T, N> {
+    #[inline]
+    fn new(fill: T) -> Self {
+        Self { inline: [fill; N], len: 0, spill: None }
+    }
+
+    #[inline]
+    fn push(&mut self, value: T) {
+        if let Some(v) = &mut self.spill {
+            v.push(value);
+        } else if let Some(slot) = self.inline.get_mut(self.len) {
+            *slot = value;
+            self.len += 1;
+        } else {
+            let mut v = Vec::with_capacity_in(N * 2, Global);
+            v.extend_from_slice(&self.inline);
+            v.push(value);
+            self.spill = Some(v);
+        }
+    }
+    #[inline]
+    fn pop(&mut self) -> Option<T> {
+        if let Some(v) = &mut self.spill {
+            v.pop()
+        } else if let Some(next_len) = self.len.checked_sub(1)
+            && let Some(&val) = self.inline.get(next_len)
+        {
+            self.len = next_len;
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        if let Some(v) = &mut self.spill {
+            v.clear();
+        } else {
+            self.len = 0;
+        }
+    }
+
+    #[inline]
+    fn truncate(&mut self, len: usize) {
+        if let Some(v) = &mut self.spill {
+            v.truncate(len);
+        } else if len < self.len {
+            self.len = len;
+        }
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        match &self.spill {
+            Some(v) => v.as_slice(),
+            None => self.inline.get(..self.len).unwrap_or(&[]),
+        }
+    }
+}
+
+impl<T: Copy, const N: usize> core::ops::Deref for SmallPath<T, N> {
+    type Target = [T];
+    #[inline]
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+const EMPTY_SEGMENT: lf::Segment = lf::Segment {
+    kind: lf::SegKind::Ident,
+    name: None,
+    args: tc::List { start: 0, len: 0 },
+    has_args: false,
+    parenthesized: false,
+    return_notation: false,
+    ty: None,
+    trait_: None,
+};
+
 /// A path's segments as the resolver takes them: their texts, and whether it starts at `::`.
 /// A qualified (`<T as Tr>::X`) or parenthesized segment is not a plain path.
-pub fn path_texts<'v>(v: &View<'v>, p: PathIdx) -> Result<(bool, Vec<&'v str, Global>, Vec<lf::Segment, Global>, Range), Why> {
+pub fn path_texts<'v>(v: &View<'v>, p: PathIdx) -> Result<(bool, SmallPath<&'v str>, SmallPath<lf::Segment>, Range), Why> {
     path_texts_of(v, p, false)
 }
 
 /// [`path_texts`]; `sugar`: the caller reads `Fn(A) -> B` on the last segment itself.
-pub fn path_texts_of<'v>(v: &View<'v>, p: PathIdx, sugar: bool) -> Result<(bool, Vec<&'v str, Global>, Vec<lf::Segment, Global>, Range), Why> {
+pub fn path_texts_of<'v>(v: &View<'v>, p: PathIdx, sugar: bool) -> Result<(bool, SmallPath<&'v str>, SmallPath<lf::Segment>, Range), Why> {
     let r = place(v, v.path_range(p))?;
     let path = v.path(p)?;
-    let mut texts = Vec::new_in(Global);
-    let mut segs = Vec::new_in(Global);
+    let mut texts = SmallPath::new("");
+    let mut segs = SmallPath::new(EMPTY_SEGMENT);
     let all = v.segments(path)?;
     for (i, &n) in all.iter().enumerate() {
         let s = lf::Segment::decode(n)?;
@@ -559,14 +661,14 @@ pub fn path_texts_of<'v>(v: &View<'v>, p: PathIdx, sugar: bool) -> Result<(bool,
 /// is passed over. A const argument (`{ N + 1 }`, `3`) and an argument that is one plain
 /// name (`N`: a type or a constant by what the name resolves to) are made by
 /// [`Builder::path_args`] once the scope is known, so they are no child here.
-fn arg_types(v: &View<'_>, s: &lf::Segment, r: Range, out: &mut Vec<lf::TypeId, Global>) -> Result<(), Why> {
+fn arg_types_into(v: &View<'_>, s: &lf::Segment, r: Range, out: &mut impl FnMut(lf::TypeId)) -> Result<(), Why> {
     if !s.has_args {
         return Ok(());
     }
     for &n in v.rows(s.args)? {
         match lf::GenericArg::decode(n)? {
             lf::GenericArg::Type(t) if bare_name(v, t)?.is_some() => {}
-            lf::GenericArg::Type(t) => out.push(t),
+            lf::GenericArg::Type(t) => out(t),
             lf::GenericArg::Lifetime(_) | lf::GenericArg::AssocType { .. } | lf::GenericArg::Const(_) => {}
             _ => return Err(Why::Unsupported("an associated item constraint", r)),
         }
@@ -722,30 +824,38 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     }
 
     fn walk_ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, mut sink: Option<&mut RegionSink<'_>>) -> Result<PTy, Why> {
+        #[derive(Clone, Copy)]
         enum S {
             Visit(lf::TypeId),
-            Make(lf::TypeId),
+            Make(lf::TypeId, usize),
         }
-        let mut todo = Vec::new_in(Global);
-        let mut done: Vec<PTy, Global> = Vec::new_in(Global);
-        let mut kids: Vec<lf::TypeId, Global> = Vec::new_in(Global);
+        let mut todo: SmallPath<S, 32> = SmallPath::new(S::Visit(lf::TypeId(0)));
+        let mut done: SmallPath<PTy, 32> = SmallPath::new(PTy(0));
+        let mut kids: SmallPath<lf::TypeId, 16> = SmallPath::new(lf::TypeId(0));
         todo.push(S::Visit(t));
         while let Some(step) = todo.pop() {
-            kids.clear();
             match step {
                 S::Visit(t) => {
-                    todo.push(S::Make(t));
-                    children(v, t, &mut kids)?;
-                    todo.extend(kids.iter().rev().map(|&k| S::Visit(k)));
-                }
-                S::Make(t) => {
-                    children(v, t, &mut kids)?;
-                    let start = done.len() - kids.len();
-                    let mut args = None;
-                    let made = self.make(tys, env, v, t, &done[start..], &mut args)?;
-                    if let Some(s) = sink.as_deref_mut() {
-                        self.regions_made(tys, env, v, t, made, &done[start..], args.as_deref().unwrap_or(&[]), s)?;
+                    kids.clear();
+                    children_into(v, t, &mut |k| kids.push(k))?;
+                    todo.push(S::Make(t, kids.len()));
+                    for &k in kids.iter().rev() {
+                        todo.push(S::Visit(k));
                     }
+                }
+                S::Make(t, nkids) => {
+                    let start = done.len() - nkids;
+                    let mut args = None;
+                    let made = if matches!(v.ty(t)?, lf::TypeRef::Macro(_)) {
+                        let r = place(v, v.type_range(t))?;
+                        self.macro_ty(tys, env, v, t, r, sink.as_deref_mut())?
+                    } else {
+                        let made = self.make(tys, env, v, t, &done[start..], &mut args)?;
+                        if let Some(s) = sink.as_deref_mut() {
+                            self.regions_made(tys, env, v, t, made, &done[start..], args.as_deref().unwrap_or(&[]), s)?;
+                        }
+                        made
+                    };
                     done.truncate(start);
                     done.push(made);
                 }
@@ -808,7 +918,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             Some(rest) => (true, rest),
             None => (false, text),
         };
-        let mut segs: Vec<&str, Global> = Vec::new_in(Global);
+        let mut segs: SmallPath<&str, 8> = SmallPath::new("");
         let mut plain = true;
         for s in rest.split("::") {
             let s = s.trim();
@@ -827,7 +937,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // place: a checked body's constant path holds no `Self` to select an impl by. A leaf
         // refused there refuses this head, naming the leaf and the reason.
         let resolve_ty = |abs: bool, segs: &[&str]| self.resolver.path(env.module, abs, segs, Ns::Type);
-        let with_values = match super::const_qpath::substitute(self.heads, &resolve_ty, text, blaze_own::Alloc::global()) {
+        blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
+        let scratch = blaze_own::Erased::new(frame);
+        let with_values = match super::const_qpath::substitute(self.heads, &resolve_ty, text, scratch.handle()) {
             Ok(done) => done,
             Err(super::const_qpath::Stop::Need(need)) => return Err(Why::NeedConst(need, r)),
             Err(super::const_qpath::Stop::Failed { start, end, why }) => {
@@ -889,6 +1001,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         }
         let need = ask.need;
         if self.heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(other()) }
+        })
     }
 
     /// A constant written as a generic argument, an array length or a const parameter's
@@ -984,144 +1097,300 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         intern(tys, PNode::ConstValue { ty, bits })
     }
 
-    /// The declared type of the const parameter that argument `index` of the path `texts`
-    /// fills (its item's head, [`Heads::const_params`]; a trait's arguments follow `Self`).
-    /// `texts` (a prefix of the written path `p` of `v`, or the whole trait path of a qualified
-    /// path) resolves where the path's first token's mark says, exactly as [`Builder::path_ty`]
-    /// and [`Builder::trait_at`] resolve that same path ([`super::item_site::resolve_written`]):
-    /// never again at `env.module` alone. alloy-rlp's `impl_max_encoded_len!` writes
-    /// `unsafe impl $crate::MaxEncodedLen<{ $len }> for $t {}`, whose `$crate` an expansion's
-    /// text spells `crate` with alloy-rlp's mark; resolved at alloy-primitives' module, the
-    /// parameter's type was `NotFound` and the impl a candidate "unread as written" (tempo
-    /// census r16, `check gap: UnreadImpl`, 41 of 53).
-    #[expect(clippy::too_many_arguments, reason = "one path's resolution: the path, its view and the argument's place")]
-    fn const_want(&self, env: &Env<'_>, v: &View<'_>, p: PathIdx, abs: bool, texts: &[&str], index: u32, r: Range) -> Result<PTy, Why> {
-        let found = self.resolve_at(env, v, p, abs, texts, Ns::Type, r)?;
-        if found.consumed as usize != texts.len() {
-            return Err(Why::Unsupported("a const argument on an associated item's path", r));
+    /// The declared type of the const parameter that argument `index` of `target` fills:
+    /// - a regular item path (`Foo<A>`, `Trait<A>`): its head's [`Heads::const_params`] (a
+    ///   trait's arguments follow `Self`), resolved where the path's first token's mark says
+    ///   ([`super::item_site::resolve_written`]);
+    /// - a generic associated type on a type parameter (`F::Config<A>`, `<F>::Config<A>`), on
+    ///   `Self` (`Self::Config<A>`, `<Self>::Config<A>`), or on a qualified trait path
+    ///   (`<T as Tr>::Config<A>`): the declaring trait's [`Heads::assoc_const_params`]
+    ///   ([`Builder::gat_const_want`]).
+    #[expect(clippy::too_many_arguments, reason = "one const parameter lookup: the table, env, view, target and site")]
+    fn const_want(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, target: ConstTarget<'_>, index: u32, r: Range) -> Result<PTy, Why> {
+        match target {
+            ConstTarget::Path { p, abs, texts } => {
+                let found = self.resolve_at(env, v, p, abs, texts, Ns::Type, r)?;
+                if usize::try_from(found.consumed).ok() != Some(texts.len()) {
+                    return Err(Why::Unsupported("a const argument on an associated item's path", r));
+                }
+                let at = if found.kind == Kind::Trait { index + 1 } else { index };
+                let consts = self.heads.const_params(found.key).ok_or(Why::Need(found.key))?;
+                match consts.iter().find(|(i, _)| *i == at) {
+                    Some(&(_, t)) => Ok(t),
+                    None => Err(program(format!("argument {} of {} is a constant; that parameter is not a const parameter", index + 1, texts.join("::")), r)),
+                }
+            }
+            ConstTarget::ParamAssoc { param, name, shown } => {
+                let (bounds, done) = match env.bounds {
+                    Bounds::Building(b) => (b, false),
+                    Bounds::Done(b) => (b, true),
+                };
+                let mut found: blaze_own::AVec<'_, (LibKey, List)> = blaze_own::AVec::new_in(tys.alloc());
+                for b in bounds.iter().filter(|b| b.param == param) {
+                    if let Some(owner) = self.assoc_owner(tys, b.trait_, b.args, name, r, shown)? {
+                        if !found.iter().any(|x| *x == owner) {
+                            found.push(owner);
+                        }
+                    }
+                }
+                match found.as_slice() {
+                    &[(owner, _)] => self.gat_const_want(owner, name, index, r, shown),
+                    [] if !done => Err(Why::Unsupported("`T::X` in a bound written before the bound of `T` that declares `X`", r)),
+                    [] => Err(Why::AssocNotFound(shown.into(), r)),
+                    many => {
+                        let traits = many.iter().map(|&(t, _)| t).collect();
+                        Err(Why::AssocAmbiguous(shown.into(), traits, r))
+                    }
+                }
+            }
+            ConstTarget::SelfAssoc { name, shown } => match env.self_ {
+                SelfTy::Trait(tr) => {
+                    let (g, _) = self.heads.trait_head(tr).ok_or(Why::Need(tr))?;
+                    let mut args: blaze_own::AVec<'_, PTy> = blaze_own::AVec::with_capacity_in(usize::try_from(g).unwrap_or(0), tys.alloc());
+                    for i in 0..g {
+                        args.push(intern(tys, PNode::Param(i))?);
+                    }
+                    let args = intern_list(tys, &args)?;
+                    let mut found: blaze_own::AVec<'_, (LibKey, List)> = blaze_own::AVec::new_in(tys.alloc());
+                    if let Some(owner) = self.assoc_owner(tys, tr, args, name, r, shown)? {
+                        found.push(owner);
+                    }
+                    let (Bounds::Building(bounds) | Bounds::Done(bounds)) = env.bounds;
+                    for b in bounds.iter().filter(|b| b.param == 0) {
+                        if let Some(owner) = self.assoc_owner(tys, b.trait_, b.args, name, r, shown)? {
+                            if !found.iter().any(|x| *x == owner) {
+                                found.push(owner);
+                            }
+                        }
+                    }
+                    match found.as_slice() {
+                        &[(owner, _)] => self.gat_const_want(owner, name, index, r, shown),
+                        [] => Err(Why::Program(blaze_own::format_in!(tys.alloc(), "{shown} names no associated type of the trait, its supertraits or a bound on `Self` in scope").as_str().into(), r)),
+                        many => {
+                            let traits = many.iter().map(|&(t, _)| t).collect();
+                            Err(Why::AssocAmbiguous(shown.into(), traits, r))
+                        }
+                    }
+                }
+                SelfTy::Ty(_, Some((tr, args))) => match self.assoc_owner(tys, tr, args, name, r, shown)? {
+                    Some((owner, _)) => self.gat_const_want(owner, name, index, r, shown),
+                    None => Err(Why::Program(blaze_own::format_in!(tys.alloc(), "{shown} names no associated type of the trait or its supertraits").as_str().into(), r)),
+                },
+                SelfTy::Ty(_, None) => Err(Why::Unsupported("type or const arguments on an inherent associated type", r)),
+                SelfTy::None => Err(Why::Unsupported(SELF_HERE, r)),
+            },
+            ConstTarget::TraitAssoc { trait_path, name, shown } => {
+                let (tabs, ttexts, _, tr_r) = path_texts(v, trait_path)?;
+                let Bounded::Trait(tr) = self.bound_target(env, v, trait_path, tabs, &ttexts, tr_r)? else {
+                    return Err(Why::Program(blaze_own::format_in!(tys.alloc(), "`{shown}`: trait alias stands for bounds, not one trait").as_str().into(), tr_r));
+                };
+                let Some(owner) = self.assoc_owner_key(tr, name, r, shown, tys.alloc())? else {
+                    return Err(Why::Program(blaze_own::format_in!(tys.alloc(), "`{shown}` names no associated type of the trait").as_str().into(), r));
+                };
+                self.gat_const_want(owner, name, index, r, shown)
+            }
         }
-        let at = if found.kind == Kind::Trait { index + 1 } else { index };
-        let consts = self.heads.const_params(found.key).ok_or(Why::Need(found.key))?;
-        match consts.iter().find(|(i, _)| *i == at) {
-            Some(&(_, t)) => Ok(t),
-            None => Err(program(format!("argument {} of `{}` is a constant; that parameter is not a const parameter", index + 1, texts.join("::")), r)),
+    }
+
+    /// The trait declaring associated type `name` among `tr` and its supertraits (by key only,
+    /// without substituting arguments): used by [`Builder::const_want`] for `<T as Tr>::X<..>`.
+    fn assoc_owner_key(&self, tr: LibKey, name: Name, r: Range, shown: &str, alloc: Alloc<'_>) -> Result<Option<LibKey>, Why> {
+        const MOST_SUPERS: usize = 256;
+        let mut todo: blaze_own::AVec<'_, LibKey> = blaze_own::AVec::new_in(alloc);
+        todo.push(tr);
+        let mut found: Option<LibKey> = None;
+        let mut seen: blaze_own::AVec<'_, LibKey> = blaze_own::AVec::new_in(alloc);
+        for _ in 0..MOST_SUPERS {
+            let Some(t) = todo.pop() else { break };
+            if seen.iter().any(|x| *x == t) {
+                continue;
+            }
+            seen.push(t);
+            if self.heads.trait_has_assoc(t, name).ok_or(Why::Need(t))? {
+                match found {
+                    Some(prev) if prev != t => return Err(Why::Program(blaze_own::format_in!(alloc, "`{shown}` is ambiguous: two supertraits declare it").as_str().into(), r)),
+                    _ => found = Some(t),
+                }
+                continue;
+            }
+            for &(st, _) in self.heads.trait_supers(t).ok_or(Why::Need(t))? {
+                todo.push(st);
+            }
         }
+        if !todo.is_empty() {
+            return Err(Why::Unsupported("a supertrait tree past 256 traits", r));
+        }
+        Ok(found)
     }
 
     /// A path's generic arguments in written order: each type argument from `kids` (as
     /// [`children`] listed them: a qualified path's self type first), each const argument
     /// and each one-name argument (`N`: a type if the name is a type parameter or resolves in
     /// the type namespace, else a constant; the Reference, "Generic parameters") made here.
-    pub(super) fn path_args(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, p: PathIdx, kids: &[PTy]) -> Result<Vec<PTy, Global>, Why> {
+    pub(super) fn path_args(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, p: PathIdx, kids: &[PTy]) -> Result<SmallPath<PTy, 8>, Why> {
         let r = place(v, v.path_range(p))?;
-        let path = v.path(p)?;
-        let mut out = Vec::with_capacity_in(kids.len(), Global);
+        let shown = v.text_at(v.path_range(p)?)?;
+        let mut out: SmallPath<PTy, 8> = SmallPath::new(PTy(0));
         let mut next = kids.iter().copied();
-        // Each segment whose arguments are listed, with the path its arguments are for (the
-        // written path whose first token's mark says where it resolves: `const_want`).
-        let mut work: Vec<(lf::Segment, PathIdx, bool, Vec<&str, Global>), Global> = Vec::new_in(Global);
         let (abs, texts, segs, _) = path_texts_of(v, p, true)?;
-        for (k, s) in segs.iter().enumerate() {
+        let handle_seg = |tys: &mut PortableTys<'_>,
+                          out: &mut SmallPath<PTy, 8>,
+                          next: &mut core::iter::Copied<core::slice::Iter<'_, PTy>>,
+                          s: lf::Segment,
+                          target: ConstTarget<'_>|
+         -> Result<(), Why> {
+            if !s.has_args {
+                return Ok(());
+            }
+            let mut index = 0u32;
+            for &n in v.rows(s.args)? {
+                let made = match lf::GenericArg::decode(n)? {
+                    lf::GenericArg::Type(t) => match bare_name(v, t)? {
+                        None => next.next().ok_or(program(format!("a type argument is missing"), r))?,
+                        Some(name) => {
+                            let param = env.params.iter().find(|(n, _)| *n == Name::of(name)).map(|&(_, i)| i);
+                            let is_const = param.is_some_and(|i| env.consts.iter().any(|(c, _)| *c == i));
+                            let lf::TypeRef::Path(tp) = v.ty(t)? else { return Err(program(format!("a one-name argument that is no path"), r)) };
+                            let ar = place(v, v.type_range(t))?;
+                            // An item the body declares takes part as in a body path's own
+                            // argument (body.rs `name_arg`; the one rule is const_open.rs
+                            // `local_arg`): the Reference, "Generic parameters": a one-name
+                            // argument is a type if it resolves to one in the type
+                            // namespace, else a const; "Statements", "Item declarations":
+                            // a block's item is in scope in its block. tempo's
+                            // `Exec::for_config::<Config<SPEC_ID>>()` names the `const
+                            // SPEC_ID` of its block; read at the module alone, it was
+                            // "cannot find type `SPEC_ID`".
+                            let local = match env.body {
+                                Some(body) => super::const_open::local_arg(body.locals, body.owner, self.heads, v, t, name, ar),
+                                None => Ok(None),
+                            };
+                            // The name resolves where its token's mark says, as the
+                            // argument's own type would (`path_ty`): never at the module
+                            // alone when a macro wrote it.
+                            let at_mark = |ns: Ns| self.resolve_at(env, v, tp, false, &[name], ns, ar);
+                            // A type if a type parameter, or the names library's answer in
+                            // the type namespace is a type (a constant item answers there
+                            // too, as the library files it: then it is a constant).
+                            let names_a_type = || match at_mark(Ns::Type) {
+                                Ok(f) => f.consumed == 1 && matches!(f.kind, Kind::Struct | Kind::Enum | Kind::Union | Kind::TypeAlias | Kind::Builtin(_) | Kind::WideInt { .. }),
+                                Err(_) => false,
+                            };
+                            let local_type = matches!(local, Ok(Some(super::const_open::LocalArg::Type)));
+                            let is_type = local_type || (!is_const && (param.is_some() || names_a_type()));
+                            if is_type {
+                                self.path_ty(tys, env, v, tp, &[])?
+                            } else if let Ok(Some(super::const_open::LocalArg::Const(bits))) = local {
+                                // The constant's bits in the parameter's type, as a module
+                                // constant's are (`const_term`). A scalar parameter only: a
+                                // fieldless enum's value is its variant under the enum's key
+                                // (const_enum.rs), which a body's constant's bits are not.
+                                let ty = self.const_want(tys, env, v, target, index, ar)?;
+                                if !matches!(tys.view().get(ty), Some(PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Infer | PNode::Error)) {
+                                    return Err(Why::Unsupported("a const argument naming a `const` the body declares, for a parameter whose type is no integer, `bool` or `char`", ar));
+                                }
+                                intern(tys, PNode::ConstValue { ty, bits })?
+                            } else if let Err(why) = local {
+                                // A body's constant not evaluated yet (`Why::NeedConst`: the
+                                // driver evaluates it and lowers again), or a body's value
+                                // item that is no constant: refused by name, never read at
+                                // the module, where the name would mean another item.
+                                return Err(why);
+                            } else {
+                                // A name that is no parameter, no type and no value here
+                                // names nothing: refused as unresolved, never guessed to be
+                                // a constant (zerocopy's `HasField<Client, value, ..>`, whose
+                                // `value` is an enum of the impl's own block, was refused
+                                // "argument 2 of `HasField` is a constant").
+                                if param.is_none() && name != "true" && name != "false" {
+                                    at_mark(Ns::Value)?;
+                                }
+                                let want = |tys: &mut PortableTys<'_>| self.const_want(tys, env, v, target, index, ar);
+                                self.const_term(tys, env, name, ar, &want)?
+                            }
+                        }
+                    },
+                    lf::GenericArg::Const(c) => {
+                        let at = v.const_range(c)?;
+                        let ar = v.site(at)?;
+                        let text = v.text_at(at)?;
+                        let want = |tys: &mut PortableTys<'_>| self.const_want(tys, env, v, target, index, ar);
+                        self.const_term(tys, env, text, ar, &want)?
+                    }
+                    _ => continue,
+                };
+                out.push(made);
+                index += 1;
+            }
+            Ok(())
+        };
+        for (k, &s) in segs.iter().enumerate() {
             if s.kind == lf::SegKind::Anchor {
                 out.push(next.next().ok_or(program(format!("a qualified path's self type is missing"), r))?);
                 // `<T>::X` has no trait whose arguments are listed (`children`).
                 if let Some(tr) = s.trait_ {
                     let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Err(program(format!("a trait that is no path"), r)) };
                     let (tabs, ttexts, tsegs, _) = path_texts(v, tp)?;
-                    for ts in tsegs {
-                        work.push((ts, tp, tabs, ttexts.clone()));
+                    for &ts in tsegs.iter() {
+                        handle_seg(tys, &mut out, &mut next, ts, ConstTarget::Path { p: tp, abs: tabs, texts: &ttexts })?;
                     }
                 }
-            } else {
-                let mut upto = Vec::new_in(Global);
-                upto.extend_from_slice(&texts[..=k]);
-                work.push((*s, p, abs, upto));
-            }
-            // Arguments are lowered segment by segment, in the order `children` lists them.
-            for (s, spath, sabs, stexts) in work.drain(..) {
-                if !s.has_args {
-                    continue;
-                }
-                let mut index = 0u32;
-                for &n in v.rows(s.args)? {
-                    let made = match lf::GenericArg::decode(n)? {
-                        lf::GenericArg::Type(t) => match bare_name(v, t)? {
-                            None => next.next().ok_or(program(format!("a type argument is missing"), r))?,
-                            Some(name) => {
-                                let param = env.params.iter().find(|(n, _)| *n == Name::of(name)).map(|&(_, i)| i);
-                                let is_const = param.is_some_and(|i| env.consts.iter().any(|(c, _)| *c == i));
-                                let lf::TypeRef::Path(tp) = v.ty(t)? else { return Err(program(format!("a one-name argument that is no path"), r)) };
-                                let ar = place(v, v.type_range(t))?;
-                                // An item the body declares takes part as in a body path's own
-                                // argument (body.rs `name_arg`; the one rule is const_open.rs
-                                // `local_arg`): the Reference, "Generic parameters": a one-name
-                                // argument is a type if it resolves to one in the type
-                                // namespace, else a const; "Statements", "Item declarations":
-                                // a block's item is in scope in its block. tempo's
-                                // `Exec::for_config::<Config<SPEC_ID>>()` names the `const
-                                // SPEC_ID` of its block; read at the module alone, it was
-                                // "cannot find type `SPEC_ID`".
-                                let local = match env.body {
-                                    Some(body) => super::const_open::local_arg(body.locals, body.owner, self.heads, v, t, name, ar),
-                                    None => Ok(None),
-                                };
-                                // The name resolves where its token's mark says, as the
-                                // argument's own type would (`path_ty`): never at the module
-                                // alone when a macro wrote it.
-                                let at_mark = |ns: Ns| self.resolve_at(env, v, tp, false, &[name], ns, ar);
-                                // A type if a type parameter, or the names library's answer in
-                                // the type namespace is a type (a constant item answers there
-                                // too, as the library files it: then it is a constant).
-                                let names_a_type = || match at_mark(Ns::Type) {
-                                    Ok(f) => f.consumed == 1 && matches!(f.kind, Kind::Struct | Kind::Enum | Kind::Union | Kind::TypeAlias | Kind::Builtin(_) | Kind::WideInt { .. }),
-                                    Err(_) => false,
-                                };
-                                let local_type = matches!(local, Ok(Some(super::const_open::LocalArg::Type)));
-                                let is_type = local_type || (!is_const && (param.is_some() || names_a_type()));
-                                if is_type {
-                                    self.path_ty(tys, env, v, tp, &[])?
-                                } else if let Ok(Some(super::const_open::LocalArg::Const(bits))) = local {
-                                    // The constant's bits in the parameter's type, as a module
-                                    // constant's are (`const_term`). A scalar parameter only: a
-                                    // fieldless enum's value is its variant under the enum's key
-                                    // (const_enum.rs), which a body's constant's bits are not.
-                                    let ty = self.const_want(env, v, spath, sabs, &stexts, index, ar)?;
-                                    if !matches!(tys.view().get(ty), Some(PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Infer | PNode::Error)) {
-                                        return Err(Why::Unsupported("a const argument naming a `const` the body declares, for a parameter whose type is no integer, `bool` or `char`", ar));
+            } else if s.has_args
+                && let Some(upto) = texts.get(..=k)
+            {
+                let first_seg = segs.first().copied();
+                let target = if k == 1
+                    && let Some(first) = first_seg
+                    && first.kind == lf::SegKind::Anchor
+                {
+                    if let Some(n) = s.name {
+                        let name = Name(v.name(n)?);
+                        if let Some(tr) = first.trait_
+                            && let lf::TypeRef::Path(tp) = v.ty(tr)?
+                        {
+                            ConstTarget::TraitAssoc { trait_path: tp, name, shown }
+                        } else if first.trait_.is_none() {
+                            let is_self = match first.ty {
+                                Some(written) => match v.ty(written)? {
+                                    lf::TypeRef::Path(sp) => {
+                                        let (sabs, stexts, _, _) = path_texts(v, sp)?;
+                                        !sabs && stexts.as_slice() == ["Self"]
                                     }
-                                    intern(tys, PNode::ConstValue { ty, bits })?
-                                } else if let Err(why) = local {
-                                    // A body's constant not evaluated yet (`Why::NeedConst`: the
-                                    // driver evaluates it and lowers again), or a body's value
-                                    // item that is no constant: refused by name, never read at
-                                    // the module, where the name would mean another item.
-                                    return Err(why);
-                                } else {
-                                    // A name that is no parameter, no type and no value here
-                                    // names nothing: refused as unresolved, never guessed to be
-                                    // a constant (zerocopy's `HasField<Client, value, ..>`, whose
-                                    // `value` is an enum of the impl's own block, was refused
-                                    // "argument 2 of `HasField` is a constant").
-                                    if param.is_none() && name != "true" && name != "false" {
-                                        at_mark(Ns::Value)?;
-                                    }
-                                    let want = |_: &mut PortableTys<'_>| self.const_want(env, v, spath, sabs, &stexts, index, ar);
-                                    self.const_term(tys, env, name, ar, &want)?
-                                }
+                                    _ => false,
+                                },
+                                None => false,
+                            };
+                            if is_self {
+                                ConstTarget::SelfAssoc { name, shown }
+                            } else if let Some(PNode::Param(param)) = out.first().and_then(|&t| tys.view().get(t).copied()) {
+                                ConstTarget::ParamAssoc { param, name, shown }
+                            } else {
+                                ConstTarget::Path { p, abs, texts: upto }
                             }
-                        },
-                        lf::GenericArg::Const(c) => {
-                            let at = v.const_range(c)?;
-                            let ar = v.site(at)?;
-                            let text = v.text_at(at)?;
-                            let want = |_: &mut PortableTys<'_>| self.const_want(env, v, spath, sabs, &stexts, index, ar);
-                            self.const_term(tys, env, text, ar, &want)?
+                        } else {
+                            ConstTarget::Path { p, abs, texts: upto }
                         }
-                        _ => continue,
-                    };
-                    out.push(made);
-                    index += 1;
-                }
+                    } else {
+                        ConstTarget::Path { p, abs, texts: upto }
+                    }
+                } else if k == 1
+                    && !abs
+                    && let [first_text, second_text] = texts.as_slice()
+                    && *first_text == "Self"
+                {
+                    ConstTarget::SelfAssoc { name: Name::of(second_text), shown }
+                } else if k == 1
+                    && !abs
+                    && let [first_text, second_text] = texts.as_slice()
+                    && first_seg.is_some_and(|first| !first.has_args)
+                    && let Some(&(_, param)) = env.params.iter().find(|(n, _)| *n == Name::of(first_text))
+                    && !env.consts.iter().any(|(c, _)| *c == param)
+                {
+                    ConstTarget::ParamAssoc { param, name: Name::of(second_text), shown }
+                } else {
+                    ConstTarget::Path { p, abs, texts: upto }
+                };
+                handle_seg(tys, &mut out, &mut next, s, target)?;
             }
         }
         if next.next().is_some() {
@@ -1132,7 +1401,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
 
     /// The type `t` made of its children `kids`; a path's arguments (`path_args`' answer) are
     /// left in `args` for its region slots ([`Builder::regions_made`]).
-    fn make(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, kids: &[PTy], args: &mut Option<Vec<PTy, Global>>) -> Result<PTy, Why> {
+    fn make(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, kids: &[PTy], args: &mut Option<SmallPath<PTy, 8>>) -> Result<PTy, Why> {
         let r = place(v, v.type_range(t))?;
         match v.ty(t)? {
             // The written lifetime is the reference's region slot (`regions_made`), never
@@ -1269,7 +1538,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     return Err(program(format!("`...` on a fn pointer type of the \"{}\" ABI: that calling convention has no variadics (E0045)", abi.name()), r));
                 }
                 let safety = if unsafety { tc::Safety::Unsafe } else { tc::Safety::Safe };
-                let mut l = Vec::with_capacity_in(kids.len() + 1, Global);
+                let mut l = blaze_own::Vec::with_capacity_in(kids.len() + 1, tys.alloc());
                 l.extend_from_slice(kids);
                 if ret.is_none() {
                     let unit = intern_list(tys, &[])?;
@@ -1278,7 +1547,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let l = intern_list(tys, &l)?;
                 intern(tys, PNode::FnPtr(l, tc::FnPtrHeader { abi, safety, c_variadic: variadic }))
             }
-            lf::TypeRef::Macro(_) => self.macro_ty(tys, env, v, t, r),
+            lf::TypeRef::Macro(_) => self.macro_ty(tys, env, v, t, r, None),
             lf::TypeRef::Pat { pat, .. } => self.pat_ty(tys, env, v, kids[0], pat, r),
             // `for<'a> fn(&'a T)`: the binder's lifetimes are erased ([`super::preds::lifetimes_only`],
             // checked where `children` lists the inner type), so the type is its inner type.
@@ -1432,7 +1701,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 if self.heads.trait_supers(tr).is_none() && !self.heads.trait_has_assoc(tr, name).ok_or(Why::Need(tr))? {
                     return self.written_self_assoc(tys, env, v, name, kids, r, shown);
                 }
-                let mut args = Vec::with_capacity_in(g as usize, Global);
+                let mut args = blaze_own::Vec::with_capacity_in(g as usize, tys.alloc());
                 for i in 0..g {
                     args.push(intern(tys, PNode::Param(i))?);
                 }
@@ -1519,7 +1788,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// is `TryInto<T>`'s). Two distinct traits declaring it are ambiguous (rustc's E0221).
     #[expect(clippy::too_many_arguments, reason = "the trait, the associated item's own arguments, and the path's site")]
     fn trait_self_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, tr: LibKey, args: List, name: Name, own: &[PTy], r: Range, shown: &str) -> Result<PTy, Why> {
-        let mut found: Vec<(LibKey, List), Global> = Vec::new_in(Global);
+        let mut found: blaze_own::Vec<(LibKey, List), Alloc<'_>> = blaze_own::Vec::new_in(tys.alloc());
         if let Some(owner) = self.assoc_owner(tys, tr, args, name, r, shown)? {
             found.push(owner);
         }
@@ -1555,7 +1824,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             Bounds::Building(b) => (b, false),
             Bounds::Done(b) => (b, true),
         };
-        let mut found: Vec<(LibKey, List), Global> = Vec::new_in(Global);
+        let mut found: blaze_own::Vec<(LibKey, List), Alloc<'_>> = blaze_own::Vec::new_in(tys.alloc());
         for b in bounds.iter().filter(|b| b.param == param) {
             if let Some(owner) = self.assoc_owner(tys, b.trait_, b.args, name, r, shown)? {
                 if !found.contains(&owner) {
@@ -1583,10 +1852,11 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// arguments substituted; `None` when none does, an error when two do.
     pub(super) fn assoc_owner(&self, tys: &mut PortableTys<'_>, tr: LibKey, args: List, name: Name, r: Range, shown: &str) -> Result<Option<(LibKey, List)>, Why> {
         const MOST_SUPERS: usize = 256;
-        let mut todo = Vec::new_in(Global);
+        let alloc = tys.alloc();
+        let mut todo = blaze_own::Vec::new_in(alloc);
         todo.push((tr, args));
         let mut found: Option<(LibKey, List)> = None;
-        let mut seen = Vec::new_in(Global);
+        let mut seen = blaze_own::Vec::new_in(alloc);
         for _ in 0..MOST_SUPERS {
             let Some((t, a)) = todo.pop() else { break };
             if seen.contains(&(t, a)) {
@@ -1601,13 +1871,13 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 continue;
             }
             let given = tys.view().list(a).map_err(|_| program(format!("a list outside the table"), r))?;
-            let mut given_v = Vec::with_capacity_in(given.len(), Global);
+            let mut given_v = blaze_own::Vec::with_capacity_in(given.len(), alloc);
             given_v.extend_from_slice(given);
             for &(st, sargs) in self.heads.trait_supers(t).ok_or(Why::Need(t))? {
                 let written = tys.view().list(sargs).map_err(|_| program(format!("a list outside the table"), r))?;
-                let mut written_v = Vec::with_capacity_in(written.len(), Global);
+                let mut written_v = blaze_own::Vec::with_capacity_in(written.len(), alloc);
                 written_v.extend_from_slice(written);
-                let mut out = Vec::with_capacity_in(written_v.len(), Global);
+                let mut out = blaze_own::Vec::with_capacity_in(written_v.len(), alloc);
                 for &w in &written_v {
                     out.push(subst(tys, w, &given_v)?);
                 }
@@ -1664,10 +1934,10 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     pub fn trait_ref(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, self_ty: PTy) -> Result<(LibKey, List), Why> {
         let r = place(v, v.type_range(t))?;
         let lf::TypeRef::Path(p) = v.ty(t)? else { return Err(program(format!("a trait that is no path"), r)) };
-        let mut written = Vec::new_in(Global);
-        children(v, t, &mut written)?;
-        let mut given = Vec::with_capacity_in(written.len(), Global);
-        for &w in &written {
+        let mut written: SmallPath<lf::TypeId, 8> = SmallPath::new(lf::TypeId(0));
+        children_into(v, t, &mut |id| written.push(id))?;
+        let mut given: SmallPath<PTy, 8> = SmallPath::new(PTy(0));
+        for &w in written.iter() {
             given.push(self.ty(tys, env, v, w)?);
         }
         let given = self.path_args(tys, env, v, p, &given)?;
@@ -1711,17 +1981,17 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// The trait alias `alias` as a bound on `self_ty` with the written arguments `given`: its
     /// clauses with `Self` and its parameters substituted (the unstable book, `trait_alias`:
     /// a bound naming it "is equivalent to" its right-hand side), into `out`.
-    pub(super) fn alias_clauses(&self, tys: &mut PortableTys<'_>, alias: LibKey, r: Range, self_ty: PTy, given: &[PTy], out: &mut Vec<PClause, Global>) -> Result<(), Why> {
+    pub(super) fn alias_clauses<O: Extend<PClause>>(&self, tys: &mut PortableTys<'_>, alias: LibKey, r: Range, self_ty: PTy, given: &[PTy], out: &mut O) -> Result<(), Why> {
         let head = self.heads.trait_alias(alias).ok_or(Why::Need(alias))?;
         let want = head.generics as usize - 1;
         if given.len() != want {
             return Err(program(format!("a trait alias written with {} type arguments; it takes {want}", given.len()), r));
         }
-        let mut args = Vec::with_capacity_in(want + 1, Global);
+        let mut args = blaze_own::Vec::with_capacity_in(want + 1, tys.alloc());
         args.push(self_ty);
         args.extend_from_slice(given);
         for &c in &head.clauses {
-            out.push(subst_clause(tys, c, &args)?);
+            out.extend(core::iter::once(subst_clause(tys, c, &args)?));
         }
         Ok(())
     }
@@ -1734,7 +2004,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         if given.len() > want {
             return Err(program(format!("a trait written with {} type arguments; it takes {want}", given.len()), r));
         }
-        let mut args = Vec::with_capacity_in(want + 1, Global);
+        let mut args = blaze_own::Vec::with_capacity_in(want + 1, tys.alloc());
         args.push(self_ty);
         args.extend_from_slice(given);
         for i in given.len()..want {
@@ -1802,6 +2072,20 @@ fn mentions_param0(tys: tc::PTys<'_>, root: PTy, alloc: Alloc<'_>) -> bool {
     false
 }
 
+/// What item or generic associated type a segment's const arguments belong to
+/// ([`Builder::const_want`]).
+#[derive(Clone, Copy)]
+enum ConstTarget<'a> {
+    /// A regular path segment (`Foo<A>`, `Trait<A>`): resolve `texts` in `Ns::Type`.
+    Path { p: PathIdx, abs: bool, texts: &'a [&'a str] },
+    /// A generic associated type on a type parameter (`F::Config<A>` or `<F>::Config<A>`).
+    ParamAssoc { param: u32, name: Name, shown: &'a str },
+    /// A generic associated type on `Self` (`Self::Config<A>` or `<Self>::Config<A>`).
+    SelfAssoc { name: Name, shown: &'a str },
+    /// A generic associated type on a qualified trait path (`<T as Tr>::Config<A>`).
+    TraitAssoc { trait_path: PathIdx, name: Name, shown: &'a str },
+}
+
 /// What a bound's path names ([`Builder::bound_target`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bounded {
@@ -1812,8 +2096,11 @@ pub enum Bounded {
 /// The clause `c` with each `Param(i)` replaced by `args[i]` ([`subst`] over its parts).
 pub fn subst_clause(tys: &mut PortableTys<'_>, c: PClause, args: &[PTy]) -> Result<PClause, Why> {
     let list = |tys: &mut PortableTys<'_>, l: List| -> Result<List, Why> {
-        let old = tys.view().list(l).map_err(|_| program(format!("a clause refers past the type table"), Range::new(0, 0)))?.to_vec_in(Global);
-        let mut new = Vec::with_capacity_in(old.len(), Global);
+        let alloc = tys.alloc();
+        let old_slice = tys.view().list(l).map_err(|_| program(format!("a clause refers past the type table"), Range::new(0, 0)))?;
+        let mut old = blaze_own::Vec::with_capacity_in(old_slice.len(), alloc);
+        old.extend_from_slice(old_slice);
+        let mut new = blaze_own::Vec::with_capacity_in(old.len(), alloc);
         for t in old {
             new.push(subst(tys, t, args)?);
         }
@@ -1875,6 +2162,62 @@ pub(super) fn fn_ptr_abi(written: &str, r: Range) -> Result<tc::Abi, Why> {
 /// (super::const_open::local_const). `None`: not a body's type, not one name, no path in the
 /// type to place it, or no item of the body takes the name: the caller reads the length as
 /// before (at the module). A body item of the name that is no constant is refused by name.
+/// The block scope enclosing written type `t` in `v`: first any path written inside `t`
+/// (its own `scope`, exact for `[u8; SIZE]`), then the innermost `Expr::Block` whose range
+/// covers `t` (needed when `t` contains no path, such as `*const [_; SIZE]` in `bytes`'s
+/// `buf_try_get_impl!` macro), falling back to the call site's enclosing block when `t`
+/// lives in a macro expansion with no block of its own.
+fn type_scope(v: &View<'_>, t: lf::TypeId) -> Result<Option<lf::ScopeId>, Why> {
+    let at = v.type_range(t)?;
+    for (p, _) in (0u32..).zip(v.paths) {
+        let p = PathIdx(p);
+        if at.cover(v.path_range(p)?) != Some(at) {
+            continue;
+        }
+        if let Some(s) = v.path(p)?.scope {
+            return Ok(Some(s));
+        }
+    }
+    let mut best: Option<(u32, lf::ScopeId)> = None;
+    for (e, _) in (0u32..).zip(v.exprs) {
+        let eid = blaze_typeck::ExprId(e);
+        if let lf::Expr::Block { scope, .. } = v.expr(eid)? {
+            let br = v.expr_range(eid)?;
+            if br.cover(at) == Some(br) {
+                let len = br.len();
+                if best.is_none_or(|(b, _)| len < b) {
+                    best = Some((len, scope));
+                }
+            }
+        }
+    }
+    if let Some((_, scope)) = best {
+        return Ok(Some(scope));
+    }
+    if at.in_expansion() {
+        let site = v.site(at)?;
+        for (e, _) in (0u32..).zip(v.exprs) {
+            let eid = blaze_typeck::ExprId(e);
+            if let lf::Expr::Block { scope, .. } = v.expr(eid)? {
+                let br = v.expr_range(eid)?;
+                if let Some(ir) = v.item_relative(br)
+                    && ir.start <= site.start
+                    && site.end <= ir.end
+                {
+                    let len = ir.end.saturating_sub(ir.start);
+                    if best.is_none_or(|(b, _)| len < b) {
+                        best = Some((len, scope));
+                    }
+                }
+            }
+        }
+        if let Some((_, scope)) = best {
+            return Ok(Some(scope));
+        }
+    }
+    Ok(None)
+}
+
 fn body_const_len<H: Heads + ?Sized>(heads: &H, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, text: &str, r: Range) -> Result<Option<u128>, Why> {
     let Some(body) = env.body else { return Ok(None) };
     let mut name = text.trim();
@@ -1885,19 +2228,7 @@ fn body_const_len<H: Heads + ?Sized>(heads: &H, env: &Env<'_>, v: &View<'_>, t: 
     if !ident {
         return Ok(None);
     }
-    let at = v.type_range(t)?;
-    let mut scope = None;
-    for p in 0..v.paths.len() {
-        let p = PathIdx(p as u32);
-        if at.cover(v.path_range(p)?) != Some(at) {
-            continue;
-        }
-        if let Some(s) = v.path(p)?.scope {
-            scope = Some(s);
-            break;
-        }
-    }
-    let Some(scope) = scope else { return Ok(None) };
+    let Some(scope) = type_scope(v, t)? else { return Ok(None) };
     let Some(row) = body.locals.find(body.owner, Some(scope.0), name, super::locals::LocalNs::Value) else { return Ok(None) };
     match row.kind {
         super::locals::LocalKind::Const => match heads.const_bits(row.key) {
@@ -1911,7 +2242,7 @@ fn body_const_len<H: Heads + ?Sized>(heads: &H, env: &Env<'_>, v: &View<'_>, t: 
 }
 
 /// The types `t` is made of, in order; `None` past the table.
-pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global>) -> Option<()> {
+pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut impl Extend<PTy>) -> Option<()> {
     t.children_of(*t.get(ty)?, out).ok()
 }
 
@@ -1931,8 +2262,8 @@ pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global
 /// The same numbering is a type alias's (super::tait `alias_opaques`: each `impl` an alias's
 /// type writes is one opaque of the alias), so `out` takes the caller's allocator.
 pub(super) fn return_impls<A: core::alloc::Allocator>(v: &View<'_>, ret: lf::TypeId, out: &mut Vec<lf::TypeId, A>) -> Result<bool, Why> {
-    let mut todo: Vec<lf::TypeId, Global> = Vec::new_in(Global);
-    let mut kids: Vec<lf::TypeId, Global> = Vec::new_in(Global);
+    let mut todo: SmallPath<lf::TypeId, 16> = SmallPath::new(lf::TypeId(0));
+    let mut kids: SmallPath<lf::TypeId, 16> = SmallPath::new(lf::TypeId(0));
     let mut macros = false;
     todo.push(ret);
     while let Some(t) = todo.pop() {
@@ -1942,21 +2273,23 @@ pub(super) fn return_impls<A: core::alloc::Allocator>(v: &View<'_>, ret: lf::Typ
                 out.push(t);
                 for &b in v.rows(bounds)? {
                     if let lf::Bound::Trait { ty, .. } = lf::Bound::decode(b)? {
-                        bound_arg_types(v, ty, &mut kids)?;
+                        bound_arg_types_into(v, ty, &mut |id| kids.push(id))?;
                     }
                 }
             }
             lf::TypeRef::Macro(_) => macros = true,
-            _ => children(v, t, &mut kids)?,
+            _ => children_into(v, t, &mut |id| kids.push(id))?,
         }
-        todo.extend(kids.iter().rev());
+        for &k in kids.iter().rev() {
+            todo.push(k);
+        }
     }
     Ok(macros)
 }
 
 /// The types written in a bound's trait path's arguments: type arguments, associated type
 /// bindings (`Item = T`) and a parenthesized `Fn(A) -> B`'s inputs and output, in order.
-fn bound_arg_types(v: &View<'_>, ty: lf::TypeId, out: &mut Vec<lf::TypeId, Global>) -> Result<(), Why> {
+fn bound_arg_types_into(v: &View<'_>, ty: lf::TypeId, out: &mut impl FnMut(lf::TypeId)) -> Result<(), Why> {
     let lf::TypeRef::Path(p) = v.ty(ty)? else { return Ok(()) };
     for &n in v.segments(v.path(p)?)? {
         let s = lf::Segment::decode(n)?;
@@ -1965,12 +2298,14 @@ fn bound_arg_types(v: &View<'_>, ty: lf::TypeId, out: &mut Vec<lf::TypeId, Globa
         }
         for &a in v.rows(s.args)? {
             match lf::GenericArg::decode(a)? {
-                lf::GenericArg::Type(t) | lf::GenericArg::AssocType { ty: t, .. } => out.push(t),
+                lf::GenericArg::Type(t) | lf::GenericArg::AssocType { ty: t, .. } => out(t),
                 _ => {}
             }
         }
         if s.parenthesized {
-            out.extend(s.ty);
+            if let Some(ret) = s.ty {
+                out(ret);
+            }
         }
     }
     Ok(())
@@ -1978,26 +2313,34 @@ fn bound_arg_types(v: &View<'_>, ty: lf::TypeId, out: &mut Vec<lf::TypeId, Globa
 
 /// The written types a type is made of, in order (the work list's children).
 pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Global>) -> Result<(), Why> {
+    children_into(v, t, &mut |id| out.push(id))
+}
+
+pub(super) fn children_into(v: &View<'_>, t: lf::TypeId, out: &mut impl FnMut(lf::TypeId)) -> Result<(), Why> {
     let r = place(v, v.type_range(t))?;
     match v.ty(t)? {
-        lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => out.push(inner),
-        lf::TypeRef::Array { elem, .. } => out.push(elem),
-        lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => out.extend(v.ids(l)?.iter().map(|&i| lf::TypeId(i))),
+        lf::TypeRef::Ref { inner, .. } | lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => out(inner),
+        lf::TypeRef::Array { elem, .. } => out(elem),
+        lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => {
+            for &i in v.ids(l)? {
+                out(lf::TypeId(i));
+            }
+        }
         lf::TypeRef::Path(p) => {
             let path = v.path(p)?;
             for &n in v.segments(path)? {
                 let s = lf::Segment::decode(n)?;
                 if s.kind == lf::SegKind::Anchor {
                     let Some(ty) = s.ty else { return Err(program(format!("a qualified path's self type is missing"), r)) };
-                    out.push(ty);
+                    out(ty);
                     // `<T>::X`: the self type only (`Builder::qualified_no_trait`).
                     let Some(tr) = s.trait_ else { continue };
                     let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Err(program(format!("a trait that is no path"), r)) };
                     for &tn in v.segments(v.path(tp)?)? {
-                        arg_types(v, &lf::Segment::decode(tn)?, r, out)?;
+                        arg_types_into(v, &lf::Segment::decode(tn)?, r, out)?;
                     }
                 } else {
-                    arg_types(v, &s, r, out)?;
+                    arg_types_into(v, &s, r, out)?;
                 }
             }
         }
@@ -2015,14 +2358,16 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
                     }
                     continue;
                 }
-                out.push(p.ty.ok_or(Why::Unsupported("a fn pointer parameter with no type", r))?);
+                out(p.ty.ok_or(Why::Unsupported("a fn pointer parameter with no type", r))?);
             }
-            out.extend(ret);
+            if let Some(ret) = ret {
+                out(ret);
+            }
         }
         lf::TypeRef::Dyn(bounds) => {
             for &b in v.rows(bounds)? {
                 if let Some((_, seg)) = super::dyn_ty::dyn_bound(v, lf::Bound::decode(b)?, r)? {
-                    super::dyn_ty::dyn_arg_types(v, &seg, r, out)?;
+                    super::dyn_ty::dyn_arg_types_into(v, &seg, r, out)?;
                 }
             }
         }
@@ -2031,18 +2376,18 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
         lf::TypeRef::Impl(_) => {}
         // A signature's type macro is expanded from its own text ([`super::pattern_ty`]).
         lf::TypeRef::Macro(_) => {}
-        lf::TypeRef::Pat { base, .. } => out.push(base),
+        lf::TypeRef::Pat { base, .. } => out(base),
         lf::TypeRef::Record(fields) => {
             // Yield record field and spread types in written order so `make()` and
             // `record_regions()` align `rows[i]` with `kids[i]` before expanding spreads and
             // sorting into canonical alphabetical field-name order.
             for &n in v.rows(fields)? {
-                out.push(lf::Field::decode(n)?.ty);
+                out(lf::Field::decode(n)?.ty);
             }
         }
         lf::TypeRef::For { binder, inner } => {
             super::preds::lifetimes_only(v, binder, r)?;
-            out.push(inner);
+            out(inner);
         }
         lf::TypeRef::Error => return Err(Why::Unsupported("this type", r)),
     }
@@ -2585,7 +2930,7 @@ impl<'c> Captures<'c> {
 pub struct ContainerParamBound {
     pub param: u32,
     pub trait_: ItemKey,
-    pub regions: Vec<Region, Alloc<'static>>,
+    pub regions: blaze_own::Vec<Region, Alloc<'static>>,
 }
 
 /// What a container's member's region walk is given for `Self` and for bounds on the container's
@@ -2623,7 +2968,7 @@ pub struct RegionSink<'s> {
     slots: Vec<Slot, Alloc<'s>>,
     frags: Vec<Frag, Alloc<'s>>,
     /// Each elided lifetime's site, by its id.
-    elided: Vec<Range, Alloc<'s>>,
+    elided: blaze_own::Vec<Range, Alloc<'s>>,
     /// `Self`'s regions where `Self` is a type (an impl's self type, numbered as its members'
     /// container group); `None` where they are not known.
     self_slots: Option<Vec<Region, Alloc<'s>>>,
@@ -2633,13 +2978,13 @@ pub struct RegionSink<'s> {
     impl_trait: Option<Vec<Region, Alloc<'s>>>,
     /// The container's non-higher-ranked trait bounds on its type parameters: `(param, trait_,
     /// start, len)` indexing `param_bound_regions`.
-    param_bounds: Vec<(u32, ItemKey, u32, u32), Alloc<'s>>,
-    param_bound_regions: Vec<Region, Alloc<'s>>,
+    param_bounds: blaze_own::Vec<(u32, ItemKey, u32, u32), Alloc<'s>>,
+    param_bound_regions: blaze_own::Vec<Region, Alloc<'s>>,
     /// The captured lifetime count of each opaque type of the item being made.
-    opaques: Vec<(ItemKey, u32), Alloc<'s>>,
+    opaques: blaze_own::Vec<(ItemKey, u32), Alloc<'s>>,
     /// The regions each of `opaques` captures, one run per opaque ([`Captures`]).
-    captured: Vec<Region, Alloc<'s>>,
-    scratch: Vec<Slot, Alloc<'s>>,
+    captured: blaze_own::Vec<Region, Alloc<'s>>,
+    scratch: blaze_own::Vec<Slot, Alloc<'s>>,
     refused: Option<RegionRefusal>,
     /// The part of the signature being laid ([`RegionSink::set_part`]).
     part: SigPart,
@@ -2653,14 +2998,14 @@ impl<'s> RegionSink<'s> {
             alloc,
             slots: Vec::new_in(alloc),
             frags: Vec::new_in(alloc),
-            elided: Vec::new_in(alloc),
+            elided: blaze_own::Vec::new_in(alloc),
             self_slots: None,
             impl_trait: None,
-            param_bounds: Vec::new_in(alloc),
-            param_bound_regions: Vec::new_in(alloc),
-            opaques: Vec::new_in(alloc),
-            captured: Vec::new_in(alloc),
-            scratch: Vec::new_in(alloc),
+            param_bounds: blaze_own::Vec::new_in(alloc),
+            param_bound_regions: blaze_own::Vec::new_in(alloc),
+            opaques: blaze_own::Vec::new_in(alloc),
+            captured: blaze_own::Vec::new_in(alloc),
+            scratch: blaze_own::Vec::new_in(alloc),
             refused: None,
             part: SigPart::Whole,
             refused_part: SigPart::Whole,
@@ -2682,6 +3027,38 @@ impl<'s> RegionSink<'s> {
         self.self_slots.as_deref()
     }
 
+    /// Snapshot of slot, elided-site and refusal state before walking a type macro's expansion.
+    pub(super) fn mark_expansion(&self) -> (usize, usize, bool) {
+        (self.slots.len(), self.elided.len(), self.refused.is_some())
+    }
+
+    /// Rewrites ranges recorded while walking a type macro's expansion (which are relative to
+    /// the expanded text) to the macro call's range `at` in the enclosing item.
+    pub(super) fn remap_expansion_ranges(&mut self, mark: (usize, usize, bool), at: Range) {
+        let (slots_from, elided_from, had_refused) = mark;
+        for slot in self.slots.get_mut(slots_from..).into_iter().flatten() {
+            match &mut slot.kind {
+                SlotKind::Named(_, r) | SlotKind::ObjectDefault(r) => *r = at,
+                _ => {}
+            }
+        }
+        for r in self.elided.get_mut(elided_from..).into_iter().flatten() {
+            *r = at;
+        }
+        if !had_refused
+            && let Some(why) = &mut self.refused
+        {
+            match why {
+                RegionRefusal::Undeclared { at: r }
+                | RegionRefusal::LifetimeArgs { at: r, .. }
+                | RegionRefusal::ObjectDefault { at: r }
+                | RegionRefusal::NotLaid { at: r, .. }
+                | RegionRefusal::NoType { at: r } => *r = at,
+                RegionRefusal::Regions(_) | RegionRefusal::NoContainer { .. } => {}
+            }
+        }
+    }
+
     /// The impl's trait reference's column for the types made next, in the numbering `Self`'s
     /// regions are in (`None`: none or not known; a `Self::Name` of a trait with lifetimes is
     /// then refused by name).
@@ -2699,9 +3076,10 @@ impl<'s> RegionSink<'s> {
         self.param_bounds.clear();
         self.param_bound_regions.clear();
         for b in bounds {
-            let start = self.param_bound_regions.len() as u32;
+            let start = u32::try_from(self.param_bound_regions.len()).unwrap_or(u32::MAX);
             self.param_bound_regions.extend_from_slice(&b.regions);
-            self.param_bounds.push((b.param, b.trait_, start, b.regions.len() as u32));
+            let len = u32::try_from(b.regions.len()).unwrap_or(u32::MAX);
+            self.param_bounds.push((b.param, b.trait_, start, len));
         }
     }
 
@@ -2770,12 +3148,12 @@ impl<'s> RegionSink<'s> {
 
     /// The site of the elided lifetime `id`.
     pub fn elided_at(&self, id: u32) -> Option<Range> {
-        self.elided.get(id as usize).copied()
+        usize::try_from(id).ok().and_then(|i| self.elided.get(i).copied())
     }
 
     /// A new elided lifetime at `at`.
     pub fn new_elided(&mut self, at: Range) -> SlotKind {
-        let id = self.elided.len() as u32;
+        let id = u32::try_from(self.elided.len()).unwrap_or(u32::MAX);
         self.elided.push(at);
         SlotKind::Elided(id)
     }
@@ -3142,7 +3520,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::QualifiedNoTrait, r))) };
                 let tsegs = path_texts(v, tp)?.2;
                 let nt = tsegs.len();
-                for (j, ts) in tsegs.into_iter().enumerate() {
+                for (j, &ts) in tsegs.iter().enumerate() {
                     todo.push((ts, if j + 1 == nt { SegRole::QualifiedTrait } else { SegRole::Early }));
                 }
             } else {
@@ -3377,7 +3755,49 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         None => {
                             let sub = soft!(subtree(tys.view(), a, &arity, alloc));
                             if sub.slots != 0 {
-                                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                                let raw_default = self.heads.adt_generics(found.key).and_then(|(_, ds)| ds.get(i).copied().flatten());
+                                let Some(raw_default) = raw_default else {
+                                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                                };
+                                let mut visits: blaze_own::Vec<(PTy, PNode, u32), Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+                                soft!(each_slot_node(tys.view(), raw_default, &arity, alloc, &mut |t, node, own| {
+                                    visits.push((t, node, own));
+                                    Ok(())
+                                }));
+                                let Ok(cap) = usize::try_from(sub.slots) else {
+                                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                                };
+                                let mut added: blaze_own::Vec<Slot, Alloc<'_>> = blaze_own::Vec::with_capacity_in(cap, alloc);
+                                let mut db = 0u32;
+                                for &(_, node, own) in &visits {
+                                    if let PNode::Param(p) = node
+                                        && let Ok(pi) = usize::try_from(p)
+                                        && let Some(&(start, len, b)) = index.get(pi)
+                                        && let (Ok(st), Ok(ln)) = (usize::try_from(start), usize::try_from(len))
+                                        && let Some(slice) = st.checked_add(ln).and_then(|end| pool.get(st..end))
+                                    {
+                                        for &slot in slice {
+                                            let slot = match slot.kind {
+                                                SlotKind::ObjectDefault(_) if want == 0 => Slot::quiet(SlotKind::Static),
+                                                SlotKind::ObjectDefault(oat) => return Ok(Err(RegionRefusal::ObjectDefault { at: oat })),
+                                                _ => Slot::quiet(slot.shifted(binders + db).kind),
+                                            };
+                                            added.push(slot);
+                                        }
+                                        db += b;
+                                        continue;
+                                    }
+                                    if own != 0 {
+                                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                                    }
+                                    if is_binder(node) {
+                                        db += 1;
+                                    }
+                                }
+                                if u32::try_from(added.len()).ok() != Some(sub.slots) || db != sub.binders {
+                                    return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DefaultArg, r)));
+                                }
+                                s.scratch.extend_from_slice(&added);
                             }
                             binders += sub.binders;
                         }
@@ -3591,11 +4011,10 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         }
                         (matched, conflict)
                     });
-                if trait_count == 0 {
-                    if let Some((Some(m), false)) = container_match {
-                        param_bound_col = Some(m);
-                    }
-                } else {
+                if let Some((Some(m), false)) = container_match {
+                    param_bound_col = Some(m);
+                }
+                if trait_count != 0 {
                     let mut found = 0u32;
                     for &n in v.rows(v.list(blaze_lower::head::GENERICS))? {
                         if let lf::GenericParam::Type { name: pn, bounds, .. } = lf::GenericParam::decode(n)?
@@ -3634,7 +4053,6 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 }
                                 slots.extend(lead.iter().map(|&g| Slot::quiet(SlotKind::Given(g))));
                                 param_bound_col = Some((bs, be));
-                                found = 1;
                             }
                             _ => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::ProjectionBoundElsewhere, r))),
                         }
@@ -3921,7 +4339,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let Some((p, _)) = super::dyn_ty::dyn_bound(v, lf::Bound::decode(b)?, r)? else { continue };
                 let (abs, texts, _, pr) = path_texts_of(v, p, true)?;
                 if let Ok(Bounded::Trait(key)) = self.bound_target(env, v, p, abs, &texts, pr) {
-                    let mut work: Vec<LibKey, Alloc<'_>> = Vec::new_in(alloc);
+                    let mut work: blaze_own::Vec<LibKey, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
                     work.push(key);
                     let mut next = 0usize;
                     while next < work.len() && work.len() < 64 {
@@ -3933,7 +4351,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         }
                         if let Some(supers) = self.heads.trait_supers(k) {
                             for &(sk, _) in supers {
-                                if !work.contains(&sk) {
+                                if work.scan_for(&sk).is_none() {
                                     work.push(sk);
                                 }
                             }

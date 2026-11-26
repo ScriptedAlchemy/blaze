@@ -55,6 +55,9 @@ pub trait Layout {
     /// Whether `ty` is not `Freeze`: an `UnsafeCell` held by value somewhere in it
     /// (blaze-build's `Layouts::interior_mut`).
     fn interior_mut(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, Stop>;
+    /// Whether `ty` passes a validity assertion (`assert_inhabited`, `assert_zero_valid`,
+    /// `assert_mem_uninitialized_valid`), answered by blaze-build's exact check.
+    fn permits(&mut self, check: blaze_build::intrinsics::validity::Check, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, Stop>;
 }
 
 fn stop(e: &blaze_build::layout::LayoutError) -> Stop {
@@ -66,11 +69,17 @@ fn stop(e: &blaze_build::layout::LayoutError) -> Stop {
         L::Recursive => Refusal::Malformed { what: "a type that holds itself by value" },
         L::TooLarge => Refusal::Unsupported { what: "a type larger than `isize::MAX` bytes" },
         L::NoAdt(item) => Refusal::Missing { what: "ADT definition", item },
-        L::Ground(ref error) => match projection_of(error) {
-            Some((trait_, name)) => Refusal::Projection { trait_, name },
-            None => Refusal::Unsupported { what: "a field type with no ground form" },
+        L::Ground(ref error) => match *error {
+            blaze_build::BuildError::OpaqueOwnerUnchecked { owner, .. } => Refusal::Missing { what: "opaque defining body", item: owner },
+            _ => match projection_of(error) {
+                Some((trait_, name)) => Refusal::Projection { trait_, name },
+                None => Refusal::Unsupported { what: "a field type with no ground form" },
+            },
         },
-        L::FieldGround { adt, field, name, ref error } => Refusal::FieldGround { adt, field, name, projection: projection_of(error) },
+        L::FieldGround { adt, field, name, ref error } => match *error {
+            blaze_build::BuildError::OpaqueOwnerUnchecked { owner, .. } => Refusal::Missing { what: "opaque defining body", item: owner },
+            _ => Refusal::FieldGround { adt, field, name, projection: projection_of(error) },
+        },
         L::NoSize(item) => Refusal::NoSize { item },
     })
 }
@@ -91,7 +100,10 @@ impl<A: Allocator + Clone> Layout for Layouts<A> {
         let id = self.of(ty, cx).map_err(|e| stop(&e))?;
         let row = match self.get(id).variants {
             blaze_build::layout::Variants::Multiple { .. } => self.variant(id, variant).ok_or(NO_ROW)?,
-            blaze_build::layout::Variants::Single { .. } => id,
+            blaze_build::layout::Variants::Single { index } if index == variant => id,
+            // An absent enum variant (blaze-build layout.rs `enum_`): uninhabited and every
+            // field is a 1-ZST (size 0, align 1), so every valid field sits at offset 0.
+            blaze_build::layout::Variants::Single { .. } => return Ok(0),
         };
         Ok(Layouts::field_offset(self, row, field).ok_or(NO_ROW)?)
     }
@@ -103,6 +115,10 @@ impl<A: Allocator + Clone> Layout for Layouts<A> {
 
     fn interior_mut(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, Stop> {
         Layouts::interior_mut(self, ty, cx).map_err(|e| stop(&e))
+    }
+
+    fn permits(&mut self, check: blaze_build::intrinsics::validity::Check, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<bool, Stop> {
+        blaze_build::intrinsics::validity::permits(check, ty, self, cx).map_err(|e| stop(&e))
     }
 
     fn tag(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<Tag, Stop> {
@@ -187,15 +203,15 @@ pub(crate) fn int_size(n: PNode) -> Option<u64> {
 /// How many struct tails [`is_unsized`] follows before it refuses (rule 18).
 const TAIL_DEPTH: u32 = 64;
 
-/// Whether a pointer to `pointee` is wide (pointer and length): a slice, `str`, or a struct
-/// whose last field is, followed through each struct's last field (the Reference, "Dynamically
-/// sized types": "a struct may contain a DST as the last field ... making the struct itself a
-/// DST"; core's `CStr { inner: [c_char] }`).
+/// Whether a pointer to `pointee` is wide (pointer and metadata: slice length or vtable): a
+/// slice, `str`, trait object (`dyn Trait`), or a struct whose last field is, followed through
+/// each struct's last field (the Reference, "Dynamically sized types": "a struct may contain a
+/// DST as the last field ... making the struct itself a DST"; core's `CStr { inner: [c_char] }`).
 pub fn is_unsized<W: LayoutFacts>(world: &W, g: &mut PortableTys<'_>, pointee: PTy, scratch: Alloc<'_>) -> Result<bool, Refusal<'static>> {
     let mut t = pointee;
     for _ in 0..TAIL_DEPTH {
         match g.view().node(t).map_err(|_| bad())? {
-            PNode::Slice(_) | PNode::Str => return Ok(true),
+            PNode::Slice(_) | PNode::Str | PNode::Dynamic(_) => return Ok(true),
             PNode::Adt(key, args) => {
                 let Some(adt) = world.adt(key) else { return Err(Refusal::Missing { what: "ADT definition", item: key }) };
                 if adt.kind != blaze_typeck::AdtKind::Struct {
@@ -232,8 +248,10 @@ pub(crate) fn field_ty(key: ItemKey, adt: &Adt<'_>, field: u32, args: List, grou
     let f = adt.fields.get(field as usize).ok_or(Refusal::Malformed { what: "a field past its ADT" })?;
     let mut a: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
     a.extend_from_slice(ground.view().list(args).map_err(|_| bad())?);
-    blaze_build::ground(adt.types, f.ty, &a, ground, scratch, facts)
-        .map_err(|e| Refusal::FieldGround { adt: key, field, name: f.name, projection: projection_of(&e) })
+    blaze_build::ground(adt.types, f.ty, &a, ground, scratch, facts).map_err(|e| match e {
+        blaze_build::BuildError::OpaqueOwnerUnchecked { owner, .. } => Refusal::Missing { what: "opaque defining body", item: owner },
+        _ => Refusal::FieldGround { adt: key, field, name: f.name, projection: projection_of(&e) },
+    })
 }
 
 #[cfg(test)]

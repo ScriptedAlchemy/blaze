@@ -301,6 +301,86 @@ fn a_locked_crate_on_the_checkout_is_refused_by_name() {
     }
 }
 
+/// Under a scoped start, a locked crate outside the active unit closure that depends on a
+/// checkout crate (e.g. a `[patch.crates-io]` vendor crate) is skipped rather than refusing the
+/// whole start; when that locked crate IS in scope, it is still refused by name.
+#[test]
+fn a_scoped_run_ids_skips_out_of_scope_locked_crate_on_the_checkout() {
+    let mut t = table([1; 32]);
+    t.0[3].deps = &[4];
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
+    let tools = tools();
+    let heap = blaze_own::testing::heap();
+    let out_of_scope = crate::engine_check::ScopedUnits::from_allowed(&[true, true, true, false, true], heap.alloc());
+    let ids = RunIds::new_scoped(&cx, ToolchainId([7; 32]), &t, Some(&out_of_scope), &tools, &[], &[], &mut Looked(SortedToday::EMPTY), None, Most::USUAL, blaze_own::testing::bump())
+        .unwrap_or_else(|e| panic!("out-of-scope locked crate blocked scoped RunIds: {e}"));
+    assert_eq!(ids.grain(item(DEP_A, 1)), Some(Grain::Dependency), "in-scope locked crate is keyed");
+    assert_eq!(ids.grain(item(APP, 1)), Some(Grain::Workspace), "in-scope checkout crate is keyed");
+    assert_eq!(ids.grain(item(DEP_B, 1)), None, "out-of-scope locked crate is omitted from the scoped table");
+    let in_scope = crate::engine_check::ScopedUnits::from_allowed(&[true, true, true, true, true], heap.alloc());
+    match RunIds::new_scoped(&cx, ToolchainId([7; 32]), &t, Some(&in_scope), &tools, &[], &[], &mut Looked(SortedToday::EMPTY), None, Most::USUAL, blaze_own::testing::bump()) {
+        Err(RunIdsError::LockedReadsWorkspace { krate: "b", dep: "app" }) => {}
+        Err(other) => panic!("control refused otherwise: {other}"),
+        Ok(_) => panic!("control: in-scope locked crate on the checkout was keyed"),
+    }
+}
+
+/// A locked crate depending on a non-member checkout dependency (`Place::CheckoutDep`, e.g. a
+/// `[patch.crates-io]` vendored crate) is keyed coarsely as `Grain::Dependency`, and both its
+/// digest and the checkout dep's digest move when the checkout dep's inputs change.
+#[test]
+fn a_locked_crate_on_a_checkout_dep_is_keyed_and_moves_with_it() {
+    struct DepAnswer {
+        scope: Name,
+        digest: Option<[u8; 32]>,
+    }
+    impl Today for DepAnswer {
+        fn out(&self, _name: Name) -> Option<ContentId> {
+            None
+        }
+        fn cell(&self, _name: Name, _cell: Cell) -> Option<ContentId> {
+            None
+        }
+    }
+    impl Answer for DepAnswer {
+        fn open(&mut self, _cx: &Cx, _name: Name, _seen: &mut dyn FnMut(Seen<'_>) -> Result<(), RunIdsError<'static>>) -> Result<bool, RunIdsError<'static>> {
+            Ok(false)
+        }
+        fn skipped(&self, _file: Name) -> bool {
+            false
+        }
+        fn body(&mut self, _cx: &Cx, _check: Name, _tool: Tool, _known: Option<(ContentId, Name)>, out: &mut BodyScratch<'_>) -> Result<Option<BodyFacts>, RunIdsError<'static>> {
+            out.clear();
+            Ok(None)
+        }
+        fn checkout_dep_digest(&self, scope: Name, _alloc: Alloc<'_>) -> Result<Option<[u8; 32]>, RunIdsError<'static>> {
+            Ok((scope == self.scope).then_some(self.digest).flatten())
+        }
+    }
+    const VENDOR: u8 = 6;
+    let mut t = table([1; 32]);
+    t.0.push(Row { byte: VENDOR, name: "vendor_dep", place: Place::CheckoutDep, deps: &[1] });
+    t.0[3].deps = &[5]; // locked crate `b` depends on `vendor_dep`
+    let scope = blaze_drive::key::crate_scope_name(&CrateItemKey(ContentId([VENDOR; 32])));
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
+    let tools = tools();
+    let run = |digest: Option<[u8; 32]>| {
+        let mut ans = DepAnswer { scope, digest };
+        RunIds::new(&cx, ToolchainId([7; 32]), &t, &tools, &[], &[], &mut ans, None, Most::USUAL, blaze_own::testing::bump())
+    };
+    let before = run(Some([0x11; 32])).unwrap_or_else(|e| panic!("before: {e}"));
+    let after = run(Some([0x22; 32])).unwrap_or_else(|e| panic!("after: {e}"));
+    assert_eq!(before.grain(item(VENDOR, 1)), Some(Grain::Dependency));
+    assert_eq!(before.grain(item(DEP_B, 1)), Some(Grain::Dependency));
+    let b_before = before.body_check(item(DEP_B, 1)).expect("b before");
+    let b_after = after.body_check(item(DEP_B, 1)).expect("b after");
+    assert_ne!(b_before.reads[0].digest, b_after.reads[0].digest, "checkout dep change must move locked crate digest");
+    // Control: missing checkout dep digest is refused by name, never guessed.
+    assert!(matches!(run(None), Err(RunIdsError::Unplaced { krate: "vendor_dep", .. })));
+}
+
 /// A body whose file's `Owners` out (or the `UnitGraph`'s) the command does not know today is
 /// not keyed with a guessed `ABSENT`: it is `NotToday` naming the missing name, and not `Clean`.
 /// CONTROL: with both known it is `NoRecord` (the empty store), not `NotToday`.

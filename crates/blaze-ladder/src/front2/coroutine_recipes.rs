@@ -11,8 +11,8 @@
 use std::alloc::Global;
 use std::vec::Vec;
 
-use blaze_flow_lower::state_recipe::{StateRecipe, state_recipe};
-use blaze_flow_lower::{Refusal, lower_async};
+use blaze_flow_lower::state_recipe::StateRecipe;
+use blaze_flow_lower::{Refusal, lower_async_witness};
 use blaze_own::Alloc;
 use blaze_typeck as tc;
 
@@ -44,12 +44,15 @@ pub fn recipes_of<'n, S: NamesSource<'n>>(
     let langs = BorrowLangs::of(r.index);
     let facts = gather_facts(r, owner, done, langs, alloc);
     // Every fn's signature regions are its head record's, read in place (D148).
-    let reader = r.store.regions.reader(r.store.tys.alloc());
+    let reader = r.store.regions.reader(r.store.work_alloc());
     let nested = NestedFacts::new(facts.read_by(&reader, r.store.tys.view()));
     let tys = body.tys.view(&r.store.tys)?;
     let view = body.typeck.view(tys);
     for (ordinal, block) in blaze_build::coroutines_in(&view) {
-        let recipe = lower_async(&view, done, block, &nested, alloc).and_then(|lowered| state_recipe(&view, &lowered, Global));
+        // The WITNESS lowering (`one_call::Erased`), matching `exact_interior.rs`: what the state
+        // stores needs no region, so a region refusal of the borrow lowering never leaves an async
+        // block without its state recipe.
+        let recipe = lower_async_witness(&view, done, block, &nested, alloc).and_then(|w| w.state_recipe(&view, Global));
         rows.push((owner, ordinal, recipe));
     }
     Ok(())

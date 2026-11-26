@@ -797,6 +797,9 @@ pub trait Stable<T> {
     fn extend(&self, values: &[T]) -> Result<u32, Full>;
     /// Every element appended so far.
     fn as_slice(&self) -> &[T];
+    /// Resets the column to empty (`&mut self`: no live slices exist), retaining bounded backing
+    /// capacity for reuse.
+    fn clear(&mut self);
 }
 
 /// A [`Stable`] column at its cap: interned as `Limit::Table`.
@@ -838,6 +841,18 @@ impl<'a> OwnIndex<'a> {
         let found = self.list_index.find(hash, |id| lists.get(own_range(rows[id as usize])) == Some(tys))?;
         Some(rows[found as usize])
     }
+
+    fn clear(&mut self) {
+        self.node_index.clear();
+        if self.node_index.capacity() > 2048 {
+            self.node_index.shrink_to(256);
+        }
+        self.list_index.clear();
+        self.list_rows.clear();
+        if self.list_rows.capacity() > 2048 {
+            self.list_rows.shrink_to(256);
+        }
+    }
 }
 
 /// The `&self` form's own part: its columns and its index in a cell (borrowed only inside one
@@ -867,6 +882,7 @@ trait StableOwn {
     fn list_col(&self) -> &dyn Stable<PTy>;
     fn record_schema_col(&self) -> &dyn Stable<(RecordSchema, List)>;
     fn record_name_col(&self) -> &dyn Stable<Name>;
+    fn clear(&mut self);
 }
 
 fn table_full(_: Full) -> CheckError {
@@ -955,6 +971,14 @@ impl StableOwn for StableCols<'_> {
 
     fn record_name_col(&self) -> &dyn Stable<Name> {
         &*self.record_names
+    }
+
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.lists.clear();
+        self.record_schemas.clear();
+        self.record_names.clear();
+        self.index.get_mut().clear();
     }
 }
 
@@ -1241,6 +1265,28 @@ impl<'a> PortableTys<'a> {
             alloc,
         );
         Ok(PortableTys { base: None, alloc, own: Own::Stable(cols) })
+    }
+
+    /// Resets this table's own columns and interning index to empty (`&mut self`: no live views),
+    /// retaining bounded backing capacity for reuse across items.
+    pub fn clear(&mut self) {
+        self.base = None;
+        match &mut self.own {
+            Own::Owned { nodes, lists, record_schemas, record_names, index } => {
+                nodes.clear();
+                if nodes.capacity() > 2048 {
+                    nodes.shrink_to(256);
+                }
+                lists.clear();
+                if lists.capacity() > 2048 {
+                    lists.shrink_to(256);
+                }
+                record_schemas.clear();
+                record_names.clear();
+                index.clear();
+            }
+            Own::Stable(s) => s.clear(),
+        }
     }
 
     /// [`PortableTys::over`] with the own part in [`Stable`] columns ([`PortableTys::new_stable`]).
@@ -1716,6 +1762,41 @@ impl<'a> OwnTys<'a> {
     /// The number of own nodes.
     pub fn own_len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Copies the kept own columns into `alloc`.
+    pub fn clone_in<'b>(&self, alloc: Alloc<'b>) -> OwnTys<'b> {
+        let mut nodes = Vec::with_capacity_in(self.nodes.len(), alloc);
+        nodes.extend_from_slice(&self.nodes);
+        let mut lists = Vec::with_capacity_in(self.lists.len(), alloc);
+        lists.extend_from_slice(&self.lists);
+        let mut record_schemas = Vec::with_capacity_in(self.record_schemas.len(), alloc);
+        record_schemas.extend_from_slice(&self.record_schemas);
+        let mut record_names = Vec::with_capacity_in(self.record_names.len(), alloc);
+        record_names.extend_from_slice(&self.record_names);
+        OwnTys {
+            base_nodes: self.base_nodes,
+            base_lists: self.base_lists,
+            base_record_schemas: self.base_record_schemas,
+            base_record_names: self.base_record_names,
+            nodes,
+            lists,
+            record_schemas,
+            record_names,
+            whole: self.whole,
+        }
+    }
+
+    /// Appends one node to this body's table (`base` directly when `whole`, else this overlay's
+    /// own nodes). Used when patching a body's deferred anonymous constant arguments.
+    pub fn push_node(&mut self, base: &mut PortableTys<'_>, node: PNode) -> Result<PTy, CheckError> {
+        if self.whole {
+            return base.intern(node);
+        }
+        let own = u32::try_from(self.nodes.len()).map_err(|_| CheckError::Limit(crate::error::Limit::Table))?;
+        let id = self.base_nodes.checked_add(own).ok_or(CheckError::Limit(crate::error::Limit::Table))?;
+        self.nodes.push(node);
+        Ok(PTy(id))
     }
 
     /// The body's table: `base`'s first nodes and list entries as they were when the body

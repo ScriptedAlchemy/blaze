@@ -139,7 +139,7 @@ impl<'w> ProjectAsk<'w> {
         };
         let Some(module) = keys.library_in(names, trait_) else { return refuse(ProjectionWhy::NoLibraryTrait) };
         let spell = Spelling::fixed();
-        let alloc = store.tys.alloc();
+        let alloc = store.work_alloc();
         let blocks = BlockTraits::module(alloc);
         let self_ = SelfTy::None;
         let world = BodyWorld {
@@ -178,11 +178,11 @@ impl<'w> ProjectAsk<'w> {
             used.truncate(used_before);
             hit
         };
-        if pending_hit {
-            return refuse(ProjectionWhy::Solver(None));
-        }
         let fills = world.fills.into_inner();
         let gaps = world.gaps.into_inner();
+        if fills.is_empty() && gaps.is_empty() && pending_hit {
+            return refuse(ProjectionWhy::Solver(None));
+        }
         // Taken only when the world noted nothing to make or answer AND the answer is ground: while
         // a question is unanswered the solver leaves the goal pending and the term exports as
         // the projection itself, which `normalize_ground` would ask again until its round bound.

@@ -13,9 +13,9 @@
 use core::cell::RefCell;
 use core::fmt;
 
-use blaze_fetch::PackView;
+use blaze_fetch::{FileBytes, PackView};
 use blaze_id::{ContentId, CrateItemKey};
-use blaze_mem::{Frame, Tag};
+use blaze_mem::{Arena, Frame, Tag};
 use blaze_own::{AVec, Alloc, Bump, Erased};
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, Names, NamesError, SourceTexts, resolve_crates};
@@ -27,8 +27,13 @@ use edition::PackageEdition;
 
 pub mod library;
 
-/// The one target the ladder runs on.
+/// The host target the ladder runs on.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub const TRIPLE: &str = "aarch64-apple-darwin";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub const TRIPLE: &str = "aarch64-unknown-linux-gnu";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub const TRIPLE: &str = "x86_64-unknown-linux-gnu";
 
 /// The profile's atoms, beside the target's: the ladder builds as `dev`.
 const PROFILE: &[(&str, Option<&str>)] = &[("debug_assertions", None)];
@@ -153,6 +158,8 @@ pub struct Toolchain {
     units: Vec<Unit>,
     /// The target's cfg atoms, as the record states them.
     cfg: Vec<(String, Option<String>)>,
+    /// Shared arena for decompressing compressed `BLZFPK04` toolchain pack files on read.
+    arena: Arena,
 }
 
 impl Toolchain {
@@ -162,7 +169,7 @@ impl Toolchain {
     /// pattern type (`usize is 0..=HALF`) reads `target_pointer_width` as any crate's does.
     /// `alloc` is the caller's scratch for the target's cfg, copied out before this returns.
     pub fn none(alloc: Alloc<'_>) -> Toolchain {
-        Toolchain { units: Vec::new(), cfg: target_cfg(alloc) }
+        Toolchain { units: Vec::new(), cfg: target_cfg(alloc), arena: Arena::new(Tag::Other) }
     }
 
     /// Opens the shelf's pinned manifest and reads the packs of every unit reachable from bstd,
@@ -238,7 +245,7 @@ impl Toolchain {
             }
         }
         let cfg = view.cfg(TRIPLE).ok_or(CratesError::NoTarget)?.map(|(n, v)| (n.to_owned(), v.map(str::to_owned))).collect();
-        Ok(Toolchain { units, cfg })
+        Ok(Toolchain { units, cfg, arena: Arena::new(Tag::Other) })
     }
 }
 
@@ -247,7 +254,7 @@ impl Toolchain {
 /// one list that names every target atom (`target_pointer_width`, `target_os`, ..). Asserted
 /// equal in triple by the constant's name: [`TRIPLE`] is `aarch64-apple-darwin`.
 fn target_cfg(alloc: Alloc<'_>) -> Vec<(String, Option<String>)> {
-    let target = blaze_scope::task::Target::AARCH64_APPLE_DARWIN;
+    let target = blaze_scope::task::Target::host();
     let cfg = blaze_scope::task::Cfg::of(&target, &[], alloc);
     cfg.atoms().iter().map(|&(n, v)| (n.to_owned(), v.map(str::to_owned))).collect()
 }
@@ -282,6 +289,7 @@ impl<T> core::ops::Deref for Shared<'_, T> {
 pub struct Texts<'t> {
     user: &'t [(String, String)],
     packs: Shared<'t, PackView<'t>>,
+    arena: &'t Arena,
 }
 
 impl<'t> SourceTexts<'t> for Texts<'t> {
@@ -291,8 +299,15 @@ impl<'t> SourceTexts<'t> for Texts<'t> {
         }
         let rest = path.strip_prefix("/toolchain/")?;
         let (_, inner) = rest.split_once('/')?;
-        let file = self.packs.get(krate - 1)?.find(inner)?;
-        core::str::from_utf8(file.bytes).ok()
+        let entry = self.packs.get(krate - 1)?.find_entry(inner)?;
+        let local = self.arena.local();
+        match entry.read_in(&local).ok()? {
+            FileBytes::Borrowed(bytes) => core::str::from_utf8(bytes).ok(),
+            FileBytes::Owned(bytes) => {
+                let text = core::str::from_utf8(bytes.as_slice()).ok()?;
+                Some(local.alloc_str(text))
+            }
+        }
     }
 }
 
@@ -363,7 +378,7 @@ impl<'t> Inputs<'t> {
         // the strategy their records were cut under (the target list's), as Rust does with std.
         crate::panic_strategy::derive_cfg(&mut cfgs[0], user.panic);
         Ok(Inputs {
-            texts: Texts { user: user.files, packs: Shared::Owned(packs) },
+            texts: Texts { user: user.files, packs: Shared::Owned(packs), arena: &tc.arena },
             features: Shared::Owned(features),
             cfgs: Shared::Owned(cfgs),
             deps: Shared::Owned(deps),

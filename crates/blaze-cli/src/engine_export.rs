@@ -67,9 +67,20 @@ pub enum ExportCliError {
     /// Computing the program's entry roots failed.
     Roots { shown: AString<'static> },
     /// A reached workspace body did not check clean (the call/reachability gate, D151).
-    NotChecked { function: ItemKey, symbol: [u8; 32], why: NotRunnable },
+    NotChecked {
+        krate: AString<'static>,
+        function: ItemKey,
+        symbol: [u8; 32],
+        row: usize,
+        reached: usize,
+        compiled: usize,
+        cached: usize,
+        why: NotRunnable,
+    },
     /// Stepping an instance/static/TLS row in the reachability walk failed.
     Walk { symbol: [u8; 32], shown: AString<'static> },
+    /// Whole-program cross-function LIR inlining and LTO emission failed.
+    Lto { shown: AString<'static> },
     /// Making a special record (TLS getter or ender) failed.
     Special { what: &'static str, shown: AString<'static> },
     /// Reading a code or datum entry from the store failed.
@@ -118,13 +129,15 @@ impl fmt::Display for ExportCliError {
             ExportCliError::Native { shown } => write!(f, "blaze export: native image: {} (engine_native.rs)", shown.as_str()),
             ExportCliError::Builder { shown } => write!(f, "blaze export: code builder: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::Roots { shown } => write!(f, "blaze export: program roots: {} (engine_export.rs)", shown.as_str()),
-            ExportCliError::NotChecked { function, symbol, why } => write!(
+            ExportCliError::NotChecked { krate, function, symbol, row, reached, compiled, cached, why } => write!(
                 f,
-                "blaze export: reached fn {:#x} (symbol {}) may not be exported: {why} (engine_export.rs)",
+                "blaze export: reached fn {:#x} in crate `{}` (symbol {}; row {row}/{reached}, {compiled} compiled, {cached} cached) may not be exported: {why} (engine_export.rs)",
                 function.0,
+                krate.as_str(),
                 Hex(symbol)
             ),
             ExportCliError::Walk { symbol, shown } => write!(f, "blaze export: compiling symbol {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Lto { shown } => write!(f, "blaze export: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::Special { what, shown } => write!(f, "blaze export: building {what}: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::Store { symbol, shown } => write!(f, "blaze export: reading code entry {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::MissingEntry { symbol } => write!(f, "blaze export: code entry {} missing from store after step (engine_export.rs)", Hex(symbol)),
@@ -149,6 +162,17 @@ fn owned_str(text: &str, alloc: Alloc<'static>) -> AString<'static> {
     let mut s = String::new_in(alloc);
     s.push_str(text);
     s
+}
+
+fn crate_of_item(list: &blaze_world::crate_list::CrateList<'_>, item: ItemKey, alloc: Alloc<'static>) -> AString<'static> {
+    let b = item.0.to_be_bytes();
+    let prefix = [b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]];
+    for at in 0..blaze_world::crate_list::CrateGraph::len(list) {
+        if list.key(at).prefix() == prefix {
+            return owned_str(blaze_world::crate_list::CrateGraph::name(list, at), alloc);
+        }
+    }
+    owned_str("<unknown>", alloc)
 }
 
 fn owned_fmt(args: fmt::Arguments<'_>, frame: &Frame, alloc: Alloc<'static>) -> AString<'static> {
@@ -191,25 +215,6 @@ fn check_export_flags(flags: &crate::Flags<'_>) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Resident-daemon entry point for `blaze export` (dispatched from `daemon_server.rs`).
-#[expect(clippy::too_many_arguments, reason = "top-level command entry: each argument one capability extracted at daemon")]
-pub(crate) fn command_in_daemon(
-    cx: &Cx,
-    args: &bstd::args::Args,
-    fs: &Fs,
-    env: Option<&bstd::env::Env>,
-    net: Option<&bstd::net::Net>,
-    host: &bstd::host::Host,
-    clock: &bstd::clock::Clock,
-    rng: &mut bstd::rng::Rng,
-    out: &Out,
-    err: &Out,
-    phases: &mut Phases,
-    heap: &'static blaze_own::Heap,
-) -> Result<Status, CliError> {
-    command(cx, args, fs, env, net, host, clock, rng, out, err, phases, heap)
-}
-
 /// Top-level `blaze export` command entry point, dispatched from `main.rs`.
 #[expect(clippy::too_many_arguments, reason = "top-level command entry: each argument one capability extracted at main")]
 pub(crate) fn command(
@@ -243,10 +248,13 @@ pub(crate) fn command(
     let line = crate::run_line::LineOpts { live: false, ..line };
     let lined = crate::run_line::watched(cx, err, clock, line, |watch, _bg| {
         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
-        check_for_start(cx, Some(args), fs, env, net, host, rng, err, err, phases, heap, &flags, true, None, |standing, phases, _rng| {
+        check_for_start(cx, Some(args), fs, env, net, host, rng, err, err, phases, heap, &flags, true, crate::engine_check::StartScope::Bin(select), None, |standing, phases, _rng| {
             let (root, frame) = (standing.checkout, standing.frame);
             let select = run_package::Select { member: standing.member, ..select };
-            let picked = run_package::pick(cx, root, select, frame)?;
+            let picked = match standing.picked {
+                Some(picked) => picked,
+                None => run_package::pick(cx, root, select, frame)?,
+            };
             let summary = export_program(cx, standing, &picked, fs, output_flag, release, dist.as_ref(), phases, watch)?;
             write_start_profile(cx, root, phases, frame)?;
             let wall_ns = phases.since(started_ns);
@@ -267,12 +275,21 @@ struct ExportSummary<'f> {
     cached: usize,
     unkeyed: usize,
     stubs: usize,
+    lto_bodies: usize,
+    lto_inlined: usize,
 }
 
 /// How one walked row's entry bytes are held until assembly.
 enum RowOutcome<'a> {
     Keyed(CodeKey),
     Unkeyed(AVec<'a, u8>),
+    /// Whole-program cross-function LTO-optimized `CodeRecord` emitted for the host CPU
+    /// (`Machine::SME2 | Machine::CSSC | Machine::SHA3`), kept ephemeral in `export_bump` so
+    /// host-specific code never enters portable `HomeCodeStore` (Rule 25).
+    Lto {
+        record: AVec<'a, u8>,
+        vtable_data: AVec<'a, (CodeSymbol, AVec<'a, u8>)>,
+    },
     /// A non-root library/cold function that `blaze-build` cannot lower to LIR yet: replaced by a
     /// deterministic trap stub (`write(2, msg, len); _exit(125); brk #0`) that reports the exact
     /// refusal if ever called at runtime (same contract as `blaze-ladder/src/run.rs` `Stubs`).
@@ -574,6 +591,9 @@ fn export_program<'f>(
     let bump = erased.bump();
 
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
+    // Ensure the store is mapped before reading records: on a warm certificate hit, `engine_check`
+    // skipped pool tasks and never triggered `Store::map_all`.
+    standing.store.map_all(cx)?;
     let mut read = EngineRecords::new(heap.alloc());
     let seen = TreesSeen::default();
     let pack_dirs = SyncPackDirs::default();
@@ -605,11 +625,11 @@ fn export_program<'f>(
     let ids_line = ids.line(&asked, ids_ns);
 
     let overflow = if release {
-        blaze_ladder::run::OverflowChecks::Off
+        program::release_overflow(cx, root, frame)?
     } else {
         program::dev_overflow(cx, root, frame)?
     };
-    let panic_profile = program::dev_profile_panic(cx, root, frame)?;
+    let panic_profile = if release { program::release_profile_panic(cx, root, frame)? } else { program::dev_profile_panic(cx, root, frame)? };
     let panic_ladder = blaze_ladder::panic_strategy::of_profile(panic_profile);
     let export_panic = match panic_profile {
         blaze_manifest::layout::panic::ProfilePanic::Unwind => Panic::Unwind,
@@ -728,13 +748,114 @@ fn export_program<'f>(
     let root_count = roots.len();
 
     let mut next_row = 0usize;
+    {
+        let _walk_span = cx.span("export: walk reachable functions");
+        while next_row < walk.len() {
+            let row = next_row;
+            next_row += 1;
+            let tabled = walk.tabled(row);
+            let symbol = walk.symbol(row);
+            let kind = walk.kind(row);
+            let proof = ids.runnable(tabled).map_err(|why| {
+                let krate = crate_of_item(list, tabled, heap.alloc());
+                box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
+            })?;
+            match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
+                Ok(one) => match one.stepped {
+                    Stepped::Found(key) => {
+                        cached += 1;
+                        outcomes.push(RowOutcome::Keyed(key));
+                    }
+                    Stepped::Made(key) => {
+                        compiled += 1;
+                        outcomes.push(RowOutcome::Keyed(key));
+                    }
+                    Stepped::Unkeyed(_) => {
+                        unkeyed += 1;
+                        let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
+                        copied.extend_from_slice(scratch.made());
+                        outcomes.push(RowOutcome::Unkeyed(copied));
+                    }
+                },
+                Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
+                    let msg = bstd::mem::format_in!(frame, "blaze export: called unbuilt function: {why}");
+                    let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
+                    stubs += 1;
+                    outcomes.push(RowOutcome::UnbuiltStub(stub_bytes));
+                }
+                Err(why) => {
+                    return Err(box_err(
+                        ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                        heap,
+                    ));
+                }
+            }
+        }
+    }
+
+    // Whole-program demand-driven cross-function LIR inlining + host-ISA SOTA emission over
+    // workspace functions and their non-cold reachable callees (kept ephemeral in `export_bump`,
+    // never written into portable `HomeCodeStore`).
+    let mut lto_seeds: AVec<'_, usize> = Vec::new_in(alloc);
+    for (row, outcome) in outcomes.iter().enumerate() {
+        if walk.kind(row) == RowKind::Instance
+            && !matches!(outcome, RowOutcome::UnbuiltStub(_))
+            && ids.grain(walk.tabled(row)) == Some(crate::run_ids::Grain::Workspace)
+        {
+            lto_seeds.push(row);
+        }
+    }
+    let lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
+    let lto_out = {
+        let _lto_span = cx.span("export: workspace LTO");
+        blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
+            &walk,
+            lto_seeds.as_slice(),
+            |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
+            |tabled| ids.runnable(tabled).ok(),
+            &mut maker,
+            lto_opts,
+            alloc,
+            heap.alloc(),
+        )
+        .map_err(|why| {
+            box_err(
+                ExportCliError::Lto { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?
+    };
+    let lto_bodies = lto_out.bodies.len();
+    let lto_inlined = lto_out.total_inlined;
+    let mut extra_roots: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::new_in(alloc);
+    for body in lto_out.bodies {
+        if let Some(slot) = outcomes.get_mut(body.row) {
+            *slot = RowOutcome::Lto {
+                record: body.record,
+                vtable_data: body.vtable_data,
+            };
+        }
+        for decl in body.extra_declared {
+            extra_roots.push(decl);
+        }
+    }
+    for (tabled, name_bytes) in extra_roots {
+        walk.root::<RunError>((tabled, name_bytes.as_slice()), MOST_WALKED).map_err(|why| {
+            box_err(
+                ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+    }
     while next_row < walk.len() {
         let row = next_row;
         next_row += 1;
         let tabled = walk.tabled(row);
         let symbol = walk.symbol(row);
-        let kind = walk.kind(row);
-        let proof = ids.runnable(tabled).map_err(|why| box_err(ExportCliError::NotChecked { function: tabled, symbol: symbol.0, why }, heap))?;
+        let proof = ids.runnable(tabled).map_err(|why| {
+            let krate = crate_of_item(list, tabled, heap.alloc());
+            box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
+        })?;
         match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
             Ok(one) => match one.stepped {
                 Stepped::Found(key) => {
@@ -752,12 +873,6 @@ fn export_program<'f>(
                     outcomes.push(RowOutcome::Unkeyed(copied));
                 }
             },
-            Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
-                let msg = bstd::mem::format_in!(frame, "blaze export: called unbuilt function: {why}");
-                let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
-                stubs += 1;
-                outcomes.push(RowOutcome::UnbuiltStub(stub_bytes));
-            }
             Err(why) => {
                 return Err(box_err(
                     ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
@@ -797,6 +912,7 @@ fn export_program<'f>(
                     }
                     RowOutcome::Unkeyed(bytes) => statics::entry_record(bytes.as_slice())
                         .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?,
+                    RowOutcome::Lto { record, .. } => record.as_slice(),
                     RowOutcome::UnbuiltStub(bytes) => bytes.as_slice(),
                 };
                 let view = CodeView::read(rec_bytes)
@@ -837,6 +953,33 @@ fn export_program<'f>(
 
     for (row, outcome) in outcomes.iter().enumerate() {
         let symbol = walk.symbol(row);
+        if let RowOutcome::Lto { record, vtable_data } = outcome {
+            let raw_view = CodeView::read(record.as_slice())
+                .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "LTO code record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
+            let view = materialize_positionless(
+                symbol,
+                raw_view,
+                |item, site| names.records.source_position(item, site, alloc),
+                frame,
+                export_bump,
+                heap,
+            )
+            .map_err(|e| box_err(e, heap))?;
+            functions.push(Function { symbol, record: view, tier: Tier::Optimized });
+            for (vtable_sym, datum_bytes) in vtable_data.iter() {
+                push_datum(
+                    &mut data,
+                    &mut seen_data,
+                    &mut tls_count,
+                    Target { space: Space::Vtable, symbol: *vtable_sym },
+                    datum_bytes.as_slice(),
+                    frame,
+                    export_bump,
+                    heap,
+                )?;
+            }
+            continue;
+        }
         if let RowOutcome::UnbuiltStub(stub_bytes) = outcome {
             let view = CodeView::read(stub_bytes.as_slice())
                 .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "stub code record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
@@ -848,7 +991,7 @@ fn export_program<'f>(
                 .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
                 .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: symbol.0 }, heap))?,
             RowOutcome::Unkeyed(bytes) => bytes.as_slice(),
-            RowOutcome::UnbuiltStub(_) => continue,
+            RowOutcome::Lto { .. } | RowOutcome::UnbuiltStub(_) => continue,
         };
         let rec_bytes = statics::entry_record(entry_bytes)
             .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
@@ -894,6 +1037,22 @@ fn export_program<'f>(
                     export_bump,
                     heap,
                 )?;
+                statics::each_vtable_datum(
+                    entry_bytes,
+                    |vtable_sym, datum_bytes| {
+                        push_datum(
+                            &mut data,
+                            &mut seen_data,
+                            &mut tls_count,
+                            Target { space: Space::Vtable, symbol: vtable_sym },
+                            datum_bytes,
+                            frame,
+                            export_bump,
+                            heap,
+                        )
+                    },
+                    |why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "vtable entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap),
+                )?;
             }
             RowKind::ThreadLocal => {
                 push_datum(
@@ -905,6 +1064,22 @@ fn export_program<'f>(
                     frame,
                     export_bump,
                     heap,
+                )?;
+                statics::each_vtable_datum(
+                    entry_bytes,
+                    |vtable_sym, datum_bytes| {
+                        push_datum(
+                            &mut data,
+                            &mut seen_data,
+                            &mut tls_count,
+                            Target { space: Space::Vtable, symbol: vtable_sym },
+                            datum_bytes,
+                            frame,
+                            export_bump,
+                            heap,
+                        )
+                    },
+                    |why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "vtable entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap),
                 )?;
             }
         }
@@ -967,6 +1142,8 @@ fn export_program<'f>(
         cached,
         unkeyed,
         stubs,
+        lto_bodies,
+        lto_inlined,
     })
 }
 
@@ -1165,7 +1342,7 @@ fn print_summary(
         err.line(
             cx,
             format_args!(
-                "export stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} bytes={} wall={}ms",
+                "export stats: functions={} folded={} stubs={} data={} tls={} compiled={} cached={} unkeyed={} lto={} inlined={} bytes={} wall={}ms",
                 summary.exported.functions,
                 summary.exported.folded,
                 summary.stubs,
@@ -1174,6 +1351,8 @@ fn print_summary(
                 summary.compiled,
                 summary.cached,
                 summary.unkeyed,
+                summary.lto_bodies,
+                summary.lto_inlined,
                 summary.exported.len,
                 wall_ms
             ),

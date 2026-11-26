@@ -303,13 +303,32 @@ pub fn instance_key_normalized(
     facts: &dyn LayoutFacts,
     scratch: Alloc<'_>,
 ) -> Result<InstanceKey, BuildError> {
+    instance_key_normalized_own(code, args, from, None, ground, facts, scratch)
+}
+
+/// Like [`instance_key_normalized`], rewriting any `PNode::Future` of `own`'s body inside a
+/// projection to its `PNode::Coroutine` identity before normalizing.
+pub fn instance_key_normalized_own(
+    code: ContentId,
+    args: List,
+    from: PTys<'_>,
+    own: Option<&BodyView<'_>>,
+    ground: &mut PortableTys<'_>,
+    facts: &dyn LayoutFacts,
+    scratch: Alloc<'_>,
+) -> Result<InstanceKey, BuildError> {
     let malformed = |_| BuildError::Malformed { what: "an instance's arguments past the ground table" };
     let mut all: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
     all.extend_from_slice(ground.view().list(args).map_err(malformed)?);
     let given = all.len();
     for (at, node) in from.nodes().enumerate() {
         if matches!(node, PNode::Alias { .. }) {
-            let normalized = crate::instance::ground(from, PTy(at as u32), &all[..given], ground, scratch, facts)?;
+            let given_args = all.get(..given).ok_or(BuildError::Malformed { what: "an instance's arguments past the ground table" })?;
+            let ty = PTy(u32::try_from(at).map_err(|_| BuildError::Malformed { what: "a type index past u32" })?);
+            let normalized = match own {
+                Some(body) => crate::instance::ground_own(from, ty, given_args, body, ground, scratch, facts)?,
+                None => crate::instance::ground(from, ty, given_args, ground, scratch, facts)?,
+            };
             all.push(normalized);
         }
     }
@@ -382,6 +401,85 @@ pub fn reify_shim_key_args(target: Instance, ground: &mut PortableTys<'_>, scrat
     all.extend_from_slice(ground.view().list(target.args).map_err(malformed)?);
     all.push(ground.intern(PNode::FnDef(REIFY_SHIM_ITEM, List::EMPTY)).map_err(full)?);
     ground.intern_list(&all).map_err(full)
+}
+
+/// Synthetic item key naming the by-value `self` vtable shim of a trait method dispatched
+/// through a trait object (`FnOnce::call_once` on `Box<dyn FnOnce<Args>>`):
+/// `Instance { item: VTABLE_SHIM_ITEM, args: [PNode::FnDef(target.item, target.args)] }`.
+///
+/// The shim takes `(data_ptr: *mut Self, args..)` where `data_ptr` points to the concrete
+/// receiver in memory (e.g. a `Box`'s heap allocation), reads/moves the concrete `Self` out by
+/// value according to its Rust ABI, and calls `target` directly.
+pub const VTABLE_SHIM_ITEM: ItemKey = ItemKey(u128::from_be_bytes(*b"blaze-build vts1"));
+
+/// The `VTableShim` instance wrapping concrete by-value callee `callee`:
+/// `Instance { item: VTABLE_SHIM_ITEM, args: [PNode::FnDef(callee.item, callee.args)] }`.
+pub fn vtable_shim_instance(callee: Instance, ground: &mut PortableTys<'_>) -> Result<Instance, BuildError> {
+    let full = |_| BuildError::Malformed { what: "the ground table is full" };
+    let fn_ty = ground.intern(PNode::FnDef(callee.item, callee.args)).map_err(full)?;
+    let args = ground.intern_list(&[fn_ty]).map_err(full)?;
+    Ok(Instance { item: VTABLE_SHIM_ITEM, args })
+}
+
+/// If `instance` is a `VTableShim` (`item == VTABLE_SHIM_ITEM`, `args == [FnDef(target, args)]`),
+/// returns the underlying concrete callee `Instance`.
+pub fn vtable_shim_of(instance: Instance, ground: PTys<'_>) -> Option<Instance> {
+    if instance.item != VTABLE_SHIM_ITEM {
+        return None;
+    }
+    let &[fn_ty] = ground.list(instance.args).ok()? else { return None };
+    let PNode::FnDef(item, args) = ground.node(fn_ty).ok()? else { return None };
+    Some(Instance { item, args })
+}
+
+/// The list a `VTableShim` for `target` is keyed by over its tabled owner's code identity:
+/// `VTABLE_SHIM_ITEM` as a `FnDef`, `target.item` as a `FnDef`, then `target.args`. Distinct
+/// from the owner's own list, any `FnShim`, any `ReifyShim`, and any closure method list.
+pub fn vtable_shim_key_args(target: Instance, ground: &mut PortableTys<'_>, scratch: Alloc<'_>) -> Result<List, BuildError> {
+    let malformed = |_| BuildError::Malformed { what: "a vtable shim's target arguments past the ground table" };
+    let full = |_| BuildError::Malformed { what: "the ground table is full" };
+    let mut all: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
+    all.push(ground.intern(PNode::FnDef(VTABLE_SHIM_ITEM, List::EMPTY)).map_err(full)?);
+    all.push(ground.intern(PNode::FnDef(target.item, List::EMPTY)).map_err(full)?);
+    all.extend_from_slice(ground.view().list(target.args).map_err(malformed)?);
+    ground.intern_list(&all).map_err(full)
+}
+
+/// Synthetic item key naming the test report shim of a `#[test]` fn returning a `T: Termination`
+/// other than `()` (docs/v2/plan/design/test.md, piece 8):
+/// `Instance { item: TEST_REPORT_SHIM_ITEM, args: [PNode::FnDef(test, List::EMPTY)] }`.
+///
+/// The shim has C `main`'s signature `extern "C" fn(argc: i32, argv: *const *const c_char) -> i32`,
+/// ignores its arguments, calls `test()`, passes the returned value to
+/// `<R as Termination>::report`, and returns the resulting `ExitCode` byte zero-extended to `i32`.
+pub const TEST_REPORT_SHIM_ITEM: ItemKey = ItemKey(u128::from_be_bytes(*b"blaze-build trs1"));
+
+/// The test report shim instance wrapping monomorphic test fn `test`:
+/// `Instance { item: TEST_REPORT_SHIM_ITEM, args: [PNode::FnDef(test, List::EMPTY)] }`.
+pub fn test_report_shim_instance(test: ItemKey, ground: &mut PortableTys<'_>) -> Result<Instance, BuildError> {
+    let full = |_| BuildError::Malformed { what: "the ground table is full" };
+    let fn_ty = ground.intern(PNode::FnDef(test, List::EMPTY)).map_err(full)?;
+    let args = ground.intern_list(&[fn_ty]).map_err(full)?;
+    Ok(Instance { item: TEST_REPORT_SHIM_ITEM, args })
+}
+
+/// If `instance` is a test report shim (`item == TEST_REPORT_SHIM_ITEM`,
+/// `args == [FnDef(test, [])]`), returns the underlying test fn `ItemKey`.
+pub fn test_report_shim_of(instance: Instance, ground: PTys<'_>) -> Option<ItemKey> {
+    if instance.item != TEST_REPORT_SHIM_ITEM {
+        return None;
+    }
+    let &[fn_ty] = ground.list(instance.args).ok()? else { return None };
+    let PNode::FnDef(item, args) = ground.node(fn_ty).ok()? else { return None };
+    (args.len == 0).then_some(item)
+}
+
+/// The list a test report shim for `test` is keyed by over `test`'s code identity:
+/// `[FnDef(TEST_REPORT_SHIM_ITEM, [])]`. Distinct from `test`'s own empty argument list.
+pub fn test_report_shim_key_args(ground: &mut PortableTys<'_>) -> Result<List, BuildError> {
+    let full = |_| BuildError::Malformed { what: "the ground table is full" };
+    let marker = ground.intern(PNode::FnDef(TEST_REPORT_SHIM_ITEM, List::EMPTY)).map_err(full)?;
+    ground.intern_list(&[marker]).map_err(full)
 }
 
 /// The one function every type lowered at an instance passes through (signatures, locals,
