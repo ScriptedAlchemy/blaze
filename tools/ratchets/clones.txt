@@ -25,7 +25,7 @@ blaze-deflate	5
 blaze-dist	135
 blaze-dist-local	59
 blaze-drive	16
-blaze-emit	17
+blaze-emit	20
 blaze-engine	3
 blaze-expand	29
 blaze-fetch	12
@@ -47,13 +47,14 @@ blaze-inproc	3
 blaze-json	9
 blaze-keyed	4
 blaze-kit	15
-blaze-ladder	54
+blaze-ladder	55
 blaze-launch	4
 blaze-launch-rt	4
 blaze-launcher	2
 blaze-lint	6
 blaze-lint-defs	1
 blaze-lir	29
+blaze-llvm-abi	1
 blaze-lower	20
 blaze-manifest	243
 blaze-mem	5
@@ -64,7 +65,7 @@ blaze-new	7
 blaze-own	90
 blaze-pack	1
 blaze-pg	2
-blaze-proc-macro	82
+blaze-proc-macro	84
 blaze-producers	12
 blaze-profile	118
 blaze-protocol	10

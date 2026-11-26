@@ -18,6 +18,7 @@ blaze-columns	1
 blaze-core	3
 blaze-deflate	1
 blaze-fmt	35
+blaze-git	1
 blaze-glob	1
 blaze-graph	1
 blaze-hash	2
@@ -33,6 +34,7 @@ blaze-real	2
 blaze-rel	15
 blaze-report	1
 blaze-script	8
+blaze-sh	16
 blaze-sql	4
 blaze-squeeze	1
 blaze-std	5
