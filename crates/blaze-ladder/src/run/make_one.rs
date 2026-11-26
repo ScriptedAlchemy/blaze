@@ -117,11 +117,31 @@ impl<'a> BuiltLir<'a> {
     }
 }
 
-/// Destination for one built instance inside [`build_one`]: either emit an encoded `CodeStore`
-/// entry, or hand back the verified LIR and resolved reference tables for whole-program LTO.
+#[cfg(feature = "llvm")]
+pub mod source_unit;
+
+/// Destination for one built instance after its outside references are resolved.
 enum BuildSink<'e, 'a> {
-    Entry(&'e mut AVec<'a, u8>),
+    Code(CodeSink<'e, 'a>),
     Lir { alloc: Alloc<'a>, out: &'e mut Option<BuiltLir<'a>> },
+}
+
+enum CodeSink<'e, 'a> {
+    Entry(&'e mut AVec<'a, u8>),
+    #[cfg(feature = "llvm")]
+    Prepare(&'e mut dyn FnMut(Grounded<'_>)),
+}
+
+/// Verified LIR and the resolved tables passed to a release backend during the source walk.
+#[cfg(feature = "llvm")]
+pub struct Grounded<'a> {
+    pub body: blaze_lir::Verified<'a>,
+    pub names: &'a InstanceNames<'a>,
+    pub declared: &'a [Declared<'a>],
+    pub vtables: &'a [VtableDatum<'a>],
+    pub reads: &'a reads::ReadList,
+    pub traps: &'a [blaze_code::record::TrapSource],
+    pub routines: crate::front2::builtins_shim::Routines<'a>,
 }
 
 /// How many bodies were checked for a walk's makes: the claim "a run that finds every record
@@ -952,7 +972,7 @@ fn make_instance_timed<'a, P: FrontEnd, T: Typing<P>>(
     name: &[u8],
     entry: &mut AVec<'a, u8>,
 ) -> Result<(), RunError> {
-    let mut sink = BuildSink::Entry(entry);
+    let mut sink = BuildSink::Code(CodeSink::Entry(entry));
     run_instance_loop(program, typing, state, checks, tabled, name, &mut sink)
 }
 
@@ -2468,7 +2488,7 @@ fn resolve_and_emit_phase<'a, P: FrontEnd>(
             let _ = built_slot.take();
             return Ok(Phase2::Done);
         }
-        BuildSink::Entry(entry) => {
+        BuildSink::Code(sink) => {
             use blaze_core::wait::Clock as _;
             let routines = work.routines.bind(&mut funcs).map_err(|error| RunError::CodeRecord { function: name(), error })?;
             let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &c_statics, vtables: &vtables, tls: &built.thread_locals };
@@ -2482,14 +2502,23 @@ fn resolve_and_emit_phase<'a, P: FrontEnd>(
                 carried.push(VtableDatum { symbol: *symbol, datum: datum.as_slice() });
             }
             let read_list = work.reads.seal(&mut work.ground, work.alloc).map_err(|error| RunError::CodeRecord { function: name(), error: CodeRecordError::Reads(error) })?;
-            let emitted_from = work.clock.map(|c| c.now());
-            let made = make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
-                .map_err(|error| RunError::CodeRecord { function: name(), error })?;
-            if let (Some(c), Some(from)) = (work.clock, emitted_from) {
-                work.times.emit += c.now().saturating_sub(from);
-                work.times.last = Some(MadeSizes::of(name(), built, &made));
+            match sink {
+                CodeSink::Entry(entry) => {
+                    let emitted_from = work.clock.map(|c| c.now());
+                    let made = make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
+                        .map_err(|error| RunError::CodeRecord { function: name(), error })?;
+                    if let (Some(c), Some(from)) = (work.clock, emitted_from) {
+                        work.times.emit += c.now().saturating_sub(from);
+                        work.times.last = Some(MadeSizes::of(name(), built, &made));
+                    }
+                    entry.extend_from_slice(&made);
+                }
+                #[cfg(feature = "llvm")]
+                CodeSink::Prepare(prepare) => prepare(Grounded {
+                    body: built.func.verified(), names: &names, declared: &declared, vtables: &carried,
+                    reads: &read_list, traps: &built.traps, routines,
+                }),
             }
-            entry.extend_from_slice(&made);
             let _ = built_slot.take();
             if let Some((at, part)) = from_coroutine {
                 work.stash[at].parts[part] = None;
@@ -3136,6 +3165,26 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             (watch.report)(&sizes);
         }
         Ok(())
+    }
+
+    /// Prepare a reached instance in the same resolved phase that emits baseline records.
+    #[cfg(feature = "llvm")]
+    fn prepare<R>(&mut self, _grant: &G, tabled: ItemKey, name: &[u8], mut prepare: impl FnMut(Grounded<'_>) -> R) -> Result<R, RunError> {
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        self.construct(tabled)?;
+        let Some((program, state)) = self.made.as_mut() else {
+            return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made for release preparation" });
+        };
+        let mut prepared = None;
+        let made = run_instance_loop(program, &mut self.typing, state, &mut self.checks, tabled, name,
+            &mut BuildSink::Code(CodeSink::Prepare(&mut |body| prepared = Some(prepare(body)))));
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        made?;
+        prepared.ok_or(RunError::OneBody { key: tabled, why: "release preparation completed without a grounded body" })
     }
 
     /// Builds verified LIR and resolved outside references for one instance without emitting

@@ -1367,6 +1367,7 @@ dependencies = [
  "blaze-ids",
  "blaze-impls",
  "blaze-inproc",
+ "blaze-int",
  "blaze-launch",
  "blaze-launch-rt",
  "blaze-lir",

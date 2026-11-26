@@ -285,6 +285,12 @@ impl<'a> Roots<'a> {
         self.rows.row(i)
     }
 
+    /// Root instance symbols in the order their source instances were selected.
+    #[cfg(feature = "llvm")]
+    pub fn symbols(&self) -> &[Symbol] {
+        &self.symbols
+    }
+
     /// Root instance `i` with its symbol.
     pub fn root(&self, i: usize) -> RootRow<'_> {
         let (tabled, name) = self.rows.row(i);
