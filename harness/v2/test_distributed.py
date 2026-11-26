@@ -37,7 +37,7 @@ class DistributedLedgerTests(unittest.TestCase):
         source = patch.object(d.identity, "source", side_effect=current_source)
         source.start()
         self.addCleanup(source.stop)
-        for name in ("blaze", "blaze-launcher", "blaze-fact-shim", "blaze-dist-local", "blaze-serve"):
+        for name in ("blaze", "blaze-launcher", "blaze-fact-shim", "blaze-dist-local", "blaze-serve", "proc_macro_modules"):
             path = self.bin / name
             path.write_text(f"synthetic {name}; never executed\n")
             path.chmod(0o700)
@@ -96,6 +96,7 @@ class DistributedLedgerTests(unittest.TestCase):
             self.assertEqual(it.blaze, str(self.bin / "blaze"))
             self.assertEqual(it.dist_local, str(self.bin / "blaze-dist-local"))
             self.assertEqual(it.serve, str(self.bin / "blaze-serve"))
+            self.assertEqual(it.module_builder, str(self.bin / "proc_macro_modules"))
             self.assertEqual(it.env, {"BLAZE_LOCK": "write", "XDG_CACHE_HOME": str(Path(it.scratch) / "machine-cache")})
         self.assertEqual([(it["name"], it["verdict"]) for it in result["outcomes"]],
                          [("distv2-dev", "pass"), ("distv2-release", "pass")])
@@ -103,6 +104,14 @@ class DistributedLedgerTests(unittest.TestCase):
                          {"blaze", "blaze-launcher", "blaze-fact-shim", "blaze-dist-local", "blaze-serve"})
         self.assertEqual(json.loads((evidence / "build-identity.json").read_text()),
                          result["extra"]["build_identity"])
+
+    def test_missing_fixture_producer_is_refused_before_acceptance(self) -> None:
+        (self.bin / "proc_macro_modules").unlink()
+        with patch.object(d.distv2, "main") as acceptance:
+            result = self.invoke()
+        acceptance.assert_not_called()
+        self.assertIn("module_builder is not an executable file", result["outcomes"][0]["detail"])
+        self.assertIn(str(self.bin / "proc_macro_modules"), result["outcomes"][0]["detail"])
 
     def test_input_cannot_filter_profiles_disable_faults_or_replace_sealed_services(self) -> None:
         base = {"blaze": self.given.blaze, "out": self.given.out, "cores": 2, "daemon_memory_gb": 6}
@@ -296,6 +305,7 @@ class DistributedLedgerTests(unittest.TestCase):
         for call in acceptance.call_args_list:
             profile = call.args[0]
             self.assertEqual(profile.blaze, given.blaze)
+            self.assertEqual(profile.module_builder, str(self.bin / "proc_macro_modules"))
             self.assertEqual((profile.cores, profile.daemon_memory_gb), (2, 6))
 
 

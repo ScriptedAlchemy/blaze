@@ -2,7 +2,8 @@
 
 One typed JSON object (inline, a file, or `-`):
     blaze                  the source-built client, beside blaze-launcher, blaze-fact-shim,
-                           blaze-dist-local, blaze-serve and their services=true seal
+                           blaze-dist-local, blaze-serve, their services=true seal, and the
+                           source-built proc_macro_modules D52 fixture producer
     out                    a new ledger report path on a reflink filesystem
     cores                  required positive per-process core budget
     daemon_memory_gb       legacy input recorded in provenance
@@ -99,6 +100,7 @@ def profile_input(given: Input, blaze: Path, evidence: Path, name: str) -> Any:
         "blaze": str(blaze),
         "dist_local": str(blaze.parent / "blaze-dist-local"),
         "serve": str(blaze.parent / "blaze-serve"),
+        "module_builder": str(blaze.parent / "proc_macro_modules"),
         "scratch": str(scratch),
         "args": ["--release"] if name == "release" else [],
         "profile": "release" if name == "release" else "debug",
