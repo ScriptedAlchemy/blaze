@@ -5,12 +5,12 @@ use core::time::Duration;
 
 use blaze_int::Int as _;
 use blaze_own::{Vec, format_in};
-use blaze_wire::{Digest, PackRef, WireAlloc, json::hex};
+use blaze_wire::{Digest, LocalPolicy, PackRef, WireAlloc, json::hex};
 
 use crate::Error;
 use crate::blobs::Blobs;
 use crate::pack::BATCH_BYTES_TARGET;
-use crate::sys::{Receiver, Sender, TcpDeadline, channel, scope};
+use crate::sys::{Receiver, RecvTimeoutError, Sender, TcpDeadline, channel, scope};
 
 use super::{Config, ExportBudget, published_packs};
 
@@ -64,19 +64,28 @@ impl ReadAhead {
 
 impl<'a> ExportBudget<'a> {
     /// A scoped carrier can buffer one manifest and one bounded pack. The caller retains
-    /// one credit, returned only when it reaches that unit in plan order.
+    /// one credit, returned only when it reaches that unit in plan order. Explicit local
+    /// fallback reads in order so it cannot leave a speculative committed refusal behind.
     pub fn with_published_ahead<T>(
         config: &'a Config,
-        run: impl FnOnce(&mut ExportBudget<'a>) -> T,
+        run: impl for<'scope> FnOnce(&mut ExportBudget<'scope>) -> T,
     ) -> Result<T, Error> {
+        if !matches!(config.local, LocalPolicy::Never) {
+            return Ok(run(&mut Self::new(config)));
+        }
         let blobs = &config.blobs;
         let alloc = blobs.alloc;
-        let idle = config.deadline;
+        let idle = blobs.timeout.max(Duration::from_secs(1));
         scope(alloc, |scope| {
             let (ask, requests) = channel::<Request>(alloc);
             let (deliver, answers) = channel(alloc);
             let worker = scope.spawn(move || {
-                while let Ok(request) = requests.recv_timeout(idle) {
+                loop {
+                    let request = match requests.recv_timeout(idle) {
+                        Ok(request) => request,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    };
                     if deliver.send(read_publication(blobs, request)).is_err() {
                         break;
                     }

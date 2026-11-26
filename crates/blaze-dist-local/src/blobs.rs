@@ -281,24 +281,26 @@ impl Blobs {
 /// A read error at that point must never turn into permission to rebuild locally
 /// under the immutable key. Earlier IO failures remain subject to local policy.
 fn committed_get_head(method: &str, reply: &[u8]) -> bool {
-    if method != "GET" {
-        return false;
+    method == "GET" && response_status(reply) == Some(200)
+}
+
+fn response_status(reply: &[u8]) -> Option<u16> {
+    let mut fields = reply.split(|&byte| byte == b'\n').next()?
+        .split(u8::is_ascii_whitespace).filter(|field| !field.is_empty());
+    if !fields.next()?.starts_with(b"HTTP/1.") {
+        return None;
     }
-    let remaining =
-        reply.strip_prefix(b"HTTP/1.1 200").or_else(|| reply.strip_prefix(b"HTTP/1.0 200"));
-    remaining.is_some_and(|after| {
-        after.first().is_none_or(|&b| matches!(b, b' ' | b'\r' | b'\n'))
-    })
+    core::str::from_utf8(fields.next()?).ok()?.parse().ok()
 }
 
 fn read_failure(
     method: &str,
     path: &str,
-    reply: &[u8],
+    committed: bool,
     error: IoError,
     err_alloc: WireAlloc,
 ) -> Error {
-    if committed_get_head(method, reply) {
+    if committed {
         Error::Committed(format_in!(
             err_alloc,
             "{method} {path}: interrupted committed HTTP 200 reply: {error}"
@@ -340,7 +342,7 @@ fn read_response<A: Allocator>(
         };
         let read = stream
             .read_bytes(slice)
-            .map_err(|error| read_failure(method, path, &reply, error, err_alloc))?;
+            .map_err(|error| read_failure(method, path, committed_get_head(method, &reply), error, err_alloc))?;
         if read == 0 {
             return decode_response(method, path, reply, pack_ceiling, err_alloc);
         }
@@ -395,7 +397,7 @@ fn read_response<A: Allocator>(
                 }
             }
             Err(error) if error.is_interrupted() => continue,
-            Err(error) => return Err(read_failure(method, path, &reply, error, err_alloc)),
+            Err(error) => return Err(read_failure(method, path, method == "GET" && head.status == 200, error, err_alloc)),
         }
     }
     if reply.len().widen_to::<u64>() > most {
@@ -470,16 +472,7 @@ fn decode_head(
             invalid("the head is not text")
         }
     })?;
-    let status = head
-        .split("\r\n")
-        .next()
-        .and_then(|line| {
-            let mut fields = line.split_ascii_whitespace();
-            if !fields.next()?.starts_with("HTTP/1.") {
-                return None;
-            }
-            fields.next()?.parse::<u16>().ok()
-        })
+    let status = response_status(head.as_bytes())
         .ok_or_else(|| invalid("no HTTP/1 status"))?;
     // A successful GET names committed data. Bad framing must not permit
     // the caller to rebuild locally under that immutable cache key.
@@ -914,7 +907,7 @@ mod tests {
 
         let alloc = test_alloc();
         let path = "/v1/blob/packs/test.pack";
-        let prefix = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc";
+        let prefix = b"HTTP/1.1  200 OK\r\nContent-Length: 5\r\n\r\nabc";
         for (reader, committed) in [(&b""[..], false), (&prefix[..], true)] {
             let error = read_response(&mut ExpiresAfter(reader), "GET", path, Some(5), alloc, alloc).unwrap_err();
             if committed {
@@ -1121,8 +1114,9 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\npartial".as_slice(),
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\npart".as_slice(),
         ] {
-            let refused =
-                read_failure("GET", path, bytes, IoError::from_errno(Errno::TimedOut), alloc);
+            let refused = read_failure(
+                "GET", path, committed_get_head("GET", bytes), IoError::from_errno(Errno::TimedOut), alloc,
+            );
             assert!(
                 matches!(&refused, Error::Committed(why) if why.contains(path)),
                 "partial HTTP 200 must be a committed-state refusal: {refused}"
@@ -1150,7 +1144,7 @@ mod tests {
             ("PUT", b"HTTP/1.1 200 OK".as_slice()),
         ] {
             assert!(matches!(
-                read_failure(method, path, partial, IoError::from_errno(Errno::TimedOut), alloc),
+                read_failure(method, path, committed_get_head(method, partial), IoError::from_errno(Errno::TimedOut), alloc),
                 Error::Io(_)
             ));
         }
