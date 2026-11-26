@@ -1179,8 +1179,9 @@ mod tests {
         create_dir_all, current_pid, join_path, list_dir, lstat_info, open_create_new, open_read,
         remove_empty_dir, unlink_path, write_all_fd,
     };
+    use crate::temp_tests::scratch_root;
 
-    /// Test-only RAII temp directory rooted under `/tmp` with recursive cleanup on drop.
+    /// Test-only scratch directory with recursive cleanup on drop.
     pub(crate) struct TestDir {
         path: WireString,
         alloc: WireAlloc,
@@ -1190,7 +1191,9 @@ mod tests {
         pub(crate) fn new(tag: &str, alloc: WireAlloc) -> Self {
             let pid = current_pid();
             let stamp = SystemClock.monotonic_nanos().unwrap_or(0);
-            let path = format_in!(alloc.clone(), "/tmp/blaze-serve-{tag}-{pid}-{stamp}");
+            let root = scratch_root(alloc.clone());
+            let name = format_in!(alloc.clone(), "blaze-serve-{tag}-{pid}-{stamp}");
+            let path = join_path(root.as_str(), name.as_str(), alloc.clone());
             assert!(create_dir_all(path.as_str()).is_ok(), "create temp dir {}", path.as_str());
             Self { path, alloc }
         }

@@ -21,6 +21,8 @@ mod error;
 mod server;
 mod store;
 mod sys;
+#[cfg(test)]
+mod temp_tests;
 
 pub use blob::{Kind, ObjectName};
 pub use error::{Error, ErrorCode, ErrorMessage, ServeError};

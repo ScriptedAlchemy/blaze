@@ -10,6 +10,8 @@
 mod native_pack;
 #[path = "../src/sys/directory.rs"]
 mod directory;
+#[path = "../src/temp_tests.rs"]
+mod temp_tests;
 
 use core::ffi::c_void;
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -228,14 +230,16 @@ struct TempDir {
 impl TempDir {
     fn new(tag: &str, alloc: WireAlloc) -> Self {
         let pid = getpid();
+        let root = temp_tests::scratch_root(alloc.clone());
+        let base = root.trim_end_matches('/');
         for attempt in 0u64..100 {
             let stamp = now_stamp().saturating_add(attempt);
-            let path = format_in!(alloc.clone(), "/tmp/blaze-serve-it-{tag}-{pid}-{stamp}");
+            let path = format_in!(alloc.clone(), "{base}/blaze-serve-it-{tag}-{pid}-{stamp}");
             if mkdir_one(path.as_str()).is_ok() {
                 return Self { path, alloc };
             }
         }
-        panic!("could not create temporary directory for {tag}");
+        panic!("could not create temporary directory for {tag} under {root}");
     }
 
     fn path(&self) -> &str {
