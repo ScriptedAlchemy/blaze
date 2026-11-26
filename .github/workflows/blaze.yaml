@@ -36,7 +36,7 @@ jobs:
           timeout -k 15 600 python3 .github/scripts/llvm.py "$input"
           export LLVM_SYS_231_PREFIX="$prefix"
           tc="$(cat pins/toolchain)"
-          timeout -k 20 1800 cargo +"$tc" test --locked --keep-going --no-run -p blaze-ladder -p blaze-dist-local --lib \
+          timeout -k 20 1800 cargo +"$tc" test --locked --no-run -p blaze-ladder -p blaze-dist-local --lib \
             --features blaze-ladder/llvm --message-format=json-render-diagnostics > "$evidence/cargo.jsonl" 2> >(tee "$evidence/compile.stderr" >&2)
           test_bin() {
             # shellcheck disable=SC2016
