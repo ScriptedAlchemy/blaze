@@ -149,11 +149,16 @@ impl Limits {
 const RNG_SALT: u64 = 0x6273_7464_2e72_6e67;
 const STAGING_SALT: u64 = 0x6273_7464_2e74_6d70;
 
+#[cfg(target_os = "linux")]
+type NativeDriver = blaze_core::uring::DeferredUring;
+#[cfg(any(target_os = "macos", windows, target_os = "wasi"))]
+type NativeDriver = blaze_core::Native;
+
 /// The driver inside an [`Io`].
 enum Backend {
     #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
     // alloc: once per process, the driver.
-    Native(Box<blaze_core::Native>),
+    Native(Box<NativeDriver>),
     // alloc: once per simulated world.
     Sim(Box<Sim>),
     /// A hosted program's: every reach a call through its host's table ([`crate::guest`]).

@@ -2090,6 +2090,12 @@ pub trait Driver {
     fn inline_files(&self) -> Option<threads::inline::Inline> {
         None
     }
+
+    /// Descriptor-relative file operations provided by native Unix drivers. They need a kernel
+    /// confinement guarantee even where ordinary file I/O runs through a queue.
+    fn confined_files(&self) -> Option<fs::ConfinedFiles> {
+        None
+    }
 }
 
 /// The system's wall clock now, in nanoseconds since the Unix epoch: what every native

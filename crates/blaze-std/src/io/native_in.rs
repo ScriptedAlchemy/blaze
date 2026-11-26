@@ -23,7 +23,10 @@ impl Io {
             root: world.root.display().to_string(),
             why,
         };
+        #[cfg(target_os = "linux")]
+        let driver = super::NativeDriver::new(os, world.root);
         // alloc: an error's message.
+        #[cfg(not(target_os = "linux"))]
         let driver = blaze_core::native_in(os, world.root, world.threads).map_err(|error| refused(error.to_string()))?;
         // alloc: an error's message.
         let host = crate::native::host_facts(world.host_name, driver.now()).map_err(|error| refused(error.to_string()))?;

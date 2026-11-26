@@ -43,9 +43,12 @@
 //! a pointer; a provided buffer's id is checked against its group (`Provided::buffer`); and a
 //! ring offset against its mapping (`Mapping::at`), in every build.
 
+mod deferred;
 mod files;
 mod flight;
 mod ops;
+
+pub use deferred::DeferredUring;
 
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
@@ -1913,6 +1916,10 @@ static TEMPORARY: AtomicU64 = AtomicU64::new(1 << 63);
 impl Uring {
     /// A driver whose files are under `root`, or why this kernel has no ring for it.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Uring> {
+        Self::open(Arc::from(root.into()), Instant::now(), crate::boot::system())
+    }
+
+    fn open(root: Arc<Path>, start: Instant, boot: Result<crate::Boot, crate::NoBoot>) -> io::Result<Uring> {
         let ring = Ring::new(ENTRIES, COMPLETIONS)?;
         let offload = Offload::new()?;
         let table = Table::new(&ring.fd)?;
@@ -1920,11 +1927,10 @@ impl Uring {
         fn slab<T>(max: u32) -> io::Result<Slab<T>> {
             Slab::new(max, MemTag::Io).map_err(io::Error::other)
         }
-        let root: Arc<Path> = Arc::from(root.into());
         let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
         Ok(Uring {
-            start: Instant::now(),
-            boot: crate::boot::system(),
+            start,
+            boot,
             root,
             ring,
             table,
@@ -3075,6 +3081,10 @@ impl Driver for Uring {
         self.waker_given.set(true);
         // clone: a handle to the ring's wake, once per waker asked for
         Some(crate::Waker::new(Arc::clone(&self.offload.wake) as Arc<dyn crate::Wake>))
+    }
+
+    fn confined_files(&self) -> Option<crate::fs::ConfinedFiles> {
+        Some(crate::fs::ConfinedFiles::new(Arc::clone(&self.root)))
     }
 }
 
