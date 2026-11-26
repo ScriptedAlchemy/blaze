@@ -620,6 +620,7 @@ jobs:
       - uses: ./.github/actions/script
         with:
           job: source-compiler
+      - uses: ./.github/actions/toolchain-shelf
       - name: build the source CLI and retained services
         run: |
           mkdir -p "$RUNNER_TEMP/source-evidence"
@@ -633,7 +634,6 @@ jobs:
             install -m 755 "$CARGO_TARGET_DIR/release/$binary" "$RUNNER_TEMP/source-binaries/$binary"
           done
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"seal\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-      - uses: ./.github/actions/toolchain-shelf
       - name: cold warm edited and exported hello with the source CLI
         id: smoke
         timeout-minutes: 45
