@@ -325,6 +325,8 @@ fn main_with(args: &Args) {
             "test".to_owned(),
             "--locked".to_owned(),
             "--workspace".to_owned(),
+            "--features".to_owned(),
+            "blaze-proc-macro/bootstrap".to_owned(),
             "--doc".to_owned(),
             "--no-fail-fast".to_owned(),
         ];

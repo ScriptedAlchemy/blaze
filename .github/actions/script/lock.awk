@@ -98,7 +98,10 @@ END {
   root = resolve("scripts")
   if (source[root] != "") fail("scripts is not a local package")
   queue[1] = root
-  tail = 1
+  root = resolve("blaze-proc-macro")
+  if (source[root] != "") fail("blaze-proc-macro is not a local package")
+  queue[2] = root
+  tail = 2
   for (head = 1; head <= tail; head++) {
     i = queue[head]
     if (seen[i]++) continue

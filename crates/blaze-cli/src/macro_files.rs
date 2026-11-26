@@ -6,7 +6,7 @@
 //! (blaze-build-script `served::in_package`: no VCS entry, no `target` or `.blaze` folder at the
 //! crate's root), each by its package-relative path and its bytes. That digest has one home,
 //! blaze-proc-macro's, and the bootstrap builder computes the same one for a path package
-//! (scripts/src/bin/proc_macro_modules.rs `Origin::Path`).
+//! (blaze-proc-macro/src/bin/proc_macro_modules.rs `Origin::Path`).
 //!
 //! The command reads it here, through the effect layer (the checkout's `Dir` and the command's
 //! `Cx`), and keeps it as a [`LeafKind::MacroFiles`] row: the row's id IS the digest. The layout

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The built scripts' source key, from a complete checkout, with no compiler invocation.
-# lock.awk validates Cargo's generated lockfile subset and the complete scripts closure;
+# lock.awk validates Cargo's generated lockfile subset and the scripts and D52 producer closures;
 # packages.mjs uses Bun's TOML parser to resolve local identities through their declared
 # paths. Unsupported or missing inputs are errors, never successful partial keys.
 #
@@ -26,7 +26,7 @@ else
   status=$?
   [ "$status" = 1 ] || die "cannot read sparse checkout configuration"
 fi
-for need in .github/blaze-version pins/toolchain Cargo.toml Cargo.lock blaze.lock .cargo/config.toml scripts/Cargo.toml; do
+for need in .github/blaze-version pins/toolchain Cargo.toml Cargo.lock blaze.lock .cargo/config.toml scripts/Cargo.toml crates/blaze-proc-macro/Cargo.toml; do
   [ -f "$need" ] && [ ! -L "$need" ] || die "missing or symlinked input $need"
 done
 command -v bun >/dev/null || die "Bun 1.4.5 is required to parse Cargo manifests"

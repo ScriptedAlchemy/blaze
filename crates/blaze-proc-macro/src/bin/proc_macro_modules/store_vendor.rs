@@ -35,6 +35,7 @@ use blaze_fetch::{Mode, PackView, Skip, SourceId, Unit};
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{ASortedSet, AString, AVec, Alloc, CollectIn};
 use blaze_text::Shown;
+use blaze_script::json as serde_json;
 
 use super::{Failure, Origin, Plan, SCRIPT, Wanted, hex, io, member_dependencies, read, sha256, write};
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh DIR KEY builds every scripts/src/bin/<name>.rs with pins/toolchain.
+# build.sh DIR KEY builds the scripts and the D52 producer with pins/toolchain.
 # key.sh binds the complete source dependency closure; the compiler-artifact records
 # name exactly the executables copied into the atomically replaced cache directory.
 set -euo pipefail
@@ -23,16 +23,19 @@ if ! timeout -k 30 1200 cargo +"$tc" build --locked -p scripts --bins --message-
   grep '"level":"error"' "$said" | sed -n 's/.*"rendered":"\([^"]*\)".*/\1/p' | sed 's/\\n/\n/g' >&2 || true
   die "cargo +$tc build --locked -p scripts --bins --message-format=json failed (its JSON lines: $said)"
 fi
+if ! timeout -k 30 1200 cargo +"$tc" build --locked -p blaze-proc-macro --features bootstrap --bin proc_macro_modules --message-format=json >> "$said"; then
+  die "cargo +$tc build -p blaze-proc-macro --features bootstrap --bin proc_macro_modules failed (its JSON lines: $said)"
+fi
 
 fresh="$dir.new"
 rm -rf "$fresh"
 mkdir -p "$fresh"
-for src in scripts/src/bin/*.rs; do
+for src in scripts/src/bin/*.rs crates/blaze-proc-macro/src/bin/proc_macro_modules.rs; do
   name=$(basename "$src" .rs)
   # The executables the build names whose file is `<name>`: exactly one.
   found=$(grep '"reason":"compiler-artifact"' "$said" | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | awk -v n="$name" -F/ '$NF == n' | sort -u)
-  [ -n "$found" ] || die "cargo build -p scripts --bins named no executable \`$name\` in a compiler-artifact line ($said)"
-  [ "$(echo "$found" | wc -l)" = 1 ] || die "cargo build -p scripts --bins named more than one executable \`$name\`: $(echo "$found" | tr '\n' ' ')"
+  [ -n "$found" ] || die "the builds named no executable \`$name\` in a compiler-artifact line ($said)"
+  [ "$(echo "$found" | wc -l)" = 1 ] || die "the builds named more than one executable \`$name\`: $(echo "$found" | tr '\n' ' ')"
   [ -x "$found" ] || die "the build named $found for \`$name\`, which is no executable file"
   cp "$found" "$fresh/$name"
 done

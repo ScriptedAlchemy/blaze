@@ -63,7 +63,7 @@ fn no_package_walk_writes_its_own_rule() {
     let mut files = Vec::new();
     sources(roots, &mut files);
     assert!(files.len() > 1000, "the scan saw the workspace's sources: {} files", files.len());
-    for walker in ["blaze-proc-macro/src/module.rs", "blaze-cli/src/macro_files.rs", "scripts/src/bin/proc_macro_modules.rs"] {
+    for walker in ["blaze-proc-macro/src/module.rs", "blaze-cli/src/macro_files.rs", "blaze-proc-macro/src/bin/proc_macro_modules.rs"] {
         assert!(files.iter().any(|(p, _)| p.ends_with(walker)), "the scan saw the package walker {walker}");
     }
     let mut found = Vec::new();

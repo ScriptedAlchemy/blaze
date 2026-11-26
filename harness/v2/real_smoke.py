@@ -24,7 +24,7 @@ The input is one JSON object (`Input`), unknown fields refused:
             the workspace's copy and the home are made new under it
     tmpfs   a directory on a tmpfs for the second run (outputs are placed otherwise there:
             a tmpfs has no clone); "" leaves that run out and says so
-    modules the bootstrap module builder (`scripts/src/bin/proc_macro_modules.rs`, decision
+    modules the bootstrap module builder (`crates/blaze-proc-macro/src/bin/proc_macro_modules.rs`, decision
             D52): the one that builds the proc-macro and build-script modules the workspace's
             lock names, from the lock's own sources, in its sandbox. Blaze never runs it; a
             module the store lacks is a finding in blaze, never a build it starts. Given, the
@@ -312,7 +312,7 @@ def main(argv: list[str]) -> None:
             sys.exit(f"{asked.blaze} holds no `{name}`: give the directory of an installed blaze")
     if asked.modules and not (os.access(asked.modules, os.X_OK) and Path(asked.modules).is_file()):
         sys.exit(
-            f"modules {asked.modules} is not an executable file: give the bootstrap module builder (scripts/src/bin/proc_macro_modules.rs)"
+            f"modules {asked.modules} is not an executable file: give the bootstrap module builder (crates/blaze-proc-macro/src/bin/proc_macro_modules.rs)"
         )
     if asked.modules and not asked.toolchain_home:
         sys.exit(

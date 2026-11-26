@@ -1,6 +1,6 @@
 //! The module record: a proc-macro crate built for `wasm32-wasip1` with blaze's shim linked in,
 //! found by the crate's identity. A bootstrap builder writes it (decision D52:
-//! scripts/src/bin/proc_macro_modules.rs), never `blaze`; a call whose record is absent is
+//! crates/blaze-proc-macro/src/bin/proc_macro_modules.rs), never `blaze`; a call whose record is absent is
 //! [`ModuleError::Missing`], a finding naming the crate.
 //!
 //! The key is the SHA-256 of [`identity`]: the name, version and [`Source`] of the crate (the
@@ -82,7 +82,7 @@ impl<'l, 'a> LockedPackages<'l, 'a> {
     /// checksum, else the source as written), sorted, one a line, SHA-256. The lock lists every
     /// kind of dependency of every feature, so the closure is a superset of what a build links,
     /// keyed from the lock's text alone. The builder computes the same
-    /// (`scripts/src/bin/proc_macro_modules.rs`). Two packages of one name and version (two
+    /// (`crates/blaze-proc-macro/src/bin/proc_macro_modules.rs`). Two packages of one name and version (two
     /// sources): the first in the file's order is the root, as it was before (`Lock::named`
     /// keeps the file's order within a name).
     pub fn closure(&self, name: &str, version: &str) -> Result<String, ClosureError> {
@@ -275,6 +275,7 @@ impl ModuleRecord {
         hash.finish()
     }
 
+    #[cfg(feature = "runtime")]
     pub fn verify_registration(&self) -> Result<blaze_ids::ContentId, ModuleError> {
         if self.native_dylib.is_none() {
             let path = self.dir.join("module.wasm");
@@ -283,7 +284,7 @@ impl ModuleRecord {
             if found != self.wasm_sha256 {
                 return Err(ModuleError::Digest { key: self.key.clone(), held: self.wasm_sha256.clone(), found });
             }
-            let matches = blaze_manifest::bootstrap::proc_macro_decls(wasm.bytes(), |name| name == self.decls)
+            let matches = crate::registration::proc_macro_decls(wasm.bytes(), |name| name == self.decls)
                 .map_err(|error| ModuleError::Validation { path: self.dir.join("module.wasm"), error })?;
             if !matches {
                 return Err(ModuleError::Registration { path: self.dir.join("decls"), why: "the D52 module does not export the recorded proc-macro registration global" });
@@ -321,7 +322,8 @@ pub enum ModuleError {
     Digest { key: String, held: String, found: String },
     /// A D52 registration record does not belong to this crate or does not name its ABI.
     Registration { path: PathBuf, why: &'static str },
-    Validation { path: PathBuf, error: blaze_manifest::bootstrap::WasmRegistrationError },
+    #[cfg(feature = "runtime")]
+    Validation { path: PathBuf, error: crate::registration::WasmRegistrationError },
     /// A line of `macros` that is not one.
     Macros { key: String, line: String },
 }
@@ -331,9 +333,10 @@ impl std::fmt::Display for ModuleError {
         match self {
             ModuleError::Missing { name, version, key } => write!(
                 f,
-                "{name} {version}: no compiled module in the store or the cache (module key {key}); build it with scripts/src/bin/proc_macro_modules.rs (D52)"
+                "{name} {version}: no compiled module in the store or the cache (module key {key}); build it with proc_macro_modules (D52)"
             ),
             ModuleError::Io { path, error } => write!(f, "{}: {error}", path.display()),
+            #[cfg(feature = "runtime")]
             ModuleError::Validation { path, error } => write!(f, "{}: {error}", path.display()),
             ModuleError::Digest { key, held, found } => {
                 write!(f, "module {key}: its wasm-sha256 says {held}, its module.wasm is {found}")

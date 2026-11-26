@@ -86,7 +86,7 @@ has `git:` and `spawn:` rows, at most 2^16.
 
 ### 2. How the guest is built
 
-`scripts/src/bin/proc_macro_modules.rs`, the D52 interim exception to rule 1: the pinned
+`crates/blaze-proc-macro/src/bin/proc_macro_modules.rs`, the D52 interim exception to rule 1: the pinned
 nightly's rustc with `-Zbuild-std=std,panic_abort,proc_macro` for
 `guest/wasm32-wasip1-macro.json` (`:1600`), as `RUSTC_WRAPPER`, linking wasi-libc and
 `crt1-reactor.o` with `--wrap=getenv` (`:1257-1320`), offline under Seatbelt or bwrap. Build
@@ -302,7 +302,7 @@ server answers; nothing new is needed there.
 
 Where the entry is found. The wasm build exports `blaze_proc_macro_expand(decls, index, input,
 len)` and the host reads the registrations from `__rustc_proc_macro_decls_<hash>__`, which
-`scripts/src/bin/proc_macro_modules.rs` lists as `macros` lines (index, kind, name, helpers). A
+`crates/blaze-proc-macro/src/bin/proc_macro_modules.rs` lists as `macros` lines (index, kind, name, helpers). A
 code-record program names the same static by its item: the proc-macro crate's harness static,
 which blaze's front end must generate (it does not yet: no `_DECLS` item is made for a
 `proc-macro` crate, blocker 2 below), and the entry `comptime:blaze_proc_macro_expand` with the

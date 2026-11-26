@@ -78,6 +78,8 @@ pub mod spawn_route;
 pub mod wire;
 #[cfg(feature = "runtime")]
 pub mod wasm_fold;
+#[cfg(feature = "runtime")]
+pub mod registration;
 
 #[cfg(all(test, feature = "runtime"))]
 mod fact_pins_tests;

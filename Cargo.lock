@@ -1510,7 +1510,6 @@ dependencies = [
  "serde_json",
  "stdx",
  "url",
- "wasmparser",
 ]
 
 [[package]]
@@ -1696,6 +1695,7 @@ dependencies = [
  "blaze-fetch",
  "blaze-file-items",
  "blaze-format",
+ "blaze-git-fetch",
  "blaze-http",
  "blaze-id",
  "blaze-ids",
@@ -1707,11 +1707,14 @@ dependencies = [
  "blaze-pins",
  "blaze-record",
  "blaze-roots",
+ "blaze-script",
  "blaze-sha256",
  "blaze-sim",
  "blaze-spawn",
  "blaze-std",
  "blaze-surface",
+ "blaze-text",
+ "blaze-toml",
  "blaze-toolchain",
  "blaze-typeck",
  "blaze-unit-graph",
@@ -4221,16 +4224,13 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "scripts"
 version = "0.0.0"
 dependencies = [
- "blaze-build-script",
  "blaze-data",
  "blaze-fetch",
- "blaze-git-fetch",
  "blaze-lex",
  "blaze-manifest",
  "blaze-mem",
  "blaze-own",
  "blaze-pins",
- "blaze-roots",
  "blaze-script",
  "blaze-sha256",
  "blaze-text",

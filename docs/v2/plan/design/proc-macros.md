@@ -63,7 +63,7 @@ natively in its place.
 
 ## What is not supported
 
-2026-11-16 (lane proc-macro, `scripts/src/bin/proc_macro_modules.rs` over tempo's 79
+2026-11-16 (lane proc-macro, `crates/blaze-proc-macro/src/bin/proc_macro_modules.rs` over tempo's 79
 proc-macro units): one crate refuses wasm32-wasip1 unchanged, and blaze does not patch it.
 
 - **synstructure's `decl_derive!` on wasm32 + wasi.** synstructure (0.13.2 and 0.14.0 alike)

@@ -17,14 +17,26 @@ producer = ["expander"]
 [lib]
 doctest = false
 
+[[bin]]
+name = "proc_macro_modules"
+path = "src/bin/proc_macro_modules.rs"
+required-features = ["bootstrap"]
+
 [features]
 # Running a module: Wasmtime, the bridge server, the host, the hook and build scripts. Without
 # it: a module's identity and key, the module store's lookup and the expansion records' key and
 # lookup (what a command that expands nothing asks).
 runtime = ["dep:wasmtime", "dep:tracing", "dep:blaze-unit-graph", "dep:blaze-format", "dep:blaze-id", "dep:blaze-base-tools"]
 default = ["runtime"]
+# The standalone D52 producer, never linked into a compiler command.
+bootstrap = ["runtime", "dep:blaze-script", "dep:blaze-git-fetch", "dep:blaze-toml", "dep:blaze-lex", "dep:blaze-text"]
 
 [dependencies]
+blaze-script = { workspace = true, optional = true }
+blaze-git-fetch = { workspace = true, optional = true }
+blaze-toml = { workspace = true, optional = true }
+blaze-lex = { workspace = true, optional = true }
+blaze-text = { workspace = true, optional = true }
 # The expansion records' files through the effect layer (`record::OnDir`).
 blaze-std.workspace = true
 # `jobserver.rs`: its named lock (`blaze_core::lock`, taken with a bound where no `Cx` is
@@ -69,7 +81,7 @@ tracing = { workspace = true, optional = true }
 blaze-unit-graph = { workspace = true, optional = true }
 # `module.rs`: a module key's lock closure walks the lock blaze-manifest's one reader read
 # (`lock::Lock`, sans-IO, on blaze-own; rule 30).
-blaze-manifest = { workspace = true, default-features = false, features = ["wasm-registration"] }
+blaze-manifest = { workspace = true, default-features = false }
 # The source corrections (`blaze_fetch::correct`, D58): a corrected package's pin in a module's
 # closure names the row's digest, so the module key changes when the row does.
 blaze-fetch.workspace = true

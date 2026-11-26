@@ -105,6 +105,7 @@ use std::{
 };
 
 use blaze_script::input::{self, Fields, Input, InputError};
+use blaze_script::json as serde_json;
 
 // The build-script mode: a folder of its own, so cargo does not take it for a binary.
 #[path = "proc_macro_modules/build_scripts.rs"]
@@ -1849,7 +1850,7 @@ impl Plan<'_> {
         };
         let wasm = std::fs::read(wasm_path).map_err(io(Path::new(wasm_path)))?;
         let macros = macros_of(&read(Path::new(expanded_path))?, &wanted.name)?;
-        let decls = blaze_manifest::bootstrap::proc_macro_decls(&wasm, str::to_owned).map_err(|error| Failure::NoModule {
+        let decls = blaze_proc_macro::registration::proc_macro_decls(&wasm, str::to_owned).map_err(|error| Failure::NoModule {
             name: wanted.name.clone(),
             version: wanted.version.clone(),
             why: error.to_string(),

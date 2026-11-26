@@ -519,12 +519,12 @@ fn d52_registration_distinguishes_absent_invalid_and_empty_export_tables() {
     };
     replace_module(&wrong);
     assert!(matches!(read().unwrap().verify_registration(), Err(ModuleError::Validation {
-        error: blaze_manifest::bootstrap::WasmRegistrationError::WrongType, ..
+        error: crate::registration::WasmRegistrationError::WrongType, ..
     })), "a valid module's i64 global cannot serve the wasm32 dispatch ABI");
     wrong.push(0xff);
     replace_module(&wrong);
     assert!(matches!(read().unwrap().verify_registration(), Err(ModuleError::Validation {
-        error: blaze_manifest::bootstrap::WasmRegistrationError::Invalid(_), ..
+        error: crate::registration::WasmRegistrationError::Invalid(_), ..
     })), "the matching digest and real export name cannot certify malformed Wasm");
     std::fs::remove_dir_all(store).expect("remove the registration");
 }

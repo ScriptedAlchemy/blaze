@@ -1,6 +1,6 @@
 // blaze's shim: the module's side of the host's ABI (`src/host.rs`), linked into every
 // proc-macro crate's `wasm32-wasip1` module next to the crate's own code. The crate is not
-// changed: the bootstrap builder (scripts/src/bin/proc_macro_modules.rs) builds this file as a
+// changed: the bootstrap builder (src/bin/proc_macro_modules.rs) builds this file as a
 // crate of its own against the same std, and passes its rlib to the linker with each of its
 // exports named, so the module keeps them.
 //

@@ -4,7 +4,7 @@
 //! when any crate's `src/` splits text at that header again.
 //!
 //! Left, outside `src/` and so not scanned: the interim bootstrap builder's copies
-//! (scripts/src/bin/proc_macro_modules.rs and its build_scripts.rs) and the example
+//! (blaze-proc-macro/src/bin/proc_macro_modules.rs and its build_scripts.rs) and the example
 //! crates/blaze-proc-macro/examples/tempo_pipeline.rs; they go with the builder (D193 point 1).
 //! Exempt by name: blaze-proc-macro's module_lock_tests.rs, which keeps the old reader as the
 //! control of its byte-equality test.

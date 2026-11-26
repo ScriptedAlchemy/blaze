@@ -149,6 +149,7 @@ try {
   }
   const top = manifest("Cargo.toml");
   select("scripts/Cargo.toml", "scripts");
+  select("crates/blaze-proc-macro/Cargo.toml", "blaze-proc-macro");
   if (Object.hasOwn(top.data, "workspace")) {
     const shared = table(top.data.workspace, "Cargo.toml: workspace").dependencies;
     if (shared !== undefined) {

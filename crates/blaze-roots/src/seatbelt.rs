@@ -1,7 +1,7 @@
 //! macOS Seatbelt SBPL profile renderer (one home, rule 30; sans-IO, `#![no_std]`).
 //!
 //! Used by `bstd::procs::hermetic::seatbelt` for every `Level::Inputs` run on macOS and by
-//! `scripts/src/bin/proc_macro_modules` for the native build-script builder so both render the
+//! `blaze-proc-macro/src/bin/proc_macro_modules` for the native build-script builder so both render the
 //! exact same deny-by-default profile without duplicating SBPL rules or pulling `bstd`'s full
 //! dependency closure into bootstrap scripts.
 

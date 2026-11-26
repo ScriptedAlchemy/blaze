@@ -213,7 +213,7 @@ their record, 217 do not, none is missing from the store.
 proc-macro lane's runner (crates/blaze-proc-macro: Wasmtime, a fresh instance, no ambient
 authority, fuel and memory limits; rule 9, rule 10). There is no second sandbox and no native
 run, ever. The module comes from the same bootstrap builder as proc macros
-(`scripts/src/bin/proc_macro_modules.rs`, decision D52): the script and its build-dependencies
+(`crates/blaze-proc-macro/src/bin/proc_macro_modules.rs`, decision D52): the script and its build-dependencies
 compiled for `wasm32-wasip1` with the pinned nightly, fetched first, built offline in its
 sandbox, paths remapped. This is the same named interim exception to rule 1, extended to build
 scripts in D52's row; it ends when blaze compiles them itself. A module record absent is a
@@ -339,7 +339,7 @@ driver's successor runs the build-script task kind (unit in, record out).
   `tempo_scripts export`): crates resolved without their script's outputs went from 89 to 10,
   unresolved imports from 10306 to 9810.
 - **The bootstrap's build-script mode**
-  (`scripts/src/bin/proc_macro_modules/build_scripts.rs`, input `{"build_scripts": {...}}`).
+  (`crates/blaze-proc-macro/src/bin/proc_macro_modules/build_scripts.rs`, input `{"build_scripts": {...}}`).
   It compiles std with the process shim and two patches: `rt.rs` enters
   `CARGO_MANIFEST_DIR`, and the fs layer's `perm()` reports the owner-write bit, because
   wasi-libc's `st_mode` has no permission bits and `autocfg::new()` would otherwise refuse
@@ -546,7 +546,7 @@ path the grant cannot say is refused before the run, by name; inside the run the
 (EPERM/EACCES); naming each refused path needs a witness (the old interposer's role), not built.
 
 **The script binary.** Built today only for `wasm32-wasip1`, by the interim builder
-(`scripts/src/bin/proc_macro_modules.rs`, D52: cargo from the pinned nightly in Seatbelt or bwrap,
+(`crates/blaze-proc-macro/src/bin/proc_macro_modules.rs`, D52: cargo from the pinned nightly in Seatbelt or bwrap,
 paths remapped, `--target wasm32-wasip1`). A native script is the same build with `--target` the
 host and no process shim (it must really spawn the pinned clang); its module key adds the target.
 Not built in this leg.

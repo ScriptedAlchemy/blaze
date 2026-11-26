@@ -112,6 +112,16 @@ version.workspace = true
 direct.workspace = true
 registry-pkg.workspace = true
 `,
+    "crates/blaze-proc-macro/Cargo.toml": `[package]
+name = "blaze-proc-macro"
+version.workspace = true
+[dependencies]
+producer-only = { path = "../producer-only" }
+`,
+    "crates/producer-only/Cargo.toml": `[package]
+name = "producer-only"
+version.workspace = true
+`,
     "crates/direct/Cargo.toml": `[package]
 name = "direct"
 version.workspace = true
@@ -144,6 +154,17 @@ version = "1.0.0"
     // A malformed unrelated fixture must not impersonate a real local path or block it.
     "unrelated/Cargo.toml": "intentionally invalid TOML\n",
     "Cargo.lock": `version = 4
+
+[[package]]
+name = "blaze-proc-macro"
+version = "1.0.0"
+dependencies = [
+ "producer-only",
+]
+
+[[package]]
+name = "producer-only"
+version = "1.0.0"
 
 [[package]]
 name = "scripts"
@@ -194,6 +215,8 @@ version = "1.0.0"
 `,
   };
   for (const [path, content] of Object.entries(fixture)) write(path, content, base);
+  write("crates/blaze-proc-macro/src/bin/proc_macro_modules.rs", "// producer\n", base);
+  write("crates/producer-only/src/lib.rs", "// producer dependency\n", base);
   for (const path of ["scripts/src/main.rs", "crates/direct/src/lib.rs", "crates/shared/src/lib.rs", "nested/deep/src/lib.rs", "vendor/leaf/src/lib.rs", "vendor/leaf/c/native.c"]) {
     write(path, "// initial source\n", base);
   }
@@ -202,6 +225,23 @@ version = "1.0.0"
   reset();
   baseline = successful(key());
   check("stable key and unused patch record", () => assert.equal(successful(key()), baseline));
+  changes("producer source", () => write("crates/blaze-proc-macro/src/bin/proc_macro_modules.rs", "// changed producer\n"));
+  changes("producer-only dependency", () => write("crates/producer-only/src/lib.rs", "// changed producer dependency\n"));
+  refuses("missing producer", () => rmSync(join(checkout, "crates/blaze-proc-macro"), { recursive: true }), /missing or symlinked input/);
+  refuses("missing producer-only dependency", () => rmSync(join(checkout, "crates/producer-only"), { recursive: true }), /ENOENT/);
+  check("cached tools require the producer binary", () => {
+    write("scripts/src/bin/probe.rs", "// script\n");
+    write("built/KEY", "fixture-key\n");
+    write("built/probe", "#!/bin/sh\nexit 0\n");
+    chmodSync(join(checkout, "built/probe"), 0o755);
+    const absent = run("bash", [".github/actions/script/check.sh", "built", "fixture-key"]);
+    assert.notEqual(absent.status, 0);
+    assert.match(absent.stderr, /no proc_macro_modules/);
+    write("built/proc_macro_modules", "#!/bin/sh\nexit 0\n");
+    chmodSync(join(checkout, "built/proc_macro_modules"), 0o755);
+    const complete = run("bash", [".github/actions/script/check.sh", "built", "fixture-key"]);
+    assert.equal(complete.status, 0, complete.stderr);
+  });
   for (const path of ["scripts/src/main.rs", "crates/direct/src/lib.rs", "crates/shared/src/lib.rs", "nested/deep/src/lib.rs", "vendor/leaf/c/native.c"]) {
     changes(`source input ${path}`, () => write(path, "// changed source\n"));
   }

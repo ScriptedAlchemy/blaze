@@ -3,7 +3,7 @@ use super::*;
 
 fn command(args: &Args, tc: &str) -> Vec<String> {
     let mut argv: Vec<String> =
-        ["cargo", &format!("+{tc}"), "test", "--locked", "--workspace", "--no-run"]
+        ["cargo", &format!("+{tc}"), "test", "--locked", "--workspace", "--features", "blaze-proc-macro/bootstrap", "--no-run"]
             .into_iter()
             .map(str::to_owned)
             .collect();
