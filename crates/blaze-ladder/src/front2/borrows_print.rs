@@ -40,7 +40,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                 if !done.diags.is_empty() {
                     return Err(NotPrinted::Untyped);
                 }
-                let facts = gather_facts(r, lowered.owner, done, BorrowLangs::of(r.index), alloc);
+                let facts = gather_facts(r, lowered.owner, done, BorrowLangs::of(r.index), alloc).map_err(|_| NotPrinted::TypeTable)?;
                 // Every fn's signature regions are its head record's, read in place (D148).
                 let reader = r.store.regions.reader(r.store.tys.alloc());
                 let facts = facts.read_by(&reader, r.store.tys.view());

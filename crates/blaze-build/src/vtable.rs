@@ -263,6 +263,22 @@ pub struct VtableRef {
     pub args: List,
 }
 
+impl VtableRef {
+    /// Emit the address of this table, adding it once to the built body's vtable references.
+    pub fn address<A: Allocator + Copy>(self, tables: &mut blaze_own::Vec<Self, A>, builder: &mut blaze_lir::Builder<A, blaze_lir::Full>) -> Result<blaze_lir::Value, core::num::TryFromIntError> {
+        let place = match tables.iter().position(|&table| table == self) {
+            Some(at) => u32::try_from(at)?,
+            None => {
+                let at = u32::try_from(tables.len())?;
+                tables.push(self);
+                at
+            }
+        };
+        let reference = builder.reference(blaze_lir::func::RefKind::Vtable, place);
+        Ok(builder.data_addr(reference))
+    }
+}
+
 /// A key naming one table: [`vtable_key`]'s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct VtableKey(pub ContentId);

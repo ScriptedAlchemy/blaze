@@ -28,12 +28,9 @@ is used. Independent semantic failures are collected. A timeout or an ownership 
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
-from pathlib import Path
-import platform
 import re
 import shutil
 import signal
@@ -42,11 +39,15 @@ import sys
 import tempfile
 import time
 import tomllib
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "forkfixes"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools/typed-input/src"))
-from cases import CASES  # noqa: E402
-from typed_input import parse  # noqa: E402
+import toolchain_pins as c_toolchain
+from cases import CASES
+from typed_input import parse
 
 RESOURCE_ENV = ("BLAZE_LIBRARY", "BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB", "BLAZE_HUGE_PAGES",
                 "BLAZE_TESTS", "BLAZE_STORE_MAX_BYTES", "BLAZE_STORE_MAX_GB")
@@ -224,41 +225,14 @@ def link_or_copy(source: Path, target: Path) -> None:
         shutil.copy2(source, target)
 
 
-def copy_pinned_directory(source: Path, target: Path) -> None:
-    require(source.is_dir() and not source.is_symlink(), f"unpacked pinned C toolchain is missing at {source}")
-    real = source.resolve()
-    for path in source.rglob("*"):
-        if path.is_symlink() and (path.readlink().is_absolute() or not path.resolve(strict=True).is_relative_to(real)):
-            raise CaseFailed(f"C toolchain link escapes its pinned directory: {path}")
-    shutil.copytree(source, target, symlinks=True, copy_function=link_or_copy)
-
-
 def copy_clang(given: Input, home: Path) -> dict:
     """Copy the host's unpacked pin, preserving its internal compiler and linker links."""
-    shelf = Path(given.clang_shelf) if given.clang_shelf else Path(given.shelf) / "clang"
     source = Path(given.source or Path(__file__).resolve().parents[1])
-    pins = json.loads((source / "pins/clang.json").read_text())
-    arch = platform.machine().replace("arm64", "aarch64")
-    system = {"darwin": "apple-darwin", "linux": "unknown-linux-gnu"}.get(sys.platform, sys.platform)
-    host = f"{arch}-{system}"
-    require(host in pins["targets"], f"pins/clang.json has no C toolchain for {host}")
-    archive = shelf / pins["targets"][host]["sha256"]
-    destination = home / ".blaze/v2/toolchain"
-    copy_pinned_directory(archive, destination / "clang" / archive.name)
-    members = pins["shelf_programs"][host]
-    verified = {}
-    for name in members["names"].split():
-        row = members[name]
-        relative = Path(row["member"])
-        member = destination / "clang" / archive.name / relative.relative_to(relative.parts[0])
-        require(member.is_file() and digest(member) == row["sha256"], f"{member} differs from pins/clang.json")
-        verified[name] = row["sha256"]
-    sysroot = pins["sysroots"][host]
-    if sysroot != "macos-sdk":
-        require(isinstance(sysroot, str) and re.fullmatch(r"[0-9a-f]{64}", sysroot) is not None,
-                f"pins/clang.json has no pinned sysroot for {host}")
-        copy_pinned_directory(shelf.parent / "sysroot" / sysroot, destination / "sysroot" / sysroot)
-    return {"host": host, "archive": archive.name, "members": verified, "sysroot": sysroot}
+    override = Path(given.clang_shelf) if given.clang_shelf else None
+    try:
+        return c_toolchain.select(source, Path(given.shelf), override).copy_into(home)
+    except (OSError, ValueError, KeyError) as error:
+        raise CaseFailed(str(error)) from error
 
 
 def write_files(root: Path, files: dict[str, str]) -> dict[str, str]:

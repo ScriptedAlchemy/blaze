@@ -517,7 +517,7 @@ fn dyn_principals<'v>(views: impl Iterator<Item = PTys<'v>>) -> Vec<ItemKey, Glo
     for v in views {
         for n in v.nodes() {
             if let tc::PNode::Dynamic(l) = *n
-                && let Some(k) = tc::object_principal(v, l)
+                && let Some((k, _)) = tc::object_table_trait(v, l)
             {
                 asked.push(k);
             }

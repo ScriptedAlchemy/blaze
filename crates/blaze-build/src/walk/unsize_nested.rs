@@ -289,7 +289,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             (PNode::Dynamic(_), PNode::Dynamic(_), Some(vt)) => {
                 let (pf, pt) = (self.principal(e, from)?, self.principal(e, to)?);
                 match (pf, pt) {
-                    (_, None) => return Err(refused(e, None, "an unsizing to a trait object of auto traits alone (no principal trait)")),
+                    (_, None) => vt,
                     (Some((a, _)), Some((b, _))) if a == b => vt,
                     (Some((a, _)), Some((b, _))) => {
                         let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.scratch)
@@ -308,10 +308,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 }
             }
             (PNode::Dynamic(_), _, _) | (_, _, Some(_)) => return Err(malformed("an unsizing of a trait object to other than a trait object")),
-            (_, PNode::Dynamic(_), None) => {
-                let Some((principal, args)) = self.principal(e, to)? else {
-                    return Err(refused(e, None, "an unsizing to a trait object of auto traits alone (no principal trait)"));
-                };
+            (_, PNode::Dynamic(preds), None) => {
+                let (principal, args) = blaze_typeck::object_table_trait(self.ground.view(), preds).ok_or(malformed("a trait object without a table trait"))?;
                 self.vtable_addr(crate::vtable::VtableRef { concrete: from, principal, args })?
             }
             _ => return Err(refused(e, None, "an unsizing whose pointer's pointee changes to other than a slice or a trait object")),

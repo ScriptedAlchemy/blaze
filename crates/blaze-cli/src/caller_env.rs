@@ -13,6 +13,8 @@ use blaze_int::Int;
 use blaze_sys::posix::{io::{OpenFlags, getentropy}, thread::geteuid};
 use bstd::{digest::HmacSha256, env::{Env, VarName, VarNameError}, mem::Frame};
 
+const KEY_NAME: &str = ".blaze-build-env-key";
+
 #[derive(Debug)]
 pub enum Error {
     Denied(VarName),
@@ -45,15 +47,14 @@ fn read_key(path: &Path) -> io::Result<[u8; 32]> {
 }
 
 fn key(home: &Path) -> Result<[u8; 32], Error> {
-    let path = home.join(".blaze-build-env-key");
-    open_or_create_key(home, &path).map_err(|source| Error::Key { path, source })
+    let path = home.join(KEY_NAME);
+    match read_key(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => publish_key(home, &path),
+        found => found,
+    }.map_err(|source| Error::Key { path, source })
 }
 
-fn open_or_create_key(home: &Path, path: &Path) -> io::Result<[u8; 32]> {
-    match read_key(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        found => return found,
-    }
+fn publish_key(home: &Path, path: &Path) -> io::Result<[u8; 32]> {
     // Each contender publishes a complete key with link(2). A loser reads the installed key.
     // The temporary name uses independent entropy and reveals none of the key.
     let mut key = [0; 32];
@@ -111,7 +112,7 @@ pub(crate) fn project<'a>(names: &[&'a str], env: Option<&'a Env>, frame: &'a Fr
 mod tests {
     use super::*;
     use bstd::env::Vars;
-    use std::os::unix::fs::PermissionsExt;
+    use blaze_sys::posix::{io::{CWD, openat}, proc::change_mode};
 
     #[test]
     fn caller_grants_read_only_named_values_and_key_absence_separately_from_empty() {
@@ -125,14 +126,16 @@ mod tests {
         let grant = project(&["App", "MISSING"], Some(&env), &frame).expect("never reads SECRET");
         let stable = project(&["App", "MISSING"], Some(&env), &frame).expect("reopens the same key");
         assert_eq!(grant.identity(), stable.identity());
-        assert_eq!(grant.iter().collect::<Vec<_>>(), [("App", Some("")), ("MISSING", None)]);
+        assert!(grant.iter().eq([("App", Some("")), ("MISSING", None)]));
         assert_eq!(grant.answer("MISSING"), blaze_drive::key::ABSENT);
         assert_eq!(grant.answer("SECRET"), default.answer("SECRET"));
         assert_ne!(grant.answer("App"), grant.answer("MISSING"));
-        assert_eq!(grant.copy_in(&frame).answer("App"), grant.answer("App"));
+        let worker = grant.copy_in(&frame);
+        assert_eq!(worker.identity(), grant.identity());
+        assert_eq!(worker.rows(), grant.rows());
         assert!(project(&["SECRET"], Some(&env), &frame).is_err());
-        let key_path = home.path().join(".blaze-build-env-key");
-        assert_eq!(key_path.metadata().expect("key").permissions().mode() & 0o777, 0o600);
+        let key_path = home.join(KEY_NAME);
+        assert_eq!(key_path.metadata().expect("key").mode() & 0o777, 0o600);
         let key = read_key(&key_path).expect("key");
         assert_ne!(present(&key, "A", "bc"), present(&key, "Ab", "c"));
         assert_ne!(present(&key, "App", ""), present(&key, "App", "first"));
@@ -145,23 +148,22 @@ mod tests {
     #[test]
     fn concurrent_first_grants_open_one_complete_private_key_and_reject_other_files() {
         let home = blaze_core::temp::TempDir::for_test("caller-env-key");
-        let start = std::sync::Barrier::new(4);
-        std::thread::scope(|workers| {
-            let mut handles = Vec::new();
-            for _ in 0..4 {
-                handles.push(workers.spawn(|| { start.wait(); key(home.path()).expect("complete private key") }));
-            }
-            let winner = handles.pop().expect("worker").join().expect("joined");
-            for handle in handles {
-                assert_eq!(handle.join().expect("joined"), winner);
-            }
+        let path = home.join(KEY_NAME);
+        blaze_dist_local::sys::scope(blaze_own::testing::heap().shared(), |workers| {
+            // All four publish, even if one installs its key before another gets CPU time.
+            let handles = [(); 4].map(|()| workers.spawn(|| publish_key(home.path(), &path)).expect("spawn key contender"));
+            let keys = handles.map(|h| h.join().expect("joined").expect("complete private key"));
+            let installed = key(home.path()).expect("installed key");
+            assert_eq!(keys, [installed; 4]);
         });
-        let path = home.path().join(".blaze-build-env-key");
         assert_eq!(home.path().read_dir().expect("key home").count(), 1);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("plant public key");
-        assert!(key(home.path()).is_err());
-        std::fs::remove_file(&path).expect("remove plant");
-        std::os::unix::fs::symlink("/dev/null", &path).expect("plant symlink");
+        let linked = blaze_core::temp::TempDir::for_test("caller-env-link");
+        std::os::unix::fs::symlink(&path, linked.join(KEY_NAME)).expect("link to a valid private key");
+        assert!(key(linked.path()).is_err());
+        let mut buf = [0; 4096];
+        let name = blaze_sys::Path::in_buffer(path.as_os_str().as_encoded_bytes(), &mut buf).expect("key path");
+        let fd = openat(CWD, name, OpenFlags::READ.with(OpenFlags::CLOSE_ON_EXEC), 0).expect("open private key");
+        change_mode(fd.fd(), 0o644).expect("plant public key");
         assert!(key(home.path()).is_err());
     }
 }

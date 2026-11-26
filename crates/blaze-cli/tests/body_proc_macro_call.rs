@@ -49,6 +49,11 @@ const NO_DEFINITION: &str = "NoDefinition";
 const NAMED: &str = "mac 0.1.0: no compiled proc-macro module in";
 /// The body's call, named by its path in the body's finding (blaze-lower by_name.rs).
 const CALL: &str = "mac::same";
+const MACRO: &str = "use proc_macro::TokenStream;\n\n#[proc_macro]\npub fn same(input: TokenStream) -> TokenStream {\n    input\n}\n";
+
+fn write_fixture_file(path: &Path, text: &str) {
+    std::fs::write(path, text).unwrap_or_else(|error| panic!("writing {}: {error}", path.display()));
+}
 
 /// pm-small at `dir`.
 fn workspace(dir: &Path) {
@@ -56,14 +61,14 @@ fn workspace(dir: &Path) {
         ("Cargo.toml", "[workspace]\nmembers = [\"mac\", \"app\"]\nresolver = \"2\"\n"),
         ("Cargo.lock", "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"mac\",\n]\n\n[[package]]\nname = \"mac\"\nversion = \"0.1.0\"\n"),
         ("mac/Cargo.toml", "[package]\nname = \"mac\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n"),
-        ("mac/src/lib.rs", "use proc_macro::TokenStream;\n\n#[proc_macro]\npub fn same(input: TokenStream) -> TokenStream {\n    input\n}\n"),
+        ("mac/src/lib.rs", MACRO),
         ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nmac = { path = \"../mac\" }\n"),
         ("app/src/main.rs", "fn main() {\n    let x: u32 = mac::same!(1 + 2);\n    let _ = x;\n}\n"),
     ];
     for (path, text) in files {
         let at = dir.join(path);
         std::fs::create_dir_all(at.parent().expect("a file's folder")).unwrap_or_else(|error| panic!("making the folder of {}: {error}", at.display()));
-        std::fs::write(&at, text).unwrap_or_else(|error| panic!("writing {}: {error}", at.display()));
+        write_fixture_file(&at, text);
     }
 }
 
@@ -127,12 +132,11 @@ fn a_source_registration_checks_the_signature_of_its_macro() {
     let at = home.join("pm");
     workspace(&at);
     let source = at.join("mac/src/lib.rs");
-    let good = std::fs::read_to_string(&source).expect("the macro crate source");
-    let bad = good.replace("-> TokenStream {\n    input", "-> u32 {\n    42");
-    assert_ne!(bad, good);
+    let bad = MACRO.replace("-> TokenStream {\n    input", "-> u32 {\n    42");
+    assert_ne!(bad, MACRO);
     let label = "compiler-generated proc-macro registration of crate `mac`";
-    for (text, wrong_signature) in [(&good, false), (&bad, true), (&good, false)] {
-        std::fs::write(&source, text).expect("set the macro signature");
+    for (text, wrong_signature) in [(MACRO, false), (bad.as_str(), true), (MACRO, false)] {
+        write_fixture_file(&source, text);
         let said = check(&at, &home.join("home"));
         let error = said.lines().any(|line| line.contains(label) && ["E0271", "E0277", "E0308", "E0631"].iter().any(|code| line.contains(code)));
         assert_eq!(error, wrong_signature, "the registration requires TokenStream -> TokenStream:\n{said}");

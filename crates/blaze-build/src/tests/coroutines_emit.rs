@@ -494,7 +494,7 @@ fn forward3(to: ItemKey) -> Built<Global> {
     refs.push(Instance { item: to, args: List::EMPTY });
     let traps = StdVec::new_in(*refs.allocator());
     let func = blaze_lir::VerifiedFunc::new(func).unwrap_or_else(|e| panic!("the forwarder does not verify: {e}"));
-    Built { func, refs, statics: StdVec::new_in(Global), thread_locals: StdVec::new_in(Global), vtables: StdVec::new_in(Global), traps, copy_insts: 0 }
+    Built { func, refs, statics: StdVec::new_in(Global), thread_locals: StdVec::new_in(Global), vtables: blaze_own::Vec::new_in(Global), traps, copy_insts: 0 }
 }
 
 /// `main`, in LIR: a slot of the state's size and alignment; the `async fn` called with it as
@@ -525,7 +525,7 @@ fn main_lir(state: StateShape, refs: [Instance; 4]) -> Built<Global> {
     all.extend(refs);
     let traps = StdVec::new_in(*all.allocator());
     let func = blaze_lir::VerifiedFunc::new(func).unwrap_or_else(|e| panic!("main does not verify: {e}"));
-    Built { func, refs: all, statics: StdVec::new_in(Global), thread_locals: StdVec::new_in(Global), vtables: StdVec::new_in(Global), traps, copy_insts: 0 }
+    Built { func, refs: all, statics: StdVec::new_in(Global), thread_locals: StdVec::new_in(Global), vtables: blaze_own::Vec::new_in(Global), traps, copy_insts: 0 }
 }
 
 /// What one run gave: the executor's value (`u64::MAX`: never ready), its polls, the drops of

@@ -523,6 +523,7 @@ cranelift-frontend = "=0.137.1"
 # The reference interpreter and CLIF reader blaze-stencil's tests check each stencil with.
 cranelift-interpreter = "=0.137.1"
 cranelift-reader = "=0.137.1"
+wasmparser = { version = "=0.261.0", default-features = false, features = ["validate", "features", "simd"] }
 # The runtime a proc macro's wasm32-wasip1 module runs on, in process (rule `proc-macros-on-wasm`,
 # crates/blaze-macro-eval/src/wasm.rs). `=`: the release whose Cranelift is 0.137.1, the one above,
 # so the patched `vendor/cranelift-codegen` is the only Cranelift in the tree. No component
@@ -530,7 +531,6 @@ cranelift-reader = "=0.137.1"
 # No `parallel-compilation`: it compiles on rayon's pool, and a second pool beside blaze's
 # deadlocked the self-build (blaze_graph::par is the one pool). `vendor/wasmtime` by the patch above.
 wasmtime = { version = "=50.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
-wasmparser = { version = "=0.261.0", default-features = false, features = ["validate", "features", "simd"] }
 # `vendor/llvm-sys` by the patch above.
 llvm-sys = "231"
 # The stackful fibers blaze-graph's scheduler parks a waiting job on (docs/v2/plan/design/fibers.md, Phase 2).

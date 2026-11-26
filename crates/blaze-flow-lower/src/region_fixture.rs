@@ -577,6 +577,9 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     fn future_trait(&self) -> Option<ItemKey> {
         self.base.future_trait()
     }
+    fn pin_adt(&self) -> Option<ItemKey> {
+        self.base.pin_adt()
+    }
     fn ties(&self, item: ItemKey) -> Option<Ties<'_>> {
         self.base.ties(item)
     }

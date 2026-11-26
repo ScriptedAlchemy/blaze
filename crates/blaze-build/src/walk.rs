@@ -505,7 +505,7 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// By `Tls` reference place: the thread-local static item.
     thread_locals: Vec<ItemKey, A>,
     /// By `Vtable` reference place: the table.
-    vtables: Vec<crate::vtable::VtableRef, A>,
+    vtables: blaze_own::Vec<crate::vtable::VtableRef, A>,
     /// Each `unreachable` written to end a construct ([`Walk::unreachable_of`]), in order.
     trap_marks: Vec<TrapMark, A>,
     /// The LIR instructions [`Walk::copy`] wrote (`Built::copy_insts`).
@@ -857,7 +857,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         refs: Vec::new_in(alloc),
         statics: Vec::new_in(alloc),
         thread_locals: Vec::new_in(alloc),
-        vtables: Vec::new_in(alloc),
+        vtables: blaze_own::Vec::new_in(alloc),
         trap_marks: Vec::new_in(alloc),
         copy_insts: 0,
         task_at: None,
@@ -4619,7 +4619,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         };
         Ok(match view.node(first).map_err(|_| malformed("a type past the ground table"))? {
             PNode::ExTrait(k, args) => Some((k, args)),
-            _ => None,
+            PNode::ExAuto(_) => None,
+            _ => return Err(malformed("the first predicate of a trait object is neither a principal nor an auto trait")),
         })
     }
 
@@ -5239,16 +5240,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// The address of `table`: `data_addr` of its `Vtable` reference, one place per table. The
     /// unsizing to `dyn` (codegen.md, "Trait objects") pairs it with the data pointer.
     fn vtable_addr(&mut self, table: crate::vtable::VtableRef) -> Result<Value, BuildError> {
-        let place = match self.vtables.iter().position(|&t| t == table) {
-            Some(at) => at,
-            None => {
-                self.vtables.push(table);
-                self.vtables.len() - 1
-            }
-        };
-        let place = u32::try_from(place).map_err(|_| malformed("more than 2^32 vtables"))?;
-        let r = self.b.reference(RefKind::Vtable, place);
-        Ok(self.b.data_addr(r))
+        table.address(&mut self.vtables, &mut self.b).map_err(|_| malformed("more than 2^32 vtables"))
     }
 
     fn ref_place(&mut self, instance: Instance) -> u32 {

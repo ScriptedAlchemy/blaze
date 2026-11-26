@@ -14,7 +14,7 @@ blaze-blake3	23	0	0	20
 blaze-body-build	0	0	2	0
 blaze-body-eval	0	0	4	3
 blaze-bstd-convert	6	0	13	429
-blaze-build	4	1	0	287
+blaze-build	4	1	0	285
 blaze-build-script	15	1	0	72
 blaze-bytes	0	0	3	19
 blaze-cad	29	0	0	2
@@ -27,7 +27,7 @@ blaze-cas	89	1	4	410
 blaze-cbor	0	0	1	0
 blaze-cc	0	0	4	3
 blaze-check	72	1	0	107
-blaze-cli	504	1	0	427
+blaze-cli	503	1	0	426
 blaze-columns	29	0	1	23
 blaze-comptime/rungs/derive-hello	0	1	0	0
 blaze-cond	1	0	0	11

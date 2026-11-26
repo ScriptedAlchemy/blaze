@@ -687,6 +687,16 @@ pub fn object_principal(t: PTys<'_>, l: List) -> Option<ItemKey> {
     }
 }
 
+/// The existing trait item naming a concrete vtable. A marker-only object uses its first
+/// canonical auto trait, whose table has only drop, size and alignment.
+pub fn object_table_trait(t: PTys<'_>, l: List) -> Option<(ItemKey, List)> {
+    match *t.get(*t.list(l).ok()?.first()?)? {
+        PNode::ExTrait(item, args) => Some((item, args)),
+        PNode::ExAuto(item) => Some((item, List::EMPTY)),
+        _ => None,
+    }
+}
+
 /// The most predicates one trait object holds (a principal, its bindings, its auto traits).
 pub const MAX_OBJECT_PREDS: usize = 32;
 

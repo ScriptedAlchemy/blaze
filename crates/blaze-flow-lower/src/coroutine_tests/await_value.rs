@@ -37,6 +37,10 @@ use crate::{AdtFacts, CalleeFacts, Facts, Region};
 /// Plain structs needing drop, no lifetimes; nothing said of any future.
 struct ValueFacts;
 
+const OBJECT_FUTURE: ItemKey = ItemKey(701);
+const PIN: ItemKey = ItemKey(702);
+const BOX: ItemKey = ItemKey(703);
+
 impl Facts for ValueFacts {
     // Every other fact not known here, written out: `Facts` has no default answer.
     fn regions(&self) -> &dyn crate::RegionFacts {
@@ -78,11 +82,17 @@ impl Facts for ValueFacts {
     fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
         None
     }
-    fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
-        None
+    fn trait_lifetimes(&self, key: blaze_typeck::ItemKey) -> Option<u32> {
+        (key == OBJECT_FUTURE).then_some(0)
     }
-    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
-        None
+    fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, name: blaze_typeck::Name) -> Option<u32> {
+        (name == Name::of("Output")).then_some(0)
+    }
+    fn future_trait(&self) -> Option<ItemKey> {
+        Some(OBJECT_FUTURE)
+    }
+    fn pin_adt(&self) -> Option<ItemKey> {
+        Some(PIN)
     }
     fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
         None
@@ -99,8 +109,8 @@ impl Facts for ValueFacts {
     fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
         None
     }
-    fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
-        Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
+    fn adt(&self, key: ItemKey) -> Option<AdtFacts> {
+        Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: key == BOX })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
         Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
@@ -114,6 +124,29 @@ impl Facts for ValueFacts {
     fn param_copy(&self, _: u32) -> bool {
         false
     }
+}
+
+#[test]
+fn a_boxed_dyn_future_yields_only_its_output_region() {
+    let mut fx = Fx::new();
+    let scalar = fx.u8();
+    let output = fx.r(Mutbl::Not, scalar);
+    let mut object = |trait_| {
+        let projection = fx.ty(PNode::ExProj { trait_, name: Name::of("Output"), args: blaze_typeck::List::EMPTY, term: output });
+        let preds = fx.list(&[projection]);
+        fx.ty(PNode::Dynamic(preds))
+    };
+    let future = object(OBJECT_FUTURE);
+    let other = object(ItemKey(704));
+    let boxed = fx.adt(BOX, &[future, output]);
+    let pinned = fx.adt(PIN, &[boxed]);
+    let impostor = fx.adt(ItemKey(705), &[future]);
+    let slots = [Region::Param(0), Region::Static, Region::Param(1)];
+    let extract = |ty, regions| crate::await_call::dyn_future_output(fx.t.view(), &ValueFacts, ty, regions);
+    assert_eq!(extract(pinned, &slots), Some((output, &slots[1..2])));
+    assert_eq!(extract(pinned, &slots[..2]), None, "the allocator column is required");
+    assert_eq!(extract(impostor, &slots[..2]), None, "a user wrapper may implement a different Future");
+    assert_eq!(extract(other, &slots[..2]), None, "another trait's Output cannot prove Future::Output");
 }
 
 struct World {

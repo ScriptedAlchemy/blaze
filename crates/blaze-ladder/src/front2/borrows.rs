@@ -610,6 +610,7 @@ pub struct BorrowFacts<'a> {
     /// Each ADT whose `Copy` or `Drop` answer was not known (the census takes it as `false`;
     /// the command refuses the body: [`BorrowRefused::FactUnknown`]).
     unknown: AVec<'a, (u128, &'static str)>,
+    predicate_error: Option<tc::CheckError>,
     /// Why each of `unknown` was not known, in its order.
     unknown_why: AVec<'a, ImplsUnknown>,
     /// Each ADT of the body's types whose row the store could not make, and why, sorted by
@@ -633,6 +634,7 @@ pub struct BorrowFacts<'a> {
     relates_nothing: [Option<tc::ItemKey>; 4],
     fn_traits: [Option<tc::ItemKey>; 3],
     future_trait: Option<tc::ItemKey>,
+    pin_adt: Option<tc::ItemKey>,
     discriminant_kind: Option<tc::ItemKey>,
     pointee: Option<tc::ItemKey>,
     /// Unique `Deref` impl per ADT, sorted by ADT key (`Facts::deref_impl`).
@@ -708,6 +710,7 @@ impl<'a> BorrowFacts<'a> {
             variance_list: AVec::new_in(alloc),
             items: AVec::new_in(alloc),
             unknown: AVec::new_in(alloc),
+            predicate_error: None,
             unknown_why: AVec::new_in(alloc),
             unmade: AVec::new_in(alloc),
             reads: AVec::new_in(alloc),
@@ -717,6 +720,7 @@ impl<'a> BorrowFacts<'a> {
             relates_nothing: [None; 4],
             fn_traits: [None; 3],
             future_trait: None,
+            pin_adt: None,
             discriminant_kind: None,
             pointee: None,
             deref_impls: AVec::new_in(alloc),
@@ -868,6 +872,9 @@ impl Facts for ReadBy<'_, '_> {
     }
     fn future_trait(&self) -> Option<tc::ItemKey> {
         self.facts.future_trait
+    }
+    fn pin_adt(&self) -> Option<tc::ItemKey> {
+        self.facts.pin_adt
     }
     fn assoc_item(&self, trait_: tc::ItemKey, name: tc::Name) -> Option<tc::ItemKey> {
         let at = self.facts.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, n, _)| (k, n)).ok()?;
@@ -1339,8 +1346,12 @@ pub enum ImplsUnknown {
 /// fn's text is read: the lowering reads the signature column itself, [`BorrowFacts::read_by`]).
 /// THE ONE HOME of this gathering: the command
 /// ([`ProjectWorld::check_borrows`]) and the census (tests/flow_census.rs) both call it.
-pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owner: tc::ItemKey, c: &tc::Checked<'_>, langs: BorrowLangs, alloc: Alloc<'a>) -> BorrowFacts<'a> {
-    gather_facts_planted(r, owner, c, langs, FactsPlant::None, alloc)
+pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owner: tc::ItemKey, c: &tc::Checked<'_>, langs: BorrowLangs, alloc: Alloc<'a>) -> Result<BorrowFacts<'a>, tc::CheckError> {
+    let facts = gather_facts_planted(r, owner, c, langs, FactsPlant::None, alloc);
+    match facts.predicate_error {
+        Some(error) => Err(error),
+        None => Ok(facts),
+    }
 }
 
 /// A provider of [`gather_facts`] turned off, for a test's control (rule 23: the cause removed,
@@ -1395,6 +1406,7 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     g.fn_traits = langs.fn_traits;
     let future = r.index.lang("future_trait");
     g.future_trait = future.map(checker_of);
+    g.pin_adt = r.index.lang("pin").map(checker_of);
     g.discriminant_kind = langs.discriminant_kind;
     g.pointee = langs.pointee;
     // A `const` or `static` item's body (module-level, local in a fn/macro, associated, or
@@ -1653,13 +1665,17 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             }
         }
     }
-    // Ensure trait heads transitively through supertraits so `regions.clauses(trait_)` is loaded
-    // for supertrait elaboration in `blaze-borrow`.
+    // A trait's where-clauses and associated bounds may name further traits inside projections.
+    // Visit each reachable trait and each portable type once, including on a warm records read.
     {
         let mut ti = 0usize;
         traits.sort_unstable();
         traits.dedup();
-        while ti < traits.len() && traits.len() < 256 {
+        let mut seen = blaze_hash::HashSet::new_in(alloc);
+        seen.extend(traits.iter().copied());
+        let mut seen_types = blaze_hash::HashSet::new_in(alloc);
+        let mut pending = AVec::new_in(alloc);
+        while ti < traits.len() {
             let tk = tc::ItemKey(traits[ti]);
             ti += 1;
             if let Some(lib) = r.keys.library_in(r.names, tk)
@@ -1667,24 +1683,22 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
             {
                 container_head(r, lib, true);
             }
-            if let Some(def) = r.store.trait_defs.get(&tk) {
-                for sc in def.supertraits.iter() {
-                    if let tc::PClause::Trait { trait_: sup, .. } | tc::PClause::Projection { trait_: sup, .. } = *sc
-                        && traits.scan_for(&sup.0).is_none()
-                    {
-                        traits.push(sup.0);
-                    }
+            let mut collect = |clauses: &[tc::PClause]| {
+                if g.predicate_error.is_none() {
+                    g.predicate_error = predicate_traits(r.store.tys.view(), clauses, &mut seen_types, &mut pending, |trait_| {
+                        if seen.insert(trait_.0) { traits.push(trait_.0); }
+                    }).err();
                 }
+            };
+            if let Some(predicates) = r.store.preds.get(&tk) {
+                collect(&predicates.clauses);
+            }
+            if let Some(def) = r.store.trait_defs.get(&tk) {
+                collect(&def.supertraits);
                 for a in def.assoc.iter() {
                     g.assoc_items.push((tk.0, a.name, a.item));
                     if let Some(ap) = r.store.preds.get(&a.item) {
-                        for ac in ap.clauses.iter() {
-                            if let tc::PClause::Trait { trait_: sup, .. } | tc::PClause::Projection { trait_: sup, .. } = *ac
-                                && traits.scan_for(&sup.0).is_none()
-                            {
-                                traits.push(sup.0);
-                            }
-                        }
+                        collect(&ap.clauses);
                     }
                 }
             }
@@ -2322,6 +2336,32 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
     g
 }
 
+fn predicate_traits(
+    tys: tc::PTys<'_>, clauses: &[tc::PClause], seen: &mut blaze_hash::HashSet<tc::PTy, Alloc<'_>>,
+    pending: &mut AVec<'_, tc::PTy>, mut add: impl FnMut(tc::ItemKey),
+) -> Result<(), tc::CheckError> {
+    for &clause in clauses {
+        let args = match clause {
+            tc::PClause::Trait { trait_, args } => { add(trait_); args }
+            tc::PClause::Projection { trait_, args, term, .. } => { add(trait_); pending.push(term); args }
+            tc::PClause::ForFields { trait_, container, args } => { add(trait_); pending.push(container); args }
+            tc::PClause::Const { args, .. } => args,
+            tc::PClause::TypeOutlives { ty, .. } => { pending.push(ty); tc::List::EMPTY }
+            tc::PClause::RegionOutlives { .. } => continue,
+        };
+        pending.extend_from_slice(tys.list(args)?);
+    }
+    while let Some(ty) = pending.pop() {
+        if !seen.insert(ty) { continue; }
+        let node = tys.node(ty)?;
+        if let tc::PNode::Alias { trait_, .. } | tc::PNode::ExProj { trait_, .. } | tc::PNode::ExTrait(trait_, _) | tc::PNode::ExAuto(trait_) = node {
+            add(trait_);
+        }
+        tys.children_of(node, pending)?;
+    }
+    Ok(())
+}
+
 /// Files `FiledRegions` for a provided trait fn's RPITIT `Twin` opaque (`rpitit::default_key`)
 /// by cloning its source opaque's regions and rewriting `Opaque(source, args)` to
 /// `Opaque(twin, args)` in each clause column root.
@@ -2798,7 +2838,7 @@ pub(super) fn witness_and_decide<'n, 'a, S: NamesSource<'n>>(
         reads.extend_from_slice(facts.ties.reads());
         let reader = r.store.regions.reader(alloc);
         let lowering = facts.read_by(&reader, r.store.tys.view());
-        if let Ok(tys) = body.tys.view(&r.store.tys) {
+        if facts.predicate_error.is_none() && let Ok(tys) = body.tys.view(&r.store.tys) {
             let view = body.typeck.view(tys);
             let requirements = Requirements::new_in(alloc);
             interiors.witness_all(&view, done, &NestedFacts::with_requirements(lowering, &requirements), alloc);
@@ -2845,6 +2885,10 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     reads.extend_from_slice(facts.reads());
     reads.extend_from_slice(facts.calls.reads());
     reads.extend_from_slice(facts.ties.reads());
+    if let Some(error) = facts.predicate_error {
+        verdict.refused = Some(BorrowRefused::TypeTable(error));
+        return verdict;
+    }
     if let (Some(&(adt, fact)), Some(&why)) = (facts.unknown().first(), facts.unknown_why().first()) {
         let item = r.keys.library_in(r.names, tc::ItemKey(adt));
         verdict.refused = Some(BorrowRefused::FactUnknown { adt: tc::ItemKey(adt), item, fact, why });
@@ -3233,6 +3277,28 @@ mod region_record_tests {
     use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
     use crate::front2::project::{BodyRef, ProjectWorld};
     use crate::refusal::SourceFile;
+
+    #[test]
+    fn a_where_clause_reads_traits_nested_in_its_projection_term() {
+        use blaze_typeck as tc;
+        let heap = blaze_own::testing::heap();
+        let g = heap.alloc();
+        let tr = tc::ItemKey(1);
+        let nested = tc::ItemKey(2);
+        let mut nodes = blaze_own::AVec::new_in(g);
+        nodes.push(tc::PNode::Alias { trait_: nested, name: tc::Name::of("Assoc"), args: tc::List::EMPTY });
+        for i in 0..96 {
+            nodes.push(tc::PNode::Ref(tc::Mutbl::Not, tc::PTy(i)));
+        }
+        let types = tc::PTys::flat(&nodes, &[]);
+        let clause = |term| tc::PClause::Projection { trait_: tr, args: tc::List::EMPTY, name: tc::Name::of("Output"), term };
+        let mut seen = blaze_hash::HashSet::new_in(g);
+        let mut pending = blaze_own::AVec::new_in(g);
+        let mut traits = blaze_own::AVec::new_in(g);
+        super::predicate_traits(types, &[clause(tc::PTy(96))], &mut seen, &mut pending, |t| traits.push(t)).unwrap();
+        assert_eq!(&traits[..], &[tr, nested]);
+        assert!(super::predicate_traits(types, &[clause(tc::PTy(97))], &mut seen, &mut pending, |_| {}).is_err());
+    }
 
     const SOURCE: &str = r#"
 fn f<'a, 'b>(y: &'b u8, x: &'a u8) -> &'a u8 {

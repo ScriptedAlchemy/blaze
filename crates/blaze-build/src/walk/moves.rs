@@ -336,8 +336,26 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         };
         // A local enum's switch owns its first `field_bit`s (a whole local's only: a local with
         // a field scrutinee is a struct or tuple, `field_path`'s `Shape::Fields`).
-        let base = match (cx.root.owner, prefix, self.layout(cx.root.g).map(|l| self.layouts[l as usize].shape)) {
-            (Owner::Local(_), None, Ok(Shape::Enum { first, len, .. })) => (0..len).map(|v| self.layout_variants[(first + v) as usize].1).sum(),
+        let base = match (cx.root.owner, prefix) {
+            (Owner::Local(_), None) => {
+                let layout = self.layout(cx.root.g).map_err(|_| malformed("a local with field flags and no layout"))?;
+                if let Shape::Enum { first, len: variants, .. } = self.layouts[layout as usize].shape {
+                    let index = |i| usize::try_from(i).map_err(|_| malformed("an enum field path past the layout table"));
+                    let rows = self.layout_variants.get(index(first)?..).and_then(|s| s.get(..usize::try_from(variants).ok()?))
+                        .ok_or(malformed("a local enum's variants past the layout table"))?;
+                    if len == 1 && let Some(&Step::Variant { v, row }) = self.moves.steps.get(index(start)?) {
+                        let &(first_field, fields) = rows.get(index(v)?).ok_or(malformed("a direct move from a missing enum variant"))?;
+                        let field = row.checked_sub(first_field).filter(|&j| j < fields).ok_or(malformed("a direct move from a missing variant field"))?;
+                        // A whole-local assignment already tests this bit, including on a loop's next turn.
+                        let bit = self.field_bit(layout, v, field)?.ok_or(BuildError::UnsupportedPat { pat: p, what: "a moved enum field past its 64-bit drop mask" })?;
+                        self.moves.steps.truncate(index(start)?);
+                        return self.arm_effect(Pending::Clear { mask, bits: 1u64 << bit }, cx.guarded);
+                    }
+                    rows.iter().map(|(_, fields)| fields).sum()
+                } else {
+                    0
+                }
+            }
             _ => 0u32,
         };
         let Some(bit) = self.part_bit(mask, start, len, base, Some(cx.root.expr))? else {

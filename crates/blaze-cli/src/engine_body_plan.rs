@@ -513,6 +513,14 @@ pub(crate) struct Registration {
     pub(crate) module: Name,
 }
 
+impl Reacher {
+    pub(crate) fn registration_for(&self, row: TaskRow) -> Option<Registration> {
+        self.registration.filter(|one| {
+            one.root == row.file && Name::new(Kind::BodyCheck, one.key.0) == row.name
+        })
+    }
+}
+
 /// A member unit the members record does not hold, or holds as another unit: its reach is not
 /// known without its module tree ([`Reach::of_members`]); named, never guessed (rule 3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -745,7 +753,7 @@ impl Reach {
     }
 
     pub(crate) fn registration(&self, row: TaskRow) -> Option<Registration> {
-        self.registration_in(row.file, row.rank).filter(|one| Name::new(Kind::BodyCheck, one.key.0) == row.name)
+        self.unit(row.rank)?.registration_for(row)
     }
 
     /// How many member units are ranked.

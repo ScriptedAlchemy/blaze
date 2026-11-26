@@ -143,8 +143,7 @@ fn a_git_package_s_macro_finds_cargo_unset_and_reads_its_own_manifest() {
     };
     let env = CrateEnv::of(facts, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the environment of reth_rpc_api: {e}"));
     let files = || {
-        let listed: std::vec::Vec<(String, &'static [u8])> = std::vec![(String::from("Cargo.toml"), MANIFEST), (String::from("src/lib.rs"), &b""[..])];
-        Files::Listed(Arc::from(listed))
+        Files::Listed(Arc::from([(String::from("Cargo.toml"), MANIFEST), (String::from("src/lib.rs"), &b""[..])]))
     };
     let package = unit_package(&env, files()).unwrap_or_else(|e| panic!("{e:?}"));
     let mut sandbox = Sandbox::new(Arc::new(package));

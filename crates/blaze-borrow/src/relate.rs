@@ -2509,18 +2509,28 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                     }
                 }
             }
-            PNode::Alias { trait_: at, name, .. } => {
+            PNode::Alias { .. } => {
                 let selected: &'c dyn Selected = self.selected;
-                // Check the associated type's own item bounds (`type Searcher<'a>: Searcher<'a>`,
-                // `type Structural: UniqueSet`) first, then the trait's own clauses.
-                for source in [selected.assoc_clauses(at, name), selected.trait_clauses(at)] {
-                    if let Some((at_lts, views)) = source
-                        && !views.is_empty()
-                        && self.fits(subject).is_ok()
-                        && self.try_prove_from_alias_clauses(at_lts, views, subject, trait_ref, has_subject, trait_)?
-                    {
-                        return Ok(true);
+                // A where-clause on an ancestor projection may name this exact descendant.
+                // Instantiate each ancestor's own Self and GAT arguments, keeping the original
+                // subject as the obligation being proved.
+                let mut alias = subject;
+                let mut depth = 0;
+                while let PNode::Alias { trait_: at, name, .. } = self.node(alias)? {
+                    self.step(alias.ty, depth)?;
+                    self.fits(alias)?;
+                    for (at_lts, views) in [selected.assoc_clauses(at, name), selected.trait_clauses(at)].into_iter().flatten() {
+                        if !views.is_empty() && self.try_prove_from_alias_clauses(at_lts, views, alias, subject, trait_ref, has_subject, trait_, depth == 0)? {
+                            return Ok(true);
+                        }
                     }
+                    let own = self.own(alias)?;
+                    let kids = self.kids_of(alias)?;
+                    let (_, rest) = alias.slots.split(own).ok_or(self.malformed(alias.ty, Bad::StepBound))?;
+                    let (inner, _) = self.kid(alias, &kids, rest, 0)?;
+                    let Resolved::Side(inner) = self.resolve(inner)? else { break };
+                    alias = inner;
+                    depth += 1;
                 }
             }
             _ => {}
@@ -2528,21 +2538,24 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         Ok(false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_prove_from_alias_clauses(
         &mut self,
         at_lts: u32,
         views: &'c [blaze_typeck::region_facts::ClauseView<'c>],
+        alias: Side<'c>,
         subject: Side<'c>,
         trait_ref: Side<'c>,
         has_subject: bool,
         trait_: ItemKey,
+        direct: bool,
     ) -> Result<bool, Refused> {
-        let s_own = self.own(subject)?;
-        let skids = self.kids_of(subject)?;
+        let s_own = self.own(alias)?;
+        let skids = self.kids_of(alias)?;
         let lts = at_lts.max(s_own.get());
         let Some(aenv) = self.envs.impl_env(lts, skids.len()) else { return Ok(false) };
         for k in 0..at_lts.min(s_own.get()) {
-            match self.slot(subject, k)? {
+            match self.slot(alias, k)? {
                 RegAt::Known(r) => {
                     if self.envs.bind_reg(aenv, k, r).is_err() {
                         return Ok(false);
@@ -2555,19 +2568,22 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             let o = self.out.fresh(Kind::Existential);
             let _ = self.envs.bind_reg(aenv, k, Reg::Origin(o));
         }
-        let (_, mut srest) = subject.slots.split(s_own).ok_or(self.malformed(subject.ty, Bad::StepBound))?;
+        let (_, mut srest) = alias.slots.split(s_own).ok_or(self.malformed(alias.ty, Bad::StepBound))?;
         for k in 0..skids.len() {
-            let (kid, sr) = self.kid(subject, &skids, srest, k)?;
+            let (kid, sr) = self.kid(alias, &skids, srest, k)?;
             srest = sr;
-            let _ = self.envs.bind_type(aenv, k, kid);
+            self.envs.bind_type(aenv, k, kid).map_err(|why| self.malformed(alias.ty, why))?;
         }
-        for allow_alias in [false, true] {
+        for &allow_alias in if direct { &[false, true][..] } else { &[false][..] } {
             for cv in views {
                 let c = Side { ty: cv.col.ty(), slots: Slots::Sig { col: cv.col.as_slice(), env: aenv } };
                 if self.match_trait_clause(c, subject, trait_ref, has_subject, allow_alias)? {
                     return Ok(true);
                 }
             }
+        }
+        if !direct {
+            return Ok(false);
         }
         let mut visited = [ItemKey(0); 16];
         let mut vlen = 0usize;

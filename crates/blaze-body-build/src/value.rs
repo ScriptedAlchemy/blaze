@@ -899,17 +899,34 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                 _ => return Err(self.unsupported("a transmute of a value that is not one scalar")),
             },
             CastKind::Unsize => {
-                // `&[T; N]` to `&[T]`: the length joins the address.
-                let pointee = match self.node(g)? {
-                    PNode::Ref(_, t) | PNode::Ptr(_, t) => t,
-                    _ => return Err(self.unsupported("an unsizing of a value that is not a reference or raw pointer")),
+                let pointee = |cx: &Self, ty| match cx.node(ty)? {
+                    PNode::Ref(_, t) | PNode::Ptr(_, t) => Ok(t),
+                    _ => Err(cx.unsupported("an unsizing of a value that is not a reference or raw pointer")),
                 };
-                let PNode::Array(_, len) = self.node(pointee)? else {
-                    return Err(self.unsupported("an unsizing to a trait object"));
-                };
-                let n = self.const_bits(len)?;
-                let x = self.scalar(a)?;
-                V::Two(x, self.b.iconst(Ty::I64, n))
+                let from = pointee(self, g)?;
+                let to = pointee(self, to)?;
+                match (a, self.node(from)?, self.node(to)?) {
+                    (V::One(ptr), PNode::Array(_, len), PNode::Slice(_)) => {
+                        let n = self.const_bits(len)?;
+                        V::Two(ptr, self.b.iconst(Ty::I64, n))
+                    }
+                    (V::One(ptr), _, PNode::Dynamic(preds)) => {
+                        let (principal, args) = blaze_typeck::object_table_trait(self.subst.ground.view(), preds)
+                            .ok_or(self.malformed("a trait object without a table trait"))?;
+                        let table = blaze_build::vtable::VtableRef { concrete: from, principal, args };
+                        let vt = table.address(&mut self.vtables, &mut self.b).map_err(|_| self.malformed("more than 2^32 vtables"))?;
+                        V::Two(ptr, vt)
+                    }
+                    (V::Two(ptr, vt), PNode::Dynamic(src), PNode::Dynamic(dst)) => {
+                        let view = self.subst.ground.view();
+                        let (to, _) = blaze_typeck::object_table_trait(view, dst).ok_or(self.malformed("a trait object without a table trait"))?;
+                        if blaze_typeck::object_principal(view, dst).is_some() && blaze_typeck::object_principal(view, src) != Some(to) {
+                            return Err(self.unsupported("an upcast to a different principal trait"));
+                        }
+                        V::Two(ptr, vt)
+                    }
+                    _ => return Err(self.unsupported("an unsizing whose operand or pointee representation is unsupported")),
+                }
             }
             CastKind::ReifyFnPointer => {
                 let PNode::FnDef(item, args) = self.node(g)? else {

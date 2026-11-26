@@ -19,6 +19,7 @@
 //! the future operand"; the head's own signature (`fn into_future(self) -> Self::IntoFuture`)
 //! is what its call may relate.
 
+use blaze_borrow::{Columns, RegionTypes};
 use blaze_flow::{Local, Place};
 use core::alloc::Allocator;
 
@@ -225,7 +226,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let facts: &'b F = self.facts;
         let out_ty = self.sig_declared(life, life.inputs(), e)?;
         let PNode::Opaque(k, _) = self.head_node(out_ty, e)? else {
-            return Ok(Err(AwaitUnrelated::NoWrittenReturn));
+            let output = life.output().and_then(|slots| {
+                dyn_future_output(facts.region_tys().unwrap_or(self.tys), facts, out_ty, slots)
+            });
+            return Ok(output.ok_or(AwaitUnrelated::NoWrittenReturn));
         };
         let regions = facts.regions();
         let (Ok(captures), Ok(clauses)) = (regions.opaque_captures(k), regions.clauses(k)) else {
@@ -258,4 +262,50 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         }
         Ok(found.ok_or(AwaitUnrelated::OpaqueOutputUnread { opaque: k }))
     }
+}
+
+/// The `Future::Output` column of a trait object reached through the standard forwarding
+/// implementations. Neither the object's lifetime nor Box's allocator belongs to the result.
+pub(super) fn dyn_future_output<'s>(
+    tys: blaze_typeck::PTys<'_>, facts: &impl Facts, mut ty: PTy, mut slots: &'s [Region],
+) -> Option<(PTy, &'s [Region])> {
+    let future = facts.future_trait()?;
+    let arity = crate::one_call::FactsArity { facts };
+    let heads = Columns::new(tys, &arity, &arity);
+    if heads.count(ty).ok()?.len() != slots.len() { return None; }
+    for _ in 0..crate::MOST_POSITIONS {
+        let rest = slots.get(heads.own(ty).ok()?.len()..)?;
+        let inner = match tys.node(ty).ok()? {
+            PNode::Ref(blaze_typeck::Mutbl::Mut, target) => target,
+            PNode::Adt(key, args) => {
+                let args = tys.list(args).ok()?;
+                if (Some(key) == facts.pin_adt() && args.len() == 1) || facts.adt(key).is_some_and(|adt| adt.is_box) {
+                    *args.first()?
+                } else {
+                    return None;
+                }
+            }
+            PNode::Dynamic(preds) => {
+                let mut rest = rest;
+                let mut output = None;
+                for &pred in tys.list(preds).ok()? {
+                    let (column, tail) = rest.split_at_checked(heads.count(pred).ok()?.len())?;
+                    rest = tail;
+                    if let PNode::ExProj { trait_, name, args, term } = tys.node(pred).ok()?
+                        && trait_ == future && name == Name::of("Output")
+                    {
+                        if output.is_some() || !tys.list(args).ok()?.is_empty() || heads.count(term).ok()?.len() != column.len() {
+                            return None;
+                        }
+                        output = Some((term, column));
+                    }
+                }
+                return rest.is_empty().then_some(output).flatten();
+            }
+            _ => return None,
+        };
+        slots = rest.get(..heads.count(inner).ok()?.len())?;
+        ty = inner;
+    }
+    None
 }

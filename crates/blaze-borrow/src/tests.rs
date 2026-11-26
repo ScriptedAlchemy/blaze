@@ -1526,6 +1526,11 @@ fn same_alias_requires_erased_equal_subjects() {
 /// `Unselected`.
 #[test]
 fn assoc_item_bounds_prove_alias_trait_clauses() {
+    alias_bound(false);
+    alias_bound(true);
+}
+
+fn alias_bound(descendant: bool) {
     use blaze_typeck::region_facts::{ClauseView, ColView};
 
     const T_PAT: ItemKey = ItemKey(0x0501);
@@ -1537,13 +1542,19 @@ fn assoc_item_bounds_prove_alias_trait_clauses() {
     let r = t.r(u8_);
     let p0 = t.param(0);
     let searcher_alias = t.alias(T_PAT, SEARCHER, &[p0]);
-    let callee_clause = t.extrait(T_SEARCH, &[searcher_alias]);
+    let next = ItemKey(0x0503);
+    let child = Name::of("Child");
+    let subject = if descendant { t.alias(next, child, &[searcher_alias]) } else { searcher_alias };
+    let callee_clause = t.extrait(T_SEARCH, &[subject]);
+    let parent_clause = t.extrait(T_SEARCH, &[searcher_alias]);
     // Inside `trait Pattern { type Searcher<'a>: Searcher<'a>; }`, the item bound's subject is
     // `<Self as Pattern>::Searcher<'a>` (with `Self = Param(0)`, `'a = Region::Param(0)`).
     let item_bound_ty = callee_clause;
     let facts = Facts::default()
         .trait_(T_PAT, 0)
         .trait_(T_SEARCH, 1)
+        .trait_(next, 0)
+        .alias(next, child, 0)
         .alias(T_PAT, SEARCHER, 1);
     let cols = Columns::new(t.t.view(), &facts, &facts);
 
@@ -1566,12 +1577,12 @@ fn assoc_item_bounds_prove_alias_trait_clauses() {
     // `fn run<'a, P: Pattern>(s: P::Searcher<'a>, x: &'a u8) where P::Searcher<'a>: Searcher<'a>`
     // Called with `P = Param(0)`, `'a = slot 0`, `s: P::Searcher<'1>`, `x: &'2 u8`.
     let p = params(1, &[]);
-    let inputs = [ty(searcher_alias, P0), ty(r, P0)];
+    let inputs = [ty(subject, P0), ty(r, P0)];
     let clauses = [ClauseIn::TraitOf { trait_ref: ty(callee_clause, P00) }];
     let sig = Sig { item: METHOD, params: ParamsView::of(&p), inputs: &inputs, output: ty(r, P0), clauses: &clauses };
     let types = [arg(p0, 0, 0)];
     let generics = GenericArgs { lifetimes: range(0, 1), types: &types };
-    let args = [arg(searcher_alias, 1, 1), arg(r, 2, 1)];
+    let args = [arg(subject, 1, 1), arg(r, 2, 1)];
     let dest = arg(r, 3, 1);
 
     let item_col = blaze_typeck::regions::RegionCol::lay(t.t.view(), item_bound_ty, &facts, P00, alloc()).expect("item bound laid");
@@ -1584,6 +1595,12 @@ fn assoc_item_bounds_prove_alias_trait_clauses() {
     let sel_without = AssocSel { bound: None };
     let (res, _) = run(&cols, &sel_without, &Own::default(), 4, Callee::Fn(sig), generics, &args, dest);
     assert!(matches!(res, Err(Refused::Unselected { trait_: T_SEARCH, .. })), "CONTROL: without assoc_clauses, refused Unselected: {res:?}");
+    if descendant {
+        let col = blaze_typeck::regions::RegionCol::lay(t.t.view(), parent_clause, &facts, P00, alloc()).unwrap();
+        let parent_only = AssocSel { bound: Some((1, [ClauseView { nth: 0, binders: 0, col: ColView::of(&col), outlives: None }])) };
+        let (res, _) = run(&cols, &parent_only, &Own::default(), 4, Callee::Fn(sig), generics, &args, dest);
+        assert!(matches!(res, Err(Refused::Unselected { trait_: T_SEARCH, .. })), "a bound on the parent cannot prove the child's bound: {res:?}");
+    }
 }
 
 /// Higher-ranked clause instantiation (`BinderCtx::Clause`):

@@ -4,8 +4,8 @@
 """
 from __future__ import annotations
 
-import importlib.util
 import hashlib
+import importlib.util
 import json
 import os
 import signal
@@ -15,10 +15,47 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 HARNESS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARNESS))
+import toolchain_pins as c_toolchain
+
+
+def make_c_toolchain_fixture(source: Path, shelf: Path) -> tuple[Path, Path, dict[str, Any]]:
+    archive = shelf / "clang" / ("a" * 64)
+    for name in sorted(set(c_toolchain.DARWIN + c_toolchain.LINUX)):
+        member = archive / name
+        if name == "lib/clang":
+            member.mkdir(parents=True, exist_ok=True)
+            (member / "stddef.h").write_text("synthetic resource header\n")
+        else:
+            member.parent.mkdir(parents=True, exist_ok=True)
+            member.write_text("pinned clang" if name == "bin/clang-23" else f"synthetic {name}\n")
+            member.chmod(0o755)
+    (archive / "bin/clang").unlink()
+    (archive / "bin/clang").symlink_to("clang-23")
+    sysroot = shelf / "sysroot" / "unkeyed"
+    sysroot.mkdir(parents=True)
+    (sysroot / "stdlib.h").write_text("library")
+    keyed = sysroot.with_name(c_toolchain.tree_digest(sysroot))
+    sysroot.rename(keyed)
+    darwin, linux = "aarch64-apple-darwin", "aarch64-unknown-linux-gnu"
+    programs = {"names": "clang-23", "clang-23": {
+        "member": "LLVM/bin/clang-23", "sha256": c_toolchain.sha256(archive / "bin/clang-23"),
+    }}
+    pins = {
+        "targets": {host: {"sha256": archive.name} for host in (darwin, linux)},
+        "sysroots": {darwin: "macos-sdk", linux: keyed.name},
+        "shelf_programs": {host: programs for host in (darwin, linux)},
+        "shelf_trees": {linux: c_toolchain.tree_digest(archive)},
+    }
+    (source / "pins").mkdir(parents=True, exist_ok=True)
+    (source / "pins/clang.json").write_text(json.dumps(pins))
+    return archive, keyed, pins
+
+
 spec = importlib.util.spec_from_file_location("forkfixes_runner", HARNESS / "forkfixes.py")
 runner = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = runner
@@ -503,31 +540,16 @@ class ForkfixHarness(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             given = runner.Input(**self.fixture_input(root), source=str(root))
-            archive = Path(given.shelf) / "clang" / ("a" * 64)
+            archive, sysroot, _ = make_c_toolchain_fixture(root, Path(given.shelf))
             clang = archive / "bin/clang-23"
-            clang.parent.mkdir(parents=True)
-            clang.write_text("pinned clang")
             link = archive / "bin/clang"
-            link.symlink_to("clang-23")
-            host = "aarch64-apple-darwin"
-            linux = "aarch64-unknown-linux-gnu"
-            pins = {"targets": {host: {"sha256": archive.name}}, "sysroots": {host: "macos-sdk"}, "shelf_programs": {host: {
-                "names": "clang-23", "clang-23": {"member": "LLVM/bin/clang-23", "sha256": runner.digest(clang)}}}}
-            (root / "pins").mkdir()
-            sysroot = Path(given.shelf) / "sysroot" / ("b" * 64)
-            sysroot.mkdir(parents=True)
-            (sysroot / "stdlib.h").write_text("library")
-            pins["targets"][linux] = pins["targets"][host]
-            pins["shelf_programs"][linux] = pins["shelf_programs"][host]
-            pins["sysroots"][linux] = sysroot.name
-            (root / "pins/clang.json").write_text(json.dumps(pins))
-            with patch.object(runner.platform, "machine", return_value="aarch64"), patch.object(sys, "platform", "linux"):
+            with patch.object(runner.c_toolchain.platform, "machine", return_value="aarch64"), patch.object(sys, "platform", "linux"):
                 home = root / "linux-home"
                 runner.copy_shelf(Path(given.shelf), home)
                 self.assertFalse((home / ".blaze/v2/toolchain/sysroot").exists())
                 self.assertEqual(runner.copy_clang(given, home)["sysroot"], sysroot.name)
                 self.assertEqual((home / ".blaze/v2/toolchain/sysroot" / sysroot.name / "stdlib.h").read_text(), "library")
-            with patch.object(runner.platform, "machine", return_value="arm64"), patch.object(sys, "platform", "darwin"):
+            with patch.object(runner.c_toolchain.platform, "machine", return_value="arm64"), patch.object(sys, "platform", "darwin"):
                 runner.validate(given, directory)
                 home = root / "home"
                 runner.copy_shelf(Path(given.shelf), home)
@@ -542,6 +564,7 @@ class ForkfixHarness(unittest.TestCase):
                 with self.assertRaisesRegex(runner.CaseFailed, "escapes its pinned directory"):
                     runner.copy_clang(given, root / "escape")
                 link.unlink()
+                link.symlink_to("clang-23")
                 clang.write_text("different compiler")
                 with self.assertRaisesRegex(runner.CaseFailed, "differs from pins/clang.json"):
                     runner.copy_clang(given, root / "changed")

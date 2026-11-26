@@ -337,7 +337,7 @@ impl<'b> Records<'b> for Folder {
 
 /// One crate made this command: its payload, out, and the checkout files its resolution read.
 pub(crate) struct Resolved {
-    pub(crate) caller_reads: std::vec::Vec<(blaze_engine::CellId, ContentId), Global>,
+    pub(crate) caller_reads: blaze_own::Vec<(blaze_engine::CellId, ContentId), Global>,
     /// The record's payload ([`sections::write`]).
     payload: blaze_own::Vec<u8, Global>,
     /// The digest both check drivers publish for this resolution.

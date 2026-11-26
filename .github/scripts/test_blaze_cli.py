@@ -5,18 +5,21 @@ import importlib.util
 import io
 import json
 import subprocess
-from collections.abc import Mapping
-from dataclasses import replace
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from collections.abc import Mapping
+from dataclasses import replace
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "harness/v2"))
+sys.path.insert(0, str(ROOT / "harness"))
+sys.path.insert(0, str(ROOT / "harness/forkfixes"))
 import real_smoke as rs
+from test_harness import make_c_toolchain_fixture
 
 SPEC = importlib.util.spec_from_file_location("source_cli_smoke", ROOT / "harness/blaze_cli.py")
 smoke = importlib.util.module_from_spec(SPEC)
@@ -211,6 +214,11 @@ class RealSmokeTests(unittest.TestCase):
         self.shelf = self.root / "shelf"
         self.shelf.mkdir()
         (self.shelf / "manifest-record").write_text("synthetic shelf\n")
+        self.pin_source = self.root / "source"
+        self.clang, self.sysroot, self.pins = make_c_toolchain_fixture(self.pin_source, self.shelf)
+        for fixture in (patch.object(rs, "TREE", self.pin_source), patch.object(rs.c_toolchain, "host", return_value="aarch64-apple-darwin")):
+            fixture.start()
+            self.addCleanup(fixture.stop)
         self.toolchain_home = self.root / "toolchain-home"
         (self.toolchain_home / ".rustup" / "toolchains").mkdir(parents=True)
         self.given = rs.Input(
@@ -236,6 +244,7 @@ class RealSmokeTests(unittest.TestCase):
                             "modules": given.modules,
                             "toolchain_home": given.toolchain_home,
                             "shelf": given.shelf,
+                            "clang_shelf": given.clang_shelf,
                         }
                     ),
                 ]
@@ -298,6 +307,7 @@ class RealSmokeTests(unittest.TestCase):
             len(list((home / "build-script" / "modules").glob("*/module.wasm"))), len(rs.SCRIPTS)
         )
         self.assertTrue((home / "toolchain" / "manifest-record").is_file())
+        self.assertEqual((home / "toolchain/clang" / self.clang.name / "bin/clang").readlink(), Path("clang-23"))
         self.assertEqual([name for name, _ in rows], ["smoke", "smoke", "smoke", "smoke-edition"])
         for _, env in rows:
             self.assertEqual(env["HOME"], str(self.root / "work" / "home"))
@@ -344,6 +354,45 @@ class RealSmokeTests(unittest.TestCase):
             self.invoke(replace(self.given, modules=""), code=1)
         self.assertEqual(requests, [])
         self.assertEqual(run.call_count, 4)
+
+    def test_missing_or_changed_clang_refuses_before_any_row(self) -> None:
+        for relative, contents in (("bin/clang-23", None), ("bin/clang-23", "wrong compiler"), ("lib/libclang.dylib", None)):
+            compiler = self.clang / relative
+            original = compiler.read_text()
+            with self.subTest(member=relative, contents=contents):
+                compiler.unlink()
+                if contents is not None:
+                    compiler.write_text(contents)
+                    compiler.chmod(0o755)
+                with patch.object(rs.ran, "run") as run, patch.object(rs.subprocess, "run") as builder, contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                    rs.main(["real_smoke.py", json.dumps({"blaze": str(self.bin), "work": str(self.root / "refused"), "tmpfs": "", "shelf": str(self.shelf)})])
+                run.assert_not_called()
+                builder.assert_not_called()
+                compiler.write_text(original)
+                compiler.chmod(0o755)
+
+    def test_linux_sysroot_override_and_complete_tree_validation(self) -> None:
+        override = self.root / "provided"
+        self.clang, self.sysroot, self.pins = make_c_toolchain_fixture(self.pin_source, override)
+        with patch.object(rs.c_toolchain, "host", return_value="aarch64-unknown-linux-gnu"):
+            selected = rs.c_toolchain.select(self.pin_source, self.shelf, override / "clang")
+            selected.copy_into(self.root / "linux-home")
+            installed = self.root / "linux-home/.blaze/v2/toolchain"
+            self.assertEqual((installed / "sysroot" / self.sysroot.name / "stdlib.h").read_text(), "library")
+            resource = self.clang / "lib/clang/stddef.h"
+            resource.write_text("changed resource")
+            with self.assertRaisesRegex(ValueError, "tree differs"):
+                rs.c_toolchain.select(self.pin_source, self.shelf, override / "clang")
+            resource.write_text("synthetic resource header\n")
+            (self.sysroot / "stdlib.h").write_text("changed header")
+            with self.assertRaisesRegex(ValueError, "tree differs"):
+                rs.c_toolchain.select(self.pin_source, self.shelf, override / "clang")
+
+    def test_tree_encoding_matches_the_native_verifier(self) -> None:
+        tree = self.root / "tree"
+        (tree / "include").mkdir(parents=True)
+        (tree / "include/a.h").write_text("#define VALUE 1\n")
+        self.assertEqual(rs.c_toolchain.tree_digest(tree), "86159e0c7b4806784a6a28dee4b2fab540ce1f6cb2dc3dc6c437785c4f644b19")
 
     def test_the_edition_member_names_nothing_of_its_standard_library(self) -> None:
         manifest = (rs.SOURCE / "edition" / "Cargo.toml").read_text()

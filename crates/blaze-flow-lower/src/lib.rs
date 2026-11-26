@@ -421,6 +421,10 @@ pub trait Facts {
     fn future_trait(&self) -> Option<ItemKey> {
         None
     }
+    /// The core `Pin` lang item, whose Future implementation forwards to its pointer target.
+    fn pin_adt(&self) -> Option<ItemKey> {
+        None
+    }
     /// The synthetic associated type and its declaring method for a trait return opaque.
     fn rpitit_opaque(&self, _: ItemKey) -> Option<RpititOpaque> {
         None

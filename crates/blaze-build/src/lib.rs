@@ -883,7 +883,7 @@ pub struct Built<A: Allocator> {
     pub thread_locals: Vec<ItemKey, A>,
     /// By `Vtable` reference place: the (concrete type, principal) table whose address the
     /// function takes. One place per table, however often it is named.
-    pub vtables: Vec<vtable::VtableRef, A>,
+    pub vtables: blaze_own::Vec<vtable::VtableRef, A>,
     /// Per `unreachable` the walk wrote to end a construct, which construct (blaze-code
     /// record.rs `TrapSource`: by its ordinal among the function's `unreachable`s, its kind and
     /// its item-relative site): the code record's trap table, what a fault's report says.

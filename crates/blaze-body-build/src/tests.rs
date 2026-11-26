@@ -97,11 +97,34 @@ fn from_table() -> PortableTys<'static> {
 /// `text` parsed, verified and built as `ITEM` at no arguments, under `panic`.
 fn built(text: &str, panic: Panic) -> Result<Built<Alloc<'static>>, BuildError> {
     let from = from_table();
+    built_from(text, panic, &from)
+}
+
+fn built_from(text: &str, panic: Panic, from: &PortableTys<'_>) -> Result<Built<Alloc<'static>>, BuildError> {
     let body = blaze_body::text::parse(text, Alloc::global()).unwrap();
     let verified = blaze_body::verify(&body).unwrap();
     let mut ground = PortableTys::new_in(Alloc::global());
     let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
     build(verified, from.view(), ITEM, &mut subst, &World { panic }, Alloc::global())
+}
+
+#[test]
+fn marker_cast_materializes_one_table_then_preserves_the_wide_metadata() {
+    let mut t = from_table();
+    let thin = t.intern(PNode::Ref(Mutbl::Not, PTy(0))).unwrap();
+    let auto = t.intern(PNode::ExAuto(ItemKey(0x20))).unwrap();
+    let extra = t.intern(PNode::ExAuto(ItemKey(0x21))).unwrap();
+    let mut marker_ref = |preds: &[PTy]| {
+        let list = t.intern_list(preds).unwrap();
+        let object = t.intern(PNode::Dynamic(list)).unwrap();
+        t.intern(PNode::Ref(Mutbl::Not, object)).unwrap().0
+    };
+    let both = marker_ref(&[auto, extra]);
+    let one = marker_ref(&[auto]);
+    let text = format!("local _0: t{one} return\nlocal _1: t{} arg 0\nlocal _2: t{both} temp e0 value\nbb0:\n  _2 = cast unsize(copy _1) as t{both}\n  _0 = cast unsize(copy _2) as t{one}\n  return\n", thin.0);
+    let b = built_from(&text, Panic::Abort, &t).expect("thin and wide marker casts");
+    assert_eq!(b.vtables.len(), 1);
+    assert_eq!(b.vtables[0].principal, ItemKey(0x20));
 }
 
 fn printed(b: &Built<Alloc<'static>>) -> String {

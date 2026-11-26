@@ -953,7 +953,7 @@ pub(crate) fn build<A: Allocator + Copy>(
         refs: copy_slice(&refs, alloc),
         statics: copy_slice(&statics, alloc),
         thread_locals: copy_slice(&thread_locals, alloc),
-        vtables: copy_slice(&vtables, alloc),
+        vtables: blaze_own::Vec::from_slice_in(&vtables, alloc),
         traps: Vec::new_in(alloc),
         copy_insts,
     };

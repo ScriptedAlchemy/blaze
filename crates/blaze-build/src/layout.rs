@@ -1634,7 +1634,7 @@ impl<A: Allocator + Clone> Layouts<A> {
         // up to a generous depth bound so valid chains succeed regardless of initial table size
         // while malformed recursive tails are still rejected immediately.
         const MAX_TAIL_DEPTH: usize = 1024;
-        let mut seen: Vec<PTy, Alloc<'_>> = Vec::new_in(cx.scratch);
+        let mut seen = blaze_own::AVec::new_in(cx.scratch);
         for _ in 0..MAX_TAIL_DEPTH {
             if seen.iter().any(|&q| q == p) {
                 return Err(Refusal::Malformed("a pointee tail that does not end"));

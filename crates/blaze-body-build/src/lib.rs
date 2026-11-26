@@ -173,6 +173,7 @@ pub(crate) struct Cx<'a, 'g, 't, A: Allocator + Copy> {
     /// By thread-local reference place: the static item, and the reference made for it.
     pub(crate) thread_locals: AllocVec<ItemKey, A>,
     pub(crate) tls_ids: Vec<RefId, A>,
+    pub(crate) vtables: Vec<blaze_build::vtable::VtableRef, A>,
     /// The row being built, which every error names.
     pub(crate) stmt: Option<Stmt>,
 }
@@ -219,6 +220,7 @@ pub fn build<A: Allocator + Copy>(
         static_ids: Vec::new_in(alloc),
         thread_locals: AllocVec::new_in(alloc),
         tls_ids: Vec::new_in(alloc),
+        vtables: Vec::new_in(alloc),
         stmt: None,
     };
     cx.frame()?;
@@ -232,7 +234,7 @@ pub fn build<A: Allocator + Copy>(
         // This builder marks no `unreachable` with its construct yet: its records carry no trap
         // rows (blaze-code record.rs `TrapSource`), so a fault in them is said by its code alone.
         traps: AllocVec::new_in(alloc),
-        vtables: AllocVec::new_in(alloc),
+        vtables: cx.vtables,
         // This builder has no `copy` of its own (blaze-build walk.rs): none counted.
         copy_insts: 0,
     })

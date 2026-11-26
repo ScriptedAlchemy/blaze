@@ -38,6 +38,9 @@ The input is one JSON object (`Input`), unknown fields refused:
             needs `cold`
     path    the PATH of the fixed environment: where `cc` is
     shelf   an installed toolchain shelf to copy into each fresh home (default ~/.blaze/v2/toolchain)
+    clang_shelf
+            pinned C toolchains (default <shelf>/clang), validated against this checkout's pins
+            before any row runs. Linux's pinned sysroot is beside this directory, under sysroot/.
     workers optional number of Blaze workers per command
 
 Each step is `blaze run` under `env -i`-like conditions (ran.Command: the whole environment is
@@ -73,7 +76,9 @@ from typing import TypedDict
 
 # Run with `python3 -I`, which leaves the script's directory off the path: ran.py is beside it.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ran
+import toolchain_pins as c_toolchain
 from ran import Command, Proof
 
 STEPS = ("cold", "noop", "edit", "edition")
@@ -123,6 +128,7 @@ class Input:
     steps: tuple[str, ...] = STEPS
     path: str = "/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin"
     shelf: str | None = None
+    clang_shelf: str | None = None
     workers: int | None = None
 
 
@@ -230,14 +236,15 @@ def provision(asked: Input, project: Path, home: Path, logs: Path) -> bool:
     return good
 
 
-def place(name: str, root: Path, asked: Input) -> bool:
+def place(name: str, root: Path, asked: Input, clang: c_toolchain.Toolchain) -> bool:
     """The steps in a new copy and a new home under `root`; whether every row counted."""
     blaze = str(Path(asked.blaze) / "blaze")
     shutil.rmtree(root, ignore_errors=True)
     home = root / "home"
     home.mkdir(parents=True)
     shelf = Path(asked.shelf) if asked.shelf is not None else Path.home() / ".blaze/v2/toolchain"
-    shutil.copytree(shelf, home / ".blaze/v2/toolchain")
+    shutil.copytree(shelf, home / ".blaze/v2/toolchain", ignore=lambda directory, _: ["clang", "sysroot"] if Path(directory) == shelf else [])
+    clang.copy_into(home)
     project = root / "p"
     shutil.copytree(SOURCE, project)
     env = {"HOME": str(home), "PATH": asked.path, "TERM": "dumb", "LANG": "C.UTF-8", "RUST_BACKTRACE": "0"}
@@ -325,8 +332,14 @@ def main(argv: list[str]) -> None:
         sys.exit(
             f"work {asked.work} is on a tmpfs: the first run is on a disk (the second, `tmpfs`, is the tmpfs one)"
         )
+    shelf = Path(asked.shelf) if asked.shelf is not None else Path.home() / ".blaze/v2/toolchain"
+    override = Path(asked.clang_shelf) if asked.clang_shelf is not None else None
+    try:
+        clang = c_toolchain.select(TREE, shelf, override)
+    except (OSError, ValueError, KeyError) as error:
+        sys.exit(f"real_smoke.py: {error}")
     print(f"real smoke of {asked.blaze}, load {os.getloadavg()[0]:.0f}", flush=True)
-    good = place(f"disk({disk or '?'})", Path(asked.work), asked)
+    good = place(f"disk({disk or '?'})", Path(asked.work), asked, clang)
     if asked.tmpfs:
         parent = Path(asked.tmpfs) if Path(asked.tmpfs).exists() else Path(asked.tmpfs).parent
         memory = filesystem(parent)
@@ -334,7 +347,7 @@ def main(argv: list[str]) -> None:
             sys.exit(
                 f"tmpfs {asked.tmpfs} is on {memory or 'a file system /proc/mounts does not name'}, not a tmpfs"
             )
-        good = place("tmpfs", Path(asked.tmpfs), asked) and good
+        good = place("tmpfs", Path(asked.tmpfs), asked, clang) and good
         shutil.rmtree(asked.tmpfs, ignore_errors=True)
     else:
         print("tmpfs            NOT RUN: no `tmpfs` directory was given", flush=True)

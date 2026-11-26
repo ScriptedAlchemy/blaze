@@ -265,6 +265,9 @@ impl Facts for NestedFacts<'_, '_> {
     fn future_trait(&self) -> Option<tc::ItemKey> {
         self.facts.future_trait()
     }
+    fn pin_adt(&self) -> Option<tc::ItemKey> {
+        self.facts.pin_adt()
+    }
     fn rpitit_opaque(&self, opaque: tc::ItemKey) -> Option<blaze_flow_lower::RpititOpaque> {
         self.facts.rpitit_opaque(opaque)
     }
