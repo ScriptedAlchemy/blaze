@@ -380,6 +380,12 @@ define i64 @entry() {{
         assert_eq!(view.position(0).site, 17);
         assert!((0..view.sites()).any(|i| view.site(i).kind == SiteKind::Page21));
         assert!((0..view.sites()).any(|i| view.site(i).addend >= 8 && view.site(i).target == blaze_code::record::OWN_RELRO), "the interior data address survives");
+
+        let unrelated_ir = ir.replace("@blaze_pos_entry_0", "@ordinary_zero");
+        let mut unrelated = object_fixture(&unrelated_ir);
+        unrelated.references.push(Some(target));
+        let refused = emit_release(ReleaseTask { module: &unrelated, imports: &[], opt: 2, machine }, Alloc::global());
+        assert!(matches!(refused, Err(super::emit::EmitError::Read(super::object::ReadError::Writable { .. }))), "{os:?}: an ordinary writable global cannot become record data");
     }
 }
 

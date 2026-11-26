@@ -137,10 +137,11 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
         }
         let section = file.section_by_index(index).map_err(|_| ReadError::Section { at: 0 })?;
         if index != text {
-            match section.kind() {
+            let kind = section.kind();
+            match kind {
                 SectionKind::ReadOnlyData | SectionKind::ReadOnlyString | SectionKind::ReadOnlyDataWithRel => {}
                 SectionKind::Data if section.name().map(|n| n == "__const").unwrap_or(false) => {}
-                SectionKind::Data if position_section(&file, index, module, alloc)? => {}
+                SectionKind::Data | SectionKind::UninitializedData if position_section(&file, index, module, alloc)? => {}
                 _ => {
                     let mut spelled = FixedString::<32>::new();
                     spelled.try_push_str(section.name().unwrap_or("")).ok();
@@ -152,8 +153,16 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
                 return Err(ReadError::Semantics { at: 0, what: "constant section alignment exceeds the record form" });
             }
             let start = u64::try_from(record.relro.len()).map_err(|_| ReadError::CodeOutside)?.next_multiple_of(align);
-            record.relro.resize(usize::try_from(start).map_err(|_| ReadError::CodeOutside)?, 0);
-            record.relro.extend_from_slice(section.data().map_err(|_| ReadError::CodeOutside)?);
+            let start_at = usize::try_from(start).map_err(|_| ReadError::CodeOutside)?;
+            if kind == SectionKind::UninitializedData {
+                // LLVM puts zero source-position slots in BSS, whose object section has no bytes.
+                let size = usize::try_from(section.size()).map_err(|_| ReadError::CodeOutside)?;
+                let end = start_at.checked_add(size).filter(|&end| u32::try_from(end).is_ok()).ok_or(ReadError::CodeOutside)?;
+                record.relro.resize(end, 0);
+            } else {
+                record.relro.resize(start_at, 0);
+                record.relro.extend_from_slice(section.data().map_err(|_| ReadError::CodeOutside)?);
+            }
             record.relro_align = record.relro_align.max(align_of(align));
             placed.push((index, start));
         } else {
