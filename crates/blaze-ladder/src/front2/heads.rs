@@ -4859,6 +4859,7 @@ impl<'n> Store<'n> {
         let marks = self.marks(names, key, v.item())?;
         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
+        let work = self.work_alloc();
         // The trait's bounds are lowered after its head (they may name the trait): a default
         // written with `T::X` is refused as not yet readable, never as not found.
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs, body: None };
@@ -4934,7 +4935,7 @@ impl<'n> Store<'n> {
                     ItemDetail::Const { .. } => DynMember::Const,
                     d => return Err(Why::Unsupported(crate::front::detail_name(d), whole)),
                 };
-                let shape = super::dyn_ty::member(&b.resolver, module, self.sized, &self.pointers, b.marks, self.work_alloc(), kind, mv)?;
+                let shape = super::dyn_ty::member(&b.resolver, module, self.sized, &self.pointers, b.marks, work, kind, mv)?;
                 members.push(tc::dyn_compat::MemberFacts { name: Name::of(m.name), shape });
                 Ok(())
             })
@@ -5343,7 +5344,7 @@ impl<'n> Store<'n> {
                             return Ok(());
                         };
                         let of_type = param_names(mv, own + 1, &mut own_ps, Consts::Keep)?;
-                        let mut own_cs = blaze_own::Vec::with_capacity_in(cs.len() + mine.len(), alloc);
+                        let mut own_cs = Vec::with_capacity_in(cs.len() + mine.len(), alloc);
                         own_cs.extend_from_slice(&cs);
                         own_cs.extend(mine.iter().map(|&(i, t)| (own + 1 + i, t)));
                         let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
