@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 575cd58581f2987503fa13a6905ea80fdd1e94a3
+          ref: c7f657a2357eac165ca525267671516f4720789d
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink

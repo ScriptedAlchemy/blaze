@@ -155,6 +155,7 @@ impl Emission {
 /// Provenance carried by the compiler that produced a native store value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeEmission {
+    /// The emitted machine record's role in the release plan.
     pub kind: BackendKind,
     /// The compiler's canonical grant name inside the unit.
     pub grant: Digest,
@@ -162,9 +163,12 @@ pub struct NativeEmission {
     pub content: Digest,
 }
 
+/// A native release record's role as reported by its renderer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendKind {
+    /// Code emitted for a single release function and its imported definitions.
     ReleaseBlob,
+    /// A shared folded body or the entry thunk for one member.
     FoldedOutput,
 }
 

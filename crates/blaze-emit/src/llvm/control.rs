@@ -5,6 +5,69 @@ use blaze_lir::{
     op::{Target as Branch, Values},
 };
 
+// Reserved in the emitted object only. Explicit LIR traps cannot use the emitter's range.
+pub(super) const CLEANUP_LANDING: u32 = blaze_code::trap::UNREACHABLE + 1;
+
+const TERMINATE_CLAUSE: &str = "filter [0 x ptr] zeroinitializer";
+
+fn ordinary_edges<'v>(view: View<'v>, i: usize, mut edge: impl FnMut(usize, Branch<'v>)) {
+    let mut o = view.operands(i);
+    match view.op(i) {
+        Op::Jump => edge(0, o.target()),
+        Op::Br => {
+            o.value();
+            edge(0, o.target());
+            edge(1, o.target());
+        }
+        Op::Switch => {
+            let v = o.value();
+            edge(0, o.target());
+            for (k, (_, target)) in o.cases(v).enumerate() {
+                edge(k + 1, target);
+            }
+        }
+        Op::Invoke | Op::InvokeIndirect => {
+            o.word(); // the callee reference or value
+            o.sig();
+            edge(0, Branch { block: o.block(), args: Values(&[]) });
+        }
+        _ => {}
+    }
+}
+
+/// The stencil's cleanup region: landings that are already unwinding and blocks reached by
+/// ordinary edges from them. An invoke's exceptional edge starts its own landing.
+pub(super) fn cleanup_blocks<'a>(view: View<'_>, alloc: Alloc<'a>) -> AVec<'a, bool> {
+    let mut cleanup = AVec::new_in(alloc);
+    // This landing marker is only defined by the native AArch64 record ABI.
+    if view.head.ptr_bits != 64 {
+        return cleanup;
+    }
+    let mut pending = AVec::new_in(alloc);
+    for (b, _) in (0u32..).zip(view.block_starts) {
+        let block = Block(b);
+        if matches!(view.block_kind(block), BlockKind::Cleanup | BlockKind::Terminate) {
+            pending.push(block);
+        }
+    }
+    if !pending.is_empty() {
+        cleanup.resize(view.blocks(), false);
+        for block in &pending {
+            cleanup[block.index()] = true;
+        }
+    }
+    while let Some(block) = pending.pop() {
+        ordinary_edges(view, view.terminator(block), |_, target| {
+            let seen = &mut cleanup[target.block.index()];
+            if !*seen {
+                *seen = true;
+                pending.push(target.block);
+            }
+        });
+    }
+    cleanup
+}
+
 /// Give each argument-bearing edge its own predecessor. Two arms of the same
 /// terminator can branch to the same block with different arguments.
 pub(super) struct Edges<'a, 'v> {
@@ -16,31 +79,14 @@ impl<'a, 'v> Edges<'a, 'v> {
         let mut incoming = blaze_own::ABTreeMap::new_in(alloc);
         for (b, _) in (0u32..).zip(view.block_starts) {
             let i = view.terminator(Block(b));
-            let mut o = view.operands(i);
-            let mut edge = |k, t: Branch<'v>| {
+            ordinary_edges(view, i, |k, t| {
                 if !t.args.0.is_empty() {
                     incoming
                         .entry(t.block.0)
                         .or_insert_with(|| AVec::new_in(alloc))
                         .push((i, k, t.args));
                 }
-            };
-            match view.op(i) {
-                Op::Jump => edge(0, o.target()),
-                Op::Br => {
-                    o.value();
-                    edge(0, o.target());
-                    edge(1, o.target());
-                }
-                Op::Switch => {
-                    let v = o.value();
-                    edge(0, o.target());
-                    for (k, (_, t)) in o.cases(v).enumerate() {
-                        edge(k + 1, t);
-                    }
-                }
-                _ => {}
-            }
+            });
         }
         Self { incoming }
     }
@@ -98,7 +144,7 @@ impl Lower<'_, '_> {
                 BlockKind::Cleanup => "cleanup",
                 BlockKind::Catch => "catch ptr null",
                 // blaze-code's LSDA gives Terminate the empty exception specification (-1).
-                BlockKind::Terminate => "filter [0 x ptr] zeroinitializer",
+                BlockKind::Terminate => TERMINATE_CLAUSE,
                 _ => return Err(self.error("unknown LIR landing block")),
             };
             format_into!(
@@ -198,7 +244,7 @@ impl Lower<'_, '_> {
             Op::Resume => {
                 format_into!(
                     ir,
-                    "  call void @_Unwind_Resume(ptr %v{})\n  unreachable",
+                    "  notail call void @_Unwind_Resume(ptr %v{})\n  unreachable",
                     o.value().0
                 );
                 self.declaration(
@@ -227,6 +273,7 @@ impl Lower<'_, '_> {
         let sig_id = o.sig();
         let signature = Signature::new(view, sig_id).map_err(|e| self.error(e.reason()))?;
         let unwind = matches!(op, Op::Invoke | Op::InvokeIndirect).then(|| (o.block(), o.block()));
+        let cleanup_call = self.in_cleanup && matches!(op, Op::Call | Op::CallIndirect);
         let args = o.values();
         let tail = matches!(op, Op::TailCall | Op::TailCallIndirect);
         if tail && view.sig(sig_id).bits & SigRec::VARIADIC != 0 {
@@ -263,7 +310,7 @@ impl Lower<'_, '_> {
         if !view.sig(sig_id).rets.is_empty() {
             format_into!(&mut self.ir, "%v{i} = ");
         }
-        let mnemonic = if unwind.is_some() {
+        let mnemonic = if unwind.is_some() || cleanup_call {
             "invoke"
         } else if tail {
             "musttail call"
@@ -286,6 +333,12 @@ impl Lower<'_, '_> {
         signature.parameters(&mut self.ir, abi::Args::Call { values: args, instruction: i });
         if let Some((normal, landing)) = unwind {
             format_into!(&mut self.ir, " to label %b{} unwind label %b{}", normal.0, landing.0);
+        } else if cleanup_call {
+            self.cleanup_landing = true;
+            format_into!(
+                &mut self.ir,
+                " noinline to label %cleanup_return{i} unwind label %cleanup_terminate\ncleanup_return{i}:"
+            );
         }
         if tail {
             if view.sig(sig_id).rets.is_empty() {
@@ -295,6 +348,22 @@ impl Lower<'_, '_> {
             }
         }
         self.ir.push('\n');
+        Ok(())
+    }
+
+    /// Keep the call's exception edge material during optimization. The object reader can then
+    /// make the marked final LSDA ranges into gaps, which terminate in the Rust personality.
+    pub(super) fn write_cleanup_landing(&mut self) -> Result<(), LowerError> {
+        if self.cleanup_landing {
+            self.declaration(
+                AString::from_str_in("@llvm.aarch64.break", self.alloc),
+                AString::from_str_in("declare void @llvm.aarch64.break(i32)", self.alloc),
+            )?;
+            format_into!(
+                &mut self.ir,
+                "cleanup_terminate:\n  %cleanup_pad = landingpad {{ ptr, i32 }} {TERMINATE_CLAUSE}\n  call void @llvm.aarch64.break(i32 {CLEANUP_LANDING})\n  unreachable\n"
+            );
+        }
         Ok(())
     }
 }

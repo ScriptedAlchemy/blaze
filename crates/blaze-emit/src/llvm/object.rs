@@ -142,7 +142,7 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, tags: &Tags<'_>, 
     record.code.extend_from_slice(code);
     record.code_align = align_of(section.align()).max(blaze_code::record::LEAST_CODE_ALIGN);
     record.relro_align = blaze_code::record::LEAST_RELRO_ALIGN;
-    unwind.write(&file, &mut record)?;
+    unwind.write(&file, &mut record, alloc)?;
     for symbol in file.symbols().filter(|symbol| symbol.is_undefined()) {
         let symbol_name = plain(macho, symbol.name().map_err(|_| ReadError::Object)?);
         if module.references.iter().flatten().chain(module.implicit_references.iter()).any(|target| target.space == Space::Outside && target.symbol == blaze_code::record::Symbol::of_name(symbol_name)) {
@@ -227,6 +227,9 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, tags: &Tags<'_>, 
             continue;
         }
         let immediate = (word >> 5) & 0xffff;
+        if immediate == super::control::CLEANUP_LANDING {
+            return Err(ReadError::Unwind { at: index * 4, what: "cleanup marker is not a checked LSDA landing" });
+        }
         let Some(tag) = Tag::of_immediate(immediate) else { continue };
         let at = u32::try_from(index * 4).map_err(|_| ReadError::CodeOutside)?;
         let source = tags.source(tag).ok_or(ReadError::TrapTag { at, immediate })?;
