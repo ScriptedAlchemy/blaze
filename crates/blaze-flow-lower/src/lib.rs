@@ -6649,12 +6649,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let Some(param) = param else {
             let (bindings, regions) = self.body.local_fn_pointers;
             if let Expr::Local(p) = self.expr(c)?
-                && let Some((_, slots)) = bindings.iter().find(|(binding, _)| *binding == p)
+                && let Some(&(_, init, slots)) = bindings.iter().find(|(binding, ..)| *binding == p)
+                && let PNode::FnDef(item, _) = self.node(self.expr_ty(init)?, init)?
                 && let At::Place(own) = vs[0].at
                 && vs[0].ty.wrap.is_none()
             {
                 let Some(slots) = regions.get(slots.range()) else { return self.refuse(Form::Malformed, e) };
-                return self.call_fn_pointer_column(self.tys, vs[0].ty.ty, slots, own, 0, args, dest, dest_ty, e);
+                if let Ok(sig) = facts.sig(item)
+                    && sig.inputs() as usize == args.len()
+                    && self.reified_pointer_signature(sig, slots)
+                {
+                    return self.call_fn_pointer_column(self.tys, vs[0].ty.ty, slots, own, 0, args, dest, dest_ty, e);
+                }
             }
             if let Expr::Local(p) = self.expr(c)?
                 && let Some(&(_, adt, variant, field)) = self.local_field_source.iter().find(|&&(pat, ..)| pat == p)
@@ -6847,6 +6853,32 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return self.refuse(Form::CalleeValueUnknown, e);
         }
         self.call_fn_pointer_column(facts.region_tys().unwrap_or(self.tys), declared, slots, own, peel_skip, args, dest, dest_ty, e)
+    }
+
+    /// The destination may instantiate the item's late-bound lifetimes. Each occurrence of
+    /// one source variable must take the same destination region, and an item requiring
+    /// `'static` cannot acquire a higher-ranked input from the local annotation.
+    fn reified_pointer_signature(&self, sig: SigLife<'_>, slots: &[Region]) -> bool {
+        if !sig.well_formed() || !sig.bounds().is_empty() || sig.slots().len() != slots.len() {
+            return false;
+        }
+        let mut substitutions = Vec::new_in(self.alloc);
+        for (&source, &target) in sig.slots().iter().zip(slots) {
+            match source {
+                Region::Static if target == Region::Static => {}
+                Region::Param(i) if sig.is_late(i) == Some(true) && matches!(target, Region::Static | Region::Late { binder: 0, .. }) => {
+                    if let Some(&(_, earlier)) = substitutions.iter().find(|&&(p, _)| p == i) {
+                        if target != earlier {
+                            return false;
+                        }
+                    } else {
+                        substitutions.push((i, target));
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// A function pointer's free regions are carried by its place. Instantiate its bound

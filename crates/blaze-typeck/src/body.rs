@@ -428,7 +428,7 @@ pub struct BodyView<'b> {
     /// `Expr::Record` literal, ascending by [`ExprId`].
     pub record_expr_schemas: &'b [(ExprId, crate::ids::RecordSchema)],
     /// The region slots of local function-pointer annotations, indexed by their binding pattern.
-    pub local_fn_pointers: (&'b [(PatId, List)], &'b [crate::regions::Region]),
+    pub local_fn_pointers: (&'b [(PatId, ExprId, List)], &'b [crate::regions::Region]),
     /// Closure parameter annotations whose outer reference explicitly writes `'static`
     /// (`|lock: &'static str|`): `(closure_expr, param_index)`, ascending.
     pub closure_static_params: &'b [(ExprId, u32)],

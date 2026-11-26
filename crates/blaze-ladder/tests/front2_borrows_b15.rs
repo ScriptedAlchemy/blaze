@@ -75,6 +75,13 @@ fn local_bound(x: &u8) -> &u8 {
     p(x)
 }
 
+fn static_only(x: &'static u8) -> &'static u8 { x }
+
+fn local_widened_bad(x: &u8) -> &u8 {
+    let p: fn(&u8) -> &u8 = static_only;
+    p(x)
+}
+
 fn local_static_bad(x: &u8) -> &u8 {
     let p: fn(&'static u8) -> &'static u8 = identity;
     p(x)
@@ -167,6 +174,8 @@ fn b15_fn_pointer_binders() {
         let (_, found, refused, line) = check(n, FactsPlant::None);
         assert!(found && !refused, "{n}: no finding: {line}");
     }
+    let (clean, _, _, line) = check("local_widened_bad", FactsPlant::None);
+    assert!(!clean, "a local annotation widened a static-only item: {line}");
     // (d) CONTROL: a reading that knew no binder makes (a) wrong; (c)'s free lifetime is not
     // the binder's and stays clean.
     for n in ["call", "call_elided"] {

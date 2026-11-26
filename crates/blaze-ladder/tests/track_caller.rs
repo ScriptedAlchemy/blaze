@@ -520,7 +520,7 @@ impl Calls for u8 {
     fn plain(&self) -> u32 { caller_location().line }
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn main() -> i32 {
+pub extern "C-unwind" fn main() -> i32 {
     let value = 1u8;
     let object: &dyn Calls = &value;
     if object.inherited() != DYNAMIC { return 1; }

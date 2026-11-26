@@ -418,8 +418,8 @@ pub struct TypeckBody<'a> {
     /// Canonical lexicographically-sorted [`tc::RecordSchema`] for each anonymous `Expr::Record`,
     /// ascending by [`ExprId`].
     pub record_expr_schemas: AVec<'a, (ExprId, tc::RecordSchema)>,
-    /// Pattern-to-column index and region slots for annotated local function pointers.
-    pub local_fn_pointers: AVec<'a, (PatId, List)>,
+    /// Immutable binding, initializer and written signature regions for local function pointers.
+    pub local_fn_pointers: AVec<'a, (PatId, ExprId, List)>,
     pub local_fn_regions: AVec<'a, tc::regions::Region>,
     /// Closure parameter annotations whose outer reference explicitly writes `'static`
     /// (`|lock: &'static str|`): `(closure_expr, param_index)`, ascending.
@@ -1437,13 +1437,14 @@ impl Conv<'_, '_, '_, '_, '_> {
     fn stmt(&mut self, s: StmtId) -> Result<tc::Stmt, Refused> {
         Ok(match self.v.stmt(s)? {
             Stmt::Let { pat, ty, init, else_ } => {
-                let ty = match ty {
-                    Some(t) if matches!(self.v.ty(t)?, TypeRef::FnPtr { .. } | TypeRef::For { .. }) => {
+                let ty = match (ty, init) {
+                    (Some(t), Some(i)) if matches!(self.v.ty(t)?, TypeRef::FnPtr { .. } | TypeRef::For { .. })
+                        && matches!(self.v.pat(pat)?, Pat::Bind { ann, sub: None, .. } if !ann.mutable && ann.by_ref.is_none()) => {
                         let start = len(self.out.local_fn_regions.len());
                         let made = self.types.fn_pointer_ty(self.v, t, self.tys, &mut self.out.local_fn_regions)?;
                         let count = len(self.out.local_fn_regions.len()) - start;
                         if count != 0 {
-                            self.out.local_fn_pointers.push((pat, List { start, len: count }));
+                            self.out.local_fn_pointers.push((pat, i, List { start, len: count }));
                         }
                         Some(made)
                     }
