@@ -621,13 +621,24 @@ jobs:
         with:
           job: source-compiler
       - uses: ./.github/actions/toolchain-shelf
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: install the pinned LLVM for the source compiler's release tier
+        timeout-minutes: 12
+        run: |
+          prefix="$RUNNER_TEMP/pinned-llvm"
+          # shellcheck disable=SC2016
+          input=$(timeout 10 jq -nc --arg prefix "$prefix" '{command:"fetch",target:"aarch64-unknown-linux-gnu",dir:$prefix}')
+          timeout -k 15 600 python3 .github/scripts/llvm.py "$input"
+          echo "LLVM_SYS_231_PREFIX=$prefix" >> "$GITHUB_ENV"
       - name: build the source CLI and retained services
         run: |
           mkdir -p "$RUNNER_TEMP/source-evidence"
           tc="$(cat pins/toolchain)"
           git rev-parse HEAD HEAD^{tree} > "$RUNNER_TEMP/source-evidence/source.txt"
           cp pins/toolchain "$RUNNER_TEMP/source-evidence/toolchain-pin.txt"
-          timeout -k 30 5400 cargo +"$tc" build --release --locked --bins -p blaze-cli -p blaze-launcher -p blaze-dist-local -p blaze-serve \
+          timeout -k 30 5400 cargo +"$tc" build --release --locked --bins -p blaze-cli -p blaze-launcher -p blaze-dist-local -p blaze-serve --features blaze-cli/llvm \
             2>&1 | tee "$RUNNER_TEMP/source-evidence/build.log"
           mkdir "$RUNNER_TEMP/source-binaries"
           for binary in blaze blaze-launcher blaze-fact-shim blaze-dist-local blaze-serve; do
