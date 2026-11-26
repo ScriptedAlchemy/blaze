@@ -65,6 +65,8 @@ blaze-ids.workspace = true
 blaze-apple-sdk.workspace = true
 # Vec, SortedMap, VecDeque in the command's frame.
 blaze-own.workspace = true
+# The checked byte cursor for lint-prior payloads (engine_lints.rs).
+blaze-format.workspace = true
 # R4 (run.md): the kept body record's reader (engine_body_record.rs, `blaze_body::kept`).
 blaze-body.workspace = true
 # `syscalls::snapshot`: the memory layer's own system calls, counted and timed, for the profile's

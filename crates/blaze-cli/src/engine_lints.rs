@@ -45,6 +45,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use blaze_drive::{Kind, Locate, Name, Part, TaskFailure, Why};
 use blaze_engine::{Buffer, Done, Phase, Planned, SVec, Stage, Task};
+use blaze_format::cursor::{self, Reader};
 use blaze_ids::{ContentId, Hasher};
 use blaze_lint::{Cost, Rule, RuleSet};
 use blaze_own::SharedAlloc;
@@ -170,88 +171,86 @@ pub(crate) struct Prior {
 }
 
 /// Why a last lint record could not be read back (rule 19): its task is refused with it.
-const UNFORMED: &str = "its file's last lint record is not of this form (engine_lints.rs `FILE_FORM`)";
-const UNREAD: &str = "its file's last lint record ends inside a field or lists a unit it does not hold (engine_lints.rs `Prior::of`)";
-
-/// Little-endian fields read off a payload, each length checked.
-struct Fields<'b> {
-    bytes: &'b [u8],
+#[derive(Clone, Copy)]
+pub(crate) enum PriorError {
+    Form,
+    Unread,
 }
 
-impl<'b> Fields<'b> {
-    fn take(&mut self, n: usize) -> Result<&'b [u8], &'static str> {
-        if self.bytes.len() < n {
-            return Err(UNREAD);
-        }
-        let (head, rest) = self.bytes.split_at(n);
-        self.bytes = rest;
-        Ok(head)
+impl PriorError {
+    fn why(self) -> Why {
+        let what = match self {
+            Self::Form => "its file's last lint record is not of this form (engine_lints.rs `FILE_FORM`)",
+            Self::Unread => "its file's last lint record ends inside a field or lists a unit it does not hold (engine_lints.rs `Prior::of`)",
+        };
+        Why::Refused { what, rule: RULE }
     }
+}
 
-    fn id(&mut self) -> Result<[u8; 32], &'static str> {
-        self.take(32)?.try_into().map_err(|_| UNREAD)
-    }
-
-    fn u8(&mut self) -> Result<u8, &'static str> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, &'static str> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().map_err(|_| UNREAD)?))
-    }
-
-    fn u64(&mut self) -> Result<u64, &'static str> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().map_err(|_| UNREAD)?))
+impl From<cursor::Error> for PriorError {
+    fn from(_: cursor::Error) -> Self {
+        Self::Unread
     }
 }
 
 impl Prior {
     /// `record` (a file's lint record, [`file_record`]'s) read back: every field checked, so a
     /// record of another form or one cut short is a named refusal, never a record of no unit.
-    pub(crate) fn of<A: core::alloc::Allocator + Copy>(record: &Record<A>) -> Result<Prior, &'static str> {
-        let payload = record.payload_bytes().map_err(|_| UNREAD)?;
-        let mut at = Fields { bytes: payload };
-        if at.take(4).map_err(|_| UNFORMED)? != FILE_FORM {
-            return Err(UNFORMED);
+    pub(crate) fn of<A: core::alloc::Allocator + Copy>(record: &Record<A>) -> Result<Prior, PriorError> {
+        let payload = record.payload_bytes().map_err(|_| PriorError::Unread)?;
+        let mut at = Reader::new(payload);
+        if at.array::<4>().map_err(|_| PriorError::Form)? != FILE_FORM {
+            return Err(PriorError::Form);
         }
-        let under = Under { tool: ContentId(at.id()?), rules: at.id()?, edition: at.u8()? };
+        let under = Under { tool: ContentId(*at.array()?), rules: *at.array()?, edition: at.u8()? };
         let count = at.u32()? as usize;
         let mut units = std::vec::Vec::with_capacity_in(count.min(payload.len() / 64), Global);
         for _ in 0..count {
-            units.push((Name::new(Kind::Lint, ContentId(at.id()?)), ContentId(at.id()?)));
+            units.push((Name::new(Kind::Lint, ContentId(*at.array()?)), ContentId(*at.array()?)));
         }
         let with = at.u32()? as usize;
         let mut found = std::vec::Vec::with_capacity_in(with.min(payload.len()), Global);
         for _ in 0..with {
             let unit = at.u32()? as usize;
-            let name = units.get(unit).ok_or(UNREAD)?.0;
+            let name = units.get(unit).ok_or(PriorError::Unread)?.0;
             let chain = match at.u8()? {
                 0 => {
-                    at.u64()?;
+                    at.skip(8)?;
                     None
                 }
                 1 => Some(at.u64()?),
-                _ => return Err(UNREAD),
+                _ => return Err(PriorError::Unread),
             };
             let findings = at.u32()? as usize;
-            let mut one = Found { name, chain, findings: blaze_own::Vec::with_capacity_in(findings.min(at.bytes.len() / 14), Global), words: blaze_own::Vec::new_in(Global), fixes: blaze_own::Vec::new_in(Global) };
+            let mut one = Found { name, chain, findings: blaze_own::Vec::with_capacity_in(findings.min(at.left() / 14), Global), words: blaze_own::Vec::new_in(Global), fixes: blaze_own::Vec::new_in(Global) };
             for _ in 0..findings {
-                let rule = u16::from_le_bytes(at.take(2)?.try_into().map_err(|_| UNREAD)?);
+                let rule = at.u16()?;
                 let (start, end) = (at.u32()?, at.u32()?);
-                let words = at.u32()? as usize;
-                let words = at.take(words)?;
+                let words = at.bytes_u32()?;
                 let first = one.words.len();
                 one.words.extend_from_slice(words);
                 one.findings.push((rule, start, end, first, one.words.len()));
             }
-            let fixes = at.u32()? as usize;
-            one.fixes.extend_from_slice(at.take(fixes)?);
+            one.fixes.extend_from_slice(at.bytes_u32()?);
             found.push(one);
         }
-        if !at.bytes.is_empty() {
-            return Err(UNREAD);
-        }
+        at.finish()?;
         Ok(Prior { under, units, found })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContentId, Kind, Name, Prior, PriorError, Record};
+
+    #[test]
+    fn lint_prior_distinguishes_a_short_form_from_a_short_field() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut record = Record::new_in(Name::new(Kind::Lint, ContentId([0; 32])), alloc);
+        record.payload.extend_from_slice(b"BLF");
+        assert!(matches!(Prior::of(&record), Err(PriorError::Form)));
+        record.payload.push(b'1');
+        assert!(matches!(Prior::of(&record), Err(PriorError::Unread)));
     }
 }
 
@@ -424,7 +423,7 @@ pub(crate) struct LintsStage {
     /// Each entered task's last record, read back, keyed by task name ([`LintsStage::remember`]).
     /// Never iterated into output (only looked up by task name), so O(1) insert/lookup preserves
     /// deterministic output (rule 25).
-    priors: blaze_hash::Map<Name, Result<Prior, &'static str>, blaze_hash::BuildKeyHasher, Global>,
+    priors: blaze_hash::Map<Name, Result<Prior, PriorError>, blaze_hash::BuildKeyHasher, Global>,
     /// Each task entered and made, sorted by name after its phase.
     made: std::vec::Vec<Made, Global>,
     /// Each task refused, and why (rule 19).
@@ -485,7 +484,7 @@ impl LintsStage {
 
     /// Inserts an already-decoded prior (decoded in parallel on workers by `engine_check.rs`
     /// `lint_priors`) for `name`.
-    pub(crate) fn remember_prior(&mut self, name: Name, prior: Result<Prior, &'static str>) {
+    pub(crate) fn remember_prior(&mut self, name: Name, prior: Result<Prior, PriorError>) {
         self.priors.insert(name, prior);
     }
 
@@ -501,7 +500,7 @@ impl LintsStage {
         }
         let items = record.payload_bytes().map_err(|_| Why::Refused { what: "a `Lint` task whose file's outline record holds no payload", rule: RULE })?;
         let prior = match self.priors.get(&name) {
-            Some(kept) => Some(kept.as_ref().map_err(|what| Why::Refused { what: *what, rule: RULE })?),
+            Some(kept) => Some(kept.as_ref().map_err(|error| error.why())?),
             None => None,
         };
         let text = FileText { path: &one.path[..], source: one.source, edition: one.edition };

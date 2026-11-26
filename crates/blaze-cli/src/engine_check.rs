@@ -5810,7 +5810,7 @@ fn lint_priors<'a>(
     };
 
     enum PriorOut {
-        Decoded(Name, Result<crate::engine_lints::Prior, &'static str>),
+        Decoded(Name, Result<crate::engine_lints::Prior, crate::engine_lints::PriorError>),
         NeedStore(Name, blaze_drive::Key),
         OutlineBack(crate::engine_store::OutlineBack),
         Snapshot(blaze_cas::plain::SnapshotError),
