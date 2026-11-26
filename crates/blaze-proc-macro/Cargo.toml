@@ -29,12 +29,13 @@ required-features = ["bootstrap"]
 runtime = ["dep:wasmtime", "dep:tracing", "dep:blaze-unit-graph", "dep:blaze-format", "dep:blaze-id", "dep:blaze-base-tools"]
 default = ["runtime"]
 # The standalone D52 producer, never linked into a compiler command.
-bootstrap = ["runtime", "dep:blaze-script", "dep:blaze-git-fetch", "dep:blaze-toml", "dep:blaze-lex", "dep:blaze-text"]
+bootstrap = ["runtime", "dep:blaze-script", "dep:blaze-git-fetch", "dep:blaze-toml", "dep:blaze-data", "dep:blaze-lex", "dep:blaze-text"]
 
 [dependencies]
 blaze-script = { workspace = true, optional = true }
 blaze-git-fetch = { workspace = true, optional = true }
 blaze-toml = { workspace = true, optional = true }
+blaze-data = { workspace = true, optional = true }
 blaze-lex = { workspace = true, optional = true }
 blaze-text = { workspace = true, optional = true }
 # The expansion records' files through the effect layer (`record::OnDir`).
