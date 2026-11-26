@@ -1156,13 +1156,15 @@ mod tests {
     /// sched3's C4: an item that gives way on the loop's caller thread, or on the one thread of
     /// a loop of one job, is caught as a worker's is and run again after the loop, in index
     /// order, rather than unwinding the whole loop with no item named. On a pool of one
-    /// worker every item runs here; on a pool of two the caller's own ranges do.
+    /// worker every item runs here. On a pool of two, the other worker cannot drain the loop
+    /// before the caller claims a range.
     #[test]
     fn an_item_that_gives_way_on_the_callers_thread_runs_again_after_the_loop() {
         for workers in [1, 2] {
             let pool = Pool::new(&Topology::flat(workers), false).unwrap();
             let (made, runs, reruns) = pool.install(|| {
                 let caller = std::thread::current().id();
+                let caller_gave_way = AtomicBool::new(false);
                 let runs: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(0)).collect();
                 let gave: Vec<AtomicBool> = (0..64).map(|_| AtomicBool::new(false)).collect();
                 let reruns = Lock::new("graph.test.par.reruns", Vec::new());
@@ -1173,7 +1175,16 @@ mod tests {
                     } else if std::thread::current().id() == caller {
                         gave[at].store(true, Ordering::Relaxed);
                         _ = crate::pump::give_way();
+                        caller_gave_way.store(true, Ordering::Release);
                         std::panic::resume_unwind(Box::new("gave way on the caller"));
+                    } else if !caller_gave_way.load(Ordering::Acquire) {
+                        let start = std::time::Instant::now();
+                        crate::spin::SpinWait::within_on(
+                            "the loop's caller to give way",
+                            LONG,
+                            || start.elapsed(),
+                            || caller_gave_way.load(Ordering::Acquire),
+                        );
                     }
                     at * 2
                 });
