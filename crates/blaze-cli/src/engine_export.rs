@@ -49,6 +49,9 @@ use crate::phases::Phases;
 use crate::run_ids::{NotRunnable, RunIds, Runnable};
 use crate::{CliError, program, run_names, run_package};
 
+#[cfg(feature = "llvm")]
+mod release;
+
 /// Virtual reservation for the export scratch frame (walk tables, materialized records, data
 /// words, native image layout, and the emitted executable bytes). Untouched pages cost zero RSS.
 const EXPORT_FRAME_RESERVE: usize = 2 << 30;
@@ -247,7 +250,7 @@ pub(crate) fn command(
     if dist.is_some() && !flags.build_env.is_empty() {
         return Err(CliError::Usage("--build-env grants are private to this home and cannot be used for a distributed export"));
     }
-    if flags.release && dist.is_some() {
+    if flags.release && dist.is_some() && !cfg!(feature = "llvm") {
         return Err(box_err(ExportCliError::Dist(crate::engine_dist::DistError::ReleaseBackendUnavailable), heap));
     }
     let select = run_package::Select { test_packages: packages.as_slice(), ..flags.select };
@@ -592,6 +595,17 @@ struct PreparedTls {
     ender: SpecialMade,
 }
 
+fn prepare_tls(builder: &Builder, codes: &mut dyn CodeStore, alloc: Alloc<'_>, frame: &Frame, heap: &'static blaze_own::Heap) -> Result<PreparedTls, CliError> {
+    let make = |which, what, codes: &mut dyn CodeStore| {
+        make_special(which, builder, codes, alloc).map_err(|why| {
+            box_err(ExportCliError::Special { what, shown: owned_fmt(format_args!("{why:?}"), frame, heap.alloc()) }, heap)
+        })
+    };
+    let getter = make(Special::Getter, "TLS getter", codes)?;
+    let ender = make(Special::Ender, "TLS ender", codes)?;
+    Ok(PreparedTls { getter, ender })
+}
+
 /// Prepares the selected roots and their closure over the supplied code store. The caller
 /// finishes its source reads after the walk and before touching the TLS runtime records.
 #[expect(clippy::too_many_arguments, reason = "export preparation takes the caller's checked roots, maker, code store and capabilities")]
@@ -792,23 +806,7 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
     }
 
     // Emit TLS getter + ender special records into `codes` before borrowing `&codes` immutably.
-    let tls = if has_tls {
-        let getter = make_special(Special::Getter, builder, codes, alloc).map_err(|why| {
-            box_err(
-                ExportCliError::Special { what: "TLS getter", shown: owned_fmt(format_args!("{why:?}"), frame, heap.alloc()) },
-                heap,
-            )
-        })?;
-        let ender = make_special(Special::Ender, builder, codes, alloc).map_err(|why| {
-            box_err(
-                ExportCliError::Special { what: "TLS ender", shown: owned_fmt(format_args!("{why:?}"), frame, heap.alloc()) },
-                heap,
-            )
-        })?;
-        Some(PreparedTls { getter, ender })
-    } else {
-        None
-    };
+    let tls = has_tls.then(|| prepare_tls(builder, codes, alloc, frame, heap)).transpose()?;
 
     Ok(PreparedExport { walk, outcomes, tls, compiled, cached, unkeyed, stubs, lto_bodies, lto_inlined })
 }
@@ -946,10 +944,23 @@ fn export_program<'f>(
         export_id.part(b"cdylib");
     }
     let export_id = export_id.finish();
+    let unchanged = || {
+        crate::store::roots::renew_export(lent, &export_id);
+        ExportSummary {
+            output: output_path,
+            exported: Exported {
+                platform, functions: 0, folded: 0, fast: 0, optimized: 0, made: 0,
+                imports: 0, len: 0, identity: [0; 16], profile: None,
+                panics: blaze_export::Panics::Abort { functions: 0 },
+            },
+            data_count: 0, tls_count: 0, compiled: 0, cached: 0, unkeyed: 0, stubs: 0,
+            lto_bodies: 0, lto_inlined: 0,
+        }
+    };
 
     // Optional distributed compilation pass over workspace crates (D11).
     let mut dist_fp: Option<blaze_wire::Digest> = None;
-    if let Some(dist_cfg) = dist {
+    if let Some(dist_cfg) = dist.filter(|_| !release) {
         let mut dist_store = crate::engine_dist::DistStore::new(&mut codes, dist_cfg.wire_alloc);
         let (outcome, fp) = crate::engine_dist::run_distributed(
             dist_cfg,
@@ -972,31 +983,7 @@ fn export_program<'f>(
         match outcome {
             crate::engine_dist::DistExportOutcome::NoOp => {
                 end_procs(cx, &maker_procs, standing.err, "export")?;
-                crate::store::roots::renew_export(lent, &export_id);
-                return Ok(ExportSummary {
-                    output: output_path,
-                    exported: Exported {
-                        platform,
-                        functions: 0,
-                        folded: 0,
-                        fast: 0,
-                        optimized: 0,
-                        made: 0,
-                        imports: 0,
-                        len: 0,
-                        identity: [0u8; 16],
-                        profile: None,
-                        panics: blaze_export::Panics::Abort { functions: 0 },
-                    },
-                    data_count: 0,
-                    tls_count: 0,
-                    compiled: 0,
-                    cached: 0,
-                    unkeyed: 0,
-                    stubs: 0,
-                    lto_bodies: 0,
-                    lto_inlined: 0,
-                });
+                return Ok(unchanged());
             }
             crate::engine_dist::DistExportOutcome::Completed { .. } => {
                 dist_fp = Some(fp);
@@ -1006,23 +993,67 @@ fn export_program<'f>(
     }
 
     let tier = if release { Tier::Optimized } else { Tier::Fast };
-    let PreparedExport { walk, outcomes, tls, compiled, cached, unkeyed, stubs, lto_bodies, lto_inlined } =
-        prepare_export(cx, list, &ids, &builder, &mut maker, &mut codes, &roots, tier, alloc, frame, heap, || {
-            end_procs(cx, &maker_procs, standing.err, "export")?;
+    #[cfg_attr(not(feature = "llvm"), allow(unused_mut))]
+    let mut after_walk = || {
+        end_procs(cx, &maker_procs, standing.err, "export")?;
+        let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
+        phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
+        if let Some(why) = seen.refused() {
+            return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
+        }
+        Ok(())
+    };
 
-            let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
-            phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
-            if let Some(why) = seen.refused() {
-                return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
+    #[cfg(not(feature = "llvm"))]
+    let native_prepared = None;
+    #[cfg(feature = "llvm")]
+    let (image, native_prepared) = if release {
+        use crate::engine_dist::{prepared, program_roots_digest};
+        let compiler = blaze_ladder::backend_plan::native::render::Compiler::new(builder.isa);
+        let mut product = blaze_ids::Hasher::new("blaze native release product 1");
+        product.part(&program_roots_digest(picked.bin, &roots, builder.settings.panic));
+        for exports in [&native_export.public, &native_export.bindings] {
+            product.part(&(exports.len() as u64).to_le_bytes());
+            for export in exports {
+                product.part(export.name).part(&export.symbol.0);
             }
-            Ok(())
-        })?;
+        }
+        let request = prepared::Request {
+            names, closure: &closure, builder: &builder, product: product.finish().0,
+            native_image: native_export.key.0, compiler: compiler.identity(&builder), checked: standing.root,
+            program: picked.bin, destination: output_path, heap,
+        };
+        let result = release::build(&request, compiler, &roots, &ids, &mut maker, &mut codes, dist, frame, alloc);
+        after_walk()?;
+        let (outcome, fp) = result?;
+        dist_fp = fp;
+        let prepared::ResultImage::Ready { image, compiled, cached } = outcome else {
+            return Ok(unchanged());
+        };
+        let tls = image.has_tls.then(|| prepare_tls(&builder, &mut codes, alloc, frame, heap)).transpose()?;
+        let prep = PreparedExport {
+            walk: Walk::new_in(alloc), outcomes: Vec::new_in(alloc), tls, compiled, cached,
+            unkeyed: 0, stubs: 0, lto_bodies: 0, lto_inlined: 0,
+        };
+        (Some(image), Some(prep))
+    } else {
+        (None, None)
+    };
+    let PreparedExport { walk, outcomes, tls, compiled, cached, unkeyed, stubs, lto_bodies, lto_inlined } = match native_prepared {
+        Some(prepared) => prepared,
+        None => prepare_export(cx, list, &ids, &builder, &mut maker, &mut codes, &roots, tier, alloc, frame, heap, after_walk)?,
+    };
 
     // Assemble `ProgramIn` functions and data (zero-copy for cached positionless records).
     let mut functions: AVec<'_, Function<'_>> = Vec::with_capacity_in(outcomes.len() + 2, alloc);
     let mut data: AVec<'_, Data<'_>> = Vec::new_in(alloc);
     let mut seen_data: AVec<'_, Target> = Vec::new_in(alloc);
     let mut tls_count = 0usize;
+
+    #[cfg(feature = "llvm")]
+    if let Some(native) = &image {
+        release::place(native, names, &codes, frame, export_bump, heap, &mut functions, &mut data, &mut seen_data, &mut tls_count)?;
+    }
 
     for (row, outcome) in outcomes.iter().enumerate() {
         let symbol = walk.symbol(row);

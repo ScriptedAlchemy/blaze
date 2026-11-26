@@ -320,6 +320,13 @@ pub enum ProductRoots<'a> {
 }
 
 impl ProductRoots<'_> {
+    pub fn symbols(&self) -> &[Symbol] {
+        match self {
+            Self::Executable(roots) => roots.symbols(),
+            Self::Library(roots) => roots.table.symbols.as_slice(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::Executable(roots) => roots.len(),
