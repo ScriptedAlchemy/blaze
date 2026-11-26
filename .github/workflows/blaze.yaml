@@ -730,6 +730,9 @@ jobs:
           done
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
           echo 'accepted=true' >> "$GITHUB_OUTPUT"
+      - name: install the native archive fixture's pinned C toolchain
+        if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
+        uses: ./.github/actions/linux-c-shelf
       - name: every retained compiler migration fixture
         id: forkfixes
         if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}

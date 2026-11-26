@@ -30,11 +30,14 @@ fn the_pin_table_holds_both_archives() {
     assert_eq!(clang_pin(PIN, "x86_64-pc-windows-msvc"), Err(PinError::NoRow { target: "x86_64-pc-windows-msvc" }));
 }
 
-/// macOS takes the machine's SDK; Linux's sysroot row is there and empty: a typed refusal.
+/// macOS takes the SDK identity; Linux requires its complete pinned header tree.
 #[test]
-fn linux_has_no_sysroot_pinned_yet() {
+fn linux_sysroot_is_pinned_and_a_missing_pin_is_refused() {
     assert_eq!(sysroot(PIN, "aarch64-apple-darwin"), Ok(Sysroot::MacosSdk));
-    let refused = sysroot(PIN, "aarch64-unknown-linux-gnu").expect_err("no sysroot is pinned");
+    let Sysroot::Pinned { sha256 } = sysroot(PIN, "aarch64-unknown-linux-gnu").expect("pinned Linux headers") else { panic!("Linux cannot use an Apple SDK") };
+    assert_eq!(hex(&sha256).as_str(), "54a314bbbf721ace8624dd8160822603531ba2330c021ebf03848f0fe8353a66");
+    let unpinned = r#"{"sysroots":{"aarch64-unknown-linux-gnu":null}}"#;
+    let refused = sysroot(unpinned, "aarch64-unknown-linux-gnu").expect_err("no sysroot is pinned");
     assert_eq!(refused, PinError::NoSysroot { target: "aarch64-unknown-linux-gnu" });
     assert!(refused.to_string().contains("no sysroot pinned for aarch64-unknown-linux-gnu"), "{refused}");
 }

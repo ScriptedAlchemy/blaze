@@ -735,7 +735,7 @@ struct PreparedCrates<'r, 's> {
     crates: Vec<CrateIn<'s>, &'s Frame>,
 }
 
-/// Gathers the program's link-closure crates in link order, runs any deferred C tasks on macOS,
+/// Gathers the program's link-closure crates in link order, runs any deferred C tasks,
 /// and reads each crate's link table into `scratch`. Shared by [`image_for`] (`run`/`test`) and
 /// [`export_native_for`] (`export`).
 fn prepare_crates<'r, 'm: 's, 's>(
@@ -759,22 +759,18 @@ fn prepare_crates<'r, 'm: 's, 's>(
     };
     let store: &mut dyn Store<'m> = &mut *standing.store;
     let err = standing.err;
-    // A crate whose script deferred C requests: run here, before the link (native_runner_c.rs;
-    // macOS only, where the pinned clang and the SDK are; elsewhere the link refuses the record
-    // by name, natives.rs `DeferredC`).
-    let mut c_tasks = sdk.map(|sdk| {
-        crate::native_runner_c::CTasks::new(
-            ask.home,
-            sdk,
-            &ask.fs,
-            standing.workers.get(),
-            standing.heap,
-            crate::native_runner_c::CheckedCheckout {
-                root: standing.place.served.root_text(),
-                leaves: standing.leaves,
-            },
-        )
-    });
+    // The host's C toolchain is opened at the first deferred request.
+    let mut c_tasks = crate::native_runner_c::CTasks::new(
+        ask.home,
+        sdk,
+        &ask.fs,
+        standing.workers.get(),
+        standing.heap,
+        crate::native_runner_c::CheckedCheckout {
+            root: standing.place.served.root_text(),
+            leaves: standing.leaves,
+        },
+    );
 
     // The crate list, in place from the unit graph's record.
     let payload = native_image::payload_in_place(cx, store, &graph).map_err(NativeError::Store)?;
@@ -813,76 +809,68 @@ fn prepare_crates<'r, 'm: 's, 's>(
     }
     let mut done: Vec<(usize, ScriptIn<'s>), &'s Frame> = Vec::with_capacity_in(ran.len(), scratch);
     let mut refused: Vec<usize, &Frame> = Vec::new_in(scratch);
-    let deferred_total: u32 = if c_tasks.is_some() {
-        let count = ran
-            .iter()
-            .filter(|(_, script)| {
-                crate::scripts::payload_parts(script.payload)
-                    .and_then(|(_, record)| blaze_build_script::outputs::OutputsRef::open(record).ok())
-                    .is_some_and(|o| o.c_requests().next().is_some())
-            })
-            .count();
-        u32::try_from(count).unwrap_or(u32::MAX)
-    } else {
-        0
-    };
+    let count = ran
+        .iter()
+        .filter(|(_, script)| {
+            crate::scripts::payload_parts(script.payload)
+                .and_then(|(_, record)| blaze_build_script::outputs::OutputsRef::open(record).ok())
+                .is_some_and(|o| o.c_requests().next().is_some())
+        })
+        .count();
+    let deferred_total = u32::try_from(count).unwrap_or(u32::MAX);
     let mut deferred_done = 0u32;
     for r in order.iter().rev().copied() {
         let Some(script) = ran.iter().find(|(at, _)| *at == r).map(|(_, script)| *script) else { continue };
-        let script = match c_tasks.as_mut() {
-            None => script,
-            Some(c) => {
-                let package = list.name(r);
-                let defers = crate::scripts::payload_parts(script.payload).and_then(|(_, record)| blaze_build_script::outputs::OutputsRef::open(record).ok()).is_some_and(|o| o.c_requests().next().is_some());
-                if defers && let Some(dep) = list.deps(r).find(|d| refused.contains(d)) {
+        let package = list.name(r);
+        let defers = crate::scripts::payload_parts(script.payload).and_then(|(_, record)| blaze_build_script::outputs::OutputsRef::open(record).ok()).is_some_and(|o| o.c_requests().next().is_some());
+        if defers && let Some(dep) = list.deps(r).find(|d| refused.contains(d)) {
+            watch.see(blaze_screen::Step::Says);
+            err.line(cx, format_args!("the C of {package}: not built, as the C of {} it depends on was refused (said above); a call into either stops naming its C name ({RULE} `image_for`)", list.name(dep)))
+                .map_err(|e| NativeError::Store(CliError::Out(e)))?;
+            refused.push(r);
+            deferred_done = deferred_done.saturating_add(1);
+            continue;
+        }
+        if defers {
+            use core::fmt::Write as _;
+            let mut label = blaze_own::FixedString::<{ blaze_screen::ITEM_LABEL_BYTES }>::new();
+            let _ = write!(label, "{package} · cc/c++");
+            let items = [blaze_screen::ActiveItemRef { label: label.as_str(), elapsed_ms: 0 }];
+            let remaining = deferred_total.saturating_sub(deferred_done).saturating_sub(1);
+            let groups = [blaze_screen::ActiveGroupRef {
+                kind: blaze_screen::WorkKind::BuildScript,
+                items: &items,
+                extra: u16::try_from(remaining).unwrap_or(u16::MAX),
+            }];
+            watch.see(blaze_screen::Step::Activity(blaze_screen::Activity {
+                verb: "building",
+                progress: (deferred_total > 0).then_some((deferred_done, deferred_total)),
+                active: 1,
+                hint: None,
+                groups: &groups,
+            }));
+        }
+        let producers = crate::native_runner_c::Producers { scripts: &ran, done: &done, refused: &refused, graph: sections.graph };
+        let built = crate::native_runner_c::built_for(cx, &mut c_tasks, store, &list, r, package, script, &producers, scratch);
+        if defers {
+            deferred_done = deferred_done.saturating_add(1);
+        }
+        let script = match built {
+            Ok((script, report)) => {
+                if let Some(report) = report {
                     watch.see(blaze_screen::Step::Says);
-                    err.line(cx, format_args!("the C of {package}: not built, as the C of {} it depends on was refused (said above); a call into either stops naming its C name ({RULE} `image_for`)", list.name(dep)))
+                    err.line(cx, format_args!("{}", crate::native_runner_c::Said { package, report: &report }))
                         .map_err(|e| NativeError::Store(CliError::Out(e)))?;
-                    refused.push(r);
-                    deferred_done = deferred_done.saturating_add(1);
-                    continue;
                 }
-                if defers {
-                    use core::fmt::Write as _;
-                    let mut label = blaze_own::FixedString::<{ blaze_screen::ITEM_LABEL_BYTES }>::new();
-                    let _ = write!(label, "{package} · cc/c++");
-                    let items = [blaze_screen::ActiveItemRef { label: label.as_str(), elapsed_ms: 0 }];
-                    let remaining = deferred_total.saturating_sub(deferred_done).saturating_sub(1);
-                    let groups = [blaze_screen::ActiveGroupRef {
-                        kind: blaze_screen::WorkKind::BuildScript,
-                        items: &items,
-                        extra: u16::try_from(remaining).unwrap_or(u16::MAX),
-                    }];
-                    watch.see(blaze_screen::Step::Activity(blaze_screen::Activity {
-                        verb: "building",
-                        progress: (deferred_total > 0).then_some((deferred_done, deferred_total)),
-                        active: 1,
-                        hint: None,
-                        groups: &groups,
-                    }));
-                }
-                let producers = crate::native_runner_c::Producers { scripts: &ran, done: &done, refused: &refused, graph: sections.graph };
-                let built = crate::native_runner_c::built_for(cx, c, store, &list, r, package, script, &producers, scratch);
-                if defers {
-                    deferred_done = deferred_done.saturating_add(1);
-                }
-                match built {
-                    Ok((script, report)) => {
-                        if let Some(report) = report {
-                            watch.see(blaze_screen::Step::Says);
-                            err.line(cx, format_args!("{}", crate::native_runner_c::Said { package, report: &report })).map_err(|e| NativeError::Store(CliError::Out(e)))?;
-                        }
-                        script
-                    }
-                    Err(why) => {
-                        watch.see(blaze_screen::Step::Says);
-                        let refusal = NativeError::CTasks { package: held(package, ask), words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) };
-                        err.line(cx, format_args!("{refusal}; its archives are left out of this image, and only code that calls one of its C names stops, naming it"))
-                            .map_err(|e| NativeError::Store(CliError::Out(e)))?;
-                        refused.push(r);
-                        continue;
-                    }
-                }
+                script
+            }
+            Err(why) => {
+                watch.see(blaze_screen::Step::Says);
+                let refusal = NativeError::CTasks { package: held(package, ask), words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) };
+                err.line(cx, format_args!("{refusal}; its archives are left out of this image, and only code that calls one of its C names stops, naming it"))
+                    .map_err(|e| NativeError::Store(CliError::Out(e)))?;
+                refused.push(r);
+                continue;
             }
         };
         done.push((r, script));
