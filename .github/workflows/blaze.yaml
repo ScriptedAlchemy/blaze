@@ -187,7 +187,7 @@ jobs:
               return heads.pop(), states, run_ids, observation_rows
 
           captured = {label: records(root / label / ".blaze/v2/store") for label, _, _ in modes}
-          serial, serial_states, _, _ = captured["serial-a"]
+          serial, serial_states, _, serial_observations = captured["serial-a"]
           for label, (head, states, tables, observations) in captured.items():
               addresses = [head[24+i*88+40:24+i*88+72].hex()[:12] for i in range(5)]
               print(label, "head matches serial-a:", head == serial,
@@ -208,6 +208,14 @@ jobs:
                           canonical = hashlib.sha256(b"".join(sorted(pairs))).hexdigest()[:16]
                           print(label, "body observations", check, len(pairs), "recorded:", order,
                                 "canonical:", canonical, "already sorted:", list(pairs) == sorted(pairs))
+                          baseline = serial_observations.get(check, set())
+                          if len(baseline) == 1:
+                              old = set(next(iter(baseline)))
+                              current = set(pairs)
+                              for transition, changed in [("added", current-old), ("removed", old-current)]:
+                                  for pair in sorted(changed):
+                                      print(label, "body observation diff", check, transition, "kind", pair[0],
+                                            "owner", pair[1:33].hex(), "cell", pair[33:49].hex(), "digest", pair[49:].hex())
                   for table in sorted(tables):
                       nc, nb = struct.unpack_from("<II", table, 8)
                       for i in range(nc):
