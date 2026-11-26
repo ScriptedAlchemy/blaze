@@ -3104,13 +3104,13 @@ fn checking<'f, 's: 'f>(
                 }
                 *printed_out = true;
                 let stood = certified(cx, root, active_view_slot, pointer, lines, filtered_arg, cert_root, adopted.is_some(), journal, &mut store, (&tools, toolchain), shown, phases, began, request, frame, out)?;
+                let pointer_key = adopted.unwrap_or(pointer.key);
                 drop(scoped_filtered);
                 drop(cert_view_slot);
                 drop(view_slot);
                 drop(store);
                 let cleanup = crate::store::after_answer_printed(cx, opened.lent, &opened.home, false, phases.clock(), err)?;
                 phases.mark_cx(cx, "store committed", frame);
-                let pointer_key = adopted.unwrap_or(pointer.key);
                 return certificate_checked(cx, root, pointer_key, stood, sweep_counts, &journal_counts, &cleanup, phases, heap, frame);
             }
         }
@@ -3187,13 +3187,14 @@ fn checking<'f, 's: 'f>(
                 }
                 *printed_out = true;
                 let stood = certified(cx, root, whole_view_slot.as_ref(), &whole_ptr, &whole_lines, filtered_arg, whole_root.as_str(), false, journal_arg, &mut store, (&tools, toolchain), shown, phases, began, request, frame, out)?;
+                let pointer_key = whole_ptr.key;
                 drop(scoped_filtered);
                 drop(whole_view_slot);
                 drop(view_slot);
                 drop(store);
                 let cleanup = crate::store::after_answer_printed(cx, opened.lent, &opened.home, false, phases.clock(), err)?;
                 phases.mark_cx(cx, "store committed", frame);
-                return certificate_checked(cx, root, whole_ptr.key, stood, whole_sweep_counts, &whole_journal_counts, &cleanup, phases, heap, frame);
+                return certificate_checked(cx, root, pointer_key, stood, whole_sweep_counts, &whole_journal_counts, &cleanup, phases, heap, frame);
             }
             pointer = Some(whole_ptr);
             last_lines = Some(whole_lines);
