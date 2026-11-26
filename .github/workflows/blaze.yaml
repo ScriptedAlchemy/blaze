@@ -110,14 +110,11 @@ jobs:
           timeout -k 20 600 cargo +"$tc" test --locked --release -p blaze-llvm-abi --features native --test release \
             2>&1 | tee "$evidence/llvm-abi.log"
           grep -Fq 'release_pipeline_emits_both_arm64_object_formats ... ok' "$evidence/llvm-abi.log"
-      - name: Free build space for the release-only fault run
+      - name: Record disk capacity before the release-only fault run
         if: ${{ !cancelled() && steps.binaries.outcome == 'success' && inputs.profile == 'release' }}
         run: |
           evidence="$RUNNER_TEMP/plan-evidence/disk.log"
           timeout 10 df -h "$RUNNER_TEMP" "$RUNNER_TEMP/blaze-fs" | tee "$evidence"
-          timeout -k 15 170 cargo +"$(cat pins/toolchain)" clean --target-dir "$CARGO_TARGET_DIR" \
-            2>&1 | tee -a "$evidence"
-          timeout 10 df -h "$RUNNER_TEMP" "$RUNNER_TEMP/blaze-fs" | tee -a "$evidence"
       - name: Exercise the unchanged distributed fault harness
         if: ${{ !cancelled() && steps.binaries.outcome == 'success' }}
         env:
