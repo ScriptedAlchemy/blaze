@@ -97,7 +97,8 @@ fn a_slice_pattern_over_a_slice_in_a_let_is_a_named_refusal() {
     let construct = "a slice pattern over a slice `[T]` in a `let` or parameter pattern";
     assert_eq!(r.rule, RefusalRule::Unsupported, "{r:?}");
     assert_eq!(r.construct, Some(construct), "{r:?}");
-    assert_eq!(&*r.message, std::format!("{construct} {NOT_YET}"));
+    let message = blaze_own::format_in!(Alloc::global(), "{construct} {NOT_YET}");
+    assert_eq!(&*r.message, message.as_str());
     let at = (r.place + r.start) as usize;
     let end = (r.place + r.end) as usize;
     assert_eq!(text.get(at..end), Some("[..]"), "{r:?}");
