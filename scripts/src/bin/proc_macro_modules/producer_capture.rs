@@ -29,11 +29,42 @@ fn refuse(path: &Path, why: impl Into<String>) -> Failure {
     Failure::Manifest { path: path.to_owned(), why: why.into() }
 }
 
+struct UnitOutput<'a> {
+    package: &'a str,
+    /// Empty for OUT_DIR itself, a relative path under it, or absent for an invalid spelling.
+    relative: Option<&'a str>,
+}
+
+fn fingerprint(text: &str) -> bool {
+    text.len() == 16 && text.bytes().all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// Cargo places the unit under `package/fingerprint` or `package-fingerprint`.
+/// Both layouts must identify a package before their `out` suffix can be used.
+fn unit_output<'a>(path: &'a str, builds: &str) -> Option<UnitOutput<'a>> {
+    let relative = path.strip_prefix(builds)?.strip_prefix('/')?;
+    let (folder, suffix) = relative.split_once('/')?;
+    let (head, tail) = suffix.split_once('/').unwrap_or((suffix, ""));
+    let (package, relative) = if fingerprint(head) {
+        (folder, producer_outputs::under(tail, "out"))
+    } else if let Some((package, _)) = folder.rsplit_once('-').filter(|(_, hash)| fingerprint(hash)) {
+        (package, producer_outputs::under(suffix, "out"))
+    } else {
+        (folder, None)
+    };
+    Some(UnitOutput { package, relative })
+}
+
+fn is_unit_out(path: &str, builds: &str, package: &str) -> bool {
+    unit_output(path, builds).is_some_and(|unit| unit.package == package && unit.relative == Some(""))
+}
+
 /// Observe only WASI producers compiled into this member's locked closure. Cargo also
 /// emits compiler and build-script messages about its own std dependencies, and may
 /// build the same package separately as a host-only tool.
 pub(super) fn capture<'a>(output: &str, target: &Path, checkout: &Path, closure: &[String], alloc: blaze_own::Alloc<'a>) -> Result<Vec<Captured<'a>>, Failure> {
     let builds = target.join("wasm32-wasip1/release/build");
+    let builds_text = builds.to_str().ok_or_else(|| refuse(&builds, "Cargo's WASI build directory is not a UTF-8 path"))?;
     let mut observed: Vec<Captured<'a>> = Vec::new();
     for line in output.lines() {
         let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else { continue };
@@ -49,13 +80,14 @@ pub(super) fn capture<'a>(output: &str, target: &Path, checkout: &Path, closure:
             (package == name && edition == version).then(|| source.strip_prefix("files:")).flatten()
         });
         let Some(source) = source else { continue };
-        let out = Path::new(text("out_dir").ok_or_else(|| refuse(target, format!("{id}: the build-script-executed message has no out_dir")))?);
+        let out_text = text("out_dir").ok_or_else(|| refuse(target, format!("{id}: the build-script-executed message has no out_dir")))?;
+        let out = Path::new(out_text);
         if !out.starts_with(&builds) {
             continue;
         }
         let Some(placement) = out.parent() else { return Err(refuse(out, "the output has no build unit directory")) };
-        if placement.parent() != Some(builds.as_path()) || out.file_name().and_then(|part| part.to_str()) != Some("out") || std::fs::canonicalize(out).map_err(io(out))? != out {
-            return Err(refuse(out, "the WASI build's OUT_DIR is not a confined unit output directory"));
+        if !is_unit_out(out_text, builds_text, name) || std::fs::canonicalize(out).map_err(io(out))? != out {
+            return Err(refuse(out, format!("{id}: the WASI build's OUT_DIR is not a confined unit output directory for {name}")));
         }
         if observed.iter().any(|entry| entry.name == name && entry.version == version) {
             return Err(refuse(out, format!("{name} {version} has more than one WASI producer execution")));
@@ -298,8 +330,10 @@ pub(super) fn wrap(plan: &str, args: Vec<OsString>) -> ! {
         if let Some(producer) = producer {
             let physical = std::env::var("OUT_DIR").unwrap_or_else(|_| fail("Cargo did not supply the admitted producer's OUT_DIR"));
             let physical_path = Path::new(&physical);
-            if !physical_path.starts_with(builds) || physical_path.file_name().and_then(|name| name.to_str()) != Some("out") {
-                fail("Cargo supplied a producer OUT_DIR outside the admitted build directory");
+            if !name.as_deref().is_some_and(|name| is_unit_out(&physical, builds, name))
+                || !std::fs::canonicalize(physical_path).is_ok_and(|path| path == physical_path)
+            {
+                fail(&format!("Cargo supplied OUT_DIR {physical:?} outside the admitted producer's build directory"));
             }
             let root = producer.get("root").and_then(serde_json::Value::as_str).unwrap_or_else(|| fail("the plan has no compiled output root"));
             let pairs = producer.get("env").and_then(serde_json::Value::as_array).unwrap_or_else(|| fail("the plan has no compiled environment"));
@@ -358,14 +392,12 @@ fn show_search(value: &str, builds: &str, inputs: &[serde_json::Value]) -> Resul
     let Line::Instr(_, Instr::LinkSearch { kind, path }) = blaze_build_script::parse(line.as_bytes()) else {
         return Ok(None);
     };
-    let Some(relative) = path.strip_prefix(builds).and_then(|rest| rest.strip_prefix('/')) else { return Ok(None) };
-    let Some((folder, rest)) = relative.split_once('/') else { return Ok(None) };
-    let Some((unit, _)) = folder.rsplit_once('-') else { return Ok(None) };
-    let mut candidates = inputs.iter().filter(|input| input.get("name").and_then(serde_json::Value::as_str) == Some(unit)).peekable();
+    let Some(unit) = unit_output(path, builds) else { return Ok(None) };
+    let mut candidates = inputs.iter().filter(|input| input.get("name").and_then(serde_json::Value::as_str) == Some(unit.package)).peekable();
     if candidates.peek().is_none() {
         return Ok(None);
     }
-    let suffix = producer_outputs::under(rest, "out").ok_or("Cargo passed a search path outside the producer's confined OUT_DIR")?;
+    let suffix = unit.relative.ok_or("Cargo passed a search path outside the producer's confined OUT_DIR")?;
     let mut roots = candidates.filter_map(|input| {
         let search = input.get("search")?.as_array()?;
         let planned = search.iter().any(|row| {
@@ -386,6 +418,8 @@ fn show_search(value: &str, builds: &str, inputs: &[serde_json::Value]) -> Resul
 mod tests {
     use super::*;
 
+    const CARGO_UNIT: &str = "f2264a196e9669f7";
+
     #[test]
     fn only_an_admitted_producer_search_can_be_rewritten() {
         const BUILDS: &str = "/work/wasm32-wasip1/release/build";
@@ -395,12 +429,17 @@ mod tests {
             "search": [[SearchKind::Native as u8, "found"], [SearchKind::Unspecified as u8, "found=exact"]],
         })];
         let search = |value: &str| show_search(value, BUILDS, &inputs);
-        assert_eq!(search(&format!("native={BUILDS}/a-dep-abcd/out/found")), Ok(Some("native=/tmp/admitted/found".to_owned())));
-        assert_eq!(search(&format!("{BUILDS}/a-dep-abcd/out/found=exact")), Ok(Some("/tmp/admitted/found=exact".to_owned())));
-        assert!(search(&format!("native={BUILDS}/a-dep-abcd/out/unplanned")).is_err());
-        assert!(search(&format!("native={BUILDS}/a-dep-abcd/out/../found")).is_err());
-        assert!(search(&format!("crate={BUILDS}/a-dep-abcd/out/found")).is_err());
-        assert_eq!(search(&format!("native={BUILDS}/another-abcd/out/found")), Ok(None));
+        for place in [format!("{BUILDS}/a-dep/{CARGO_UNIT}"), format!("{BUILDS}/a-dep-{CARGO_UNIT}")] {
+            assert!(is_unit_out(&format!("{place}/out"), BUILDS, "a-dep"));
+            assert!(!is_unit_out(&format!("{place}/out"), BUILDS, "another"));
+            assert_eq!(search(&format!("native={place}/out/found")), Ok(Some("native=/tmp/admitted/found".to_owned())));
+            assert_eq!(search(&format!("{place}/out/found=exact")), Ok(Some("/tmp/admitted/found=exact".to_owned())));
+            assert!(search(&format!("native={place}/out/unplanned")).is_err());
+            assert!(search(&format!("native={place}/out/../found")).is_err());
+            assert!(search(&format!("crate={place}/out/found")).is_err());
+        }
+        assert!(search(&format!("native={BUILDS}/a-dep/../out/found")).is_err());
+        assert_eq!(search(&format!("native={BUILDS}/another/{CARGO_UNIT}/out/found")), Ok(None));
     }
 
     #[test]
@@ -413,7 +452,8 @@ mod tests {
         let manifest = source.join("Cargo.toml");
         write(&manifest, "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n").unwrap_or_else(|error| panic!("{error}"));
         let target = work.join("target");
-        let place = target.join("wasm32-wasip1/release/build/dep-0123456789abcdef");
+        let builds = target.join("wasm32-wasip1/release/build");
+        let place = builds.join("dep").join(CARGO_UNIT);
         let out = place.join("out");
         let found = out.join("found");
         write(&found.join("marker"), b"exact path").unwrap_or_else(|error| panic!("{error}"));
@@ -441,6 +481,20 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].features, producer_outputs::features(["a"]));
         assert_eq!(captured[0].outputs.files[0].bytes.as_slice(), b"exact path");
+
+        let mut wrong_package = message.clone();
+        let other_out = builds.join("other").join(CARGO_UNIT).join("out");
+        std::fs::create_dir_all(&other_out).unwrap();
+        wrong_package["out_dir"] = serde_json::json!(other_out);
+        assert!(matches!(capture(&format!("{wrong_package}\n{artifact}"), &target, &checkout, &closure, alloc), Err(Failure::Manifest { path, .. }) if path == other_out));
+
+        let mut escaped = message.clone();
+        let link = builds.join("dep/0123456789abcdef");
+        std::os::unix::fs::symlink(&place, &link).unwrap();
+        let linked_out = link.join("out");
+        escaped["out_dir"] = serde_json::json!(linked_out);
+        assert!(matches!(capture(&format!("{escaped}\n{artifact}"), &target, &checkout, &closure, alloc), Err(Failure::Manifest { path, .. }) if path == linked_out));
+
         message["linked_paths"] = serde_json::json!([]);
         assert!(capture(&format!("{message}\n{artifact}"), &target, &checkout, &closure, alloc).is_err());
         std::fs::remove_dir_all(work).unwrap();
