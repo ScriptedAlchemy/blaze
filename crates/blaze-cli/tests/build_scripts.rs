@@ -14,8 +14,8 @@
 //! The script's module is written here byte by byte (no rustc, rule 1): a WASI command whose
 //! `_start` writes `cargo:rustc-cfg=from_script\n` to standard output, and its record is put in
 //! the home's module store (`<home>/.blaze/v2/build-script/modules/<dir>/{identity,module.wasm}`,
-//! found by blaze-proc-macro script_unit.rs `module_of` by name, version and features). The
-//! module reads no file, so the run is not a hole (scripts.rs `run`).
+//! selected by the checkout's compiler inputs and the pinned WASI runner). The module reads no
+//! file at runtime, so the run is not a hole (scripts.rs `run`).
 //!
 //! Expected (`lanecheck.sh blaze-cli test '--test build_scripts'`):
 //! "test blaze-cli: exit 0; 2 passed, 0 failed".
@@ -31,11 +31,13 @@
 
 mod support;
 
+use std::fmt::Write as _;
 use std::fs::File;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use blaze_build_script::module_record::{CheckoutRead, Digest};
 use support::fresh_home;
 
 /// One `blaze check` of the one small member; a hang is a bug (rule 18).
@@ -124,15 +126,24 @@ fn module(line: &[u8]) -> Vec<u8> {
 }
 
 /// The module record of `app 0.1.0` with no features in `home`'s module store.
-fn put_module(home: &Path) {
-    let record = home.join(".blaze/v2/build-script/modules/app-0.1.0-test");
-    std::fs::create_dir_all(&record).unwrap_or_else(|error| panic!("making {}: {error}", record.display()));
+fn put_module(workspace: &Path, home: &Path) {
     let runner = blaze_proc_macro::script_unit::wasm_runner_lines().join("\n");
-    let identity = format!("name app\nversion 0.1.0\nfeatures \n{runner}\n");
+    let toolchain = include_str!("../../../pins/toolchain").trim();
+    let mut identity = format!("name app\nversion 0.1.0\nfeatures \n{runner}\ntoolchain {toolchain}\ncheckout-package app\n");
+    for path in ["Cargo.lock", "Cargo.toml", "app/Cargo.toml", "app/build.rs"] {
+        let input = std::fs::read(workspace.join(path)).unwrap_or_else(|error| panic!("reading fixture input {path}: {error}"));
+        let read = CheckoutRead { path, content: Digest::checkout_file(&input) };
+        write!(identity, "{read}").expect("writing the checkout read to the identity");
+    }
+    let sha256_hex = |bytes: &[u8]| -> String {
+        blaze_sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    };
+    let record = home.join(".blaze/v2/build-script/modules").join(sha256_hex(identity.as_bytes()));
+    std::fs::create_dir_all(&record).unwrap_or_else(|error| panic!("making {}: {error}", record.display()));
     std::fs::write(record.join("identity"), identity).expect("the module's identity");
     let bytes = module(LINE);
     // The record's digest (script_modules.rs reads it as the lookup's out): the module's SHA-256.
-    let digest: String = blaze_sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let digest = sha256_hex(&bytes);
     std::fs::write(record.join("wasm-sha256"), format!("{digest}\n")).expect("the module's digest");
     std::fs::write(record.join("module.wasm"), bytes).expect("the module's bytes");
 }
@@ -200,7 +211,7 @@ fn a_scripts_cfg_reaches_a_cfg_item() {
     let base = fresh_home("build_scripts_cfg", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
-    put_module(&home);
+    put_module(&at, &home);
     let (_, said) = check(&at, &home);
     assert!(!said.contains("the build script of app"), "the script did not run:\n{said}");
     // The status is not read: while the borrow check's findings stay notes, every check ends
@@ -266,7 +277,7 @@ fn engine_check_runs_the_script_and_lists_what_check_lists() {
     let base = fresh_home("build_scripts_engine", true);
     let (home, at) = (base.join("home"), base.join("ws"));
     workspace(&at);
-    put_module(&home);
+    put_module(&at, &home);
     let (_, said) = check(&at, &home);
     // Not the status: every check ends "incomplete: NOT checked: borrows" for now.
     assert!(said.contains("0 errors: blaze check") && !said.contains("not checked because"), "check of the fixture failed:\n{said}");
