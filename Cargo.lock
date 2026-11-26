@@ -1330,6 +1330,7 @@ dependencies = [
  "blaze-tier",
  "blaze-toolchain",
  "blaze-typeck",
+ "blaze-unicode",
  "blaze-unit-graph",
  "edition",
  "libc",

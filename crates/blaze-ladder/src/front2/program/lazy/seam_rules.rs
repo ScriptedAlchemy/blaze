@@ -757,7 +757,7 @@ pub(in crate::front2::program) fn item_file<'n, S: PositionSource<'n>>(names: S,
     names.file_shown(krate, file)
 }
 
-/// THE POSITION RULE: the line and column (each from 1; the column in chars) of byte `site` of
+/// THE POSITION RULE: the line and display column (each from 1) of byte `site` of
 /// item `item`'s text: the item's first byte today (`NamesSource::item_start`) plus `site`, in
 /// today's text of its file (`NamesSource::file_text`), counted there. What a `#[track_caller]`
 /// `Location`'s line and column are when the program is placed: the code record holds only
@@ -940,16 +940,23 @@ fn position_at<'n, S: NamesSource<'n>>(names: S, (krate, i, start): (usize, u32,
     line_and_column(text, start.byte(names, krate, text, alloc)?, site)
 }
 
-/// Byte `start + site` of `text` as a line and a column, each from 1, the column in chars.
+/// Place a caller location in display columns. Tabs occupy four columns at every offset.
+/// Bidi formatting controls occupy one visible replacement column in a Rust source location.
 /// [`PositionGap::PastText`]: past the end, or not on a char's first byte.
 fn line_and_column(text: &str, start: u32, site: u32) -> Result<(u32, u32), PositionGap> {
     let byte = start.checked_add(site).ok_or(PositionGap::PastText)? as usize;
     let before = text.get(..byte).ok_or(PositionGap::PastText)?;
     let line_start = before.rfind('\n').map_or(0, |n| n + 1);
     let lines = before.bytes().filter(|&b| b == b'\n').count();
-    let chars = before[line_start..].chars().count();
+    let column = before[line_start..].chars().try_fold(1usize, |column, ch| {
+        column.checked_add(match ch {
+            '\t' => 4,
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => 1,
+            _ => blaze_unicode::char_width(ch).unwrap_or(1),
+        })
+    }).ok_or(PositionGap::PastText)?;
     let line = u32::try_from(lines + 1).map_err(|_| PositionGap::PastText)?;
-    let col = u32::try_from(chars + 1).map_err(|_| PositionGap::PastText)?;
+    let col = u32::try_from(column).map_err(|_| PositionGap::PastText)?;
     Ok((line, col))
 }
 
@@ -958,16 +965,16 @@ mod tests {
     use super::line_and_column;
     use crate::seam::PositionGap;
 
-    /// Lines and columns from 1, the column in chars: a 'é' (two bytes) before the site counts
-    /// once; a site inside a char, or past the text, is `PastText`.
+    /// Place the site against the current text, even when its prefix mixes character widths.
     #[test]
-    fn a_site_is_a_line_and_a_column_in_chars() {
+    fn a_site_is_a_line_and_a_display_column() {
         let text = "fn a() {}\nfn é() { f() }\n";
         // The item `fn é` starts at byte 10; `f()` at byte 10 + 10 (two bytes of 'é').
         assert_eq!(line_and_column(text, 10, 0), Ok((2, 1)));
         assert_eq!(line_and_column(text, 10, 10), Ok((2, 10)));
         assert_eq!(line_and_column(text, 10, 4), Err(PositionGap::PastText));
         assert_eq!(line_and_column(text, 10, 100), Err(PositionGap::PastText));
-        std::println!("positions: line 2, column 10 for `f()` after a two-byte char");
+        let prefix = "a\t界e\u{301}\u{202e}\u{2067}\0";
+        assert_eq!(line_and_column(prefix, 0, u32::try_from(prefix.len()).unwrap()), Ok((1, 12)));
     }
 }
