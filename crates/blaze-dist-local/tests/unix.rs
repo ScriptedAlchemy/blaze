@@ -1379,7 +1379,10 @@ fn the_coordinator_owns_and_removes_its_actual_socket() {
         alloc,
     )
     .unwrap();
-    let ready = child.read_stdout_line(alloc).unwrap().unwrap();
+    let ready = child
+        .read_stdout_line(alloc)
+        .unwrap()
+        .expect("coordinator closed stdout before writing readiness");
     assert!(ready.starts_with("ready "));
     let mut c = Client::connect(path.as_str(), random_id().unwrap(), alloc).unwrap();
     let deadline = c.welcome.now_ms + 1000;

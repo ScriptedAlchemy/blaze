@@ -1971,10 +1971,111 @@ impl Drop for TempDir {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Child process helper over `blaze-sys` (`fork` + `execv` + `pipe` + `wait_pid` + `kill`)
+// Child process helper for the Unix transport fixtures
 // ---------------------------------------------------------------------------------------------
 
-/// Child process spawned via POSIX `fork` + `execv`, with optional piped stdin/stdout.
+#[cfg(target_os = "macos")]
+use blaze_sys::posix::proc::{SpawnActions, posix_spawn};
+#[cfg(target_os = "linux")]
+use child_spawn::{SpawnActions, posix_spawn};
+
+#[cfg(target_os = "linux")]
+mod child_spawn {
+    use core::ffi::{c_char, c_int, c_void};
+    use core::mem::MaybeUninit;
+
+    use blaze_sys::posix::types::pid_t;
+    use blaze_sys::{Errno, Fd};
+
+    // Linux spawn.h layout used by glibc and musl on the supported 64-bit Linux targets.
+    #[repr(C)]
+    pub(super) struct FileActions {
+        _allocated: c_int,
+        _used: c_int,
+        _actions: *mut c_void,
+        _padding: [c_int; 16],
+    }
+
+    unsafe extern "C" {
+        pub(super) fn posix_spawn(
+            pid: *mut pid_t,
+            path: *const c_char,
+            actions: *const FileActions,
+            attr: *const c_void,
+            argv: *const *mut c_char,
+            envp: *const *mut c_char,
+        ) -> c_int;
+        fn posix_spawn_file_actions_init(actions: *mut FileActions) -> c_int;
+        fn posix_spawn_file_actions_adddup2(
+            actions: *mut FileActions,
+            from: c_int,
+            to: c_int,
+        ) -> c_int;
+        fn posix_spawn_file_actions_destroy(actions: *mut FileActions) -> c_int;
+    }
+
+    pub(super) struct SpawnActions(MaybeUninit<FileActions>);
+
+    impl SpawnActions {
+        pub(super) fn new() -> Result<Self, Errno> {
+            let mut actions = MaybeUninit::uninit();
+            // SAFETY: the storage matches Linux spawn.h. On success libc owns the initialized
+            // list within the storage until SpawnActions drops it.
+            let code = unsafe { posix_spawn_file_actions_init(actions.as_mut_ptr()) };
+            super::spawn_result(code)?;
+            Ok(Self(actions))
+        }
+
+        pub(super) fn dup2(&mut self, from: Fd, to: Fd) -> Result<(), Errno> {
+            // SAFETY: self holds an initialized action list, borrowed exclusively here.
+            super::spawn_result(unsafe {
+                posix_spawn_file_actions_adddup2(self.0.as_mut_ptr(), from.raw(), to.raw())
+            })
+        }
+
+        pub(super) fn as_ptr(&self) -> *const FileActions {
+            self.0.as_ptr()
+        }
+    }
+
+    impl Drop for SpawnActions {
+        fn drop(&mut self) {
+            // SAFETY: the action list was initialized and is destroyed exactly once.
+            _ = unsafe { posix_spawn_file_actions_destroy(self.0.as_mut_ptr()) };
+        }
+    }
+}
+
+fn spawn_result(code: core::ffi::c_int) -> Result<(), Errno> {
+    if code == 0 {
+        return Ok(());
+    }
+    let errno = u16::try_from(code).map_err(|_| Errno::Inval)?;
+    Err(Errno::from_raw(errno))
+}
+
+fn child_pipe() -> Result<(OwnedFd, OwnedFd), Errno> {
+    use blaze_sys::posix::io::dup_at_least;
+
+    #[cfg(target_os = "linux")]
+    let (read, write) = blaze_sys::linux::pipe2(blaze_sys::linux::PipeFlags::CLOSE_ON_EXEC)?;
+    #[cfg(target_os = "macos")]
+    let (read, write) = {
+        let (read, write) = blaze_sys::posix::io::pipe()?;
+        sys_set_close_on_exec(read.fd(), true)?;
+        sys_set_close_on_exec(write.fd(), true)?;
+        (read, write)
+    };
+
+    // A pipe can claim a closed standard descriptor. Keep its ends clear of the dup2
+    // destinations so the actions cannot overwrite another end or expose it at exec.
+    let above_stdio = |end: OwnedFd| {
+        if end.fd().raw() < 3 { dup_at_least(end.fd(), 3, true) } else { Ok(end) }
+    };
+    Ok((above_stdio(read)?, above_stdio(write)?))
+}
+
+/// Child process spawned via `posix_spawn`, with optional piped stdin/stdout.
 pub struct Child {
     pid: blaze_sys::posix::types::pid_t,
     stdin: Option<OwnedFd>,
@@ -2004,100 +2105,67 @@ impl Child {
         alloc: WireAlloc,
     ) -> Result<Self, IoError> {
         let stdin_pipe = if pipe_stdin {
-            Some(blaze_sys::posix::io::pipe().map_err(IoError::from_errno)?)
+            Some(child_pipe().map_err(IoError::from_errno)?)
         } else {
             None
         };
         let stdout_pipe = if pipe_stdout {
-            Some(blaze_sys::posix::io::pipe().map_err(IoError::from_errno)?)
+            Some(child_pipe().map_err(IoError::from_errno)?)
         } else {
             None
         };
         let mut c_strings: Vec<Vec<u8, WireAlloc>, WireAlloc> =
             Vec::with_capacity_in(args.len().saturating_add(1), alloc);
-        let mut prog_bytes = Vec::with_capacity_in(program.len().saturating_add(1), alloc);
-        prog_bytes.extend_from_slice(program.as_bytes());
-        prog_bytes.push(0);
-        c_strings.push(prog_bytes);
-        for arg in args {
+        for arg in core::iter::once(program).chain(args.iter().copied()) {
             let mut bytes = Vec::with_capacity_in(arg.len().saturating_add(1), alloc);
             bytes.extend_from_slice(arg.as_bytes());
             bytes.push(0);
             c_strings.push(bytes);
         }
 
-        #[cfg(target_os = "linux")]
-        let pid = {
-            let mut linux_args: Vec<blaze_sys::linux::Arg<'_>, WireAlloc> =
-                Vec::with_capacity_in(c_strings.len().saturating_add(1), alloc);
-            for item in &c_strings {
-                let cstr = core::ffi::CStr::from_bytes_with_nul(item)
-                    .map_err(|_| IoError::from_errno(Errno::Inval))?;
-                linux_args.push(blaze_sys::linux::Arg::new(cstr));
-            }
-            linux_args.push(blaze_sys::linux::Arg::END);
-            let argv = blaze_sys::linux::Args::new(&linux_args).map_err(IoError::from_errno)?;
-            let empty_env = [blaze_sys::linux::Arg::END];
-            let envp = blaze_sys::linux::Args::new(&empty_env).map_err(IoError::from_errno)?;
-            let prog_cstr = core::ffi::CStr::from_bytes_with_nul(&c_strings[0])
+        let mut argv: Vec<*mut c_char, WireAlloc> =
+            Vec::with_capacity_in(c_strings.len().saturating_add(1), alloc);
+        for item in &c_strings {
+            let cstr = core::ffi::CStr::from_bytes_with_nul(item)
                 .map_err(|_| IoError::from_errno(Errno::Inval))?;
-            let prog_path = blaze_sys::Path::new(prog_cstr);
-
-            // SAFETY: `argv`, `envp`, and `prog_path` are prepared before `fork()`; the child only
-            // invokes async-signal-safe `dup2`, `close`, `execve`, and `exit_group`.
-            match unsafe { blaze_sys::linux::task::fork() }.map_err(IoError::from_errno)? {
-                blaze_sys::linux::Cloned::Child => {
-                    if let Some((read_end, write_end)) = stdin_pipe {
-                        let _ = blaze_sys::posix::io::dup2(read_end.fd(), Fd::new(0));
-                        drop(read_end);
-                        drop(write_end);
-                    }
-                    if let Some((read_end, write_end)) = stdout_pipe {
-                        let _ = blaze_sys::posix::io::dup2(write_end.fd(), Fd::new(1));
-                        drop(read_end);
-                        drop(write_end);
-                    }
-                    let _ = blaze_sys::linux::task::execve(prog_path, argv, envp);
-                    blaze_sys::linux::exit_group(127);
-                }
-                blaze_sys::linux::Cloned::Parent(pid) => pid,
-            }
-        };
-
+            argv.push(cstr.as_ptr().cast_mut());
+        }
+        let prog_ptr = argv.first().ok_or_else(|| IoError::from_errno(Errno::Inval))?.cast_const();
+        argv.push(core::ptr::null_mut());
+        #[cfg(target_os = "linux")]
+        let empty_env = [core::ptr::null_mut()];
+        #[cfg(target_os = "linux")]
+        let envp = empty_env.as_ptr();
         #[cfg(target_os = "macos")]
-        let pid = {
-            let mut argv: Vec<*const c_char, WireAlloc> =
-                Vec::with_capacity_in(c_strings.len().saturating_add(1), alloc);
-            for item in &c_strings {
-                argv.push(item.as_ptr().cast::<c_char>());
-            }
-            argv.push(core::ptr::null());
-            let prog_ptr = argv.first().copied().unwrap_or(core::ptr::null());
-            // SAFETY: `argv` and `c_strings` are prepared before `fork()`; the child only invokes
-            // async-signal-safe `dup2`, `close`, `execv`, and `_exit`.
-            let pid = unsafe { blaze_sys::posix::proc::fork() };
-            if pid < 0 {
-                return Err(IoError::from_errno(Errno::Again));
-            }
-            if pid == 0 {
-                if let Some((read_end, write_end)) = stdin_pipe {
-                    let _ = blaze_sys::posix::io::dup2(read_end.fd(), Fd::new(0));
-                    drop(read_end);
-                    drop(write_end);
-                }
-                if let Some((read_end, write_end)) = stdout_pipe {
-                    let _ = blaze_sys::posix::io::dup2(write_end.fd(), Fd::new(1));
-                    drop(read_end);
-                    drop(write_end);
-                }
-                // SAFETY: `prog_ptr` and `argv` are null-terminated C strings.
-                unsafe {
-                    let _ = blaze_sys::posix::proc::execv(prog_ptr, argv.as_ptr());
-                    blaze_sys::posix::signal::exit_now(127);
-                }
-            }
-            pid
-        };
+        // SAFETY: the fixture does not mutate the process environment, which is inherited by
+        // the child as it was with execv.
+        let envp = unsafe { (*blaze_sys::posix::proc::_NSGetEnviron()).cast_const() };
+        let spawn_error =
+            |errno| IoError::with_message(errno, format_in!(alloc, "spawning {program}"));
+        let mut actions = SpawnActions::new().map_err(spawn_error)?;
+        if let Some((read_end, _)) = &stdin_pipe {
+            actions.dup2(read_end.fd(), Fd::new(0)).map_err(spawn_error)?;
+        }
+        if let Some((_, write_end)) = &stdout_pipe {
+            actions.dup2(write_end.fd(), Fd::new(1)).map_err(spawn_error)?;
+        }
+
+        let mut pid = 0;
+        // SAFETY: the action list and its descriptors are live. The program and argv strings
+        // and both pointer lists are NUL-terminated, and posix_spawn does not mutate them.
+        // libc carries out the descriptor moves and exec without entering lazy Blaze code
+        // in the child, which has no launcher control thread.
+        spawn_result(unsafe {
+            posix_spawn(
+                &raw mut pid,
+                prog_ptr,
+                actions.as_ptr(),
+                core::ptr::null(),
+                argv.as_ptr(),
+                envp,
+            )
+        })
+        .map_err(spawn_error)?;
 
         let stdin = stdin_pipe.map(|(read_end, write_end)| {
             drop(read_end);
