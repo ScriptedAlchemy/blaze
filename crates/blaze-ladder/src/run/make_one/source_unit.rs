@@ -4,7 +4,7 @@
 use super::{Grounded, Maker, RecordsProgram, Typing};
 use crate::body_ids::{DeclaredList, EntryForm, Form, Grant, Make, RowKind, Walk, WalkError};
 use crate::code_records::{Callee, CodeRecordError, EntryError};
-use crate::run::{RunError, special::Roots};
+use crate::run::{RunError, special::ProductRoots};
 use blaze_code::record::Symbol;
 use blaze_emit::llvm::{self, LlvmModule, LowerError};
 use blaze_ids::{ContentId, Hasher};
@@ -153,7 +153,7 @@ fn declare(
 /// `lower` owns everything that has to survive the next source build. `calls` returns the
 /// actual internal calls of that module, including any runtime routine introduced by lowering.
 fn collect<'a, 'n, G, T, M, Denied, Lower>(
-    roots: &Roots<'_>,
+    roots: &ProductRoots<'_>,
     maker: &mut Maker<'n, G, T>,
     mut grant: impl FnMut(ItemKey) -> Result<G, Denied>,
     mut lower: impl FnMut(Symbol, &Grounded<'_>, Alloc<'a>) -> Result<M, Lower>,
@@ -212,7 +212,7 @@ where
 /// The source export's native producer. Use the same bound soft-float routine places as the
 /// ordinary emitter when resolving references introduced by target lowering.
 pub fn native<'a, 'n, G, T, Denied>(
-    roots: &Roots<'_>,
+    roots: &ProductRoots<'_>,
     maker: &mut Maker<'n, G, T>,
     grant: impl FnMut(ItemKey) -> Result<G, Denied>,
     alloc: Alloc<'a>,

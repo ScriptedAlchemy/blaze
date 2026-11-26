@@ -218,6 +218,7 @@ pub(crate) struct ProgramImage<'w> {
 /// The program's laid-out native image and Rust C exports for `blaze export`
 /// (`engine_export.rs`, `blaze_export::ProgramIn::natives` and `exports`).
 pub(crate) struct ExportNative<'a> {
+    pub(crate) key: Key,
     pub(crate) image: Option<blaze_native::image::Image<'a>>,
     /// The selected library's public symbols, sorted by name.
     pub(crate) public: AVec<'a, blaze_export::CExport<'a>>,
@@ -951,6 +952,7 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     let ask = &standing.native;
     let alloc = out_bump.alloc();
     let crates = &prepared.crates;
+    let key = image_key(prepared.program, prepared.platform, &ask.producer, crates, prepared.sdk.map(|sdk| sdk.identity()));
     let mut tables = Vec::with_capacity_in(crates.len(), out_frame);
     let mut outputs = Vec::with_capacity_in(crates.len(), out_frame);
     for c in crates.iter() {
@@ -1027,7 +1029,7 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     }
     public.sort_unstable_by(|a, b| a.name.cmp(b.name));
     bindings.sort_unstable_by(|a, b| a.name.cmp(b.name));
-    Ok(ExportNative { image: has_image.then_some(image), public, bindings, items })
+    Ok(ExportNative { key, image: has_image.then_some(image), public, bindings, items })
 }
 
 /// The link table of the crate whose `CrateScope` record `scope` names: that record's `links`

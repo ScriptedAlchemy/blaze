@@ -55,6 +55,9 @@ use crate::code_store::HomeCodeStore;
 use crate::engine_seeds::CrateAt;
 use crate::run_ids::RunIds;
 
+#[cfg(feature = "llvm")]
+pub(crate) mod prepared;
+
 /// Coordinator Unix socket environment variable.
 const SOCKET_VAR: &str = "BLAZE_DIST_SOCKET";
 /// Cache server `host:port` environment variable.
@@ -561,7 +564,7 @@ fn unit_digest_of(
 }
 
 /// Distinguishes the selected start and the explicit root closure of a final unit.
-fn program_roots_digest(name: &str, roots: &ProductRoots<'_>, panic: PanicStrategy) -> Digest {
+pub(crate) fn program_roots_digest(name: &str, roots: &ProductRoots<'_>, panic: PanicStrategy) -> Digest {
     let (form, entry) = match roots {
         ProductRoots::Executable(roots) => (match roots.form {
             EntryForm::Unit => b"unit".as_slice(),
@@ -735,21 +738,33 @@ fn json_digests(digests: &[Digest], alloc: WireAlloc) -> WireString {
     out
 }
 
+struct PlanReport<'a> {
+    name: &'a str,
+    unit: &'a Unit,
+    inputs: &'a [Digest],
+    work: Option<DevWorkReport<'a>>,
+}
+
+struct DevWorkReport<'a> {
+    items: &'a [WorkItem<'a>],
+    ids: &'a RunIds<'a>,
+}
+
 /// Write the complete plan before a worker can be held or stopped by the coordinator.
-fn write_unit_plans(report_path: Option<&str>, plans: &[CratePlan<'_>], ids: &RunIds<'_>, alloc: WireAlloc) {
+fn write_unit_plans<'a>(report_path: Option<&str>, plans: impl Iterator<Item = PlanReport<'a>>, alloc: WireAlloc) {
     let Some(path) = report_path else { return };
     let mut file = WireString::from_str_in(path, alloc);
     file.push_str(".plans");
     let mut body = WireString::from_str_in("[", alloc);
-    for (index, plan) in plans.iter().enumerate() {
+    for (index, plan) in plans.enumerate() {
         if index != 0 {
             body.push(',');
         }
         let names = json_digests(plan.unit.names.as_slice(), alloc);
         let inputs = json_digests(plan.inputs.as_slice(), alloc);
         let _ = write!(body, "{{\"unit\":\"{}\",\"unit_digest\":\"{}\",\"plan_names\":{},\"plan_inputs\":{},\"work\":[",
-            plan.unit_name.as_str(), hex(&plan.unit.spec), names.as_str(), inputs.as_str());
-        for (index, item) in plan.items.iter().enumerate() {
+            plan.name, hex(&plan.unit.spec), names.as_str(), inputs.as_str());
+        for (index, (item, ids)) in plan.work.into_iter().flat_map(|work| work.items.iter().map(move |item| (item, work.ids))).enumerate() {
             if index != 0 {
                 body.push(',');
             }
@@ -782,7 +797,8 @@ fn write_unit_plans(report_path: Option<&str>, plans: &[CratePlan<'_>], ids: &Ru
 #[expect(clippy::too_many_arguments, reason = "explicit report row fields, zero hidden globals")]
 fn append_report_row(
     report_path: Option<&str>,
-    plan: &CratePlan<'_>,
+    unit_name: &str,
+    unit: &Unit,
     arrived: &Arrived,
     tail_compiled: usize,
     from_store: usize,
@@ -808,7 +824,7 @@ fn append_report_row(
             "\"compiled_for_work\":{},\"stored_for_work\":{},\"arrived\":{},\"tail_compiled\":{},\"from_store\":{},\"instances\":{},",
             "\"unit_digest\":\"{}\",\"attempt\":{},\"publication_attempt\":{},\"work_compiled_keys\":{},\"tail_compiled_keys\":{}}}\n",
         ),
-        plan.unit_name.as_str(),
+        unit_name,
         source,
         execution,
         arrived.joined,
@@ -819,7 +835,7 @@ fn append_report_row(
         tail_compiled,
         from_store,
         instances,
-        hex(&plan.unit.spec),
+        hex(&unit.spec),
         attempt,
         pub_attempt,
         work_keys.as_str(),
@@ -1098,7 +1114,11 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         });
     }
 
-    write_unit_plans(dist.report.as_ref().map(|path| path.as_str()), plans.as_slice(), ids, wire_alloc);
+    let report = plans.iter().map(|plan| PlanReport {
+        name: plan.unit_name.as_str(), unit: &plan.unit, inputs: &plan.inputs,
+        work: Some(DevWorkReport { items: &plan.items, ids }),
+    });
+    write_unit_plans(dist.report.as_ref().map(|path| path.as_str()), report, wire_alloc);
 
     // Whole-program output fingerprint covering every unit digest and output path.
     let fp = unit_digest_of(output_path, builder, release, prior_digests.as_slice(), &[], scratch_alloc);
@@ -1162,7 +1182,8 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         store.merge_arrived(&arrived.values)?;
         append_report_row(
             dist.report.as_ref().map(|s| s.as_str()),
-            plan,
+            plan.unit_name.as_str(),
+            &plan.unit,
             &arrived,
             tail_compiled,
             tail_from_store,
