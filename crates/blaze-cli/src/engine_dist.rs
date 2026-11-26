@@ -576,7 +576,7 @@ fn program_roots_digest(name: &str, roots: &Roots<'_>, panic: PanicStrategy) -> 
     hash.part(name.as_bytes()).part(form).part(panic).part(&roots.entry.0);
     for index in 0..roots.len() {
         let (item, instance) = roots.row(index);
-        hash.part(&item.0.0).part(instance);
+        hash.part(&item.0.to_le_bytes()).part(instance);
     }
     hash.finish().0
 }
@@ -715,7 +715,7 @@ fn write_unit_plans(report_path: Option<&str>, plans: &[CratePlan<'_>], ids: &Ru
             }
             let symbol = fn_symbol_of_name(item.name.as_slice());
             let _ = write!(body, "{{\"item\":\"{}\",\"symbol\":\"{}\",\"work_name\":\"{}\"",
-                hex(&item.tabled.0.0), hex(&symbol.0), hex(&item.key.0.0));
+                hex(&item.tabled.0.to_le_bytes()), hex(&symbol.0), hex(&item.key.0.0));
             if let Some(check) = ids.body_check(item.tabled) {
                 let _ = write!(body, ",\"body_key\":\"{}\",\"body_reads\":[", hex(&check.key.0));
                 for (index, read) in check.reads.iter().enumerate() {
