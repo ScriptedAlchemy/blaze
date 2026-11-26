@@ -27,7 +27,7 @@ use core::time::Duration;
 
 use blaze_core::Driver;
 use blaze_dist::holder::HolderConfig;
-use blaze_dist_local::agent::{self, Arrived, Config, Grant, Granted, Source, Unit};
+use blaze_dist_local::agent::{self, Arrived, Config, Emission, Grant, Granted, Source, Unit};
 use blaze_dist_local::blobs::Blobs;
 use blaze_dist_local::pack::{Value, ValueRef};
 use blaze_dist_local::sys::{append_file, path_is_file, random_id, read_file, write_file};
@@ -894,7 +894,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
 
     fn compile(&mut self, names: &[usize]) -> Result<Grant, DistError> {
         let mut grant_values: BTreeMap<Digest, Value, WireAlloc> = BTreeMap::new_in(self.wire_alloc);
-        let mut compiled_keys: WireVec<Digest> = WireVec::new_in(self.wire_alloc);
+        let mut emissions = WireVec::new_in(self.wire_alloc);
         let mut compiled = 0u64;
         let mut stored = 0u64;
         let mut scratch = Scratch::new_in(self.scratch_alloc);
@@ -933,7 +933,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                     }
                     Stepped::Made(code_key) => {
                         compiled += 1;
-                        compiled_keys.push(code_key.0.0);
+                        emissions.push(Emission::plain(code_key.0.0));
                     }
                     Stepped::Unkeyed(_) => {}
                 },
@@ -953,7 +953,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
         for (_, val) in grant_values {
             values.push(val);
         }
-        Ok(Grant { values, compiled, stored, compiled_keys })
+        Ok(Grant { values, compiled, stored, emissions })
     }
 
     fn complete(

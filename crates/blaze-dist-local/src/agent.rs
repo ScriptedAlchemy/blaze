@@ -46,6 +46,8 @@ use crate::protocol::{self as carrier, Answer, Binding, Command};
 use crate::server::random_id;
 use crate::sys::{SystemClock, ThreadFailed, current_pid, env_is_set, scope, sleep};
 
+mod grant_events;
+
 /// What every executor of a machine reserves: one holder's bookkeeping, not its compile, which
 /// the daemon's own budget admits.
 pub const NEED: Reservation = Reservation { memory: 1, cpus: 1, disk: 1 };
@@ -130,8 +132,40 @@ pub struct Grant {
     pub compiled: u64,
     /// How many it found in its own store.
     pub stored: u64,
-    /// Actual emitted store keys, in emission order, including repeated compiles.
-    pub compiled_keys: WireVec<Digest>,
+    /// Actual store writes, in emission order, including repeated compiles.
+    pub emissions: WireVec<Emission>,
+}
+
+/// A store write observed by the compiler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Emission {
+    /// The emitted store value's key.
+    pub key: Digest,
+    /// The machine output and issuing work name, when the renderer produced a native result.
+    pub native: Option<NativeEmission>,
+}
+
+impl Emission {
+    /// A store write that carries no optimized backend provenance.
+    pub const fn plain(key: Digest) -> Self {
+        Self { key, native: None }
+    }
+}
+
+/// Provenance carried by the compiler that produced a native store value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeEmission {
+    pub kind: BackendKind,
+    /// The compiler's canonical grant name inside the unit.
+    pub grant: Digest,
+    /// The content key of the machine record this store value names.
+    pub content: Digest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendKind {
+    ReleaseBlob,
+    FoldedOutput,
 }
 
 /// How a unit's values arrived.
@@ -286,6 +320,8 @@ struct Batches<'a, G: Granted + ?Sized> {
 enum BatchError {
     NoncanonicalRoots { unit: Digest },
     RootIndex { unit: Digest, index: u64 },
+    EmissionGrant { unit: Digest, grant: Digest },
+    ConflictingEmission { unit: Digest, key: Digest },
     Pack { unit: Digest, source: crate::pack::PackError },
     Upload { unit: Digest, source: Error },
 }
@@ -298,6 +334,12 @@ impl fmt::Display for BatchError {
             }
             Self::RootIndex { unit, index } => {
                 write!(f, "unit {}: granted root {index} is outside the root set", hex(unit))
+            }
+            Self::EmissionGrant { unit, grant } => {
+                write!(f, "unit {}: native output names a grant outside the batch: {}", hex(unit), hex(grant))
+            }
+            Self::ConflictingEmission { unit, key } => {
+                write!(f, "unit {}: output {} has conflicting native receipts", hex(unit), hex(key))
             }
             Self::Pack { unit, source } => {
                 write!(f, "unit {}: cannot pack the granted values: {source}", hex(unit))
@@ -333,38 +375,26 @@ impl<G: Granted + ?Sized> BatchCompiler for Batches<'_, G> {
             let at = usize::try_from(*index).ok().filter(|at| *at < self.unit.names.len());
             names.push(at.ok_or(BatchError::RootIndex { unit: self.unit.spec, index: *index })?);
         }
-        if env_is_set("BLAZE_DIST_EVENTS", alloc) {
-            let mut work = Vec::with_capacity_in(names.len().saturating_add(plan.grant.names.len()), alloc);
-            for at in &names {
-                if let Some(name) = self.unit.names.get(*at) {
-                    work.push(wire_name(&self.unit.spec, name, alloc).0);
-                }
-            }
-            for name in plan.grant.names.iter() {
-                work.push(name.0);
-            }
-            let pid = current_pid();
-            crate::telemetry::emit(
-                "grant",
-                &[
-                    ("pid", crate::telemetry::json(&pid, alloc)),
-                    ("unit_digest", crate::telemetry::json(&self.unit.spec, alloc)),
-                    ("execution", crate::telemetry::json(&plan.grant.lease.execution.0, alloc)),
-                    ("attempt", crate::telemetry::json(&plan.grant.lease.attempt.0, alloc)),
-                    ("holder", crate::telemetry::json(&plan.grant.lease.holder, alloc)),
-                    ("generation", crate::telemetry::json(&plan.grant.lease.generation, alloc)),
-                    ("seq", crate::telemetry::json(&plan.seq, alloc)),
-                    ("work", crate::telemetry::json(&work, alloc)),
-                ],
-                alloc,
-            );
-        }
+        let events = if env_is_set("BLAZE_DIST_EVENTS", alloc) {
+            let fields = grant_events::issued(self.unit, plan, &names, current_pid(), alloc)?;
+            crate::telemetry::emit("grant", &fields, alloc);
+            Some(fields)
+        } else {
+            None
+        };
         self.grants = self.grants.saturating_add(1);
         let (exported, packs): (bool, WireVec<PackRef>) = match self.granted.compile(&names) {
             Ok(grant) => {
+                let native = grant_events::native_outputs(self.unit, &names, &grant.emissions, alloc)?;
+                if let Some(mut fields) = events
+                    && !native.is_empty()
+                {
+                    grant_events::backend(&mut fields, self.unit.spec, &grant.emissions, &native, alloc);
+                    crate::telemetry::emit("backend_work", &fields, alloc);
+                }
                 self.compiled = self.compiled.saturating_add(grant.compiled);
                 self.stored = self.stored.saturating_add(grant.stored);
-                self.compiled_keys.extend(grant.compiled_keys);
+                self.compiled_keys.extend(grant.emissions.into_iter().map(|output| output.key));
                 let mut references = Vec::new_in(alloc);
                 // Every pack is uploaded before this grant's result is posted.
                 for pack in Pack::batches(grant.values, alloc)
