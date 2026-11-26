@@ -108,6 +108,10 @@ jobs:
             -- place_tests::relro_end_addresses_place_across_a_page_boundary --exact \
             2>&1 | tee "$evidence/relro-address.log"
           grep -Fq 'place_tests::relro_end_addresses_place_across_a_page_boundary ... ok' "$evidence/relro-address.log"
+          timeout -k 20 600 cargo +"$tc" test --locked --release -p blaze-export --lib \
+            -- optimized_tests::both_native_export_layouts_address_empty_relro --exact \
+            2>&1 | tee "$evidence/relro-export.log"
+          timeout 10 grep -Fq 'optimized_tests::both_native_export_layouts_address_empty_relro ... ok' "$evidence/relro-export.log"
           timeout -k 30 1200 cargo +"$tc" test --locked --release -p blaze-emit --features llvm --lib \
             release_record 2>&1 | tee "$evidence/llvm-records.log"
           grep -Fq 'release_record_stores_a_splat_to_every_lane ... ok' "$evidence/llvm-records.log"
