@@ -313,7 +313,32 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             return self.diagnose_unsize_projection(tr, args, cause);
         }
         self.register_trait(tr, args, cause)?;
+        if let Cause::Expr(e) = cause {
+            self.note_unsize_projections(item, a, b, e)?;
+        }
         Ok(Some(Unsizing::Adjust))
+    }
+
+    /// File the associated type selections required by a concrete-to-object coercion. The
+    /// `Unsize` solver goal proves these with the concrete pointee as the existential `Self`.
+    /// Borrow checking replays their impls and where-clauses with the original regions.
+    fn note_unsize_projections(&mut self, item: LangItem, a: Ty, b: Ty, e: ExprId) -> Result<(), Stop> {
+        let pair = if item == LangItem::Unsize { Some((a, b)) } else { self.unsize_pair(a, b)? };
+        let Some((source, target)) = pair else { return Ok(()) };
+        let TyView::Dynamic(rows) = self.view(target) else { return Ok(()) };
+        if matches!(self.view(source), TyView::Dynamic(_)) {
+            return Ok(());
+        }
+        for i in 0..self.ty.list_len(rows) {
+            let row = self.ty.list_get(rows, i);
+            let TyView::ExProj { trait_, name, args_term } = self.view(row) else { continue };
+            let mut args = self.list(args_term);
+            args.pop().ok_or(CheckError::Malformed(Malformed::ObjectPreds { node: row.0 }))?;
+            args.insert(0, source);
+            let args = self.mk_list(&args)?;
+            self.projected.push((e, trait_, Some(name), args));
+        }
+        Ok(())
     }
 
     fn diagnose_unsize_projection(&mut self, tr: ItemKey, args: TyList, cause: Cause) -> Result<Option<Unsizing>, Stop> {
@@ -368,8 +393,8 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         Ok(None)
     }
 
-    /// The pair `(source, dyn ..)` a failed `a: CoerceUnsized<b>` unsizes at, for its diagnosis
-    /// only (the solver has answered No): the first position, through one ADT's arguments
+    /// The pair `(source, dyn ..)` an `a: CoerceUnsized<b>` unsizes at: the first position,
+    /// through one ADT's arguments
     /// (the Reference, "Unsized Coercions": "`Foo<T>` can implement `CoerceUnsized<Foo<U>>`
     /// when `T` implements `Unsize<U>` or `CoerceUnsized<Foo<U>>`") and `&`/`&mut`/raw
     /// pointers, where the target is an object and the source is a known non-object type

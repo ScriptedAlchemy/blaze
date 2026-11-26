@@ -725,6 +725,23 @@ struct ClosureSigs<'s> {
     regs: &'s [Region],
 }
 
+struct BodyRegions<A: Allocator> {
+    rows: Vec<(PTy, u32, u32), A>,
+    held: Vec<u32, A>,
+    closures: Vec<(u32, PTy, u32, u32, u32, u32), A>,
+    regs: Vec<Region, A>,
+}
+
+impl<A: Allocator> BodyRegions<A> {
+    fn params(&self) -> BodyParams<'_> {
+        BodyParams { rows: &self.rows, held: &self.held }
+    }
+
+    fn signatures(&self) -> ClosureSigs<'_> {
+        ClosureSigs { rows: &self.closures, regs: &self.regs }
+    }
+}
+
 impl<'s> ClosureSigs<'s> {
     fn of(&self, ordinal: u32) -> Option<blaze_borrow::ClosureSig<'s>> {
         let &(_, sig_ty, ncap, nsig, start, len) = self.rows.iter().find(|r| r.0 == ordinal)?;
@@ -932,6 +949,135 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         self.refuse(Form::OneRule { callee, why }, e)
     }
 
+    fn closure_signature_slots(&self, bodies: &mut Vec<(PTy, SlotCount), A>, e: ExprId) -> Result<(), Refusal> {
+        let mut at = 0usize;
+        while let Some(&(ty, _)) = bodies.get(at) {
+            at += 1;
+            if let PNode::Closure { owner, ordinal, .. } = self.node(ty, e)?
+                && owner == self.body.owner
+                && let Some(&sig) = self.ck.closures.column::<2>().get(ordinal as usize)
+            {
+                self.body_slots(sig, bodies, e)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The caller's body types' captured parameters and exact closure signature columns.
+    fn body_regions(&self, caller: &BodyTypes<'_>, bodies: &[(PTy, SlotCount)], seen: &mut Vec<u32, A>, closures_related: bool, e: ExprId) -> Result<BodyRegions<A>, Refusal> {
+        let mut body = BodyRegions {
+            rows: Vec::new_in(self.alloc),
+            held: Vec::new_in(self.alloc),
+            closures: Vec::new_in(self.alloc),
+            regs: Vec::new_in(self.alloc),
+        };
+        let mut slots: Vec<crate::closure::SigSlot, A> = Vec::new_in(self.alloc);
+        for &(ty, total_slots) in bodies {
+            let mut params = Vec::new_in(self.alloc);
+            if closures_related {
+                self.captured_params(ty, e, &mut params)?;
+            }
+            let (Ok(start), Ok(len)) = (u32::try_from(body.held.len()), u32::try_from(params.len())) else { return self.refuse(Form::Bound, e) };
+            for &p in params.iter() {
+                if !seen.contains(&p) {
+                    seen.push(p);
+                }
+                body.held.push(p);
+            }
+            body.rows.push((ty, start, len));
+            if closures_related
+                && let PNode::Closure { owner, ordinal, .. } = self.node(ty, e)?
+                && owner == self.body.owner
+                && !body.closures.iter().any(|r| r.0 == ordinal)
+                && let Some(&sig) = self.ck.closures.column::<2>().get(ordinal as usize)
+                && self.sig_slots(ordinal as usize, e, &mut slots).is_ok()
+                && caller.count(sig) == Ok(SlotCount::new(slots.len() as u32))
+            {
+                let mut nsig = 0u32;
+                let mut max_late = 0u32;
+                for &slot in slots.iter() {
+                    match slot {
+                        crate::closure::SigSlot::Owner(j) => nsig = nsig.max(j + 1),
+                        crate::closure::SigSlot::Late(Some((0, v))) => max_late = max_late.max(v + 1),
+                        _ => {}
+                    }
+                }
+                if let Some(ncap) = total_slots.get().checked_sub(nsig) {
+                    let start = u32::try_from(body.regs.len()).unwrap_or(u32::MAX);
+                    let mut next_late = max_late;
+                    for &slot in slots.iter() {
+                        body.regs.push(match slot {
+                            crate::closure::SigSlot::Owner(j) => Region::Param(j),
+                            crate::closure::SigSlot::Static => Region::Static,
+                            crate::closure::SigSlot::Late(Some((binder, var))) | crate::closure::SigSlot::InnerBound(binder, var) => Region::Late { binder, var },
+                            crate::closure::SigSlot::Late(None) => {
+                                let var = next_late;
+                                next_late += 1;
+                                Region::Late { binder: 0, var }
+                            }
+                        });
+                    }
+                    body.closures.push((ordinal, sig, ncap, nsig, start, slots.len() as u32));
+                }
+            }
+        }
+        Ok(body)
+    }
+
+    /// Replay an object coercion's associated type selections in the same region model as
+    /// a call. `source` and `object` are the pointees' exact portions of the origin column.
+    pub(crate) fn relate_projected_object(&mut self, source_ty: PTy, source: PInfo, object_ty: PTy, object: PInfo, e: ExprId) -> Result<bool, Refusal> {
+        let facts: &'b F = self.facts;
+        let arity = FactsArity { facts };
+        let heads = Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+        let mut bodies = Vec::new_in(self.alloc);
+        self.body_slots(source_ty, &mut bodies, e)?;
+        self.body_slots(object_ty, &mut bodies, e)?;
+        self.closure_signature_slots(&mut bodies, e)?;
+        let caller = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &bodies);
+        let owner = self.body.owner;
+        let mut col = Vec::new_in(self.alloc);
+        let mut seen = Vec::new_in(self.alloc);
+        let source = self.value_slots(TyD::of(source_ty), Some(source), &caller, &mut col, &mut seen, owner, e)?;
+        let object = self.value_slots(TyD::of(object_ty), Some(object), &caller, &mut col, &mut seen, owner, e)?;
+        let body = self.body_regions(&caller, &bodies, &mut seen, true, e)?;
+        let static_ = self.universal(Region::Static);
+        let own = match facts.sig(owner) {
+            Ok(own) => own,
+            Err(r) => return self.refuse(Form::RegionsUnread { item: r.item, why: r.why }, e),
+        };
+        let bounds = match facts.regions().clauses(owner) {
+            Ok(bounds) => bounds,
+            Err(r) => return self.refuse(Form::RegionsUnread { item: r.item, why: r.why }, e),
+        };
+        for i in 0..own.params().count() {
+            self.universal(Region::Param(i));
+        }
+        for p in seen {
+            self.param_origin(p);
+        }
+        let selected = CallSel { rows: self.ck.call_selections(e), body_rows: &self.ck.selected, facts, tys: self.tys };
+        let who = CallOwner {
+            item: owner,
+            uni: &self.uni,
+            params: &self.param_origs,
+            bounds,
+            sig: (!self.in_nested).then(|| {
+                let c = own.regions().col;
+                Typed { ty: c.ty(), col: c.as_slice() }
+            }),
+            heads: &heads,
+            bodies: body.params(),
+            closures: body.signatures(),
+        };
+        let mut sink = Sink { b: &mut self.b, static_, dyn_ph: &mut self.dyn_bound_placeholders, drop_next: false };
+        let mut cx = Cx { types: &caller, sig_types: &heads, selected: &selected, owner: &who, origins: &col, out: &mut sink };
+        match blaze_borrow::unsize_projected_object(&mut cx, source, object, owner, self.alloc) {
+            Ok(handled) => Ok(handled),
+            Err(r) => self.one_refuse(owner, OneRuleWhy::of(r), e),
+        }
+    }
+
     /// THE ADAPTER: the call's contract inputs built from the lowering's (the callee's head,
     /// the call's generic arguments' and values' slots in one origin column, the selected
     /// impls), `blaze_borrow::call` run, its constraints into the same flow.
@@ -979,17 +1125,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             self.body_slots(site.ty.ty, &mut bodies, e)?;
             // Also collect any nested body types inside a closure's own signature type so
             // `caller.count(sig_ty)` knows their slot counts.
-            let mut bi = 0usize;
-            while bi < bodies.len() {
-                let bt = bodies[bi].0;
-                bi += 1;
-                if let PNode::Closure { owner, ordinal, .. } = self.node(bt, e)?
-                    && owner == self.body.owner
-                    && let Some(&sig_ty) = self.ck.closures.column::<2>().get(ordinal as usize)
-                {
-                    self.body_slots(sig_ty, &mut bodies, e)?;
-                }
-            }
+            self.closure_signature_slots(&mut bodies, e)?;
         }
         let caller = BodyTypes::new(Columns::new(self.tys, &arity, &arity), &bodies);
         let heads = Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
@@ -1030,61 +1166,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         // Each body type among the call's types: the caller's parameters its captures hold
         // (`Owner::body_params`, read by the components rule), their `ρ_P` made with the rest;
         // and for each closure of this body, its laid signature column for `Owner::closure_sig`.
-        let mut body_rows: Vec<(PTy, u32, u32), A> = Vec::new_in(self.alloc);
-        let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
-        let mut closure_rows: Vec<(u32, PTy, u32, u32, u32, u32), A> = Vec::new_in(self.alloc);
-        let mut closure_regs: Vec<Region, A> = Vec::new_in(self.alloc);
-        let mut sslots: Vec<crate::closure::SigSlot, A> = Vec::new_in(self.alloc);
-        for &(t, total_slots) in bodies.iter() {
-            let mut one: Vec<u32, A> = Vec::new_in(self.alloc);
-            if closures_related {
-                self.captured_params(t, e, &mut one)?;
-            }
-            let (Ok(start), Ok(len)) = (u32::try_from(held.len()), u32::try_from(one.len())) else { return self.refuse(Form::Bound, e) };
-            for &p in one.iter() {
-                if !seen.contains(&p) {
-                    seen.push(p);
-                }
-                held.push(p);
-            }
-            body_rows.push((t, start, len));
-            if closures_related
-                && let PNode::Closure { owner, ordinal, .. } = self.node(t, e)?
-                && owner == self.body.owner
-                && !closure_rows.iter().any(|r| r.0 == ordinal)
-                && let Some(&sig_ty) = self.ck.closures.column::<2>().get(ordinal as usize)
-                && self.sig_slots(ordinal as usize, e, &mut sslots).is_ok()
-                && caller.count(sig_ty) == Ok(SlotCount::new(sslots.len() as u32))
-            {
-                let mut nsig = 0u32;
-                let mut max_late = 0u32;
-                for &s in sslots.iter() {
-                    match s {
-                        crate::closure::SigSlot::Owner(j) => nsig = nsig.max(j + 1),
-                        crate::closure::SigSlot::Late(Some((0, v))) => max_late = max_late.max(v + 1),
-                        _ => {}
-                    }
-                }
-                if let Some(ncap) = total_slots.get().checked_sub(nsig) {
-                    let rstart = u32::try_from(closure_regs.len()).unwrap_or(u32::MAX);
-                    let mut next_late = max_late;
-                    for &s in sslots.iter() {
-                        closure_regs.push(match s {
-                            crate::closure::SigSlot::Owner(j) => Region::Param(j),
-                            crate::closure::SigSlot::Static => Region::Static,
-                            crate::closure::SigSlot::Late(Some((binder, var))) | crate::closure::SigSlot::InnerBound(binder, var) => Region::Late { binder, var },
-                            crate::closure::SigSlot::Late(None) => {
-                                let var = next_late;
-                                next_late += 1;
-                                Region::Late { binder: 0, var }
-                            }
-                        });
-                    }
-                    let rlen = sslots.len() as u32;
-                    closure_rows.push((ordinal, sig_ty, ncap, nsig, rstart, rlen));
-                }
-            }
-        }
+        let body_regions = self.body_regions(&caller, &bodies, &mut seen, closures_related, e)?;
 
         // The callee's signature and clauses, in the heads' table.
         let (inputs, sig_output) = match blaze_borrow::split_fn_col(&heads, item, life.regions().col, self.alloc) {
@@ -1129,7 +1211,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             if owner != self.body.owner {
                 continue;
             }
-            if closure_rows.iter().any(|r| r.0 == ordinal) {
+            if body_regions.closures.iter().any(|r| r.0 == ordinal) {
                 continue;
             }
             need_coarse_closure_tie = true;
@@ -1204,8 +1286,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                     Typed { ty: c.ty(), col: c.as_slice() }
                 }),
                 heads: &heads,
-                bodies: BodyParams { rows: &body_rows, held: &held },
-                closures: ClosureSigs { rows: &closure_rows, regs: &closure_regs },
+                bodies: body_regions.params(),
+                closures: body_regions.signatures(),
             };
             let mut sink = Sink { b: &mut self.b, static_, dyn_ph: &mut self.dyn_bound_placeholders, drop_next: drop_first };
             let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &col, out: &mut sink };

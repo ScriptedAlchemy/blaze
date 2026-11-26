@@ -2165,6 +2165,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     /// other type's, whose signature may bind a region per call that no owner region stands
     /// for (`Form::ClosureSigErased`). A bounded walk of `t`'s parts.
     pub(crate) fn closure_sig_kept(&self, t: PTy, e: ExprId) -> Result<(), Refusal> {
+        if self.closure_sig_required(t, e)? {
+            return self.refuse(Form::ClosureSigErased, e);
+        }
+        Ok(())
+    }
+
+    /// Whether a coercion must preserve a contained closure's signature requirements.
+    pub(crate) fn closure_sig_required(&self, t: PTy, e: ExprId) -> Result<bool, Refusal> {
         let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
         stack.push(t);
         let mut steps = 0u32;
@@ -2176,7 +2184,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             match self.node(t, e)? {
                 PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
                     if self.sig_needs(to_usize(ordinal), e)? {
-                        return self.refuse(Form::ClosureSigErased, e);
+                        return Ok(true);
                     }
                 }
                 PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => stack.push(i),
@@ -2184,7 +2192,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 _ => {}
             }
         }
-        Ok(())
+        Ok(false)
     }
 }
 

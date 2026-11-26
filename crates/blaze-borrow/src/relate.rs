@@ -249,6 +249,8 @@ enum AskAt<'c> {
     /// Subject-first node (`ExTrait`, `Alias`, or `ExProj` of `len` args) whose child 0 has
     /// already been normalized to `subject`, with remaining arguments `1..len` from `of`.
     SubjectKids { subject: Side<'c>, of: Side<'c>, len: u32 },
+    /// An existential `ExProj`: the concrete subject followed by the arguments before the term.
+    ObjectProjection { subject: Side<'c>, of: Side<'c> },
 }
 
 /// [`AskArgs`] over a walk: each argument followed through its environment and compared with a
@@ -269,6 +271,9 @@ impl<'c, A: Allocator + Copy> Keyer<'_, '_, 'c, A> {
             AskAt::SubjectKids { subject, .. } if k == 0 => Some(subject),
             AskAt::SubjectKids { of, len, .. } if k < len => self.walk.erased_kid(of, k),
             AskAt::SubjectKids { .. } => None,
+            AskAt::ObjectProjection { subject, .. } if k == 0 => Some(subject),
+            AskAt::ObjectProjection { of, .. } if k < self.walk.kids_of(of).ok()?.len() => self.walk.erased_kid(of, k - 1),
+            AskAt::ObjectProjection { .. } => None,
         }
     }
 }
@@ -279,6 +284,7 @@ impl<A: Allocator + Copy> AskArgs for Keyer<'_, '_, '_, A> {
             AskAt::Kids(s) => self.walk.kids_of(s).ok().map(|k| k.len()),
             AskAt::Subject { of, .. } => self.walk.kids_of(of).ok().and_then(|k| k.len().checked_add(1)),
             AskAt::SubjectKids { len, .. } => Some(len),
+            AskAt::ObjectProjection { of, .. } => self.walk.kids_of(of).ok().map(|k| k.len()),
         }
     }
 
@@ -2419,8 +2425,20 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 }
             }
         }
+        self.selected_projection(proj, term, AskAt::SubjectKids { subject, of: proj, len: last })
+    }
+
+    /// Relate a selected associated type to the requested term, using the goal's concrete
+    /// subject and original argument slots. The impl's own clauses may constrain type
+    /// parameters of its associated value that are absent from the impl header.
+    fn selected_projection(&mut self, proj: Side<'c>, term: Side<'c>, at: AskAt<'c>) -> Result<(), Refused> {
+        let PNode::ExProj { trait_, name, .. } = self.node(proj)? else { return Err(self.malformed(proj.ty, Bad::NotOfKind)) };
+        let own = self.own(proj)?;
+        let kids = self.kids_of(proj)?;
+        let (_, args_rest) = proj.slots.split(own).ok_or(self.malformed(proj.ty, Bad::StepBound))?;
         let selected: &'c dyn Selected = self.selected;
-        let key = Keyer { walk: &*self, at: AskAt::SubjectKids { subject, of: proj, len: last }, budget: Cell::new(MOST_WALK_STEPS) };
+        let key = Keyer { walk: &*self, at, budget: Cell::new(MOST_WALK_STEPS) };
+        let count = key.count().ok_or(self.malformed(proj.ty, Bad::NotOfKind))?;
         let (head, value) = match selected.select_keyed(Ask { trait_, name: Some(name), written: proj.ty }, &key) {
             Selection::Impl { head, value: Some(value) } => (head, value),
             Selection::Impl { value: None, .. } => return Err(self.malformed(proj.ty, Bad::NoValue)),
@@ -2447,16 +2465,23 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             }
         }
         let hkids = self.kids_of(header)?;
-        if last != hkids.len() {
-            return Err(self.malformed(proj.ty, Bad::HeaderKids { alias: last, header: hkids.len() }));
+        if count != hkids.len() {
+            return Err(self.malformed(proj.ty, Bad::HeaderKids { alias: count, header: hkids.len() }));
         }
         let (_, mut hrest) = header.slots.split(tl).ok_or(self.malformed(header.ty, Bad::StepBound))?;
         let mut prest = args_rest;
         for k in 0..hkids.len() {
             let (h, hr) = self.kid(header, &hkids, hrest, k)?;
-            let (x, r) = self.kid(proj, &kids, prest, k)?;
+            let x = match at {
+                AskAt::ObjectProjection { subject, .. } if k == 0 => subject,
+                _ => {
+                    let p = if matches!(at, AskAt::ObjectProjection { .. }) { k - 1 } else { k };
+                    let (x, r) = self.kid(proj, &kids, prest, p)?;
+                    prest = r;
+                    x
+                }
+            };
             hrest = hr;
-            prest = r;
             self.walk(h, x, Variance::In, 1)?;
         }
         self.impl_where(head.imp, trait_, proj.ty, env, head.lifetimes)?;
@@ -3841,6 +3866,59 @@ pub fn relate_sides<'c, 'k: 'c, A: Allocator + Copy>(
 pub fn relate<A: Allocator + Copy>(cx: &mut Cx<'_, '_>, a: Arg, b: Arg, v: Variance, item: ItemKey, alloc: A) -> Result<(), Refused> {
     let mut envs: Envs<'_, A> = Envs::new_in(alloc);
     relate_sides(cx, &mut envs, item, Side::caller(a), Side::caller(b), v)
+}
+
+/// Unsizing a concrete value to an object whose sole principal has no arguments or
+/// lifetimes and is proved by its associated type equalities. There is no predicate
+/// input position for an object binder to quantify in this case. A wider predicate
+/// set needs its own binder and bound relations before this path can take it.
+pub fn unsize_projected_object<A: Allocator + Copy>(cx: &mut Cx<'_, '_>, source: Arg, object: Arg, item: ItemKey, alloc: A) -> Result<bool, Refused> {
+    let mut envs = Envs::new_in(alloc);
+    let mut w = walker(cx, &mut envs, item);
+    let source = Side::caller(source);
+    let object = Side::caller(object);
+    if !matches!(w.node(source)?, PNode::Adt(..)) || !matches!(w.node(object)?, PNode::Dynamic(_)) {
+        return Ok(false);
+    }
+    w.fits(source)?;
+    w.fits(object)?;
+    let own = w.own(object)?;
+    if own.get() != 1 {
+        return Ok(false);
+    }
+    let kids = w.kids_of(object)?;
+    let (_, first) = object.slots.split(own).ok_or(w.malformed(object.ty, Bad::StepBound))?;
+    let mut rest = first;
+    let mut principal = None;
+    let mut projection = None;
+    for k in 0..kids.len() {
+        let (pred, next) = w.kid(object, &kids, rest, k)?;
+        rest = next;
+        if w.own(pred)? != SlotCount::ZERO {
+            return Ok(false);
+        }
+        let count = w.kids_of(pred)?.len();
+        match w.node(pred)? {
+            PNode::ExTrait(trait_, _) if count == 0 && principal.is_none() => principal = Some(trait_),
+            PNode::ExProj { trait_, .. } if count == 1 && projection.is_none_or(|p| p == trait_) => projection = Some(trait_),
+            _ => return Ok(false),
+        }
+    }
+    if projection.is_none() || projection != principal {
+        return Ok(false);
+    }
+    rest = first;
+    for k in 0..kids.len() {
+        let (pred, next) = w.kid(object, &kids, rest, k)?;
+        rest = next;
+        if matches!(w.node(pred)?, PNode::ExProj { .. }) {
+            let (term, _) = w.kid(pred, &w.kids_of(pred)?, pred.slots, 0)?;
+            w.selected_projection(pred, term, AskAt::ObjectProjection { subject: source, of: pred })?;
+        }
+    }
+    let RegAt::Known(region) = w.slot(object, 0)? else { return Err(w.malformed(object.ty, Bad::NotOfKind)) };
+    w.components(source, region, 0)?;
+    Ok(true)
 }
 
 /// The well-formedness of each of `inst`'s inputs and its output at the call ([`Walk::wf`]):

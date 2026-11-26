@@ -1262,7 +1262,7 @@ struct PInfo {
 /// literal (a tuple, a struct, an array), or `format_args!`'s arguments.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum UnsizeDone {
-    /// Exact closure-to-`dyn Fn*` unsizing that equated every owner signature slot onto the object.
+    /// Exact unsizing that preserved a contained closure's signature obligations.
     ClosureSigTied,
     /// Exact object unsizing that did not equate a closure's owner signature slots.
     Handled,
@@ -6325,6 +6325,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         return Ok(if tied.iter().all(|&b| b) { UnsizeDone::ClosureSigTied } else { UnsizeDone::Handled });
                     }
                 }
+            }
+        }
+        if R::RELATES && <R::Grain as grain::Grain>::SLOTS
+            && matches!(self.node(from_inner, e)?, PNode::Adt(..))
+            && self.closure_sig_required(from_inner, e)?
+        {
+            let source = PInfo { start: s.start + ref_skip, len: s.len - ref_skip, ..s };
+            let object = PInfo { start: d.start + ref_skip, len: d.len - ref_skip, ..d };
+            if self.relate_projected_object(from_inner, source, obj, object, e)? {
+                if ref_skip == 1 {
+                    let dest_ref = self.origs[d.start as usize];
+                    self.b.subset(self.origs[s.start as usize], dest_ref);
+                    self.b.subset(self.origs[object.start as usize], dest_ref);
+                }
+                return Ok(UnsizeDone::ClosureSigTied);
             }
         }
         if d.len != ref_skip + 1 {

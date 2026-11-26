@@ -81,6 +81,22 @@ fn get<'a>(x: <Wrap<'a> as Tr>::A) -> &'a u8 {
 fn get_static<'a>(x: <Wrap<'a> as Tr>::A) -> &'static u8 {
     x.0
 }
+
+struct Value<'a>(&'a [u8]);
+
+fn first_value<'a>(it: &mut dyn Iterator<Item = Value<'a>>) -> Option<Value<'a>> {
+    it.next()
+}
+
+fn mapped_value(xs: &[Vec<u8>]) -> Option<Value<'_>> {
+    let mut it = xs.iter().map(|x| Value(x.as_slice()));
+    first_value(&mut it)
+}
+
+fn mapped_value_escapes(xs: &[Vec<u8>]) -> Option<Value<'static>> {
+    let mut it = xs.iter().map(|x| Value(x.as_slice()));
+    first_value(&mut it)
+}
 ";
 
 fn shown(item: &str, v: &BorrowVerdict<'_>) -> String {
@@ -122,7 +138,7 @@ fn closure_and_projection_signatures_are_laid_and_checked() {
 
     // Print every verdict first, so one run shows them all, whichever assertion fails.
     let mut verdicts = Vec::new();
-    for n in ["user", "user_keeps", "peek", "get", "get_static"] {
+    for n in ["user", "user_keeps", "peek", "get", "get_static", "mapped_value", "mapped_value_escapes"] {
         let b = find(n);
         let (types, v) = world.check_borrows(b, heap.alloc());
         let line = shown(text_of(b), &v);
@@ -131,13 +147,13 @@ fn closure_and_projection_signatures_are_laid_and_checked() {
     }
     let of = |n: &str| verdicts.iter().find(|row| row.0 == n).expect("checked above");
 
-    for n in ["user", "peek"] {
+    for n in ["user", "peek", "mapped_value"] {
         let (_, types, checked, found, line) = of(n);
         assert!(*types, "`{n}`: its types are not clean: {line}");
         assert!(*checked, "`{n}` not borrow-checked (refused): {line}");
         assert_eq!(*found, 0, "ORACLE `{n}`: rustc accepts it: {line}");
     }
-    for n in ["user_keeps", "get_static"] {
+    for n in ["user_keeps", "get_static", "mapped_value_escapes"] {
         let (_, types, checked, found, line) = of(n);
         assert!(*types, "CONTROL `{n}`: its types are not clean: {line}");
         assert!(*checked, "CONTROL `{n}` not borrow-checked (refused): {line}");
