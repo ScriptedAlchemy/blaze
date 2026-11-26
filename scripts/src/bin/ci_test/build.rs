@@ -13,6 +13,27 @@ fn command(args: &Args, tc: &str) -> Vec<String> {
     argv
 }
 
+fn plain_build(test_argv: &[String], targets: &[&str]) -> Vec<String> {
+    let mut argv = test_argv.to_vec();
+    argv[2] = "build".to_owned();
+    argv.retain(|arg| arg != "--no-run");
+    argv.extend(targets.iter().copied().map(str::to_owned));
+    argv.push("--message-format=json-render-diagnostics".to_owned());
+    argv
+}
+
+fn has_launcher(graph: &Value) -> bool {
+    graph["units"].as_array().is_some_and(|units| {
+        units.iter().any(|unit| {
+            unit["mode"] == "build"
+                && unit["target"]["name"] == "blaze-launcher"
+                && unit["target"]["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+        })
+    })
+}
+
 fn logged(argv: &[String], root: &Path, log: &Path, seconds: u64) -> Result<Ended, String> {
     let env: Vec<(String, String)> = std::env::vars().collect();
     let env: Vec<(&str, String)> = env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
@@ -98,6 +119,23 @@ pub(super) fn run(args: &Args, tc: &str, root: &Path, evidence: &Path) -> Vec<(S
                 "base": "library and enabled binary tests, example builds, workspace doctests",
             }),
         );
+        // Cargo builds the launcher for its own integration test. CLI tests in another
+        // partition still run the plain launcher next to blaze, in the test profile.
+        if has_launcher(&graph) {
+            let launcher = plain_build(&argv, &["--bin", "blaze-launcher", "--profile", "test"]);
+            write_json(&evidence.join("launcher-command.json"), &serde_json::json!(launcher));
+            let launcher_log = evidence.join("launcher");
+            match logged(&launcher, root, &launcher_log, args.build_timeout_s) {
+                Ok(Ended::Exited(m)) if m.status == 0 => {}
+                result => fail(
+                    SCRIPT,
+                    &format!(
+                        "Cargo launcher build failed: {result:?}; {}",
+                        read_lossy(&launcher_log.with_extension("err"))
+                    ),
+                ),
+            }
+        }
         if args.partition == 0 {
             argv.push("--lib".to_owned());
             let mut binaries = BTreeSet::new();
@@ -122,13 +160,7 @@ pub(super) fn run(args: &Args, tc: &str, root: &Path, evidence: &Path) -> Vec<(S
             // cargo test's default examples are build units, not test harnesses. --examples
             // on cargo test would force test=false examples into harnesses and lose coverage
             // of their actual main functions. Keep the original build mode explicitly.
-            let mut examples = command(args, tc);
-            examples[2] = "build".to_owned();
-            examples.retain(|arg| arg != "--no-run");
-            examples.extend([
-                "--examples".to_owned(),
-                "--message-format=json-render-diagnostics".to_owned(),
-            ]);
+            let examples = plain_build(&command(args, tc), &["--examples"]);
             write_json(&evidence.join("examples-command.json"), &serde_json::json!(examples));
             let example_log = evidence.join("examples");
             match logged(&examples, root, &example_log, args.build_timeout_s) {
@@ -201,6 +233,22 @@ pub(super) fn selftest() {
     units.push(serde_json::json!({"mode":"build", "target":{"kind":["test"],"name":"inactive"}}));
     units.push(serde_json::json!({"mode":"test", "target":{"kind":["lib"],"name":"library"}}));
     let graph = serde_json::json!({"units":units});
+    assert!(!has_launcher(&graph));
+    let mut with_launcher = graph.clone();
+    with_launcher["units"].as_array_mut().expect("fixture units").push(
+        serde_json::json!({"mode":"build", "target":{"kind":["bin"],"name":"blaze-launcher"}}),
+    );
+    assert!(has_launcher(&with_launcher));
+    let test_argv =
+        ["cargo", "+nightly", "test", "--locked", "--workspace", "--no-run", "--exclude", "blaze-std"]
+            .map(str::to_owned);
+    assert_eq!(
+        plain_build(&test_argv, &["--bin", "blaze-launcher", "--profile", "test"]),
+        [
+            "cargo", "+nightly", "build", "--locked", "--workspace", "--exclude", "blaze-std",
+            "--bin", "blaze-launcher", "--profile", "test", "--message-format=json-render-diagnostics",
+        ],
+    );
     let assignment = targets(&graph, 4).expect("valid unit graph");
     assert_eq!(assignment.len(), 6);
     for partition in 1..4 {
