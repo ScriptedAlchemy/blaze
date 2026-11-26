@@ -51,7 +51,7 @@ impl<'a> Lower<'a, '_> {
             );
         }
         let imm = view.operands(v.index()).imm();
-        crate::pass::target::word(name, u64::from(imm)).map_err(|e| self.error(e))?;
+        crate::pass::target_word(name, u64::from(imm)).map_err(|e| self.error(e))?;
         let name =
             core::str::from_utf8(name).map_err(|_| self.error("invalid ARM64 intrinsic name"))?;
         // LLVM requires an immediate at the call itself. Keeping the value here also

@@ -29,6 +29,7 @@ const NATIVE: &[(&str, &str)] = &[
     ("src/llvm/memory.rs", include_str!("src/llvm/memory.rs")),
     ("src/llvm/object.rs", include_str!("src/llvm/object.rs")),
     ("src/llvm/tls.rs", include_str!("src/llvm/tls.rs")),
+    ("src/pass/target.rs", include_str!("src/pass/target.rs")),
     ("../blaze-llvm-abi/abi.h", include_str!("../blaze-llvm-abi/abi.h")),
     ("../blaze-llvm-abi/build.rs", include_str!("../blaze-llvm-abi/build.rs")),
     ("../blaze-llvm-abi/src/lib.rs", include_str!("../blaze-llvm-abi/src/lib.rs")),

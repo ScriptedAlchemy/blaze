@@ -32,6 +32,8 @@ mod runtime;
 pub(crate) mod sites;
 pub(crate) mod stack;
 mod target;
+#[cfg(feature = "llvm")]
+pub(crate) use target::word as target_word;
 /// The indexed thread-local access; its offsets are the Fast tier's template's too.
 pub(crate) mod tls_index;
 pub(crate) mod unwind;

@@ -1,9 +1,8 @@
 //! The release tier's proof: a function LLVM lowered, optimized and emitted reads back as a
-//! sealed `bzcode07` record, and the record runs and computes what the LIR says. The negative
+//! sealed code record, and the record runs and computes what the LIR says. The negative
 //! control: a record the Reference tier made is never named release or folded work.
 
-
-use blaze_code::record::{CodeView, Symbol};
+use blaze_code::record::{CodeView, SiteKind, Space, Symbol, Target};
 use blaze_lir::{
     BlockKind, Builder, Flags, Full, Ty,
     builder::{Param, Variadic},
