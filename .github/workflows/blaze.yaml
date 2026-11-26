@@ -1,5 +1,11 @@
-name: PR 81 nested WASI build dependency migration
-on: workflow_dispatch
+name: PR 81 pinned Cargo producer directives
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Exact producer source commit
+        type: string
+        required: true
 permissions:
   contents: read
 defaults:
@@ -9,13 +15,13 @@ env:
   CARGO_BUILD_JOBS: "2"
   RUST_BACKTRACE: "0"
 jobs:
-  scripts-and-ladder:
+  producer:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 65
+    timeout-minutes: 23
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: fee396b2363f7eeb7a3877f1c21d11a0ab41c9f4
+          ref: ${{ inputs.source }}
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
@@ -34,44 +40,53 @@ jobs:
       - uses: ./.github/actions/script
         with:
           job: production-acceptance
-      - uses: ./.github/actions/toolchain-shelf
-        id: shelf
-      - name: Build the exact release CLI and launcher
+      - name: Compile the retained fixture's WASI modules
         run: |
-          evidence="$RUNNER_TEMP/selection-evidence"
+          root="$RUNNER_TEMP/blaze-fs/d52-producer"
+          evidence="$RUNNER_TEMP/d52-producer-evidence"
           mkdir -p "$evidence"
-          git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
-          timeout -k 30 2500 cargo +"$(cat pins/toolchain)" build --release --locked --bins -p blaze-cli -p blaze-launcher \
-            2>&1 | tee "$evidence/build.log"
-          sha256sum "$CARGO_TARGET_DIR"/release/{blaze,blaze-launcher,blaze-fact-shim} > "$evidence/binaries.txt"
-      - name: Install the pinned C toolchain for the native-archive fixture
-        uses: ./.github/actions/linux-c-shelf
-      - name: Run the retained build-dependency fixture
+          timeout 10 git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
+          timeout 15 cargo +"$(cat pins/toolchain)" -Vv > "$evidence/cargo.txt"
+          timeout 20 python3 - "$root" > "$evidence/request.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, "harness")
+          import forkfixes
+          scratch = Path(sys.argv[1])
+          project = scratch / "project"
+          project.mkdir(parents=True)
+          case = next(case for case in forkfixes.CASES
+                      if case["name"] == "a-script-searches-where-its-build-dependencys-script-said")
+          forkfixes.write_files(project, forkfixes.initial_files(case))
+          forkfixes.write_files(project, forkfixes.steps_for(case)[0].get("files", {}))
+          print(json.dumps({"build_scripts":{
+              "checkout": str(project), "store": str(scratch / "records"),
+              "work": str(scratch / "work"), "tree": str(Path.cwd()),
+              "crates": [{"name": name, "version": "0.1.0", "features": []}
+                         for name in case["build_scripts"]],
+              "unsandboxed_build_scripts": False, "build_seconds": 600,
+          }}))
+          PY
+          sha256sum "$BLAZE_SCRIPTS/proc_macro_modules" > "$evidence/builder.sha256"
+          timeout -k 20 650 env -i HOME="$HOME" PATH="$PATH" RUST_BACKTRACE=0 \
+            "$BLAZE_SCRIPTS/proc_macro_modules" "$(cat "$evidence/request.json")" \
+            2>&1 | tee "$evidence/producer.log"
+          grep -Fq 'dep 0.1.0 []: script module' "$evidence/producer.log"
+          grep -Fq 'app 0.1.0 []: script module' "$evidence/producer.log"
+          grep -R -m 1 '^producer-output-wasi dep 0.1.0 files:' "$root/records/build-script/modules" \
+            > "$evidence/binding.txt"
+      - name: Inventory Cargo build outputs
+        if: always()
         run: |
-          scratch="$RUNNER_TEMP/blaze-fs/selected-module-forkfixes"
-          # shellcheck disable=SC2016
-          input=$(timeout 10 jq -nc --arg blaze "$CARGO_TARGET_DIR/release/blaze" --arg scratch "$scratch" --arg source "$GITHUB_WORKSPACE" \
-            --arg modules "$BLAZE_SCRIPTS/proc_macro_modules" \
-            '{blaze:$blaze,scratch:$scratch,source:$source,module_builder:$modules,timeout:600,workers:2,only:["a-script-searches-where-its-build-dependencys-script-said"]}')
-          timeout -k 20 1600 python3 harness/forkfixes.py "$input" 2>&1 | tee "$RUNNER_TEMP/selection-evidence/forkfixes.log"
-          grep -Fq 'fork migration: 1/1 cases passed' "$RUNNER_TEMP/selection-evidence/forkfixes.log"
-      - name: Verify the generated-file and search-directory receipt
-        if: ${{ !cancelled() && steps.shelf.outcome == 'success' }}
-        run: |
-          evidence="$RUNNER_TEMP/selection-evidence"
-          tc="$(cat pins/toolchain)"
-          timeout -k 20 900 cargo +"$tc" test --release --locked -p blaze-proc-macro --lib \
-            a_wasi_producer_receipt_serves_the_compiled_path_and_search_list \
-            2>&1 | tee "$evidence/producer-grant.log"
-          grep -Fq 'a_wasi_producer_receipt_serves_the_compiled_path_and_search_list ... ok' "$evidence/producer-grant.log"
-      - name: Preserve source, binary and runtime evidence
+          root="$RUNNER_TEMP/blaze-fs/d52-producer/work/bs-target"
+          if [ -d "$root" ]; then
+            timeout 35 find "$root" -type f -printf '%P\t%s\n' | timeout 10 sort > "$RUNNER_TEMP/d52-producer-evidence/cargo-files.txt"
+          fi
+      - name: Preserve producer inputs and outputs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: selection-evidence
-          path: |
-            ${{ runner.temp }}/selection-evidence
-            ${{ runner.temp }}/toolchain-cut
-            ${{ runner.temp }}/blaze-fs/selected-module-forkfixes/*.json
-            ${{ runner.temp }}/blaze-fs/selected-module-forkfixes/evidence
+          name: d52-producer-evidence
+          path: ${{ runner.temp }}/d52-producer-evidence
           if-no-files-found: warn
