@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import hashlib
 import json
@@ -167,21 +168,66 @@ class ForkfixHarness(unittest.TestCase):
             cas.mkdir(parents=True)
             (cas / "seg-one").write_bytes(b"cas bytes")
             (initial / ".blaze/v2/store/CACHEDIR.TAG").write_bytes(b"tag")
-            evidence = runner.clone_store(initial, replay)
+            evidence = runner.clone_store(initial, replay, 5)
             copied = replay / ".blaze/v2/store/f6s3/seg-one"
             self.assertEqual(copied.read_bytes(), b"cas bytes")
             self.assertFalse(os.path.samefile(cas / "seg-one", copied))
             self.assertEqual(evidence["cas_files"], 1)
             self.assertEqual(evidence["cas_format"], "f6s3")
-            self.assertEqual(evidence["store_files"], 2)
+            self.assertEqual(evidence["store_files"], 3)
             self.assertEqual(len(evidence["cas_sha256"]), 64)
             broken = root / "broken"
             (broken / ".blaze/v2/store").mkdir(parents=True)
             with self.assertRaisesRegex(ValueError, "must have one CAS format"):
-                runner.clone_store(broken, root / "other-replay")
+                runner.clone_store(broken, root / "other-replay", 5)
             (cas.parent / "f5s3").mkdir()
             with self.assertRaisesRegex(ValueError, "f5s3.*f6s3"):
-                runner.clone_store(initial, root / "ambiguous-replay")
+                runner.clone_store(initial, root / "ambiguous-replay", 5)
+
+    def test_replay_store_clone_waits_for_gc_before_snapshotting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            initial = root / "initial"
+            source = initial / ".blaze/v2/store"
+            cas = source / "f6s3"
+            cas.mkdir(parents=True)
+            (cas / "head").write_bytes(b"old head")
+            (cas / "manifests-one").write_bytes(b"old manifest")
+            replay = root / "replay"
+            lock_path = source / "gc.lock"
+            lock_path.write_bytes(b"lock bytes")
+            with lock_path.open("r+b") as gc:
+                fcntl.flock(gc, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with patch.object(runner.time, "monotonic", side_effect=(0, 2)):
+                    with self.assertRaisesRegex(runner.CaseFailed, r"timed out waiting for .*gc\.lock"):
+                        runner.clone_store(initial, replay, 1)
+                self.assertFalse(replay.exists())
+
+                def finish_gc(_seconds):
+                    (cas / "head").write_bytes(b"new head")
+                    (cas / "manifests-one").write_bytes(b"new manifest")
+                    fcntl.flock(gc, fcntl.LOCK_UN)
+
+                tree_hashes = runner.tree_hashes
+
+                def hash_under_lock(path):
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(gc, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return tree_hashes(path)
+
+                # Schedule the writer's completion at the first contention wait.
+                with patch.object(runner.time, "sleep", side_effect=finish_gc) as wait, \
+                        patch.object(runner, "tree_hashes", side_effect=hash_under_lock):
+                    evidence = runner.clone_store(initial, replay, 5)
+                wait.assert_called_once()
+                fcntl.flock(gc, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            snapshot = replay / ".blaze/v2/store"
+            self.assertEqual(evidence["store_files"], 3)
+            for relative, data in {"gc.lock": b"lock bytes", "f6s3/head": b"new head",
+                                   "f6s3/manifests-one": b"new manifest"}.items():
+                self.assertEqual((snapshot / relative).read_bytes(), data)
+                self.assertFalse(os.path.samefile(source / relative, snapshot / relative))
 
     def test_required_feature_absence_is_a_machine_note(self):
         rows = [{"note": "bin `needs` of package `app` is not built: its required feature is off; 2 file(s) not checked"}]

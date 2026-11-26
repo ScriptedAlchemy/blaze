@@ -29,6 +29,7 @@ is used. Independent semantic failures are collected. A timeout or an environmen
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import fcntl
 import hashlib
 import json
 import os
@@ -699,32 +700,49 @@ def tree_identity(hashes: dict[str, str]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def clone_store(initial_home: Path, replay_home: Path) -> dict:
+def clone_store(initial_home: Path, replay_home: Path, lock_timeout: int) -> dict:
     source = initial_home / ".blaze/v2/store"
     if not source.is_dir():
         raise CaseFailed("the initial HOME has no .blaze/v2/store to replay")
-    formats = sorted(path for path in source.iterdir()
-                     if path.is_dir() and not path.is_symlink() and re.fullmatch(r"f[0-9]+s[0-9]+", path.name))
-    if len(formats) != 1:
-        raise CaseFailed(f"fresh HOME must have one CAS format to replay, found {[path.name for path in formats]}")
-    source_cas = formats[0]
-    before = tree_hashes(source)
-    destination = replay_home / ".blaze/v2/store"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, destination)
-    after = tree_hashes(destination)
-    difference = artifact_identity_diff(before, after)
-    if difference:
-        raise CaseFailed(f"the copied replay store is not byte-identical to the initial store: {difference}")
-    cas_before = tree_hashes(source_cas)
-    cas_after = tree_hashes(destination / source_cas.name)
-    if not cas_before:
-        raise CaseFailed("the initial CAS has no files to replay")
-    if cas_before != cas_after:
-        raise CaseFailed("the copied replay CAS bytes are not byte-identical to the initial CAS")
-    for relative in before:
-        if os.path.samefile(source / relative, destination / relative):
-            raise CaseFailed(f"replay store file {relative} is the same inode, not an independent copy")
+    # Foreground commands have exited in this isolated HOME. Detached GC can still change the
+    # store, so take its root lock before scanning and keep it until all copy checks finish.
+    lock_path = source / "gc.lock"
+    with lock_path.open("a+b") as lock:
+        deadline = time.monotonic() + lock_timeout
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CaseFailed(f"timed out waiting for {lock_path} to snapshot the replay store") from None
+                time.sleep(min(0.05, remaining))
+            except OSError as error:
+                raise CaseFailed(f"could not lock {lock_path} to snapshot the replay store: {error}") from error
+
+        formats = sorted(path for path in source.iterdir()
+                         if path.is_dir() and not path.is_symlink() and re.fullmatch(r"f[0-9]+s[0-9]+", path.name))
+        if len(formats) != 1:
+            raise CaseFailed(f"fresh HOME must have one CAS format to replay, found {[path.name for path in formats]}")
+        source_cas = formats[0]
+        before = tree_hashes(source)
+        destination = replay_home / ".blaze/v2/store"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination)
+        after = tree_hashes(destination)
+        difference = artifact_identity_diff(before, after)
+        if difference:
+            raise CaseFailed(f"the copied replay store is not byte-identical to the initial store: {difference}")
+        cas_before = tree_hashes(source_cas)
+        cas_after = tree_hashes(destination / source_cas.name)
+        if not cas_before:
+            raise CaseFailed("the initial CAS has no files to replay")
+        if cas_before != cas_after:
+            raise CaseFailed("the copied replay CAS bytes are not byte-identical to the initial CAS")
+        for relative in before:
+            if os.path.samefile(source / relative, destination / relative):
+                raise CaseFailed(f"replay store file {relative} is the same inode, not an independent copy")
     return {"store_files": len(before), "store_sha256": tree_identity(before),
             "cas_format": source_cas.name, "cas_files": len(cas_before), "cas_sha256": tree_identity(cas_before)}
 
@@ -766,7 +784,7 @@ def prepare_replay_home(given: Input, log: CommandLog, state: dict,
     if replay_home.exists():
         raise CaseFailed(f"{label} HOME already exists; evidence is never overwritten")
     copy_shelf(Path(given.shelf), replay_home)
-    store_evidence = clone_store(initial_home, replay_home)
+    store_evidence = clone_store(initial_home, replay_home, given.timeout)
     logical, container = logical_home(replay_home)
     state.setdefault("home_containers", []).append(container)
     entries = {path.name for path in (replay_home / ".blaze/v2").iterdir()}
