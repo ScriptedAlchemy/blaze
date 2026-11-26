@@ -14,7 +14,7 @@ use super::LlvmModule;
 
 pub(super) struct Operand(pub Range<usize>);
 
-const FIRST: u32 = UNREACHABLE + 1;
+const FIRST: u32 = super::control::CLEANUP_LANDING + 1;
 const CAPACITY: usize = 0x1_0000 - FIRST as usize;
 const SEMANTIC_DIGITS: &[u8; 5] = b"65282";
 const _: () = assert!(UNREACHABLE == 65282);

@@ -108,6 +108,8 @@ struct Lower<'a, 'v> {
     unreachable_operands: AVec<'a, traps::Operand>,
     declarations: blaze_own::ABTreeMap<'a, AString<'a>, AString<'a>>,
     edges: control::Edges<'a, 'v>,
+    in_cleanup: bool,
+    cleanup_landing: bool,
     at: Option<usize>,
 }
 
@@ -196,6 +198,8 @@ pub fn prepare<'a>(
         unreachable_operands: AVec::new_in(alloc),
         declarations: BTreeMap::new_in(alloc),
         edges: control::Edges::new(view, alloc),
+        in_cleanup: false,
+        cleanup_landing: false,
         at: None,
     };
     for row in view.refs {
@@ -244,8 +248,10 @@ pub fn prepare<'a>(
     }
     lower.ir.push_str(" {\n");
     let end_header = lower.ir.len();
+    let cleanup = control::cleanup_blocks(view, alloc);
     for (b, _) in (0u32..).zip(view.block_starts) {
         let block = Block(b);
+        lower.in_cleanup = cleanup.get(block.index()).copied().unwrap_or(false);
         format_into!(&mut lower.ir, "b{b}:\n");
         lower.block_params(block)?;
         if b == 0 {
@@ -267,8 +273,9 @@ pub fn prepare<'a>(
         }
     }
     lower.edges.write(&mut lower.ir);
-    lower.ir.push_str("}\n");
     lower.at = None;
+    lower.write_cleanup_landing()?;
+    lower.ir.push_str("}\n");
     lower.globals(&llvm_name)?;
     for (_, decl) in &lower.declarations {
         lower.ir.push_str(decl);

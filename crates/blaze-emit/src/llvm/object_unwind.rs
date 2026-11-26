@@ -3,16 +3,17 @@
 
 use core::ops::Range;
 
-use blaze_code::record::CodeRecord;
+use blaze_code::record::{CodeRecord, RecordError};
+use blaze_code::trap;
+use blaze_code::unwind::{self, Action, Row};
 use blaze_code::unwind::cfi::{self, CfiInput};
-use blaze_code::unwind::{Action, Row};
 use blaze_own::{Alloc, Vec};
 use object::{
     BinaryFormat, Object, ObjectSection, ObjectSymbol, Relocation, RelocationFlags,
     RelocationTarget, SectionIndex, SymbolSection, elf, macho,
 };
 
-use super::object::ReadError;
+use super::{control::CLEANUP_LANDING, object::ReadError};
 
 const OMIT: u8 = 0xff;
 const PCREL_PTR: u8 = 0x10;
@@ -387,14 +388,58 @@ impl Unwind<'_> {
         &self,
         file: &object::File<'_>,
         record: &mut CodeRecord<'_>,
+        alloc: Alloc<'_>,
     ) -> Result<(), ReadError> {
         let code = u32::try_from(record.code.len()).map_err(|_| ReadError::CodeOutside)?;
         cfi::write(self.input, code, &mut record.machine_cfi).map_err(ReadError::UnwindCfi)?;
         if let Some(location) = self.lsda {
             lsda(file, location, record)?;
+            omit_cleanup_landings(record, code, alloc)?;
         }
         Ok(())
     }
+}
+
+/// A compiler-created landing gives the exact machine range that must have no LSDA row.
+/// This preserves the stencil's fatal unwind action even during the search or a forced
+/// unwind. The CFI and all other LSDA ranges remain LLVM's.
+fn omit_cleanup_landings(
+    record: &mut CodeRecord<'_>,
+    code_len: u32,
+    alloc: Alloc<'_>,
+) -> Result<(), ReadError> {
+    let mut marked = Vec::new_in(alloc);
+    for pad in &record.pads {
+        let at = pad.landing as usize;
+        if at == 0 {
+            continue;
+        }
+        let word = record.code.get(at..).and_then(|bytes| bytes.first_chunk::<4>());
+        if word.and_then(|word| trap::brk(u32::from_le_bytes(*word))) == Some(CLEANUP_LANDING) {
+            if pad.action != Action::Terminate.code() {
+                return Err(bad(at, "the cleanup marker's LSDA action is not terminate"));
+            }
+            marked.push(pad.landing);
+        }
+    }
+    if marked.is_empty() {
+        return Ok(());
+    }
+    // Validate the entire call-site table before dropping any row, including overlap with
+    // the ranges that remain. The parser preserves the order of the machine's entries.
+    let cfi = cfi::Cfi::read(&record.machine_cfi, code_len).map_err(ReadError::UnwindCfi)?;
+    unwind::check(None, Some(cfi), record.pads.len(), u64::from(code_len), |i| record.pads[i])
+        .map_err(|error| ReadError::Seal(RecordError::Unwind(error)))?;
+    marked.sort_unstable();
+    marked.dedup();
+    record.pads.retain(|pad| marked.binary_search(&pad.landing).is_err());
+    let abort = (0xd420_0000 | (trap::ABORT << 5)).to_le_bytes();
+    for landing in marked {
+        let at = landing as usize;
+        // The marker lookup above checked these four bytes, and the table check aligned them.
+        record.code[at..at + 4].copy_from_slice(&abort);
+    }
+    Ok(())
 }
 
 /// Selects the only FDE for the root symbol. ELF also gives a function size in its symbol

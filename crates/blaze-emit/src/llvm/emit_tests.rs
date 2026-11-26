@@ -87,6 +87,85 @@ fn native_objects_import_llvm_unwind_for_each_landing() {
     }
 }
 
+#[test]
+fn native_cleanup_calls_leave_gaps_without_losing_resume() {
+    use blaze_code::{eh, trap, unwind::{self, Action}};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut b = Builder::<_, Full>::new_in(64, alloc);
+    let entry_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(Ty::I32)]);
+    let call_sig = b.sig(Conv::C, Variadic::No, &[], &[]);
+    b.set_signature(entry_sig);
+    let entry = b.create_block(BlockKind::Normal);
+    let normal = b.create_block(BlockKind::Normal);
+    let landing = b.create_block(BlockKind::Cleanup);
+    let drop = b.create_block(BlockKind::Normal);
+    let callee = b.reference(blaze_lir::func::RefKind::Func, 0);
+    b.begin(entry);
+    let indirect = b.param(Ty::PTR);
+    b.invoke(Flags::NONE, callee, call_sig, &[], normal, landing);
+    b.begin(normal);
+    b.call(Flags::NONE, callee, call_sig, &[]);
+    let value = b.iconst(Ty::I32, 7);
+    b.ret(&[value]);
+    b.begin(landing);
+    let exception = b.param(Ty::PTR);
+    b.jump((drop, &[]));
+    b.begin(drop);
+    b.call(Flags::NONE, callee, call_sig, &[]);
+    b.call_indirect(Flags::NONE, indirect, call_sig, &[]);
+    b.resume(exception);
+    let function = b.finish_verified().unwrap();
+    let module = prepare(Symbol([5; 32]), function.verified(), &ByPlace, alloc).unwrap();
+    for os in [blaze_tier::Os::Linux, blaze_tier::Os::MacOs] {
+        let machine = blaze_tier::Machine { os, ..machine() };
+        let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 3, machine }, alloc).unwrap();
+        let view = CodeView::read(&emission.record).unwrap();
+        let unwind = unwind::read(view).unwrap();
+        let cfi = unwind.cfi().expect("the original machine CFI is still present");
+        assert!(unwind.has_lsda());
+        let mut cleanup = 0;
+        let mut continuing = 0;
+        let mut direct_gap = 0;
+        let mut indirect_gap = 0;
+        let code = &view.code()[..cfi.code_len() as usize];
+        for (i, &word) in code.as_chunks::<4>().0.iter().enumerate() {
+            let word = u32::from_le_bytes(word);
+            let direct = word & 0xfc00_0000 == 0x9400_0000;
+            let indirect = trap::is_blr(word);
+            assert_ne!(trap::brk(word), Some(super::control::CLEANUP_LANDING));
+            if !direct && !indirect {
+                continue;
+            }
+            let pc = (i * 4) as u32;
+            let action = (0..unwind.rows())
+                .map(|i| unwind.row(i))
+                .find(|row| (row.start..row.start + row.len).contains(&pc))
+                .map(|row| row.action);
+            match (action, direct) {
+                (Some(Action::Cleanup), true) => cleanup += 1,
+                (Some(Action::Continue), true) => continuing += 1,
+                (None, true) => direct_gap += 1,
+                (None, false) => indirect_gap += 1,
+                _ => panic!("unexpected unwind action {action:?} at {pc:#x} in {os:?}"),
+            }
+        }
+        assert_eq!((cleanup, continuing, direct_gap, indirect_gap), (1, 2, 1, 1), "{os:?}");
+
+        // The launcher includes the native exporter's exact LSDA bytes in its registered FDE.
+        let mut registered = blaze_own::AVec::new_in(alloc);
+        let entry = eh::entry(
+            &unwind,
+            eh::Placed { entry_at: 0x1000, code_at: 0x2000, personality: Some(0x3000) },
+            &mut registered,
+        ).unwrap();
+        let mut exported = blaze_own::AVec::new_in(alloc);
+        eh::lsda_table(&unwind, &mut exported).unwrap();
+        assert_eq!(entry.code_len, cfi.code_len());
+        assert_eq!(&registered[entry.lsda.unwrap()..], exported.as_slice());
+    }
+}
+
 struct ByPlace;
 impl Names for ByPlace {
     fn name(&self, outside: Outside) -> Option<Named<'_>> {
