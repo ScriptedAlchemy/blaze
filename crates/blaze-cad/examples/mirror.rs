@@ -109,7 +109,7 @@ fn main() {
     let out_dir = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "target/mirror".into()));
     std::fs::create_dir_all(&out_dir).expect("create output dir");
 
-    let heap = blaze_own::testing::heap();
+    let heap = blaze_own::Heap::process();
     let alloc = heap.alloc();
     let mut model = Model::new(ModelOpts { alloc, .. });
 

@@ -956,7 +956,7 @@ fn main() {
     let out_path = std::path::Path::new(&out_dir);
     std::fs::create_dir_all(out_path).expect("create out dir");
 
-    let alloc = blaze_own::testing::heap().alloc();
+    let alloc = blaze_own::Heap::process().alloc();
     let tex_res = 512u32;
     let threads = std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4);
 

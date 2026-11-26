@@ -20,7 +20,7 @@ fn ms(t: Instant) -> f64 {
 }
 
 fn main() -> Result<(), ModelError> {
-    let heap = blaze_own::testing::heap();
+    let heap = blaze_own::Heap::process();
     let alloc = heap.alloc();
     let tolerance = Length::mm(1.0);
     let mut cache = PieceCache::new(PieceCacheOpts { alloc, .. });

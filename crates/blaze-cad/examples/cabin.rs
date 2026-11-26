@@ -185,7 +185,7 @@ fn write_out(dir: &str, name: &str, bytes: &[u8]) {
 }
 
 fn main() -> Result<(), ModelError> {
-    let heap = blaze_own::testing::heap();
+    let heap = blaze_own::Heap::process();
     let alloc = heap.alloc();
     let dir = std::env::args().nth(1).unwrap_or_else(|| String::from("target/cabin"));
     std::fs::create_dir_all(&dir).expect("create output dir");

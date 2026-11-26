@@ -21,7 +21,7 @@ fn report(what: &str, c: &Checked<ThinWall>, ms: f64) {
 }
 
 fn main() -> Result<(), ModelError> {
-    let heap = blaze_own::testing::heap();
+    let heap = blaze_own::Heap::process();
     let alloc = heap.alloc();
     let dir = std::env::args().nth(1).unwrap_or_else(|| String::from("target/hull"));
     std::fs::create_dir_all(&dir).expect("the output directory");
