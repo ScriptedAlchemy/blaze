@@ -419,6 +419,45 @@ fn place_leaf(view: &CodeView<'_>, symbol: Symbol) -> blaze_inproc::exec::Execut
 
 #[cfg(target_arch = "aarch64")]
 #[test]
+fn release_record_shuffles_both_vectors_into_each_result_width() {
+    use blaze_lir::{Scalar, builder::MemAttrs};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut b = Builder::<_, Full>::new_in(64, alloc);
+    let ptr = Param::of(Ty::PTR);
+    let sig = b.sig(Conv::C, Variadic::No, &[ptr, ptr, ptr], &[]);
+    b.set_signature(sig);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    let first = b.param(Ty::PTR);
+    let second = b.param(Ty::PTR);
+    let output = b.param(Ty::PTR);
+    let four = Ty::vector(Scalar::I32, 4).unwrap();
+    let two = Ty::vector(Scalar::I32, 2).unwrap();
+    let a = b.load(four, Flags::NONE, first, 0, MemAttrs::aligned(2));
+    let z = b.load(four, Flags::NONE, second, 0, MemAttrs::aligned(2));
+    let interleaved = b.shuffle(four, a, z, &[6, 1, 4, 3]);
+    let narrowed = b.shuffle(two, a, z, &[7, 0]);
+    b.store(Flags::NONE, interleaved, output, 0, MemAttrs::aligned(2));
+    b.store(Flags::NONE, narrowed, output, 16, MemAttrs::aligned(2));
+    b.ret(&[]);
+
+    let func = b.finish_verified().unwrap();
+    let symbol = Symbol([18; 32]);
+    let module = prepare(symbol, func.verified(), &ByPlace, alloc).unwrap();
+    let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, alloc).unwrap();
+    let view = CodeView::read(&emission.record).unwrap();
+    let code = place_leaf(&view, symbol);
+    // SAFETY: the placed leaf has the declared C ABI.
+    let shuffle: unsafe extern "C" fn(*const u32, *const u32, *mut u32) = unsafe { code.as_fn() };
+    let mut lanes = [0; 6];
+    // SAFETY: each input holds four readable lanes and output holds six writable lanes.
+    unsafe { shuffle([11, 12, 13, 14].as_ptr(), [21, 22, 23, 24].as_ptr(), lanes.as_mut_ptr()) };
+    assert_eq!(lanes, [23, 12, 21, 14, 24, 11]);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
 fn release_record_packs_bitmask_lanes_low_to_high() {
     use blaze_lir::{IntCond, Op, Scalar, builder::MemAttrs};
 

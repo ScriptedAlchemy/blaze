@@ -397,6 +397,19 @@ impl<'a> Lower<'a, '_> {
                     typed(o.value())
                 );
             }
+            Op::Shuffle => {
+                let (first, second) = (o.value(), o.value());
+                // Verified LIR uses fixed vectors and indexes their concatenated lanes.
+                let mask_type = LlType(view, ty.with_elem(Scalar::I32));
+                format_into!(out, "  %v{i} = shufflevector {}, {}, {mask_type} <", typed(first), typed(second));
+                for (at, lane) in o.mask().iter().enumerate() {
+                    if at != 0 {
+                        out.push_str(", ");
+                    }
+                    format_into!(out, "i32 {lane}");
+                }
+                out.push('>');
+            }
             Op::Extract => {
                 format_into!(out, "  %v{i} = extractelement {}, i32 {}", typed(o.value()), o.imm())
             }
