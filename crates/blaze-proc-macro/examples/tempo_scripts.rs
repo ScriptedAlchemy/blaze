@@ -448,6 +448,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let base = blaze_proc_macro::native_unit::placed(graph, script, blaze_build_script::toolchain::Mode::Check, alloc);
         let selected = if matches!(base, blaze_build_script::native::Runner::Native { .. }) || (native.is_some() && wasm.is_none()) { native } else { wasm };
         let setting = Setting {
+            caller_env: Default::default(),
             store: &store, module: selected.as_ref(), target: TARGET, host: TARGET,
             table: Arc::clone(&setup.table), probes: None, c_mode: CMode::Deferred,
             mode: blaze_build_script::toolchain::Mode::Check,

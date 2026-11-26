@@ -35,6 +35,35 @@ use crate::machine::Plant;
 use crate::portable::PNode;
 use crate::world::{ImplPolarity, TypeAttrs};
 
+#[test]
+fn mutable_empty_array_temporary_is_promoted_but_a_local_is_not() {
+    for local in [false, true] {
+        let mut fx = Fx::new();
+        let elem = fx.ty(PNode::Uint(UintTy::U8));
+        let array = fx.array(elem, 0);
+        let out = fx.r(Mutbl::Mut, array);
+        let owner = fx.func("empty", 0, &[], out, Vec::new());
+        fx.finish();
+        let mut bb = Bb::new();
+        let empty = bb.e(crate::body::Expr::Array { elems: crate::List::EMPTY });
+        let mut statements = Vec::new();
+        let operand = if local {
+            let binding = bb.bind("array");
+            statements.push(bb.let_(binding, None, empty));
+            bb.local(binding)
+        } else {
+            empty
+        };
+        let borrow = bb.borrow(Mutbl::Mut, operand);
+        let root = bb.block(&statements, Some(borrow));
+        let checked = check_body(&fx, &bb, owner, root, Plant::None, InferPlant::None);
+        if !local {
+            assert!(checked.diags.is_empty(), "the promoted empty array checks clean: {:?}", checked.diags);
+        }
+        assert_eq!(checked.promoted.contains(&borrow), !local);
+    }
+}
+
 /// `fn f() -> &'static <made> { &<ctor>(1, 2, 3, 4) }` (or `&cell(1)` for `cell`), checked in
 /// the module doc's world; `promotable` sets `#[rustc_promotable]` on the called fn. Returns
 /// the record and the borrow's expression.

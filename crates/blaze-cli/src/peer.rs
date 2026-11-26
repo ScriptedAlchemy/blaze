@@ -724,6 +724,7 @@ mod tests {
             };
             let task_name = fetch_task::name(&planned_unit);
             let env = FetchEnv {
+                caller_env: Default::default(),
                 clock: io.need_clock().expect("clock"),
                 checkout: "",
                 served: crate::engine_script_reads::Served::Simulated,

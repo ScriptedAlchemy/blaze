@@ -72,6 +72,10 @@ pub enum RelocKind {
     Pc32 = 6,
     /// x86-64 32-bit pc-relative to the target's import word.
     GotPc32 = 7,
+    /// An independently scheduled arm64 ADRP of the target's ordinary import word.
+    ImportPage21 = 8,
+    /// An independently scheduled arm64 LDR64 from the target's ordinary import word.
+    ImportLo12 = 9,
 }
 
 /// One relocation: sorted by `at`, at most one a byte.

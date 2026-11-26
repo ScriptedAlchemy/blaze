@@ -42,7 +42,7 @@ use bstd::sync::PublishOnce;
 
 use crate::{
     host::{CallError, CompiledFinding, ExpandError, Limits, Loaded, Runtime, RuntimeError},
-    module::{Exported, ModuleError, ModuleRecord},
+    module::{ModuleError, ModuleRecord},
     parts::Part,
     record::{
         DirStore, RecordError, base_key,
@@ -351,12 +351,10 @@ impl<'r> ProcMacros<'r> {
         }
     }
 
-    /// The macros `key`'s module exports; none when it has no module.
-    pub fn exports(&self, key: CrateItemKey) -> &[Exported] {
-        match self.crates.iter().find(|it| it.key == key).map(|it| &it.module) {
-            Some(Ok(module)) => &module.macros,
-            _ => &[],
-        }
+    /// The registered module, including a module with an empty export table.
+    pub fn module(&self, key: CrateItemKey) -> Option<&ModuleRecord> {
+        let registered = self.crates.iter().find(|it| it.key == key)?;
+        registered.module.as_ref().ok()
     }
 
     /// Each registered crate: its key, `name version`, and whether it has a module.

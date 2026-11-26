@@ -7,7 +7,7 @@
 //! BL, BLR, NOP).
 
 use crate::image::ImageError;
-use crate::record::Symbol;
+use crate::record::{SiteKind, Symbol};
 
 /// `nop`.
 pub const NOP: u32 = 0xD503_201F;
@@ -113,11 +113,48 @@ pub fn add_lo12(inst: u32, to: u64) -> u32 {
 
 /// `bl to` at `pc`.
 pub fn bl(pc: u64, to: u64, symbol: Symbol) -> Result<u32, ImageError> {
-    let delta = to as i64 - pc as i64;
-    if delta % 4 != 0 || !(-(1i64 << 27)..(1i64 << 27)).contains(&delta) {
+    let delta = i128::from(to) - i128::from(pc);
+    if delta % 4 != 0 || !(-(1i128 << 27)..(1i128 << 27)).contains(&delta) {
         return Err(ImageError::OutOfReach { symbol, at: pc, what: "bl (128 MiB)" });
     }
     Ok(0x9400_0000 | (((delta >> 2) as u32) & 0x03FF_FFFF))
+}
+
+/// Size of one unsigned-immediate load/store, including SIMD Q loads and stores.
+pub fn access_scale(inst: u32) -> Option<u8> {
+    if inst & 0x3b00_0000 != 0x3900_0000 {
+        return None;
+    }
+    let size = (inst >> 30) as u8;
+    Some(if size == 0 && inst & 0x0480_0000 == 0x0480_0000 { 4 } else { size })
+}
+
+/// Patch exactly one object relocation. The sealed site supplies four bytes at `off`.
+/// `pc` is their mapped address, and `to` the mapped address of the target or its GOT word.
+pub fn single_site(code: &mut [u8], off: u64, pc: u64, to: u64, kind: SiteKind, symbol: Symbol) -> Result<(), ImageError> {
+    use SiteKind::*;
+    let not = |want| ImageError::NotInstruction { symbol, at: off, want };
+    let aligned = |inst, scale| lo12(inst, to, scale).ok_or(ImageError::OutOfReach { symbol, at: off, what: "an aligned unsigned page offset" });
+    let word = match kind {
+        Page21 | GotPage21 => adrp(expect(code, off, ADRP, symbol, "adrp")?, pc, to, symbol)?,
+        AddLo12 => add_lo12(expect(code, off, ADD64, symbol, "add Xd, Xn, #imm12")?, to),
+        GotLo12 => aligned(expect(code, off, LDR64, symbol, "ldr Xt, [Xn, #imm12 * 8]")?, 3)?,
+        Branch26 => {
+            let original = expect(code, off, (0x7c00_0000, 0x1400_0000), symbol, "b or bl")?;
+            (original & 0xfc00_0000) | (bl(pc, to, symbol)? & 0x03ff_ffff)
+        }
+        LdstLo12_1 | LdstLo12_2 | LdstLo12_4 | LdstLo12_8 | LdstLo12_16 => {
+            let inst = read32(code, off);
+            let scale = kind as u8 - LdstLo12_1 as u8;
+            if access_scale(inst) != Some(scale) {
+                return Err(not("an unsigned-offset load or store of the relocation's width"));
+            }
+            aligned(inst, scale)?
+        }
+        Load | Call | Relro => return Err(not("a single-instruction relocation")),
+    };
+    write32(code, off, word);
+    Ok(())
 }
 
 /// Where the `bl` at `pc` goes, or `None` when `inst` is not a `bl`.

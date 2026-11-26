@@ -175,6 +175,7 @@ fn a_macro_crate_s_exports_come_from_its_module_s_list() {
     const DECLARED: &str = "#![no_core]
 synstructure::decl_derive!([DerSequence, attributes(debug_derive)] => derive_der_sequence);
 fn derive_der_sequence(s: synstructure::Structure) -> TokenStream { s }
+static _DECLS: u8 = true;
 #[proc_macro]
 pub fn only_in_text(input: TokenStream) -> TokenStream { input }
 ";
@@ -206,6 +207,11 @@ pub struct Point;
         names.item_at(names.root(krate), ns, Written { kind: PathKind::Plain, segments }, g)
     };
     let derive = at(1, Namespace::Macros, &["DerSequence"]).unwrap_or_else(|e| panic!("the module's derive: {e}; notes {:?}", names.notes(1)));
+    let generated = crate::task::proc_macro_decls_key(crates[1].key);
+    assert!(!names.krate(1).tables.texts.contains_key(&generated), "the module already owns its dispatch table");
+    let written = at(1, Namespace::Values, &["_DECLS"]).expect("the user's static");
+    assert_ne!(written.def.key, generated);
+    assert!(names.krate(1).tables.texts.get(&written.def.key).expect("the user's text").0.text.contains("u8 = true"), "the user's initializer still needs type checking");
     assert_eq!(derive.def.kind, DefKind::Macro(crate::MacroShapes::DERIVE));
     // The list is the whole truth: a text attribute the module does not list declares nothing.
     assert!(at(1, Namespace::Macros, &["only_in_text"]).is_err(), "only the module's list is declared");

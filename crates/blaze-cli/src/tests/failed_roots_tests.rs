@@ -25,6 +25,23 @@ fn agent_each(io: &Io) -> (Checked, std::string::String) {
     (checked, stdout(io)[before..].to_owned())
 }
 
+#[test]
+fn incomplete_json_checks_finish_with_one_summary_on_first_check_and_replay() {
+    let io = workspace(89);
+    for _ in 0..2 {
+        let before = stdout(&io).len();
+        let checked = check_view::<fix::Atomic>(&io, View::Json, None);
+        let text = stdout(&io);
+        let output = &text[before..];
+        assert_eq!(checked.status, Some(1), "{output}");
+        assert!(output.contains("the check is incomplete: blaze could not check"), "{output}");
+        let mut summaries = output.lines().filter(|line| line.contains(r#""not_checked":["#));
+        assert_eq!(summaries.next(), output.lines().last(), "{output}");
+        assert!(summaries.next().is_none(), "{output}");
+        assert!(!output.lines().last().unwrap().contains(r#""not_checked":[]"#), "{output}");
+    }
+}
+
 /// A virtual workspace: `a`'s root file is not UTF-8, so its items' task fails on its own
 /// (a refusal, filed: a function of the text), `a`'s names wait on it, `b` and `c` depend on
 /// `a`, and `d`, apart, has an unresolved import, a real error.

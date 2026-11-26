@@ -345,7 +345,8 @@ pub fn native_outputs<'a>(
     };
     let mut scratch: AVec<'_, u8> = Vec::new_in(alloc);
     // What the producers serve is in the key, as for a wasm reader (rule 21).
-    let base: ContentId = viewed.views.key(key::base(&inputs, &mut scratch));
+    let caller = setting.caller_env.for_root(root.seen());
+    let base: ContentId = caller.with_source(viewed.views.key(key::base(&inputs, &mut scratch)));
     // The package on disk (a workspace member's folder as it is; a fetched package written out
     // under its key) and an empty `OUT_DIR`.
     let key_hex = hex(&base.0);
@@ -397,7 +398,7 @@ pub fn native_outputs<'a>(
     for (dep, value) in deps.iter().zip(laid.values.iter()) {
         run_deps.push(DepMetadata { links: dep.links, key: dep.key, value: value.as_str() });
     }
-    let run_env = blaze_build_script::env(&Given { deps: &run_deps, ..given }, alloc);
+    let run_env = caller.serve(blaze_build_script::env(&Given { deps: &run_deps, ..given }, alloc), alloc);
     let mut laid_folders: AVec<'a, &str> = Vec::new_in(alloc);
     for folder in laid.folders.iter() {
         laid_folders.push(folder.as_str());

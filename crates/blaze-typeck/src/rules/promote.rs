@@ -26,6 +26,9 @@
 //!   trait Freeze {}`, `impl<T: PointeeSized> !Freeze for UnsafeCell<T> {}`) and the ADT's
 //!   fields for an ADT.
 //!
+//! A mutable borrow is promoted only for an empty array temporary: it contains no element
+//! that could be mutated or dropped. This includes an implicit method-receiver autoref.
+//!
 //! "Where possible" is narrowed, never widened: a type this rule cannot decide (a parameter, a
 //! projection, an opaque, a closure, a future, a trait object, a variable) is not listed, and
 //! nor is an ADT when the world has no `freeze` lang item. A borrow not listed is a frame
@@ -87,14 +90,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             found.push(x);
                         }
                     }
-                    Expr::Ref { mutbl: Mutbl::Mut, .. } => {}
+                    Expr::Ref { mutbl: Mutbl::Mut, operand } => {
+                        if self.empty_array_temporary(operand)? {
+                            found.push(x);
+                        }
+                    }
                     _ => {
                         if matches!(
                             first_adjust.get(x.ix()).copied().flatten(),
-                            Some(AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
+                            Some(AdjustKind::Borrow { raw: false, .. })
                         ) && let Some(&ty) = self.expr_ty.get(x.ix())
-                            && self.promotable(x)?
-                            && self.freeze_without_drop(ty)?
+                            && (self.empty_array_temporary(x)?
+                                || (matches!(first_adjust[x.ix()], Some(AdjustKind::Borrow { mutbl: Mutbl::Not, .. }))
+                                    && self.promotable(x)? && self.freeze_without_drop(ty)?))
                         {
                             found.push(x);
                         }
@@ -112,6 +120,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         found.dedup();
         self.promoted.extend_from_slice(&found);
         Ok(())
+    }
+
+    /// An empty array rvalue has no element to mutate or drop. Its mutable borrow
+    /// may outlive this frame; a local place, even of the same type, may not.
+    fn empty_array_temporary(&self, mut e: ExprId) -> Result<bool, Stop> {
+        for _ in 0..=self.body.exprs.len() {
+            match self.body.expr(e)? {
+                Expr::Paren(inner) => e = inner,
+                Expr::Array { elems } => return Ok(self.body.expr_list(elems)?.is_empty()),
+                _ => return Ok(false),
+            }
+        }
+        Err(CheckError::Limit(Limit::Steps).into())
     }
 
     /// What value path or ctor `x` resolved to, if the walk recorded it.

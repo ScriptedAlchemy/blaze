@@ -55,6 +55,7 @@ pub(crate) struct ScopeJob<'j> {
     pub(crate) kept: blaze_own::SharedAlloc<'static>,
     /// The crate's index in the world (its texts' `krate`).
     pub(crate) at: usize,
+    pub(crate) proc_exports: Option<&'j [blaze_scope::task::ProcExport<'j>]>,
     /// Whether this crate belongs to a workspace member (only workspace members emit user-facing
     /// unresolved-path, missing-module, failed-call, include-outside, and test-mark findings).
     pub(crate) member: bool,
@@ -255,6 +256,7 @@ pub(crate) const CALL_SCRATCH: usize = 4 << 30;
 fn failed_scope(words: String, kept: blaze_own::SharedAlloc<'static>) -> Resolution {
     Resolution::Made {
         resolved: Resolved {
+            caller_reads: std::vec::Vec::new_in(Global),
             out: crate::work::failed_out(),
             payload: sections::write(0, [&[][..]; sections::SECTIONS]),
             files: std::vec::Vec::new(),
@@ -321,6 +323,7 @@ fn blocks_differential(
             let bump = erased.bump();
             let alloc = bump.alloc();
             let texts = JobTexts {
+                caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
                 cx: &span,
                 root,
                 frame: &own,
@@ -333,7 +336,7 @@ fn blocks_differential(
                 data: RefCell::new(std::vec::Vec::new()),
                 left: RefCell::new(std::vec::Vec::new()),
                 procs: crate::job_texts::Procs::of(job.procs),
-                own: Some(job.at),
+                own: Some(crate::job_texts::ScopeOwner { at: job.at, exports: job.proc_exports }),
                 callers,
                 by_need: None,
                 run_stopped: core::cell::Cell::new(None),
@@ -369,6 +372,7 @@ fn blocks_differential(
         let bump = erased.bump();
         let alloc = bump.alloc();
         let texts = JobTexts {
+            caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
             cx: &span,
             root,
             frame: &own,
@@ -381,7 +385,7 @@ fn blocks_differential(
             data: RefCell::new(std::vec::Vec::new()),
             left: RefCell::new(std::vec::Vec::new()),
             procs: crate::job_texts::Procs::of(job.procs),
-            own: Some(job.at),
+            own: Some(crate::job_texts::ScopeOwner { at: job.at, exports: job.proc_exports }),
             callers,
             by_need: None,
             run_stopped: core::cell::Cell::new(None),
@@ -420,6 +424,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
     };
     let callers: &[(usize, usize, blaze_expand::Edition)] = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in([(job.at, job.at, job.input.edition)], frame));
     let texts = JobTexts {
+        caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
         cx: &cx,
         root,
         frame,
@@ -432,7 +437,7 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         data: RefCell::new(std::vec::Vec::new()),
         left: RefCell::new(std::vec::Vec::new()),
         procs: crate::job_texts::Procs::of(job.procs),
-        own: Some(job.at),
+        own: Some(crate::job_texts::ScopeOwner { at: job.at, exports: job.proc_exports }),
         callers,
         by_need: None,
         run_stopped: core::cell::Cell::new(None),
@@ -587,7 +592,8 @@ fn resolve_metered(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame: &F
         }
         None => crate::work::failed_out(),
     };
-    Resolution::Made { resolved: Resolved { out, payload, files, absent, data, findings, left_package, failed, failed_calls, module_missing, test_marks, expansions }, ok, unresolved, oracle }
+    let caller_reads = texts.caller_reads.into_inner();
+    Resolution::Made { resolved: Resolved { out, payload, files, absent, data, findings, left_package, failed, failed_calls, module_missing, test_marks, expansions, caller_reads }, ok, unresolved, oracle }
 }
 
 /// The crate's comparison, owned on `kept`: its counts, and a line for each disagreement its
@@ -824,6 +830,7 @@ mod tests {
             module_missing: blaze_own::Vec::new_in(blaze_own::testing::heap().shared()),
             test_marks: blaze_own::Vec::new_in(Global),
             expansions: crate::work::Extras::none(),
+            caller_reads: std::vec::Vec::new_in(Global),
         };
         let frame = Frame::with_reserve(FRAME, Tag::Other).expect("a test frame");
         assert!(LEN > frame.reserved(), "the payload ({LEN} bytes) is larger than the frame ({} bytes)", frame.reserved());

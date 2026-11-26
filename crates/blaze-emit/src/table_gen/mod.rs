@@ -622,11 +622,7 @@ const fn class_byte(class: RegClass) -> u8 {
 }
 
 const fn site_byte(kind: SiteKind) -> u8 {
-    match kind {
-        SiteKind::Load => 0,
-        SiteKind::Call => 1,
-        SiteKind::Relro => 2,
-    }
+    kind as u8
 }
 
 const SITE_KINDS: [SiteKind; 3] = [SiteKind::Load, SiteKind::Call, SiteKind::Relro];

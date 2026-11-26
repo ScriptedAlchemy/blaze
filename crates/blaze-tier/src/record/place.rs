@@ -121,6 +121,17 @@ pub fn place_resolved(
                 }
                 write32(code, off, (inst & 0xFC00_0000) | (((delta >> 2) as u32) & 0x03FF_FFFF));
             }
+            RelocKind::ImportPage21 | RelocKind::ImportLo12 => {
+                let word = words.word(view.target(r.target as usize), false)?;
+                if word % 8 != 0 {
+                    return Err(PlaceError::Misaligned { symbol, what: "a target's word", at: word, align: 8 });
+                }
+                let kind = match r.kind {
+                    RelocKind::ImportPage21 => blaze_code::record::SiteKind::GotPage21,
+                    _ => blaze_code::record::SiteKind::GotLo12,
+                };
+                blaze_code::a64::single_site(code, off, pc, word, kind, symbol)?;
+            }
             RelocKind::GotPage21 => {
                 let inst = expect(code, off, ADRP, symbol, "adrp")?;
                 let word = import_word(view, words, i, symbol)?;

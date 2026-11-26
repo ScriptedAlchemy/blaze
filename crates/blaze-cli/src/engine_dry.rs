@@ -182,6 +182,7 @@ pub(crate) fn run(
     let var = |name: &str| -> Option<&str> { env?.get(&VarName::new(name).ok()?).ok().flatten() };
     let setup = phases.now();
     let max_store_bytes = crate::gc::budget_from_env(env)?;
+    let caller = crate::caller_env::project(&flags.build_env, env, frame)?.identity().unwrap_or_default();
     let opened = crate::store::open_for_command(cx, fs, host, rng, var("HOME"), max_store_bytes, &root, located.at, phases.clock(), err, heap)?;
     let erased = blaze_own::Erased::new(frame);
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
@@ -225,7 +226,13 @@ pub(crate) fn run(
                 line(&mut text, format_args!("setup (store open, pointer, directory, snapshot; not the edit path's): {}.{:03} ms", setup_ns / 1_000_000, setup_ns / 1_000 % 1_000));
                 // The precondition, as `check` would decide it for this one edited file.
                 let edited = [edit::Changed { kind: LeafKind::Slot, both: true }];
-                let base = if pointer.certifies_under(&tools) { edit::StoredBase::Own } else { edit::StoredBase::ToolsMoved };
+                let base = if !pointer.certifies_under(&tools) {
+                    edit::StoredBase::ToolsMoved
+                } else if pointer.caller != caller {
+                    edit::StoredBase::CallerMoved
+                } else {
+                    edit::StoredBase::Own
+                };
                 match edit::choose(driver, Some(&directory), base, &edited) {
                     Ok(edit::Chosen::Phases(why)) => line(&mut text, format_args!("{}", edit::EditPath::Phases(why))),
                     Ok(edit::Chosen::Wake { files }) => line(&mut text, format_args!("precondition, from the root: the wake plans {files} edited file(s); the entering kinds decide below")),

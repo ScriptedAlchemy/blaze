@@ -252,6 +252,7 @@ pub(crate) fn names_records_envs<'n>(
     let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.into_bump_slice();
     let texts: &'n JobTexts<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
         JobTexts {
+            caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
             cx,
             root,
             frame,
@@ -1195,6 +1196,7 @@ impl fmt::Display for NamesRead {
 /// `Certificate::of_answer`): an edited `version` or a changed `rustc-env` is another answer.
 /// COST: per crate asked, its list row and at most one record read in place; never at setup.
 pub(crate) struct RunEnvs<'n> {
+    caller_env: blaze_build_script::env::CallerEnv<'n>,
     list: &'n CrateList<'static>,
     /// Reader crate `k`'s row of `list` (the names records' order, the owner at 0).
     rows: &'n [usize],
@@ -1209,10 +1211,10 @@ pub(crate) struct RunEnvs<'n> {
 }
 
 impl<'n> RunEnvs<'n> {
-    pub(crate) fn new(list: &'n CrateList<'static>, rows: &'n [usize], scripts: &'n [(usize, Input)], snapshot: &'n StoreSnapshot, home: Option<&'n str>, frame: &'n Frame) -> RunEnvs<'n> {
+    pub(crate) fn new(list: &'n CrateList<'static>, rows: &'n [usize], scripts: &'n [(usize, Input)], snapshot: &'n StoreSnapshot, home: Option<&'n str>, caller_env: blaze_build_script::env::CallerEnv<'n>, frame: &'n Frame) -> RunEnvs<'n> {
         let mut made = Vec::with_capacity_in(rows.len(), frame);
         made.resize_with(rows.len(), core::cell::OnceCell::new);
-        RunEnvs { list, rows, scripts, snapshot, home, frame, made }
+        RunEnvs { list, rows, scripts, snapshot, home, caller_env, frame, made }
     }
 
     /// The one making of list row `at`'s environment.
@@ -1231,7 +1233,7 @@ impl<'n> RunEnvs<'n> {
                 }
             }
         };
-        crate::body_types::row_env(self.list, at, script, self.home, self.frame)
+        crate::body_types::row_env(self.list, at, script, self.home, self.caller_env, self.frame)
     }
 }
 
@@ -1257,6 +1259,7 @@ impl<'n> crate::job_texts::EnvsByNeed<'n> for RunEnvs<'n> {
 /// and the records' own memo (`Records`, the `Log`, the job texts), all in that maker's frame.
 #[derive(Clone, Copy)]
 pub(crate) struct RunCrates<'n> {
+    caller_env: blaze_build_script::env::CallerEnv<'n>,
     list: &'n CrateList<'static>,
     crates: &'n [Crate<'n>],
     /// Reader crate `k`'s row of `list` (the owner at 0).
@@ -1308,7 +1311,7 @@ pub(crate) fn read_crates<'n, 'm: 'n>(
     scripts.extend_from_slice(&program.scripts);
     let mut lang: Vec<usize, &'n Frame> = Vec::with_capacity_in(program.lang.len(), frame);
     lang.extend_from_slice(&program.lang);
-    Ok(RunCrates { list, crates: crates.into_bump_slice(), rows: rows.into_bump_slice(), scripts: scripts.into_bump_slice(), lang: lang.into_bump_slice(), corrected, packs, dirs, snapshot, from: PackHome::of(env), heap })
+    Ok(RunCrates { list, crates: crates.into_bump_slice(), rows: rows.into_bump_slice(), scripts: scripts.into_bump_slice(), lang: lang.into_bump_slice(), corrected, packs, dirs, snapshot, from: PackHome::of(env), heap, caller_env: env.caller_env })
 }
 
 /// The names records over `crates`, in `frame`, on the calling thread (`cx`'s): the list's trees
@@ -1324,13 +1327,13 @@ pub(crate) fn names_in<'n>(
     seen: &'n TreesSeen,
     frame: &'n Frame,
 ) -> Result<NamesRecords<'n>, RunNamesError> {
-    let RunCrates { list, crates: opened, rows, scripts, lang, corrected, packs, dirs, snapshot, from, heap } = crates;
+    let RunCrates { list, crates: opened, rows, scripts, lang, corrected, packs, dirs, snapshot, from, heap, caller_env } = crates;
     // The trees: shared command-wide mapping cache and command-scoped pack directories, so
     // multi-suite `blaze test` never leaks per-suite drivers/FDs or duplicate pack mappings.
     let trees = SharedTrees::new(packs, from.fs, dirs, seen);
     // Every crate's environment, each made at its first ask ([`RunEnvs`]): a body lowered by
     // need reads its own crate's, as `blaze check` gives a body its owner's.
-    let envs: &'n RunEnvs<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(RunEnvs::new(list, rows, scripts, snapshot, from.home, frame), frame));
+    let envs: &'n RunEnvs<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(RunEnvs::new(list, rows, scripts, snapshot, from.home, caller_env, frame), frame));
     let envs = Envs { owner: None, rest: Some(envs) };
     let trees = (trees, None);
     let made = names_records_envs(cx, root, ScopeCrates::Opened(opened), trees, corrected, procs, std::vec::Vec::new_in(Global), envs, Some(snapshot), None, frame, heap.alloc()).map_err(|error| match error {

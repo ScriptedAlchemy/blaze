@@ -129,8 +129,62 @@ fn release_record_names_its_call() {
     let view = CodeView::read(&emission.record).expect("the record reads");
     assert_eq!(view.targets(), 1);
     assert_eq!(view.target(0), Target { space: Space::Func, symbol: Symbol([7; 32]) });
-    assert_eq!(view.sites(), 1, "one call site");
-    assert_eq!(view.site(0).kind, SiteKind::Call);
+    assert_eq!(view.sites(), 2, "one original branch and its callable import veneer");
+    assert_eq!(view.site(0).kind, SiteKind::Branch26);
+    assert_eq!(view.site(1).kind, SiteKind::Load);
+    let veneer = view.site(0).addend as usize;
+    assert_eq!(u32::from_le_bytes(view.code()[veneer + 8..veneer + 12].try_into().unwrap()), 0xd61f_0200, "the veneer preserves the original branch's LR");
+}
+
+fn object_fixture(ir: &str) -> super::LlvmModule<'static> {
+    let func = control();
+    let mut module = prepare(Symbol([3; 32]), func.verified(), &ByPlace, Alloc::global()).unwrap();
+    module.ir.clear();
+    module.ir.extend_from_slice(ir.as_bytes());
+    let at = ir.find("@entry(").unwrap() + 1;
+    module.definition_name = at..at + "entry".len();
+    module.references.clear();
+    module.implicit_references.clear();
+    module.positions.clear();
+    module.traps.clear();
+    module
+}
+
+/// Real LLVM objects, emitted for both object formats. A volatile read keeps the address
+/// relocation and its nonzero local-symbol offset alive through O2.
+#[test]
+fn native_objects_keep_local_offsets_data_addends_and_position_slots() {
+    for os in [blaze_tier::Os::MacOs, blaze_tier::Os::Linux] {
+        let machine = blaze_tier::Machine { arch: blaze_tier::Arch::Arm64, os, features: 0 };
+        let target = Target { space: Space::Static, symbol: Symbol([7; 32]) };
+        let outside = std::format!("{}", super::LinkName(target));
+        let ir = std::format!(r#"
+@{outside} = external global i8
+@d = private constant <{{ [8 x i8], ptr }}> <{{ [8 x i8] zeroinitializer, ptr getelementptr(i8, ptr @{outside}, i64 -7) }}>, align 8
+@blaze_pos_entry_0 = hidden externally_initialized global [1 x i32] zeroinitializer, align 4
+define i64 @entry() {{
+  %p = load volatile ptr, ptr getelementptr(i8, ptr @d, i64 8), align 8
+  %v = ptrtoint ptr %p to i64
+  %line = load volatile i32, ptr @blaze_pos_entry_0, align 4
+  %wide = zext i32 %line to i64
+  %out = add i64 %v, %wide
+  ret i64 %out
+}}
+"#);
+        let mut module = object_fixture(&ir);
+        module.references.push(Some(target));
+        module.positions.push((0, blaze_lir::func::DataPositionRec { item: [9; 16], offset: 0, site: 17, field: 0 }));
+        let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine }, Alloc::global()).unwrap();
+        let view = CodeView::read(&emission.record).unwrap();
+        assert_eq!(view.words(), 1, "{os:?}: relocation on the constant must not be dropped");
+        assert_eq!(view.word(0).addend, -7);
+        assert_eq!(view.target(view.word(0).target as usize), target);
+        assert_eq!(view.positions(), 1);
+        assert_eq!(view.position(0).item, u128::from_le_bytes([9; 16]));
+        assert_eq!(view.position(0).site, 17);
+        assert!((0..view.sites()).any(|i| view.site(i).kind == SiteKind::Page21));
+        assert!((0..view.sites()).any(|i| view.site(i).addend >= 8 && view.site(i).target == blaze_code::record::OWN_RELRO), "the interior data address survives");
+    }
 }
 
 /// The negative control: a record the Reference tier made (`emit_record`) is never named

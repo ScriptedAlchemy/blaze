@@ -183,6 +183,8 @@ pub struct EnvFacts<'p> {
 
 /// A crate's environment: see the module's doc.
 pub struct CrateEnv<'a> {
+    /// Explicit command grants, kept apart from shareable facts and proc-macro variables.
+    caller: AVec<'a, (AString<'a>, Option<AString<'a>>, blaze_ids::ContentId)>,
     /// Each variable with its value, sorted by name, each name once.
     vars: AVec<'a, (AString<'a>, AString<'a>)>,
     /// The names cargo sets for this crate whose values are not known, sorted.
@@ -340,6 +342,7 @@ impl<'a> CrateEnv<'a> {
         let package = facts.package.map(|(name, version)| (AString::from_str_in(name, alloc), AString::from_str_in(version, alloc)));
         let meta = facts.package.and(facts.meta).map(|meta| meta.values().map(|value| AString::from_str_in(value, alloc)));
         Ok(CrateEnv {
+            caller: AVec::new_in(alloc),
             vars,
             unknown,
             test_or_bench: facts.test_or_bench,
@@ -365,8 +368,8 @@ impl<'a> CrateEnv<'a> {
         self.meta.as_ref().map(|values| values.each_ref().map(|value| AString::from_str_in(value.as_str(), alloc)))
     }
 
-    /// The facts this environment was made from: [`CrateEnv::of`] of them makes it again, equal
-    /// in every answer. What a reader with no world (a body job, blaze-cli body_types.rs) is
+    /// The shareable facts this environment was made from. Command grants are attached
+    /// separately with [`CrateEnv::grant_caller`]. What a reader with no world (a body job, blaze-cli body_types.rs) is
     /// handed through the crate list (blaze-world crate_list.rs), so a body's `env!` is
     /// answered by the ONE construction an item's is (rule 30), never a second table.
     pub fn facts(&self) -> EnvFacts<'_> {
@@ -383,6 +386,39 @@ impl<'a> CrateEnv<'a> {
             bin_exes: BinNames(self.bin_exes.as_str()),
             meta: self.meta_vars(),
         }
+    }
+
+    /// Attach command-local grants only to a workspace member. Neither `facts()` nor
+    /// `vars()` exposes them: a proc macro receives its own separately declared grants.
+    pub fn grant_caller(&mut self, caller: blaze_build_script::env::CallerEnv<'_>, alloc: Alloc<'a>) {
+        self.caller.clear();
+        if !matches!(self.seen, SeenRoot::Member { .. }) {
+            return;
+        }
+        self.caller.extend(caller.iter().map(|(name, value)| {
+            (AString::from_str_in(name, alloc), value.map(|value| AString::from_str_in(value, alloc)), caller.fact(name).expect("iterated grant has a fact"))
+        }));
+        self.caller.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    }
+
+    fn caller_in<'b>(&self, alloc: Alloc<'b>) -> AVec<'b, (AString<'b>, Option<AString<'b>>, blaze_ids::ContentId)> {
+        let mut caller = AVec::with_capacity_in(self.caller.len(), alloc);
+        caller.extend(self.caller.iter().map(|(name, value, fact)| {
+            (AString::from_str_in(name.as_str(), alloc), value.as_ref().map(|value| AString::from_str_in(value.as_str(), alloc)), *fact)
+        }));
+        caller
+    }
+
+    /// Whether this name is answered by the caller grant rather than a Cargo/script fact.
+    pub fn caller_reads(&self, name: &str) -> bool {
+        matches!(self.seen, SeenRoot::Member { .. })
+            && self.vars.binary_search_by(|v| v.0.as_str().cmp(name)).is_err()
+            && self.unknown.binary_search(&name).is_err()
+    }
+
+    /// The opaque home-private observation for an explicit grant; `None` is ungranted.
+    pub fn caller_fact(&self, name: &str) -> Option<blaze_ids::ContentId> {
+        self.caller.binary_search_by(|v| v.0.as_str().cmp(name)).ok().map(|at| self.caller[at].2)
     }
 
     /// This environment copied whole into `alloc`, borrowing nothing of `self`: a reader that
@@ -408,6 +444,7 @@ impl<'a> CrateEnv<'a> {
             Some(record) => Some(OutputsRef::open(alloc.alloc_slice_copy(record.bytes()))?),
         };
         Ok(CrateEnv {
+            caller: self.caller_in(a),
             vars,
             unknown,
             test_or_bench: self.test_or_bench,
@@ -460,6 +497,7 @@ impl<'a> CrateEnv<'a> {
         };
         let package = self.package.as_ref().map(|(name, version)| (text(name.as_str()), text(version.as_str())));
         CrateEnv {
+            caller: self.caller_in(a),
             vars,
             unknown,
             test_or_bench: self.test_or_bench,
@@ -484,6 +522,9 @@ impl<'a> CrateEnv<'a> {
         }
         if self.unknown.binary_search_by(|u| (*u).cmp(name)).is_ok() {
             return Err(EnvUnknown);
+        }
+        if let Ok(at) = self.caller.binary_search_by(|v| v.0.as_str().cmp(name)) {
+            return Ok(self.caller[at].1.as_ref().map(|value| value.as_str()));
         }
         Ok(None)
     }
@@ -682,6 +723,38 @@ mod tests {
             bin_exes: BinNames::NONE,
             meta: None,
         }
+    }
+
+    #[test]
+    fn caller_grants_are_member_local_and_never_shared_as_facts() {
+        use blaze_build_script::env::CallerEnv;
+        use blaze_ids::ContentId;
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let alloc = bump.alloc();
+        let rows = [("APP_TEST_ABSENT", None, ContentId([0; 32])), ("APP_TEST_EMPTY", Some(""), ContentId([1; 32])), ("APP_TEST_VALUE", Some("private"), ContentId([2; 32]))];
+        let grants = CallerEnv::new(&rows, ContentId([3; 32])).expect("sorted explicit grants");
+        let mut member = CrateEnv::of(EnvFacts { seen: SeenRoot::Member { dir: "app" }, ..facts("1.0.0") }, alloc).unwrap();
+        member.grant_caller(grants, alloc);
+        assert_eq!(member.get("APP_TEST_ABSENT"), Ok(None));
+        assert_eq!(member.get("APP_TEST_EMPTY"), Ok(Some("")));
+        assert_eq!(member.get("APP_TEST_VALUE"), Ok(Some("private")));
+        assert!(member.caller_reads("APP_TEST_UNGRANTED"));
+        assert!(!member.caller_reads("CARGO_PKG_NAME"));
+        assert_eq!(member.caller_fact("APP_TEST_VALUE"), Some(ContentId([2; 32])));
+        let copied = member.clone_in(bump).unwrap();
+        assert_eq!(copied.get("APP_TEST_VALUE"), Ok(Some("private")));
+        assert_eq!(copied.caller_fact("APP_TEST_EMPTY"), Some(ContentId([1; 32])));
+        let shared = CrateEnv::of(member.facts(), alloc).unwrap();
+        assert_eq!(shared.get("APP_TEST_VALUE"), Ok(None));
+        assert!(member.vars().all(|(name, _)| !name.starts_with("APP_TEST_")));
+        let mut dependency = CrateEnv::of(facts("1.0.0"), alloc).unwrap();
+        dependency.grant_caller(grants, alloc);
+        assert_eq!(dependency.get("APP_TEST_VALUE"), Ok(None));
+        assert!(!dependency.caller_reads("APP_TEST_VALUE"));
+        member.grant_caller(CallerEnv::default(), alloc);
+        assert_eq!(member.get("APP_TEST_VALUE"), Ok(None));
     }
 
     /// turso cli/tests/non_interactive_exit_code.rs reads `env!("CARGO_BIN_EXE_tursodb")`; the

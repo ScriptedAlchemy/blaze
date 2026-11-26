@@ -214,11 +214,11 @@ pub fn lay_out_positions<'a>(
         }
         for s in 0..m.record.sites() {
             let site = m.record.site(s);
-            if site.kind == SiteKind::Relro {
+            if site.kind == SiteKind::Relro || site.kind.own() {
                 continue;
             }
             let t = m.record.target(site.target as usize);
-            if relaxed(t).is_none() {
+            if site.kind.len() == 4 || relaxed(t).is_none() {
                 imports.push(t);
             }
         }
@@ -238,6 +238,19 @@ pub fn lay_out_positions<'a>(
         for s in 0..m.record.sites() {
             let site = m.record.site(s);
             let pc = code_at[i] + u64::from(site.at);
+            if site.kind.len() == 4 {
+                let at = crate::place::At { code: code_at[i], relro: relro_at + relro_off[i] };
+                let to = match at.own(site) {
+                    Some(local) => local,
+                    None => {
+                        let target = m.record.target(site.target as usize);
+                        let index = imports.binary_search(&target).map_err(|_| ImageError::Unbound { target })?;
+                        imports_at + 8 * index as u64
+                    }
+                };
+                crate::a64::single_site(&mut code, pc, pc, to, site.kind, symbol)?;
+                continue;
+            }
             if site.kind == SiteKind::Relro {
                 let to = relro_at + relro_off[i] + u64::from(site.addend);
                 let first = expect(&code, pc, ADRP, symbol, "adrp")?;

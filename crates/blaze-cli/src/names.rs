@@ -77,6 +77,8 @@ pub(crate) mod sections;
 // blaze-edition binary roots (engine_names.rs `finish`, rule 21) and expansion record keys in
 // `OUT_DOMAIN` 3.
 const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 18";
+/// A proc-macro scope records the registration lookup even when the module is absent.
+const PROC_SCOPE_DOMAIN: &str = "blaze-cli proc macro crate scope source 19";
 /// The out: the names record, the crate's expansion record keys (`EXPANSIONS_OUT_DOMAIN`), AND
 /// the checkout files the crate holds ([`crate_out`]). "1" was the names record alone, but a
 /// body's check reads its crate's items record to find which crate owns its file (body_types.rs
@@ -335,6 +337,7 @@ impl<'b> Records<'b> for Folder {
 
 /// One crate made this command: its payload, out, and the checkout files its resolution read.
 pub(crate) struct Resolved {
+    pub(crate) caller_reads: std::vec::Vec<(blaze_engine::CellId, ContentId), Global>,
     /// The record's payload ([`sections::write`]).
     payload: blaze_own::Vec<u8, Global>,
     /// The digest both check drivers publish for this resolution.
@@ -1191,6 +1194,12 @@ impl Names<'_> {
         self.scripts.binary_search_by_key(&at, |(krate, _)| *krate).ok().map(|i| self.scripts[i].1)
     }
 
+    /// The lookup that determines whether this proc-macro crate uses D52's registration.
+    pub(crate) fn proc_module_of(&self, at: usize) -> Option<Name> {
+        self.list.proc_macro(at).then(|| Name::new(Kind::MacroModule,
+            crate::macros::subject_of(self.list.package(at), self.list.version(at))))
+    }
+
     /// The world index of the crate whose `CrateScope` subject is `subject`.
     pub(crate) fn crate_at(&self, subject: ContentId) -> Option<usize> {
         self.by_subject.binary_search_by_key(&subject, |(subject, _)| *subject).ok().map(|i| self.by_subject[i].1)
@@ -1491,7 +1500,7 @@ fn make_world<'f>(
             _ => NamesError::World(String::from(words.as_str())),
         }
     };
-    let (world, placed, lazy_trees) = if let Some(stored) = stored_list {
+    let (mut world, placed, lazy_trees) = if let Some(stored) = stored_list {
         let mut packages = CheckoutOnly { paths, lock: lock_whole, alloc: bump };
         let listed = {
             let _cx = cx.span("names: the crate list and toolchain manifest opened (lazy)");
@@ -1523,6 +1532,7 @@ fn make_world<'f>(
         };
         (world, packages.finish().leak_slice(), None)
     };
+    world.texts.grant_caller(env.caller_env, bump.alloc());
     let _cx = cx.span("names: the world's public crates and scripts");
     let from_archive = |unit: blaze_unit_graph::UnitId| {
         let package = lock.package(graph.units[unit.0 as usize].package);
@@ -1656,7 +1666,8 @@ pub(crate) fn parts(names: &Names<'_>) -> std::vec::Vec<(Name, ContentId), Globa
     let mut parts = std::vec::Vec::with_capacity(list.len());
     for r in 0..list.len() {
         let key = list.key(r);
-        parts.push((blaze_drive::key::crate_scope_name(&key), ContentId::of(SOURCE_DOMAIN, &key.0.0)));
+        let domain = if list.proc_macro(r) { PROC_SCOPE_DOMAIN } else { SOURCE_DOMAIN };
+        parts.push((blaze_drive::key::crate_scope_name(&key), ContentId::of(domain, &key.0.0)));
     }
     parts.sort_unstable_by_key(|(name, _)| name.subject);
     parts.dedup_by_key(|(name, _)| name.subject);

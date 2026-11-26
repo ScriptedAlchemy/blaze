@@ -17,7 +17,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 
 /// tests/run_trapped/enum_value: 3 transmuted into `Two` (discriminants 1 and 2) and passed in
 /// a struct by value. The program ends by SIGTRAP (128 + 5 = 133); the named line says the
-/// discriminant read found no variant, that it read 0x3 from x9, and that `Two` has
+/// discriminant read found no variant, that it read 0x3 from the emitter's held register, and that `Two` has
 /// discriminants 0x1, 0x2. With the registers left out of the child's fault (fault_report.rs
 /// `on_signal`'s `fault.regs = state`), the line says "the program sent no registers" and the
 /// 0x3 assertion fails; with the row's subject left out (walk.rs `unreachable_of_enum`), the
@@ -54,7 +54,7 @@ fn a_bad_discriminant_is_said_by_its_value_and_the_enum() {
     assert_eq!(output.status.code(), Some(128 + 5), "the program did not end by SIGTRAP: {said}");
     let line = said.lines().find(|line| line.contains("it struck at")).unwrap_or_else(|| panic!("no named line: {said}"));
     assert!(line.contains("the read of the enum's discriminant") && line.contains("found no variant's discriminant"), "{line}");
-    assert!(line.contains("it read 0x3 (x9)"), "the value read is not said: {line}");
+    assert!(line.contains("it read 0x3 (x16)"), "the value read is not said: {line}");
     assert!(line.contains("`Two` has discriminants 0x1, 0x2"), "the enum and its discriminants are not said: {line}");
     println!("run trapped enum: {line}");
     // The callers (run schema 3, the child's frame-pointer walk): the trap is in `make` (or

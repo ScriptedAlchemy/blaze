@@ -63,7 +63,7 @@ fn alignments_round_trip_and_older_forms_are_refused() {
     let alloc = erased.handle();
     let bytes = aligned(6, 6, alloc).expect("seals");
     assert_eq!(&bytes[..8], &MAGIC);
-    assert_eq!(&MAGIC, b"bzcode07");
+    assert_eq!(&MAGIC, b"bzcode09");
     assert_eq!(&bytes[12..16], &[6, 6, 0, 0], "the two alignments where `bzcode05` held a zero `flags`");
     let view = CodeView::read(&bytes).expect("reads back");
     assert_eq!((view.code_align(), view.relro_align()), (6, 6));

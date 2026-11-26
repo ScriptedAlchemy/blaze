@@ -67,6 +67,7 @@ fn write(io: &Io, cx: &Cx, path: &str, bytes: &[u8]) {
 /// `CARGO_HOME=/c`, started in `/`, in the checkout `checkout`.
 fn env(io: &Io, checkout: &'static str) -> FetchEnv<'static> {
     FetchEnv {
+        caller_env: Default::default(),
         clock: io.need_clock().expect("a clock"),
         checkout,
         served: crate::engine_script_reads::Served::Simulated,

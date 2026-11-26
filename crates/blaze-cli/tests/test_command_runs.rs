@@ -421,7 +421,7 @@ fn the_inventory_oracle_catches_one_unit_and_display_path_identity() {
     assert!(!listed_each_unit(&by_display_path, Some(0)));
 }
 
-const REFUSED: &str = "a `ref` binding or a binding with a subpattern";
+const REFUSED: &str = "a `sym` operand naming a `#[thread_local]` static";
 const REFUSED_SUMMARY: &str = "test result: FAILED. ran 1: 1 passed, 0 failed, 1 not run (code not built)";
 
 fn only_dependent_test_refused(stdout: &str, code: Option<i32>) -> bool {
@@ -438,15 +438,31 @@ fn only_dependent_test_refused(stdout: &str, code: Option<i32>) -> bool {
 #[test]
 #[cfg(target_os = "macos")]
 fn refused_first_call_does_not_hide_the_next_test() {
-    // A `let` binding with an `@` subpattern is refused in walk.rs `plain_binding` with
-    // `REFUSED`. Keep it in the *callee* so the launcher first enters a successfully built test.
-    let lib = "fn refused_callee() { let _word @ _ = 7u8; }\n\
+    // The builder cannot yet relocate a thread-local `sym` operand (walk/asm.rs).
+    // Keep it in the callee: the launcher first enters a successfully built test.
+    // This is a regression control for that existing gap, not a new refusal.
+    let lib = "#![feature(thread_local)]\n\
+               #[thread_local] static WORD: u8 = 7;\n\
+               fn refused_callee() { unsafe { core::arch::asm!(\"/* {word} */\", word = sym WORD); } }\n\
                #[test] fn a_needs_callee() { refused_callee(); }\n\
                #[test] fn b_returns() {}\n";
     let said = fixture("test_command_refused_call", &[("Cargo.toml", MANIFEST), ("src/lib.rs", lib)], |dir, home| {
         run(dir, home, &["--", "--test-threads", "1", "--deadline", "20s"])
     });
     assert!(only_dependent_test_refused(&said.stdout, said.code), "{}", evidence(REFUSED_SUMMARY, &said));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn a_supported_at_binding_runs_on_first_call() {
+    let lib = "fn supported_callee() { let word @ _ = 7u8; assert_eq!(word, 7); }\n\
+               #[test] fn a_needs_callee() { supported_callee(); }\n\
+               #[test] fn b_returns() {}\n";
+    let said = fixture("test_command_at_binding", &[("Cargo.toml", MANIFEST), ("src/lib.rs", lib)], |dir, home| {
+        run(dir, home, &["--", "--test-threads", "1", "--deadline", "20s"])
+    });
+    assert_eq!(said.code, Some(0), "{}", evidence("two supported tests pass", &said));
+    assert!(said.stdout.contains("test result: ok. ran 2: 2 passed, 0 failed"), "{}", evidence("two supported tests pass", &said));
 }
 
 #[test]

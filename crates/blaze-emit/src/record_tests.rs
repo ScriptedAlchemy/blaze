@@ -152,6 +152,7 @@ pub(crate) fn holds(func: View<'_>, isa: Isa) -> Option<(usize, usize)> {
                 assert_eq!(second, 0xf940_0000 | (rd << 5) | rd, "`ldr x{rd}, [x{rd}]` after the `adrp` at {at}");
                 assert!((row.target as usize) < view.targets(), "the site at {at} names a target row");
             }
+            _ => panic!("reference emitter unexpectedly produced a native relocation"),
         }
         if row.kind == SiteKind::Call {
             assert_eq!(rd, 16, "a call site loads x16");
@@ -429,6 +430,7 @@ mod runs {
                 let to = match site.kind {
                     SiteKind::Relro => data_at + relro_at as u64 + u64::from(site.addend),
                     SiteKind::Load | SiteKind::Call => data_at + 8 * u64::from(site.target),
+                    _ => panic!("reference emitter unexpectedly produced a native relocation"),
                 };
                 let pages = (to >> 12) as i64 - (pc >> 12) as i64;
                 assert!((-(1i64 << 20)..1i64 << 20).contains(&pages), "the site at {at} is past `adrp`'s 4 GiB");
@@ -441,6 +443,7 @@ mod runs {
                         assert_eq!(low % 8, 0, "an import word is 8-aligned");
                         inst(code, at + 4) | ((low >> 3) << 10)
                     }
+                    _ => panic!("reference emitter unexpectedly produced a native relocation"),
                 };
                 code[at..at + 4].copy_from_slice(&first.to_le_bytes());
                 code[at + 4..at + 8].copy_from_slice(&second.to_le_bytes());

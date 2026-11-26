@@ -23,6 +23,7 @@ use crate::{
 };
 
 const EDITION: Edition = Edition::E2024;
+const DECLS: &str = "__rustc_proc_macro_decls_123__";
 
 /// `produced` kept as `base`'s answer in `package`'s crate, as a command does it: the crate's
 /// results opened, the row taken, the table written.
@@ -185,7 +186,7 @@ fn wasm_importing(body: &[u8], extra: &[&str]) -> Vec<u8> {
     // Globals: 0 `decls` = 0; 1 `ran`, mutable, = 0.
     section(6, &[2, I32, 0, 0x41, 0, op::END, I32, 1, 0x41, 0, op::END], &mut out);
     let mut s = vec![5];
-    for (field, kind, index) in [("memory", 2u8, 0u8), ("decls", 3, 0), ("_initialize", 0, own), ("blaze_proc_macro_alloc", 0, own + 1), ("blaze_proc_macro_expand", 0, own + 2)] {
+    for (field, kind, index) in [("memory", 2u8, 0u8), (DECLS, 3, 0), ("_initialize", 0, own), ("blaze_proc_macro_alloc", 0, own + 1), ("blaze_proc_macro_expand", 0, own + 2)] {
         name(field, &mut s);
         s.extend_from_slice(&[kind, index]);
     }
@@ -274,7 +275,7 @@ fn module_in(dir: &Path, wasm: Vec<u8>, macros: u32) -> ModuleRecord {
         version: "0.0.0".to_owned(),
         wasm_sha256: digest,
         macros: (0..macros).map(|index| Exported { index, kind: ProcKind::FnLike, name: format!("m{index}"), helpers: Vec::new() }).collect(),
-        decls: "decls".to_owned(),
+        decls: DECLS.to_owned(),
         dir: dir.to_owned(),
         compiled: dir.join("compiled"),
         native_dylib: None,
@@ -465,6 +466,48 @@ fn reader() -> Setup {
 /// The reader's module record, kept in `dir`.
 fn reader_in(dir: &Path) -> ModuleRecord {
     module_in(dir, wasm(&reader_body()), 4)
+}
+
+#[test]
+fn d52_registration_distinguishes_absent_invalid_and_empty_export_tables() {
+    use crate::module::{ModuleError, identity, read_module};
+    let store = folder("d52-registration");
+    let id = CrateId { name: "mac", version: "1.0.0", source: Source::Registry { checksum: "m0" }, deps: "", features: &[] };
+    let read = || read_module(&store, &id);
+    assert!(matches!(read(), Err(ModuleError::Missing { .. })));
+    let dir = store.join("proc-macro/modules").join(module_key(&id));
+    std::fs::create_dir_all(&dir).expect("the registration directory");
+    let put = |file: &str, text: &str| std::fs::write(dir.join(file), text).expect("the registration field");
+    let module = wasm(&reader_body());
+    let digest = sha256_hex(&module);
+    put("wasm-sha256", &digest);
+    put("macros", "");
+    put("decls", DECLS);
+    put("identity", "a different crate");
+    assert!(matches!(read(), Err(ModuleError::Registration { path, .. }) if path == dir.join("identity")));
+    put("identity", &identity(&id));
+    put("wasm-sha256", "no digest");
+    assert!(matches!(read(), Err(ModuleError::Registration { path, .. }) if path == dir.join("wasm-sha256")));
+    put("wasm-sha256", &digest);
+    put("decls", "_DECLS");
+    assert!(matches!(read(), Err(ModuleError::Registration { path, .. }) if path == dir.join("decls")));
+    put("decls", DECLS);
+    put("macros", "1 bang go \n");
+    assert!(matches!(read(), Err(ModuleError::Macros { .. })));
+    put("macros", "");
+    let empty = read().expect("an empty registration");
+    assert!(empty.macros.is_empty());
+    assert!(matches!(empty.verify_registration(), Err(ModuleError::Io { path, .. }) if path == dir.join("module.wasm")));
+    std::fs::write(dir.join("module.wasm"), &module).expect("the real module");
+    let verified = empty.verify_registration().expect("the empty table in the matching module");
+    put("decls", "__rustc_proc_macro_decls_other__");
+    assert!(matches!(read().unwrap().verify_registration(), Err(ModuleError::Registration { .. })));
+    put("decls", DECLS);
+    put("macros", "0 bang go \n");
+    assert_ne!(read().unwrap().verify_registration().unwrap(), verified, "a changed export moves the registration input");
+    put("wasm-sha256", &sha256_hex(b"other module"));
+    assert!(matches!(read().unwrap().verify_registration(), Err(ModuleError::Digest { .. })));
+    std::fs::remove_dir_all(store).expect("remove the registration");
 }
 
 /// Each of the reader's four macros run once, its record's bytes.

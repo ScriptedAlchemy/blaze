@@ -11,7 +11,7 @@
 //! Ported from the fork's `hir-ty-codegen/llvm/emitted.rs` (`ccb0b95cf7`), onto `CodeRecord`.
 
 
-use blaze_code::record::{CodeRecord, Held, RecordError, Site, SiteKind, Space, Target, TrapRow};
+use blaze_code::record::{CodeRecord, Held, RecordError, Site, SiteKind, Space, Target, TrapRow, Word, PositionRow, PositionPart, PositionField, OWN_CODE, OWN_RELRO};
 use core::fmt;
 
 use blaze_own::{AVec, Alloc, FixedString, String, Vec};
@@ -47,6 +47,8 @@ pub enum ReadError {
     AddressOfCode { at: u64 },
     /// A section the code refers to is writable.
     Writable { section: FixedString<32> },
+    /// A recognized relocation whose operand or target cannot have the required meaning.
+    Semantics { at: u64, what: &'static str },
     /// The record did not seal.
     Seal(RecordError),
 }
@@ -65,6 +67,7 @@ impl fmt::Display for ReadError {
             ReadError::TrapSource { at } => write!(f, "a `brk` at {at} for an `unreachable` whose source the module does not carry"),
             ReadError::AddressOfCode { at } => write!(f, "a constant at {at} holds an address of the code"),
             ReadError::Writable { section } => write!(f, "the code refers to the writable section {section}"),
+            ReadError::Semantics { at, what } => write!(f, "native object relocation at {at}: {what}"),
             ReadError::Seal(why) => write!(f, "the record did not seal: {why}"),
         }
     }
@@ -79,14 +82,17 @@ fn function_name<'a>(module: &LlvmModule<'_>, alloc: Alloc<'a>) -> String<Alloc<
 }
 
 /// Where a relocation leads: a named symbol (an import, or the function's own) or a section.
-enum Destination<'name> {
-    Named(&'name str),
-    Section,
+enum Destination {
+    Named(Target),
+    Section { index: SectionIndex, offset: i64 },
 }
 
 /// Reads `object` (what LLVM wrote for `module`) as a sealed `bzcode07` record in `alloc`.
 pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ReadError> {
     let file = object::File::parse(object).map_err(|_| ReadError::Object)?;
+    if file.architecture() != object::Architecture::Aarch64 || !file.is_little_endian() {
+        return Err(ReadError::Semantics { at: 0, what: "only little-endian AArch64 object code is supported" });
+    }
     let name = function_name(module, alloc);
     let macho = file.format() == BinaryFormat::MachO;
     let mut found: Option<(SectionIndex, u64)> = None;
@@ -112,7 +118,8 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
     // tier it stands in for, so the launcher's trap reporting finds the frame.
     record.frame = 0;
 
-    // Every section the code's relocations lead to, laid out after it.
+    // Reach every local data section through both instruction and data relocations. Data
+    // stays in relro: absolute words and source positions are filled only at placement.
     let mut placed: Vec<(SectionIndex, u64), Alloc<'a>> = Vec::new_in(alloc);
     let mut pending: Vec<SectionIndex, Alloc<'a>> = Vec::from_slice_in(&[text], alloc);
     while let Some(index) = pending.pop() {
@@ -122,8 +129,9 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
         let section = file.section_by_index(index).map_err(|_| ReadError::Section { at: 0 })?;
         if index != text {
             match section.kind() {
-                SectionKind::Text | SectionKind::ReadOnlyData | SectionKind::ReadOnlyString | SectionKind::ReadOnlyDataWithRel => {}
+                SectionKind::ReadOnlyData | SectionKind::ReadOnlyString | SectionKind::ReadOnlyDataWithRel => {}
                 SectionKind::Data if section.name().map(|n| n == "__const").unwrap_or(false) => {}
+                SectionKind::Data if position_section(&file, index, module, alloc)? => {}
                 _ => {
                     let mut spelled = FixedString::<32>::new();
                     spelled.try_push_str(section.name().unwrap_or("")).ok();
@@ -131,74 +139,37 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
                 }
             }
             let align = section.align().max(1);
-            let start = (record.code.len() as u64).next_multiple_of(align);
-            record.code.resize(start as usize, 0);
-            record.code.extend_from_slice(section.data().map_err(|_| ReadError::CodeOutside)?);
-            record.code_align = record.code_align.max(align_of(align));
+            if !align.is_power_of_two() || align > (1 << blaze_code::record::MOST_PART_ALIGN) {
+                return Err(ReadError::Semantics { at: 0, what: "constant section alignment exceeds the record form" });
+            }
+            let start = (record.relro.len() as u64).next_multiple_of(align);
+            record.relro.resize(start as usize, 0);
+            record.relro.extend_from_slice(section.data().map_err(|_| ReadError::CodeOutside)?);
+            record.relro_align = record.relro_align.max(align_of(align));
             placed.push((index, start));
         } else {
             placed.push((index, 0));
         }
-        for (_, relocation) in section.relocations() {
-            if let RelocationTarget::Section(target) = relocation.target() {
+        for (at, relocation) in section.relocations() {
+            if index == text && !range.contains(&at) { continue; }
+            if let Destination::Section { index: target, .. } = destination(&file, &relocation, at, module, alloc)? {
                 pending.push(target);
             }
         }
     }
-
-    // The relocations of the code. A `bl` is a `Call` site on its own. An `adrp` is the
-    // first half of a `Load` site and its `ldr` the second: the record form names the pair as
-    // one 8-byte site, so the two are paired by the symbol they name (LLVM may put an
-    // unrelated instruction between them, which the form cannot express: refused by name,
-    // never written as a wrong site). A `PAGEOFF12` whose `adrp` is not in this function's
-    // code is the second half of a site the caller owns, and is left alone.
-    let section = file.section_by_index(text).map_err(|_| ReadError::NoSection)?;
-    let mut pages: Vec<(u64, Target), Alloc<'a>> = Vec::new_in(alloc);
-    for (offset, relocation) in section.relocations() {
-        if !range.contains(&offset) {
-            continue;
-        }
-        let at = offset - range.start;
-        let is_page = matches!(relocation.flags(), RelocationFlags::MachO { r_type: macho::ARM64_RELOC_PAGE21 | macho::ARM64_RELOC_GOT_LOAD_PAGE21, .. }
-            | RelocationFlags::Elf { r_type: elf::R_AARCH64_ADR_PREL_PG_HI21 | elf::R_AARCH64_ADR_GOT_PAGE });
-        if !is_page {
-            continue;
-        }
-        let target = named_target(&file, &relocation, at, module, alloc)?;
-        pages.push((at, target));
-    }
-    for (offset, relocation) in section.relocations() {
-        if !range.contains(&offset) {
-            continue;
-        }
-        let at = offset - range.start;
-        let flags = relocation.flags();
-        let kind = match flags {
-            RelocationFlags::MachO { r_type: macho::ARM64_RELOC_BRANCH26, .. }
-            | RelocationFlags::Elf { r_type: elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 } => SiteKind::Call,
-            RelocationFlags::MachO { r_type: macho::ARM64_RELOC_PAGE21 | macho::ARM64_RELOC_GOT_LOAD_PAGE21, .. }
-            | RelocationFlags::Elf { r_type: elf::R_AARCH64_ADR_PREL_PG_HI21 | elf::R_AARCH64_ADR_GOT_PAGE } => {
-                // The `adrp`: its `ldr` is found when the `PAGEOFF12` is read.
-                continue;
+    for &(index, base) in &placed {
+        let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
+        for (offset, relocation) in section.relocations() {
+            if index == text && !range.contains(&offset) { continue; }
+            let dest = destination(&file, &relocation, offset, module, alloc)?;
+            if index == text {
+                instruction(&file, &relocation, offset - range.start, dest, &placed, text, range.start, &mut record)?;
+            } else {
+                data_relocation(&file, &relocation, base + offset, dest, &placed, text, range.start, &mut record)?;
             }
-            RelocationFlags::MachO { r_type: macho::ARM64_RELOC_PAGEOFF12 | macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12, .. }
-            | RelocationFlags::Elf { r_type: elf::R_AARCH64_ADD_ABS_LO12_NC | elf::R_AARCH64_LDST8_ABS_LO12_NC | elf::R_AARCH64_LDST16_ABS_LO12_NC | elf::R_AARCH64_LDST32_ABS_LO12_NC | elf::R_AARCH64_LDST64_ABS_LO12_NC | elf::R_AARCH64_LDST128_ABS_LO12_NC | elf::R_AARCH64_LD64_GOT_LO12_NC } => {
-                let target = named_target(&file, &relocation, at, module, alloc)?;
-                if !pages.iter().any(|&(page_at, page_target)| page_at + 4 == at && page_target == target) {
-                    return Err(ReadError::UnpairedLoad { at, target });
-                }
-                let index = record.target(target);
-                record.sites.push(Site { at: (at - 4) as u32, kind: SiteKind::Load, target: index, addend: 0 });
-                continue;
-            }
-            RelocationFlags::MachO { r_type, .. } => return Err(ReadError::Relocation { at, kind: u32::from(r_type.0) }),
-            RelocationFlags::Elf { r_type } => return Err(ReadError::Relocation { at, kind: r_type.0 }),
-            _ => return Err(ReadError::Relocation { at, kind: 0 }),
-        };
-        let target = named_target(&file, &relocation, at, module, alloc)?;
-        let index = record.target(target);
-        record.sites.push(Site { at: at as u32, kind, target: index, addend: 0 });
+        }
     }
+    positions(&file, module, &placed, &mut record, alloc)?;
 
     // The traps: each `brk` in LLVM's code is one the lowerer wrote for a LIR `trap` or
     // `unreachable`. An `unreachable`'s `brk #0xff02` takes the next `TrapSource` by ordinal
@@ -244,26 +215,190 @@ fn atom(file: &object::File<'_>, text: SectionIndex, address: u64) -> Result<cor
     Ok(start..end - section.address())
 }
 
-/// The `Target` a relocation names, as the lowering lane's `references` spell it; a
-/// relocation against a section (the function's own constants) names none.
-fn named_target<'a>(file: &object::File<'_>, relocation: &object::Relocation, at: u64, module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Result<Target, ReadError> {
-    let RelocationTarget::Symbol(index) = relocation.target() else {
-        return Err(ReadError::Section { at });
-    };
-    let symbol = file.symbol_by_index(index).map_err(|_| ReadError::Object)?;
-    match destination(file, &symbol)? {
-        Destination::Named(name) => target_of(module, name, alloc),
-        Destination::Section => Err(ReadError::Section { at }),
+/// A defined symbol carries its offset even if it is global. Undefined symbols alone name
+/// other records. This also makes recursive calls refer to this atom, not an absent import.
+fn destination(file: &object::File<'_>, relocation: &object::Relocation, at: u64, module: &LlvmModule<'_>, alloc: Alloc<'_>) -> Result<Destination, ReadError> {
+    match relocation.target() {
+        RelocationTarget::Section(index) => Ok(Destination::Section { index, offset: 0 }),
+        RelocationTarget::Symbol(index) => {
+            let symbol = file.symbol_by_index(index).map_err(|_| ReadError::Object)?;
+            if let SymbolSection::Section(index) = symbol.section() {
+                let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
+                let offset = symbol.address().checked_sub(section.address()).and_then(|n| i64::try_from(n).ok()).ok_or(ReadError::CodeOutside)?;
+                Ok(Destination::Section { index, offset })
+            } else {
+                let name = plain(file.format() == BinaryFormat::MachO, symbol.name().map_err(|_| ReadError::Object)?);
+                Ok(Destination::Named(target_of(module, name, alloc)?))
+            }
+        }
+        _ => Err(ReadError::Section { at }),
     }
 }
 
-/// Where a relocation leads.
-fn destination<'file>(file: &'file object::File<'_>, symbol: &object::Symbol<'_, 'file>) -> Result<Destination<'file>, ReadError> {
-    let macho = file.format() == BinaryFormat::MachO;
-    if !matches!(symbol.section(), SymbolSection::Section(_)) || symbol.is_global() {
-        return Ok(Destination::Named(plain(macho, symbol.name().map_err(|_| ReadError::Object)?)));
+fn local(index: SectionIndex, offset: i64, placed: &[(SectionIndex, u64)], text: SectionIndex, start: u64, at: u64) -> Result<(u32, i64), ReadError> {
+    let base = placed.iter().find(|p| p.0 == index).ok_or(ReadError::Section { at })?.1;
+    let adjustment = if index == text { -(start as i64) } else { base as i64 };
+    Ok((if index == text { OWN_CODE } else { OWN_RELRO }, offset.checked_add(adjustment).ok_or(ReadError::CodeOutside)?))
+}
+
+fn unsupported(relocation: &object::Relocation, at: u64) -> ReadError {
+    let kind = match relocation.flags() {
+        RelocationFlags::MachO { r_type, .. } => u32::from(r_type.0),
+        RelocationFlags::Elf { r_type } => r_type.0,
+        _ => 0,
+    };
+    ReadError::Relocation { at, kind }
+}
+
+fn word(bytes: &[u8], at: u64) -> Result<u32, ReadError> {
+    let at = usize::try_from(at).map_err(|_| ReadError::CodeOutside)?;
+    let bytes = bytes.get(at..at + 4).ok_or(ReadError::CodeOutside)?;
+    Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| ReadError::CodeOutside)?))
+}
+
+fn low_kind(word: u32, at: u64) -> Result<SiteKind, ReadError> {
+    if word & 0xffc0_0000 == 0x9100_0000 { return Ok(SiteKind::AddLo12); }
+    if word & 0x3b00_0000 != 0x3900_0000 {
+        return Err(ReadError::Semantics { at, what: "PAGEOFF12 is neither ADD64 nor an unsigned-offset load/store" });
     }
-    Ok(Destination::Section)
+    let scale = if word & 0x0480_0000 == 0x0480_0000 { 4 } else { word >> 30 };
+    Ok(match scale { 0 => SiteKind::LdstLo12_1, 1 => SiteKind::LdstLo12_2, 2 => SiteKind::LdstLo12_4, 3 => SiteKind::LdstLo12_8, _ => SiteKind::LdstLo12_16 })
+}
+
+fn scale(kind: SiteKind) -> u32 {
+    match kind { SiteKind::LdstLo12_2 => 1, SiteKind::LdstLo12_4 => 2, SiteKind::LdstLo12_8 | SiteKind::GotLo12 => 3, SiteKind::LdstLo12_16 => 4, _ => 0 }
+}
+
+fn instruction(file: &object::File<'_>, relocation: &object::Relocation, at: u64, dest: Destination, placed: &[(SectionIndex, u64)], text: SectionIndex, start: u64, record: &mut CodeRecord<'_>) -> Result<(), ReadError> {
+    let original = word(&record.code, at)?;
+    let kind = match relocation.flags() {
+        RelocationFlags::MachO { r_type: macho::ARM64_RELOC_BRANCH26, r_pcrel: true, r_length: 2 } |
+        RelocationFlags::Elf { r_type: elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 } => SiteKind::Branch26,
+        RelocationFlags::MachO { r_type: macho::ARM64_RELOC_PAGE21, r_pcrel: true, r_length: 2 } |
+        RelocationFlags::Elf { r_type: elf::R_AARCH64_ADR_PREL_PG_HI21 } => SiteKind::Page21,
+        RelocationFlags::MachO { r_type: macho::ARM64_RELOC_GOT_LOAD_PAGE21, r_pcrel: true, r_length: 2 } |
+        RelocationFlags::Elf { r_type: elf::R_AARCH64_ADR_GOT_PAGE } => SiteKind::GotPage21,
+        RelocationFlags::MachO { r_type: macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12, r_pcrel: false, r_length: 2 } |
+        RelocationFlags::Elf { r_type: elf::R_AARCH64_LD64_GOT_LO12_NC } => SiteKind::GotLo12,
+        RelocationFlags::MachO { r_type: macho::ARM64_RELOC_PAGEOFF12, r_pcrel: false, r_length: 2 } => low_kind(original, at)?,
+        RelocationFlags::Elf { r_type: elf::R_AARCH64_ADD_ABS_LO12_NC } => SiteKind::AddLo12,
+        RelocationFlags::Elf { r_type: elf::R_AARCH64_LDST8_ABS_LO12_NC } => SiteKind::LdstLo12_1,
+        RelocationFlags::Elf { r_type: elf::R_AARCH64_LDST16_ABS_LO12_NC } => SiteKind::LdstLo12_2,
+        RelocationFlags::Elf { r_type: elf::R_AARCH64_LDST32_ABS_LO12_NC } => SiteKind::LdstLo12_4,
+        RelocationFlags::Elf { r_type: elf::R_AARCH64_LDST64_ABS_LO12_NC } => SiteKind::LdstLo12_8,
+        RelocationFlags::Elf { r_type: elf::R_AARCH64_LDST128_ABS_LO12_NC } => SiteKind::LdstLo12_16,
+        _ => return Err(unsupported(relocation, at)),
+    };
+    let (mask, implicit) = match kind {
+        SiteKind::Branch26 if original & 0x7c00_0000 == 0x1400_0000 => (0x03ff_ffff, (i64::from(original & 0x03ff_ffff) << 38 >> 38) * 4),
+        SiteKind::Page21 | SiteKind::GotPage21 if original & 0x9f00_0000 == 0x9000_0000 => {
+            let imm = ((original >> 29) & 3) | ((original >> 5) & 0x7ffff) << 2;
+            (0x60ff_ffe0, (i64::from(imm) << 43 >> 43) * 4096)
+        }
+        SiteKind::GotLo12 if original & 0xffc0_0000 == 0xf940_0000 => (0x003f_fc00, i64::from((original >> 10) & 4095) * 8),
+        kind if kind.own() && low_kind(original, at)? == kind => (0x003f_fc00, i64::from((original >> 10) & 4095) << scale(kind)),
+        _ => return Err(ReadError::Semantics { at, what: "relocation kind does not match its AArch64 instruction" }),
+    };
+    let mut addend = relocation.addend();
+    if relocation.has_implicit_addend() {
+        addend = addend.checked_add(implicit).ok_or(ReadError::CodeOutside)?;
+        // A section relocation's field is an address in the input object, not an offset
+        // relative to a named symbol. A PAGE21 alone loses the low address bits; refuse
+        // instead of guessing which later instruction consumes the page register.
+        if let RelocationTarget::Section(index) = relocation.target() {
+            if kind == SiteKind::Page21 {
+                return Err(ReadError::Semantics { at, what: "section-relative PAGE21 has no symbol identifying its full address" });
+            }
+            let address = file.section_by_index(index).map_err(|_| ReadError::NoSection)?.address();
+            addend = addend.checked_sub(address as i64).ok_or(ReadError::CodeOutside)?;
+        }
+    }
+    let (target, addend) = match dest {
+        Destination::Section { index, offset } => {
+            if matches!(kind, SiteKind::GotPage21 | SiteKind::GotLo12) {
+                return Err(ReadError::Semantics { at, what: "GOT relocation to a locally defined symbol" });
+            }
+            local(index, offset.checked_add(addend).ok_or(ReadError::CodeOutside)?, placed, text, start, at)?
+        }
+        Destination::Named(target) if kind == SiteKind::Branch26 => {
+            if addend != 0 { return Err(ReadError::Semantics { at, what: "external branch with a nonzero addend" }); }
+            let veneer = u32::try_from(record.code.len()).map_err(|_| ReadError::CodeOutside)?;
+            let target = record.target(target);
+            // BL sets LR at its original site. The veneer tail-branches, preserving that
+            // return address; a tail B also preserves its caller's LR.
+            for word in [0x9000_0010u32, 0xf940_0210, 0xd61f_0200] { record.code.extend_from_slice(&word.to_le_bytes()); }
+            record.sites.push(Site { at: veneer, kind: SiteKind::Load, target, addend: 0 });
+            (OWN_CODE, i64::from(veneer))
+        }
+        Destination::Named(target) if matches!(kind, SiteKind::GotPage21 | SiteKind::GotLo12) && addend == 0 => (record.target(target), 0),
+        Destination::Named(_) => return Err(ReadError::Semantics { at, what: "direct external address or nonzero GOT addend requires an address relocation" }),
+    };
+    let addend = u32::try_from(addend).map_err(|_| ReadError::Semantics { at, what: "local relocation is outside its record part" })?;
+    let offset = u32::try_from(at).map_err(|_| ReadError::CodeOutside)?;
+    record.code[at as usize..at as usize + 4].copy_from_slice(&(original & !mask).to_le_bytes());
+    record.sites.push(Site { at: offset, kind, target, addend });
+    Ok(())
+}
+
+fn data_relocation(file: &object::File<'_>, relocation: &object::Relocation, at: u64, dest: Destination, placed: &[(SectionIndex, u64)], text: SectionIndex, start: u64, record: &mut CodeRecord<'_>) -> Result<(), ReadError> {
+    if !matches!(relocation.flags(), RelocationFlags::MachO { r_type: macho::ARM64_RELOC_UNSIGNED, r_pcrel: false, r_length: 3 } | RelocationFlags::Elf { r_type: elf::R_AARCH64_ABS64 }) {
+        return Err(unsupported(relocation, at));
+    }
+    let slot = usize::try_from(at).map_err(|_| ReadError::CodeOutside)?;
+    let bytes = record.relro.get(slot..slot + 8).ok_or(ReadError::CodeOutside)?;
+    let mut addend = relocation.addend();
+    if relocation.has_implicit_addend() {
+        addend = addend.checked_add(i64::from_le_bytes(bytes.try_into().map_err(|_| ReadError::CodeOutside)?)).ok_or(ReadError::CodeOutside)?;
+        if let RelocationTarget::Section(index) = relocation.target() {
+            addend = addend.checked_sub(file.section_by_index(index).map_err(|_| ReadError::NoSection)?.address() as i64).ok_or(ReadError::CodeOutside)?;
+        }
+    }
+    let (target, addend) = match dest {
+        Destination::Named(target) => (record.target(target), addend),
+        Destination::Section { index, offset } => local(index, offset.checked_add(addend).ok_or(ReadError::CodeOutside)?, placed, text, start, at)?,
+    };
+    record.relro[slot..slot + 8].fill(0);
+    record.words.push(Word { at: u32::try_from(at).map_err(|_| ReadError::CodeOutside)?, target, addend });
+    Ok(())
+}
+
+fn position_name<'a>(module: &LlvmModule<'_>, row: u32, alloc: Alloc<'a>) -> String<Alloc<'a>> {
+    let mut name = String::from_str_in("blaze_pos_", alloc);
+    name.push_str(&function_name(module, alloc));
+    blaze_own::format_into!(&mut name, "_{row}");
+    name
+}
+
+fn position_section(file: &object::File<'_>, index: SectionIndex, module: &LlvmModule<'_>, alloc: Alloc<'_>) -> Result<bool, ReadError> {
+    // LLVM marks only source-position globals writable. Do not admit arbitrary writable
+    // globals just because they share a section with a position slot.
+    let mut found = false;
+    for symbol in file.symbols().filter(|symbol| symbol.section() == SymbolSection::Section(index) && symbol.kind() == object::SymbolKind::Data) {
+        let name = plain(file.format() == BinaryFormat::MachO, symbol.name().map_err(|_| ReadError::Object)?);
+        if !module.positions.iter().any(|(row, _)| name == position_name(module, *row, alloc)) { return Ok(false); }
+        found = true;
+    }
+    Ok(found)
+}
+
+fn positions(file: &object::File<'_>, module: &LlvmModule<'_>, placed: &[(SectionIndex, u64)], record: &mut CodeRecord<'_>, alloc: Alloc<'_>) -> Result<(), ReadError> {
+    for &(row, patch) in &module.positions {
+        let name = position_name(module, row, alloc);
+        let symbol = file.symbols().find(|symbol| symbol.name().is_ok_and(|s| plain(file.format() == BinaryFormat::MachO, s) == name));
+        // An unused constant can be deleted by LLVM together with all its reads.
+        let Some(symbol) = symbol else { continue };
+        let SymbolSection::Section(index) = symbol.section() else { return Err(ReadError::NoSection) };
+        let Some(&(_, base)) = placed.iter().find(|p| p.0 == index) else { continue };
+        let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
+        let at = symbol.address().checked_sub(section.address()).and_then(|n| n.checked_add(base)).and_then(|n| n.checked_add(u64::from(patch.offset))).and_then(|n| u32::try_from(n).ok()).ok_or(ReadError::CodeOutside)?;
+        let field = match blaze_lir::func::PositionField::from_word(patch.field) {
+            Some(blaze_lir::func::PositionField::Line) => PositionField::Line,
+            Some(blaze_lir::func::PositionField::Col) => PositionField::Col,
+            None => return Err(ReadError::Semantics { at: u64::from(at), what: "unknown source-position field" }),
+        };
+        record.positions.push(PositionRow { part: PositionPart::Relro, at, item: patch.item_key(), site: patch.site, field });
+    }
+    Ok(())
 }
 
 /// A symbol's name as the lowering lane spells it: Mach-O keeps a leading `_` on every
@@ -274,7 +409,7 @@ fn plain<'n>(macho: bool, name: &'n str) -> &'n str {
 
 /// The `Target` of the symbol `name`, as the lowering lane's `references` names it.
 fn target_of(module: &LlvmModule<'_>, name: &str, alloc: Alloc<'_>) -> Result<Target, ReadError> {
-    let Some(target) = module.references.iter().flatten().find(|t| LinkName(**t).spells(name, alloc)) else {
+    let Some(target) = module.references.iter().flatten().chain(module.implicit_references.iter()).find(|t| LinkName(**t).spells(name, alloc)) else {
         let mut spelled = FixedString::<80>::new();
         spelled.try_push_str(name).ok();
         return Err(ReadError::UnknownSymbol { name: spelled });

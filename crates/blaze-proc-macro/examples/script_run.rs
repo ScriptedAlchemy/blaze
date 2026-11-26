@@ -57,6 +57,7 @@ fn main() {
         tree: dir_tree(&blaze_proc_macro::script_sandbox::RealRoot::resolve(&std::path::absolute(Path::new(folder)).expect("the folder's absolute path")).expect("the folder resolves")),
         root: blaze_proc_macro::script_sandbox::ScriptRoot::package(),
         env: owned_env(&env, alloc),
+        private_env_names: Vec::new(),
         target: TARGET.to_owned(),
         host: TARGET.to_owned(),
         c_mode: CMode::Deferred,

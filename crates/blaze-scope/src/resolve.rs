@@ -173,6 +173,21 @@ pub trait SourceTexts<'a> {
         None
     }
 
+    /// A compiler builtin's environment read, shared by item and body expansion. Only
+    /// caller-provided inputs are observed here; Cargo and script facts have their own reads.
+    fn read_env(&self, krate: usize, name: &str) -> Result<Option<&str>, HostError> {
+        let refused = HostError { ask: HostAsk::Env, why: HostWhy::Refused };
+        let env = self.crate_env(krate).ok_or(refused)?;
+        let value = env.get(name).map_err(|_| refused)?;
+        if env.caller_reads(name) {
+            self.caller_env_read(name, env.caller_fact(name));
+        }
+        Ok(value)
+    }
+
+    /// Record an opaque observation; the caller's value is never handed to the recorder.
+    fn caller_env_read(&self, _name: &str, _fact: Option<blaze_ids::ContentId>) {}
+
     /// The planted bug of the attribute-path tests (rule 23,
     /// tests/attr_path_from_expansion.rs): [`AttrPlant::Spelling`] finds an attribute or derive
     /// call on its item by the path's text with the spaces taken out, as before, so a `$crate`
@@ -2451,7 +2466,10 @@ fn lower_modules<'a, P: Par>(
                 None => ProcDecls::Text,
                 Some(list) => ProcDecls::Module { here: if i == 0 { list } else { &[] } },
             };
-            lower(LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0, harness: harness && i == 0, order }, fragment, bump)
+            // A D52 module already owns the registration table its builder compiled and
+            // exported. Only a macro program built from these sources needs a table here.
+            let make_harness = harness && i == 0 && listed.is_none();
+            lower(LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0, harness: make_harness, order }, fragment, bump)
         },
         &mut parts,
     );
@@ -2986,8 +3004,7 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
     /// too; a source without one, or a variable cargo sets whose value is not known, is refused
     /// (rule 3), never answered unset.
     fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
-        let refused = HostError { ask: HostAsk::Env, why: HostWhy::Refused };
-        self.sources.crate_env(self.krate).ok_or(refused)?.get(name).map_err(|_| refused)
+        self.sources.read_env(self.krate, name)
     }
 
     /// A predicate the cfg does not read is false, as the lowering takes it.

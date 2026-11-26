@@ -55,9 +55,26 @@ pub fn from_v1<'a>(record: CodeRecord<'a>, alloc: Alloc<'a>) -> Result<Emitted<'
     }
     for i in 0..view.sites() {
         let site = view.site(i);
+        let single = match site.kind {
+            SiteKind::Page21 => Some(RelocKind::Page21),
+            SiteKind::AddLo12 | SiteKind::LdstLo12_1 => Some(RelocKind::PageOff12 { scale: 0 }),
+            SiteKind::LdstLo12_2 => Some(RelocKind::PageOff12 { scale: 1 }),
+            SiteKind::LdstLo12_4 => Some(RelocKind::PageOff12 { scale: 2 }),
+            SiteKind::LdstLo12_8 => Some(RelocKind::PageOff12 { scale: 3 }),
+            SiteKind::LdstLo12_16 => Some(RelocKind::PageOff12 { scale: 4 }),
+            SiteKind::Branch26 => Some(RelocKind::Branch26),
+            SiteKind::GotPage21 => Some(RelocKind::ImportPage21),
+            SiteKind::GotLo12 => Some(RelocKind::ImportLo12),
+            _ => None,
+        };
+        if let Some(kind) = single {
+            e.relocs.push(Reloc { at: site.at, in_relro: false, kind, target: site.target, addend: i64::from(site.addend) });
+            continue;
+        }
         let (page, off, target, addend) = match site.kind {
             SiteKind::Load | SiteKind::Call => (RelocKind::GotPage21, RelocKind::GotPageOff12, site.target, 0i64),
             SiteKind::Relro => (RelocKind::Page21, RelocKind::PageOff12 { scale: 0 }, OWN_RELRO, i64::from(site.addend)),
+            _ => unreachable!("single-instruction sites handled above"),
         };
         e.relocs.push(Reloc { at: site.at, in_relro: false, kind: page, target, addend });
         e.relocs.push(Reloc { at: site.at + 4, in_relro: false, kind: off, target, addend });

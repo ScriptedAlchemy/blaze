@@ -367,6 +367,10 @@ fn hoist_invariant_loads<A: Allocator + Copy>(
                     }
                     Op::Call
                     | Op::CallIndirect
+                    // An invoke has the same memory effects as a call on its normal
+                    // edge; the unwind successor does not make its output invariant.
+                    | Op::Invoke
+                    | Op::InvokeIndirect
                     | Op::Memcpy
                     | Op::Memmove
                     | Op::Memset
@@ -533,6 +537,8 @@ fn eliminate_dead_stores<A: Allocator + Copy>(
                 }
                 Op::Call
                 | Op::CallIndirect
+                | Op::Invoke
+                | Op::InvokeIndirect
                 | Op::Memcpy
                 | Op::Memmove
                 | Op::Memset
@@ -740,6 +746,49 @@ mod tests {
 
         let out = optimize_memory(func.view(), TestHeap).unwrap();
         assert_eq!(out.stats.loads_hoisted, 1, "non-overlapping invariant load at [ptr+0] must hoist to preheader");
+    }
+
+    /// An unwinding call writes the output slot each iteration. Its following load
+    /// must not be hoisted to the preheader (Iterator::fold's next result).
+    #[test]
+    fn memory_licm_keeps_load_after_invoke_that_writes_its_slot() {
+        for indirect in [false, true] {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(Ty::I64)]);
+            let callee_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let header = b.create_block(BlockKind::Normal);
+            let normal = b.create_block(BlockKind::Normal);
+            let exit = b.create_block(BlockKind::Normal);
+            let unwind = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let callee_ptr = b.param(Ty::PTR);
+            let slot = b.slot(8, 3, SlotKind::Named);
+            let ptr = b.slot_addr(slot);
+            b.jump((header, &[]));
+            b.begin(header);
+            if indirect {
+                b.invoke_indirect(Flags::NONE, callee_ptr, callee_sig, &[ptr], normal, unwind);
+            } else {
+                let callee = b.reference(crate::RefKind::Func, 0);
+                b.invoke(Flags::NONE, callee, callee_sig, &[ptr], normal, unwind);
+            }
+            b.begin(normal);
+            let result = b.load(Ty::I64, Flags::NONE, ptr, 0, MemAttrs::aligned(3));
+            let zero = b.iconst(Ty::I64, 0);
+            let keep = b.icmp(crate::IntCond::Ne, result, zero);
+            b.br(Flags::NONE, keep, (header, &[]), (exit, &[result]));
+            b.begin(exit);
+            let result = b.param(Ty::I64);
+            b.ret(&[result]);
+            b.begin(unwind);
+            let _exception = b.param(Ty::PTR);
+            b.trap(1);
+            let func = b.finish_checked().unwrap();
+            let out = optimize_memory(func.view(), TestHeap).unwrap();
+            assert_eq!(out.stats.loads_hoisted, 0, "invoke may overwrite its output slot");
+        }
     }
 
     #[test]

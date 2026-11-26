@@ -468,7 +468,7 @@ impl CheckoutState<'_> {
             self.watcher.disarm();
             return;
         };
-        if !pointer.certifies_under(&self.tools) {
+        if !pointer.certifies_under(&self.tools) || pointer.caller != blaze_drive::key::ABSENT {
             self.hot_answer = None;
             self.watcher.disarm();
             return;
@@ -849,6 +849,7 @@ fn execute_check_request(
     // 3. ULTRA-FAST CERTIFIED WARM HIT (< 0.2 ms daemon time!).
     let eligible_fast = !reopened
         && poll_was_clean
+        && flags.build_env.is_empty()
         && flags.fix.is_none()
         && !flags.names_oracle.on()
         && flags.origin.is_none()
@@ -995,7 +996,7 @@ fn execute_check_request(
         || dout.leaf_set_changed
         || !state.watcher.is_armed();
 
-    if certified_update.is_none() && !poll_was_clean {
+    if !flags.build_env.is_empty() || (certified_update.is_none() && !poll_was_clean) {
         // Consumed dirty/rescan events without producing a new certified Pointer: clear
         // `hot_answer` AND disarm the watcher so the next request cannot treat the drained
         // kqueue as clean against the stale pre-edit Pointer.
@@ -1066,7 +1067,7 @@ fn try_fast_certified(
     // Presentation miss writes zero bytes and returns `None` -> clean fallthrough.
     let tally = view_slot.certified(cx, hot.lines_key, &mut shown, frame, out).ok()??;
 
-    let whole = hot.facts.printed.bodies_whole;
+    let whole = hot.facts.printed.bodies_whole && tally.unchecked == 0 && shown.behind.items == 0;
     let (ran_stages, not_stages) = crate::check_coverage(hot.facts.printed.names, whole, whole && tally.borrows == 0, frame);
     let coverage = (!not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
     let silent_clean = shown.quiet_when_clean
@@ -1078,17 +1079,9 @@ fn try_fast_certified(
         if crate::print::stage_notes(cx, &not_stages, &shown, frame, out).is_err() {
             return None;
         }
-        let unchecked_only = (tally.unchecked > 0 || shown.behind.items > 0) && shown.counts.errors == 0 && shown.counts.failures == 0;
-        if !unchecked_only
-            && crate::print::closing(cx, &shown, hot.facts.files, phases.since(began), Some(0), None, coverage, frame, out).is_err()
-        {
+        if crate::print::check_closing(cx, &shown, hot.facts.files, phases.since(began), 0, tally.unchecked, coverage, frame, out).is_err() {
             return None;
         }
-    }
-    if let Some(words) = crate::not_checked::items::summary(tally.unchecked, shown.behind, frame)
-        && crate::print::note(cx, words.as_str(), &shown, frame, out).is_err()
-    {
-        return None;
     }
     let status = crate::engine_check::status_of(&tally, 0, &shown, coverage.is_some());
 

@@ -10,7 +10,8 @@
 //!
 //! The `UnitGraph` job names one `MacroModule` part per proc-macro unit ([`parts`]); its
 //! source is the graph's source with the crate's name and version, so a lock or member edit
-//! asks again and nothing else does. Present: a record whose out is the module's wasm digest.
+//! asks again. A present module publishes its validated registration digest: the binary,
+//! dispatch global, and export table tied to this crate identity.
 //! Absent: one filed failure naming the crate and the bootstrap command; the store's listing is
 //! in the part's key ([`MODULE_LISTING`]), so the next command asks again once the store moves.
 
@@ -20,7 +21,7 @@ use blaze_drive::{Input, Kind, Name, Task, TaskFailure, Want, Why};
 use blaze_ids::ContentId;
 use blaze_own::Alloc;
 use blaze_manifest::lock::LockId;
-use blaze_proc_macro::module::{LockedPackages, ModuleError, find_module};
+use blaze_proc_macro::module::{LockedPackages, ModuleError, read_module};
 use blaze_unit_graph::{Unit, UnitKind};
 use blaze_world::procs::{MacroIdentity, Unidentified, git_folders, identify};
 use bstd::cx::Cx;
@@ -31,8 +32,7 @@ use crate::store::Store;
 use crate::work::{Did, Made, held_str};
 
 const SUBJECT_DOMAIN: &str = "blaze-cli macro crate 1";
-const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 1";
-const OUT_DOMAIN: &str = "blaze-cli macro module out 1";
+const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 2";
 /// The rule a refusal of this task names.
 const RULE: &str = "macros.rs";
 /// The module store's folder under blaze's folder in the home (`<home>/.blaze`): its listing
@@ -78,11 +78,11 @@ impl Place<'_, '_> {
 
 /// A macro crate's subject: its name and version.
 pub(crate) fn subject(unit: &Unit<'_>) -> ContentId {
-    let mut text = std::vec::Vec::new_in(Global);
-    text.extend_from_slice(unit.name.as_str().as_bytes());
-    text.push(b' ');
-    text.extend_from_slice(unit.version.as_str().as_bytes());
-    ContentId::of(SUBJECT_DOMAIN, &text)
+    subject_of(unit.name.as_str(), unit.version.as_str())
+}
+
+pub(crate) fn subject_of(package: &str, version: &str) -> ContentId {
+    blaze_ids::Hasher::new(SUBJECT_DOMAIN).update(package.as_bytes()).update(b" ").update(version.as_bytes()).finish()
 }
 
 /// The `MacroModule` parts of a graph record `graph_record` made over the graph source
@@ -215,10 +215,10 @@ pub(crate) fn run<'b>(
             return Ok(Did::FailedSaying(refused("a macro crate without a module identity"), held_str(words.as_str(), held)));
         }
     };
-    match identity.with_id(|id| find_module(&modules, id)) {
-        Ok((_key, wasm_sha256)) => {
+    match identity.with_id(|id| read_module(&modules, id)?.verify_registration()) {
+        Ok(registration) => {
             let mut made = Made::new_in(name, held);
-            made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.as_bytes());
+            made.out = registration;
             Ok(Did::Done(made))
         }
         Err(ModuleError::Missing { name: package, version, key }) => {

@@ -1849,7 +1849,7 @@ impl Plan<'_> {
         };
         let wasm = std::fs::read(wasm_path).map_err(io(Path::new(wasm_path)))?;
         let macros = macros_of(&read(Path::new(expanded_path))?, &wanted.name)?;
-        let decls = decls_export(&wasm).ok_or_else(|| Failure::NoModule {
+        let decls = blaze_manifest::bootstrap::proc_macro_decls(&wasm).ok_or_else(|| Failure::NoModule {
             name: wanted.name.clone(),
             version: wanted.version.clone(),
             why: "the module exports no `__rustc_proc_macro_decls_*` global".to_owned(),
@@ -1884,52 +1884,6 @@ impl Plan<'_> {
         };
         Ok(Built { key, wasm_sha256, size: wasm.len(), macros, assumed_default, fresh })
     }
-}
-
-/// The name of the module's exported `__rustc_proc_macro_decls_*` global, from its export
-/// section.
-fn decls_export(wasm: &[u8]) -> Option<String> {
-    fn leb(bytes: &[u8], at: &mut usize) -> Option<u64> {
-        let mut value = 0u64;
-        let mut shift = 0;
-        loop {
-            let byte = *bytes.get(*at)?;
-            *at += 1;
-            value |= u64::from(byte & 0x7f) << shift;
-            if byte < 0x80 {
-                return Some(value);
-            }
-            shift += 7;
-            if shift > 63 {
-                return None;
-            }
-        }
-    }
-    let mut at = 8;
-    while at < wasm.len() {
-        let id = wasm[at];
-        at += 1;
-        let size = usize::try_from(leb(wasm, &mut at)?).ok()?;
-        let end = at.checked_add(size)?;
-        if id == 7 {
-            let mut p = at;
-            let count = leb(wasm, &mut p)?;
-            for _ in 0..count {
-                let len = usize::try_from(leb(wasm, &mut p)?).ok()?;
-                let name = std::str::from_utf8(wasm.get(p..p + len)?).ok()?;
-                p += len;
-                let kind = *wasm.get(p)?;
-                p += 1;
-                leb(wasm, &mut p)?;
-                if kind == 3 && name.starts_with("__rustc_proc_macro_decls_") {
-                    return Some(name.to_owned());
-                }
-            }
-            return None;
-        }
-        at = end;
-    }
-    None
 }
 
 fn main_with(args: &Args, heap: &blaze_own::Heap) -> i32 {

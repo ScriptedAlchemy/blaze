@@ -130,6 +130,9 @@ impl LayoutMember for Member02<'_> {
     fn relro(&self) -> &[u8] {
         self.record.relro()
     }
+    fn relro_align(&self) -> u8 {
+        self.record.relro_align()
+    }
     fn words(&self) -> usize {
         self.record.words()
     }
@@ -670,7 +673,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
         if folded {
             home[i as usize] = home[order[r] as usize];
         } else {
-            pad_to(&mut text, plan.text_at, 16);
+            pad_to(&mut text, plan.text_at, 1u64 << m.record.code_align());
             home[i as usize] = plan.text_at + text.len() as u64;
             text.extend_from_slice(m.record.code());
         }
@@ -681,6 +684,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
     // Every target a placed record USES (a poll's page is not used: see the module's
     // documentation): C names gathered, thread-locals checked for runtime and datum.
     let mut imports: AVec<'a, Import<'r>> = Vec::new_in(alloc);
+    let mut bound_got = Vec::new_in(alloc);
     for (pos, &i) in order.iter().enumerate() {
         if rep[pos] as usize != pos {
             continue;
@@ -688,7 +692,14 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
         let m = &members[i as usize];
         let r = m.record;
         let words = (0..r.words()).map(|w| r.word(w).target);
-        let relocs = (0..r.relocs()).filter(|&k| r.reloc(k).in_relro || !in_poll(&r, r.reloc(k).at)).map(|k| r.reloc(k).target);
+        let relocs = (0..r.relocs()).map(|k| r.reloc(k)).filter(|rel| rel.in_relro || !in_poll(&r, rel.at)).map(|rel| {
+            if matches!(rel.kind, RelocKind::ImportPage21 | RelocKind::ImportLo12)
+                && let Some(target) = named(&r, rel.target)
+                && matches!(target.space, Space::Func | Space::Static | Space::Vtable) {
+                bound_got.push(target);
+            }
+            rel.target
+        });
         for target in words.chain(relocs) {
             let Some(t) = named(&r, target) else { continue };
             match t.space {
@@ -767,7 +778,9 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
     }
     let text_end = plan.text_at + text.len() as u64;
 
-    let mut regions = lay_out_const_and_data(members, &order, &rep, data, &by_target, imports.len(), tls_plan, text_end, plan, tail, alloc)?;
+    bound_got.sort_unstable();
+    bound_got.dedup();
+    let mut regions = lay_out_const_and_data(members, &order, &rep, data, &by_target, imports.len(), bound_got.len(), tls_plan, text_end, plan, tail, alloc)?;
     let got_at = regions.got_at;
     let word_of = |symbol: Symbol| -> u64 {
         match import_of(symbol) {
@@ -792,6 +805,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
     // Every word the loader fixes: the GOT's first, then the relocations' and words' of each
     // record, then the data's; sorted by offset at the end.
     let mut fixups: AVec<'a, Fixup> = Vec::new_in(alloc);
+    regions.fix_bound_words(&bound_got, |t| target_home(members, &by_symbol, &home, data, &by_target, &regions.data_home, regions.tls_desc, t), &mut fixups)?;
     for k in 0..imports.len() {
         fixups.push(Fixup { at: regions.got_at + 8 * k as u64, to: FixTo::Bind { import: k as u32 } });
     }
@@ -883,6 +897,11 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                     let inst = read32(&text, x);
                     let to = address(reloc, &regions)?;
                     write32(&mut text, x, page_offset(inst, scale, to, u64::from(reloc.at), symbol).map_err(ExportError::Place)?);
+                }
+                RelocKind::ImportPage21 | RelocKind::ImportLo12 => {
+                    let word = regions.import_word(r.target(reloc.target as usize), symbol, &imports, &bound_got)?;
+                    let kind = if reloc.kind == RelocKind::ImportPage21 { blaze_code::record::SiteKind::GotPage21 } else { blaze_code::record::SiteKind::GotLo12 };
+                    blaze_code::a64::single_site(&mut text, x, pc, word, kind, symbol)?;
                 }
                 RelocKind::GotPage21 => {
                     let inst = expect(&text, x, ADRP, symbol, "adrp")?;

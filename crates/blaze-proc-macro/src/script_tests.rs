@@ -275,6 +275,7 @@ fn script(name: &str, tree: Tree, env: Vec<(String, String)>) -> Arc<Script> {
         // The workspace's root package: the wasm fixtures name `workspace/a.txt`.
         root: crate::script_sandbox::ScriptRoot::member("").expect("the root package"),
         env,
+        private_env_names: Vec::new(),
         target: "aarch64-apple-darwin".to_owned(),
         host: "aarch64-apple-darwin".to_owned(),
         c_mode: CMode::Deferred,

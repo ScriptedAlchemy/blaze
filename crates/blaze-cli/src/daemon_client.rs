@@ -377,7 +377,7 @@ fn parse_check_dir<'a>(args: &'a [&'a str]) -> Option<Option<&'a str>> {
             return None;
         }
         match arg {
-            "-p" | "--package" | "-F" | "--features" | "-o" | "--output" | "--view" | "--grant" | "--bin" | "--workers" | "--status-every" | "--color" | "--origin" | "--origin-key" => {
+            "-p" | "--package" | "-F" | "--features" | "-o" | "--output" | "--view" | "--grant" | "--build-env" | "--bin" | "--workers" | "--status-every" | "--color" | "--origin" | "--origin-key" => {
                 // Skip its value; if missing, let standalone print Usage.
                 if args.get(at).is_none() {
                     return None;

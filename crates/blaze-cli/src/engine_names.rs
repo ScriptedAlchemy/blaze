@@ -430,7 +430,7 @@ impl<'f> NamesStage<'f> {
             let edges = || edges_listed(list, index);
             let settled = if expanded {
                 edges().all(|g| walk.ready[g] == (walk.generation, true))
-            } else if names.script_of(index).is_some_and(&mut *pending) || edges().any(|g| pending(self.crate_names[g])) {
+            } else if names.script_of(index).is_some_and(&mut *pending) || names.proc_module_of(index).is_some_and(&mut *pending) || edges().any(|g| pending(self.crate_names[g])) {
                 false
             } else {
                 walk.post.push((index, true));
@@ -560,7 +560,8 @@ impl<'f> NamesStage<'f> {
                         clock.names_entered(name, crates[at].input.name);
                         clock.names_admitted(name, crates[at].input.name)
                     });
-                    let script = names.script_of(at).map(|script| lookup(&self.made, name, script, failed_out)).transpose()?;
+                    let producers = ScopeProducers::read(names, at, |producer| lookup(&self.made, name, producer, failed_out))?;
+                    let script = producers.script;
                     let gate = match (runner, world.refusal(at), script) {
                         (Err(words), _, _) => Err(Blocked::Runner(words)),
                         (_, Some(why), _) => Err(Blocked::Shelf(why)),
@@ -612,7 +613,7 @@ impl<'f> NamesStage<'f> {
                             let scratch = blaze_own::Erased::new(cx.frame());
                             let mut deps = inputs.dependencies(at, name, scratch.handle())?;
                             let fail = |why, words| WorkerAnswer {
-                                done: crate::engine_tasks::failed_with(task, failure_reads(&deps, script, alloc), alloc),
+                                done: crate::engine_tasks::failed_with(task, failure_reads(&deps, producers, alloc), alloc),
                                 result: Err((TaskFailure { name, why }, words)),
                             };
                             let procs = match gate {
@@ -638,16 +639,16 @@ impl<'f> NamesStage<'f> {
                                     Mapped::Unreadable(why) => {
                                         let words = blaze_own::format_in!(alloc, "crate `{}`: the record of its dependency `{}`: {why}", crates[at].input.name, crates[g].input.name);
                                         let failed = TaskFailure { name, why: Why::Refused { what: "a dependency's record", rule: crate::names::RULE } };
-                                        return Ok(WorkerAnswer { done: crate::engine_tasks::failed_with(task, failure_reads(&deps, script, alloc), alloc), result: Err((failed, Some(words))) });
+                                        return Ok(WorkerAnswer { done: crate::engine_tasks::failed_with(task, failure_reads(&deps, producers, alloc), alloc), result: Err((failed, Some(words))) });
                                     }
                                 }
                             }
-                            let job = Job { at, crates, all, deps: &deps, script: script_bytes, home, env, packs, corrected, procs, kept, workers, oracle, clock, board, serve };
+                            let job = Job { at, crates, all, deps: &deps, producers, script: script_bytes, home, env, packs, corrected, procs, kept, workers, oracle, clock, board, serve };
                             job.run(cx, root, task, outlined, alloc)
                         });
                         shown.end(board.now(clock));
                         Ok::<_, Infallible>((result, crate::engine_times::ns(began.since_start()), crate::engine_times::ns(clock.now().since_start()), cx.frame().committed() as u64))
-                    }), at, script, {
+                    }), at, producers, {
                         #[cfg(test)] { end_tick }
                         #[cfg(not(test))] { () }
                     }));
@@ -663,7 +664,7 @@ impl<'f> NamesStage<'f> {
             }
             let mut stopped = None;
             let mut error = None;
-            for (i, handle, at, script, _end_tick) in running {
+            for (i, handle, at, producers, _end_tick) in running {
                 let task = &tasks[i];
                 let name = task.planned.name;
                 match handle.join(&cx) {
@@ -685,7 +686,7 @@ impl<'f> NamesStage<'f> {
                                     Ok(deps) => deps,
                                     Err(why) => { error.get_or_insert(why.into()); continue; }
                                 };
-                                let reads = failure_reads(&deps, script, alloc);
+                                let reads = failure_reads(&deps, producers, alloc);
                                 answered.push((i, Completion {
                                     done: crate::engine_tasks::failed_with(task, reads, alloc),
                                     result: Err(Failure { failure: TaskFailure { name, why: Why::Panicked { used: committed, limit: crate::names::SCOPE_FRAME as u64 } }, words: None }),
@@ -1127,7 +1128,6 @@ struct WaitingName<'j, 'a> {
     task: EngineTask,
     scope: &'j bstd::task::Scope<'j>,
     job: Job<'j>,
-    script: Option<(Input, bool)>,
     blocked: Option<(Why, Option<blaze_own::String<SharedAlloc<'a>>>)>,
     root: &'j Dir<ReadWrite>,
     clock: &'j bstd::clock::Clock,
@@ -1141,7 +1141,7 @@ struct WaitingName<'j, 'a> {
 
 impl<'j, 'a: 'j> WaitingName<'j, 'a> {
     fn start(self, frame: &'j Frame) -> RunningName<'j, 'a> {
-        let Self { task, scope, job, script, blocked, root, clock, board, outlined, alloc, waiter, submitted } = self;
+        let Self { task, scope, job, blocked, root, clock, board, outlined, alloc, waiter, submitted } = self;
         let name = task.planned.name;
         #[cfg(test)]
         let end_tick = crate::engine_scripts::runner_clock().map(|sim| sim.names_admitted(name, job.crates[job.at].input.name)).filter(|tick| *tick > 0);
@@ -1154,7 +1154,7 @@ impl<'j, 'a: 'j> WaitingName<'j, 'a> {
             let start = crate::engine_times::ns(clock.now().since_start());
             let shown = board.show(Stage::Names, label, 0, board.now(clock));
             let failure = |why, words| WorkerAnswer {
-                done: crate::engine_tasks::failed_with(&task, failure_reads(job.deps, script, alloc), alloc),
+                done: crate::engine_tasks::failed_with(&task, failure_reads(job.deps, job.producers, alloc), alloc),
                 result: Err((TaskFailure { name, why }, words)),
             };
             let answer = match work::unwinding(|| match blocked {
@@ -1308,7 +1308,8 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         let krate = columns.crates[at].input.name;
         #[cfg(test)]
         if let Some(clock) = crate::engine_scripts::runner_clock() { clock.names_entered(name, krate); }
-        let script = names.script_of(at).map(|script| lookup(&stage.made, name, script, stage.failed_out)).transpose()?;
+        let producers = ScopeProducers::read(names, at, |producer| lookup(&stage.made, name, producer, stage.failed_out))?;
+        let script = producers.script;
         let refused = |what| Why::Refused { what, rule: crate::names::RULE };
         let mut gate = match (runner, world.refusal(at), script) {
             (Err(words), _, _) => Err((refused("the proc-macro runner could not be made"), Some(blaze_own::String::from_str_in(words, alloc)))),
@@ -1326,7 +1327,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         for g in edges_of(&columns.crates[at], all, at) {
             self.edges.push((name, stage.crate_names[g]));
         }
-        if let Some((input, _)) = script {
+        for (input, _) in producers.iter() {
             self.edges.push((name, input.name));
         }
         self.mapped.resize(columns.crates.len(), None);
@@ -1390,10 +1391,10 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
             }
         } else { None };
         let workers = self.set_width(scope, handles, scripts_pending);
-        let job = Job { at, crates: columns.crates, all, deps, script: script_bytes, home: handles.env.home, env, packs: columns.packs,
+        let job = Job { at, crates: columns.crates, all, deps, producers, script: script_bytes, home: handles.env.home, env, packs: columns.packs,
             corrected: columns.corrected, procs: gate.as_ref().ok().copied().flatten(), kept: handles.env.heap.shared(), workers, oracle: handles.oracle, clock: &handles.env.clock, board: handles.board, serve: handles.serve() };
         self.order.insert((!feeds_names, task.planned.phase.wave, name), task);
-        self.waiting.push_back(WaitingName { task, scope, job, script, blocked: gate.err(), root: handles.root, clock: &handles.env.clock,
+        self.waiting.push_back(WaitingName { task, scope, job, blocked: gate.err(), root: handles.root, clock: &handles.env.clock,
             board: handles.board, outlined: handles.outlined, alloc, waiter, submitted: crate::engine_times::ns(handles.env.clock.now().since_start()) });
         self.dispatch();
         Ok(())
@@ -1472,10 +1473,29 @@ fn dep_input_cell(dep: &Dependency<'_>) -> (CellId, ContentId) {
     }
 }
 
-fn failure_reads<'a>(deps: &[Dependency<'_>], script: Option<(Input, bool)>, alloc: SharedAlloc<'a>) -> SVec<'a, (CellId, ContentId)> {
-    let mut reads = SVec::with_capacity_in(deps.len() + usize::from(script.is_some()), alloc);
+#[derive(Clone, Copy)]
+struct ScopeProducers {
+    script: Option<(Input, bool)>,
+    registration: Option<(Input, bool)>,
+}
+
+impl ScopeProducers {
+    fn read(names: &Names<'_>, at: usize, lookup: impl Fn(Name) -> Result<(Input, bool), EngineCheckError>) -> Result<Self, EngineCheckError> {
+        Ok(Self {
+            script: names.script_of(at).map(&lookup).transpose()?,
+            registration: names.proc_module_of(at).map(lookup).transpose()?,
+        })
+    }
+
+    fn iter(self) -> impl Iterator<Item = (Input, bool)> {
+        self.script.into_iter().chain(self.registration)
+    }
+}
+
+fn failure_reads<'a>(deps: &[Dependency<'_>], producers: ScopeProducers, alloc: SharedAlloc<'a>) -> SVec<'a, (CellId, ContentId)> {
+    let mut reads = SVec::with_capacity_in(deps.len() + producers.iter().count(), alloc);
     reads.extend(deps.iter().map(dep_input_cell));
-    reads.extend(script.map(|(input, absent)| input_cell(input, absent)));
+    reads.extend(producers.iter().map(|(input, absent)| input_cell(input, absent)));
     reads
 }
 
@@ -1484,6 +1504,7 @@ struct Job<'j> {
     crates: &'j [blaze_world::Crate<'j>],
     all: Sysroot,
     deps: &'j [Dependency<'j>],
+    producers: ScopeProducers,
     script: Option<(Input, &'j [u8])>,
     home: Option<&'j str>,
     env: Option<EnvLent<'j, 'j>>,
@@ -1568,9 +1589,8 @@ impl Job<'_> {
         let local = bump.alloc();
         let krate = self.crates[self.at];
         let name = task.planned.name;
-        let script_input = self.script.map(|(input, _)| input);
         let refuse = |what, words| WorkerAnswer {
-            done: crate::engine_tasks::failed_with(task, failure_reads(self.deps, script_input.map(|s| (s, false)), alloc), alloc),
+            done: crate::engine_tasks::failed_with(task, failure_reads(self.deps, self.producers, alloc), alloc),
             result: Err((TaskFailure { name, why: Why::Refused { what, rule: crate::names::RULE } }, Some(words))),
         };
         let area;
@@ -1657,7 +1677,25 @@ impl Job<'_> {
             }
             (env, _) => env,
         };
-        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, member: krate.member, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs.into(), corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
+        let proc_exports = match (self.producers.registration, self.procs) {
+            (Some((record, false)), Some(runner)) => match runner.exports(self.at, record.out) {
+                Ok(exports) => exports.map(|exports| {
+                    let mut registered = blaze_own::Vec::with_capacity_in(exports.len(), cx.frame());
+                    for export in exports {
+                        let mut helpers = blaze_own::String::new_in(cx.frame());
+                        for (i, helper) in export.helpers.iter().enumerate() {
+                            if i > 0 { helpers.push_str(", "); }
+                            helpers.push_str(helper);
+                        }
+                        registered.push(blaze_scope::task::ProcExport { kind: export.kind, name: &export.name, helpers: helpers.into_bump_str() });
+                    }
+                    &*registered.into_bump_slice()
+                }),
+                Err(why) => return Ok(refuse("a proc-macro crate's registration", blaze_own::format_in!(alloc, "crate `{}`: {why}", input.name))),
+            },
+            _ => None,
+        };
+        let job = ScopeJob { workers: self.workers, kept: self.kept, at: self.at, proc_exports, member: krate.member, input: CrateInput { deps: &own_deps, ..input }, deps: &exports, sysroot, packs: self.packs.into(), corrected: self.corrected, env, procs: self.procs, oracle: self.oracle, clock: self.clock, board: Some(self.board) };
         let (resolved, ok, unresolved, oracle) = match crate::names::resolve(cx, root, &job, cx.frame()).0 {
             Resolution::Made { resolved, ok, unresolved, oracle } => (resolved, ok, unresolved, oracle),
             Resolution::Need(keys) => return need(&keys),
@@ -1722,7 +1760,7 @@ impl Job<'_> {
         found.outlined.sort_unstable_by_key(|one| one.name);
         found.probes.sort_unstable_by_key(|(slot, ..)| Name::file(slot));
         let implicit_entry_root = input.implicit.entry.then(|| input.root.strip_prefix("/0/")).flatten();
-        finish(task, input.name, implicit_entry_root, resolved, ok, unresolved, oracle, &order, script_input, outlined, found, alloc, local, self.kept)
+        finish(task, input.name, implicit_entry_root, resolved, ok, unresolved, oracle, &order, self.producers, outlined, found, alloc, local, self.kept)
     }
 }
 
@@ -1792,7 +1830,7 @@ fn unseen_file(task: Name, read: Name, krate: &str, path: &str, heap: SharedAllo
 }
 
 #[expect(clippy::too_many_arguments, reason = "one resolved crate and the inputs it was handed")]
-fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], script: Option<Input>, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
+fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], producers: ScopeProducers, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
     let name = task.planned.name;
     // A file this crate found and its worker outlined (which may upgrade a walk `DATA_FILE` to a
     // Rust outline), else one the request's outlines hold.
@@ -1802,7 +1840,7 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
     record.out = resolved.out;
     resolved.file_findings(&mut record).map_err(|crate::names::FindingText(what)| WorkerError::Finding(what))?;
     let (files, absent, data) = resolved.checkout_reads();
-    let count = files.len() + absent.len() + data.len() + deps.len() + usize::from(script.is_some());
+    let count = files.len() + absent.len() + data.len() + deps.len() + producers.iter().count();
     record.reads.reserve(count);
     let mut reads = SVec::with_capacity_in(count, alloc);
     // A file read the plan did not hand ([`unoutlined`] found none before this call; kept so a
@@ -1865,9 +1903,13 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
         record.reads.push((dep.input.name, dep.input.out));
         reads.push(dep_input_cell(dep));
     }
-    if let Some(input) = script {
+    for (input, absent) in producers.iter() {
         record.reads.push((input.name, input.out));
-        reads.push(input_cell(input, false));
+        reads.push(input_cell(input, absent));
+    }
+    for &(cell, digest) in &resolved.caller_reads {
+        record.reads.push((cell.of, digest));
+        reads.push((cell, digest));
     }
     reads.sort_unstable_by_key(|row| row.0);
     reads.dedup_by_key(|row| row.0);
