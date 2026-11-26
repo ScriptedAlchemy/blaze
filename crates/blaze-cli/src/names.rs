@@ -970,7 +970,7 @@ pub(crate) struct NamesWorld<'f> {
     /// Each crate's build-script module lookup (script_modules.rs), sorted by subject, then
     /// crate: one entry a crate reading a script, so two crates of one module are two entries.
     script_modules: std::vec::Vec<crate::script_modules::ScriptModule, Global>,
-    /// The plan of the checked scripts and of their standalone host producers.
+    /// The plan of the checked scripts and of their standalone build-dependency producers.
     runs: std::vec::Vec<blaze_world::crate_list::Run<'static>, Global>,
     /// The unit graph the world was made from (leaked with it): a proc-macro crate's unit, whose
     /// module identity the runner keys it by (proc_runner.rs).
@@ -1616,7 +1616,7 @@ fn make_world<'f>(
     let mut script_modules = std::vec::Vec::new_in(Global);
     let mut seeds = blaze_own::Vec::new_in(frame);
     let mut facts = blaze_own::Vec::new_in(frame);
-    facts.resize(graph.units.len(), [None; 3]);
+    facts.resize(graph.units.len(), [None; 4]);
     for (at, unit) in script_units(world.crates.iter().map(|krate| krate.origin), |unit| graph.units[unit.index()].build_script) {
         let module = plan_script_module(graph, lock, unit, Some(at), home, heap);
         script_roots.push((at, graph.units[unit.index()].root.as_str()));
@@ -1632,17 +1632,24 @@ fn make_world<'f>(
         }
         script_modules.push(module);
     }
-    let plans = run_plan::runs(graph, seeds.iter().copied(), frame_alloc);
+    let wasi_local = |consumer: blaze_unit_graph::UnitId, producer: blaze_unit_graph::UnitId| {
+        let consumer_unit = &graph.units[consumer.index()];
+        let producer_unit = &graph.units[producer.index()];
+        matches!(lock.package(consumer_unit.package).source, LockSource::Path)
+            && matches!(lock.package(producer_unit.package).source, LockSource::Path)
+            && crate::scripts::placement(Some(home), graph, consumer, heap) == crate::scripts::RanAs::Wasm
+    };
+    let plans = run_plan::runs(graph, seeds.iter().copied(), wasi_local, frame_alloc);
     for plan in plans.iter().filter(|plan| plan.id.consumer == Consumer::HostDependency) {
         let id = plan.id;
         let unit = &graph.units[id.unit.index()];
         let module = plan_script_module(graph, lock, id.unit, None, home, heap);
-        let source = run_plan::host_source(graph, lock, paths, id.unit).ok_or_else(|| NamesError::World(std::format!(
+        let source = run_plan::dependency_source(graph, lock, paths, id.unit, id.side).ok_or_else(|| NamesError::World(std::format!(
             "the build script of {} {} has no host library to serve", unit.name.as_str(), unit.version.as_str()
         )))?;
         let member = paths.iter().any(|entry| entry.id == unit.package && entry.kind == blaze_world::PathKind::Member);
         let input = RunInputs { host_dependency: true, member, ran_as: module.ran_as as u8, source: source.0, module: module.subject.0 };
-        facts[id.unit.index()][id.slot()] = Some((run_plan::host_name(source).subject.0, input));
+        facts[id.unit.index()][id.slot()] = Some((run_plan::dependency_name(source).subject.0, input));
         script_modules.push(module);
     }
     let mut runs = std::vec::Vec::with_capacity_in(plans.len(), Global);

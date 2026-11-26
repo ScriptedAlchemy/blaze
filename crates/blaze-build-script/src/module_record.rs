@@ -35,6 +35,15 @@ impl Digest {
         }
         Self(text)
     }
+
+    pub fn content(self) -> blaze_ids::ContentId {
+        let nibble = |byte| if byte <= b'9' { byte - b'0' } else { byte - b'a' + 10 };
+        let mut id = [0; 32];
+        for (pair, byte) in self.0.chunks_exact(2).zip(&mut id) {
+            *byte = (nibble(pair[0]) << 4) | nibble(pair[1]);
+        }
+        blaze_ids::ContentId(id)
+    }
 }
 
 /// The same source receipt spelling each D52 module has used since module format 3.

@@ -50,6 +50,7 @@ use blaze_build_script::module_record::{Executable, Selected};
 use blaze_build_script::native::Runner;
 use blaze_build_script::outputs::OutputsRef;
 use blaze_build_script::probe::Row;
+use blaze_build_script::producer_outputs::Binding;
 use blaze_build_script::toolchain::Mode;
 use blaze_drive::{Input, Kind, Name, Task, Want};
 use blaze_ids::ContentId;
@@ -57,6 +58,7 @@ use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, Erased};
 use blaze_proc_macro::native_unit::{NativeSetting, placed};
 use blaze_proc_macro::script::ScriptRuntime;
+use blaze_proc_macro::script_sandbox::dep_mount::VerifiedProducer;
 use blaze_proc_macro::script_sandbox::{ScriptRoot, Tree, dir_tree, mem_tree_with_submodules};
 use blaze_proc_macro::script_unit::{self, Consumer, Setting};
 use blaze_proc_macro::spawn_route::SpawnSetting;
@@ -247,9 +249,12 @@ pub(crate) fn parts<A: core::alloc::Allocator>(keys: impl Iterator<Item = (Conte
 /// Plan script sources for this command, including the environment of member scripts.
 pub(crate) fn parts_for<A: core::alloc::Allocator>(names: &crate::names::Names<'_>, env: &FetchEnv<'_>, alloc: A) -> blaze_own::Vec<(Name, ContentId), A> {
     let mut parts = parts(names.script_keys(), sdk_identity(env), alloc);
-    if env.caller_env.identity().is_some() {
-        for (name, source) in &mut parts {
-            if names.script_run(name.subject).is_some_and(|run| run.inputs.member) {
+    for (name, source) in &mut parts {
+        if let Some(run) = names.script_run(name.subject) {
+            if run.inputs.host_dependency && run.side == Side::Macro {
+                *source = blaze_ids::Hasher::new("blaze WASI producer toolchain 1").id(source).part(&env.toolchain.0).finish();
+            }
+            if run.inputs.member {
                 *source = env.caller_env.with_source(*source);
             }
         }
@@ -317,6 +322,7 @@ pub(crate) struct Scripts<'f> {
     graph: &'f UnitGraph<'f>,
     /// Lightweight toolchain + script-cfg world when `Names` has not built the full world yet.
     script_world: Option<&'f blaze_world::ScriptWorld<'f>>,
+    wasi_cfg: Option<Result<&'f [(&'f str, Option<&'f str>)], &'f str>>,
     sources: StoreSources<'f, 'f, 'f, SourcesDir<'f>>,
     lock: &'f Lock<'f>,
     /// Each checkout path package's lock entry, folder (checkout-relative), and kind (member vs
@@ -539,7 +545,23 @@ impl<'f> Scripts<'f> {
         let folder = crate::fetch::sources_native(env, frame).ok_or(SetupError::NoHome)?;
         let dir = SourcesDir { folder: crate::work::held_str(folder.as_str(), frame), frame };
         let sources = StoreSources::new(lock, dir, blaze_fetch::pack::PackView::open_source_put, alloc).map_err(|error| SetupError::Sources(said(frame, format_args!("{error}"))))?;
-        Ok(Scripts { shared: None, graph_record, graph, script_world, sources, lock, members, files: std::vec::Vec::new_in(Global), setups_opened: 0 })
+        Ok(Scripts { shared: None, graph_record, graph, script_world, wasi_cfg: None, sources, lock, members, files: std::vec::Vec::new_in(Global), setups_opened: 0 })
+    }
+
+    fn wasi_cfg(&mut self, cx: &Cx, env: &FetchEnv<'_>, frame: &'f Frame) -> Result<&'f [(&'f str, Option<&'f str>)], &'f str> {
+        *self.wasi_cfg.get_or_insert_with(|| {
+            let home = env.home.ok_or("the toolchain shelf has no home")?;
+            let mut shelf = crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(|error| said(frame, format_args!("{error}")))?;
+            let manifest = blaze_toolchain::shelf::open_manifest(&mut shelf, env.toolchain).map_err(|error| said(frame, format_args!("{error}")))?;
+            let manifest = blaze_toolchain::ToolchainView::open(manifest.as_ref(), env.toolchain).expect("open_manifest checked the toolchain record");
+            let cfg = manifest.cfg(MACRO_TARGET).ok_or("the toolchain shelf has no wasm32-wasip1 target cfg")?;
+            let mut rows = blaze_own::Vec::new_in(frame);
+            rows.extend(cfg.filter(|(name, _)| !matches!(*name, "panic" | "debug_assertions"))
+                .map(|(name, value)| (crate::work::held_str(name, frame), value.map(|value| crate::work::held_str(value, frame)))));
+            rows.push(("panic", Some("abort")));
+            rows.sort_unstable();
+            Ok(rows.into_bump_slice())
+        })
     }
 
     /// The shared setups opened this command: 1 once a job was made ready to run, else 0.
@@ -676,11 +698,19 @@ pub(crate) struct ScriptJob<'j> {
     files: Files<'j>,
     /// Each script of its `links` closure ([`links_closure`]), sorted by unit, each once.
     producers: &'j [Producer<'j>],
+    build_dependencies: &'j [BuildDependency<'j>],
     /// The admitted outputs of this run's producers, keyed by their task names.
     producer_reads: &'j [(Name, ContentId)],
     /// What a member's run that read the checkout gives ([`CheckoutReads`]): a hole unless its
     /// caller keeps the reads as cells.
     pub(crate) checkout: CheckoutReads,
+}
+
+struct BuildDependency<'j> {
+    name: &'j str,
+    version: &'j str,
+    selected: Selected,
+    bytes: &'j [u8],
 }
 
 /// What a member build script's reads of the checkout give (engine_scripts.rs sets it).
@@ -903,11 +933,19 @@ pub(crate) fn job<'f: 'j, 'j>(
     };
     let (script, side) = (UnitId(run.unit), run.side);
     let consumer = if run.inputs.host_dependency { Consumer::HostDependency } else { Consumer::Checked };
+    let standalone_cfg = if run.inputs.host_dependency && side == Side::Macro {
+        match scripts.wasi_cfg(&cx, env, frame) {
+            Ok(cfg) => cfg,
+            Err(words) => return Ok(Prepared::Said { what: "a WASI build dependency's target cfg is unavailable", words: said(jobs, format_args!("{} {}: {words}", run.name, run.version)), hole: true }),
+        }
+    } else {
+        &[]
+    };
     // A checked crate's run takes its crate's cfg. A standalone producer's worker
     // takes the resolved host configuration directly from the graph.
     let script_world = scripts.script_world;
     let (world, raw_cfg): (&blaze_world::World<'_>, &[(&str, Option<&str>)]) = match names.made().filter(|made| made.has_open_packs()) {
-        Some(made) if run.inputs.host_dependency => (made.world(), &[]),
+        Some(made) if run.inputs.host_dependency => (made.world(), standalone_cfg),
         Some(made) => {
             let world = made.world();
             let wanted = blaze_world::Script::Read { subject: task.name.subject };
@@ -927,7 +965,7 @@ pub(crate) fn job<'f: 'j, 'j>(
             let Some(sw) = script_world else {
                 return Err(CliError::Text { what: "the standalone build-script producer has no script world" });
             };
-            (&sw.world, &[])
+            (&sw.world, standalone_cfg)
         }
         None => {
             let Some(sw) = script_world else {
@@ -982,11 +1020,33 @@ pub(crate) fn job<'f: 'j, 'j>(
         }
     };
     let mut producer_reads = blaze_own::Vec::new_in(jobs);
+    let mut build_dependencies = blaze_own::Vec::new_in(jobs);
     for producer in run.producers() {
         let name = Name::new(Kind::Script, ContentId(producer));
-        match task.inputs.iter().find(|input| input.name == name) {
-            Some(input) => producer_reads.push((name, input.out)),
-            None => wants.push(Want { name, home: Name::unit_graph() }),
+        let Some(input) = task.inputs.iter().find(|input| input.name == name) else {
+            wants.push(Want { name, home: Name::unit_graph() });
+            continue;
+        };
+        producer_reads.push((name, input.out));
+        if let Some(dep) = names.script_run(name.subject)
+            && dep.inputs.host_dependency && dep.side == Side::Macro
+        {
+            let module_name = crate::script_modules::name(ContentId(dep.inputs.module));
+            let Some(module) = task.inputs.iter().find(|input| input.name == module_name) else {
+                wants.push(Want { name: module_name, home: Name::unit_graph() });
+                continue;
+            };
+            let proof = crate::work::payload(&cx, store, module, jobs)?;
+            let Some(selected) = Selected::decode(proof.payload()).filter(|selected| {
+                selected.executable() == Executable::Wasm && crate::script_modules::selected_out(*selected) == module.out
+            }) else {
+                return Ok(Prepared::Said { what: "a WASI build dependency has no valid module proof", words: said(jobs, format_args!("{} {}: the selected producer is not a proved WASI module", dep.name, dep.version)), hole: false });
+            };
+            producer_reads.push((module_name, module.out));
+            let bytes = held_bytes(crate::work::payload(&cx, store, input, jobs)?.payload(), jobs);
+            build_dependencies.push(BuildDependency {
+                name: crate::work::held_str(dep.name, jobs), version: crate::work::held_str(dep.version, jobs), selected, bytes,
+            });
         }
     }
     if !wants.is_empty() {
@@ -998,7 +1058,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     let mut producers: blaze_own::Vec<Producer<'j>, &'j Frame> = blaze_own::Vec::with_capacity_in(closure.len(), jobs);
     for (input, links, direct) in closure.iter() {
         let dep = if run.inputs.host_dependency {
-            plan::host_source(graph, lock, members, *input).map(plan::host_name)
+            plan::dependency_source(graph, lock, members, *input, side).map(plan::dependency_name)
         } else {
             name_of(graph, *input, side, Erased::new(jobs).handle())
         };
@@ -1035,7 +1095,8 @@ pub(crate) fn job<'f: 'j, 'j>(
     };
     Ok(Prepared::Ready(ScriptJob {
         caller_env, name: task.name, shared, script, selected, side, consumer, cfg, files,
-        producers: producers.into_bump_slice(), producer_reads: producer_reads.into_bump_slice(), checkout: CheckoutReads::Hole,
+        producers: producers.into_bump_slice(), build_dependencies: build_dependencies.into_bump_slice(),
+        producer_reads: producer_reads.into_bump_slice(), checkout: CheckoutReads::Hole,
     }))
 }
 
@@ -1092,6 +1153,32 @@ pub(crate) fn failed(what: &'static str, words: core::fmt::Arguments<'_>, hole: 
 
 /// The run on the worker; a kept member run's reads of the checkout onto `checkout`, or why its
 /// record is right for this command only onto `unkept`.
+fn verify_build_dependencies<'a>(store: &Path, consumer_identity: &'a str, dependencies: &'a [BuildDependency<'_>]) -> Result<std::vec::Vec<VerifiedProducer<'a>, Global>, std::string::String> {
+    let mut verified = std::vec::Vec::new_in(Global);
+    for offered in Binding::in_identity(consumer_identity) {
+        let binding = offered.ok_or_else(|| std::string::String::from("the build-script module has a malformed producer receipt"))?;
+        let mut matches = dependencies.iter().filter(|dep| dep.name == binding.name && dep.version == binding.version);
+        let expected = || std::format!("{} {} has no unique WASI producer run", binding.name, binding.version);
+        let producer = matches.next().ok_or_else(expected)?;
+        if matches.next().is_some() {
+            return Err(expected());
+        }
+        let identity = script_unit::selected_identity(store, producer.selected).map_err(|error| std::format!("{} {}: {error}", producer.name, producer.version))?;
+        if !binding.matches_checkout_module(&identity) {
+            return Err(std::format!("{} {}: the producer module's source or features disagree with the consumer module's receipt", producer.name, producer.version));
+        }
+        let Some((RanAs::Wasm, bytes)) = payload_parts(producer.bytes) else {
+            return Err(std::format!("{} {}: its producer did not give a WASI outputs record", producer.name, producer.version));
+        };
+        let outputs = OutputsRef::open(bytes).map_err(|error| std::format!("{} {}: its producer outputs are malformed: {error:?}", producer.name, producer.version))?;
+        verified.push(VerifiedProducer::verify(binding, outputs).map_err(|error| std::format!("{error}"))?);
+    }
+    if verified.is_empty() && !dependencies.is_empty() {
+        return Err(std::string::String::from("the module has no receipt for its WASI build-dependency outputs"));
+    }
+    Ok(verified)
+}
+
 fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engine_script_reads::ReadList, unkept: &mut Option<crate::engine_script_reads::NoCell>) -> Ran {
     let _cx = cx.span("script: run one build script");
     let erased = Erased::new(scratch);
@@ -1136,6 +1223,18 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         Executable::Native => Runner::Native { because: job.script },
     };
     let ran_as = RanAs::of(&runner);
+    let consumer_identity = if job.build_dependencies.is_empty() {
+        std::string::String::new()
+    } else {
+        match script_unit::selected_identity(&shared.store, job.selected) {
+            Ok(identity) => identity,
+            Err(error) => return failed("a build-script module has no verified identity", format_args!("the build script of {package}: {error}"), false),
+        }
+    };
+    let build_dependencies = match verify_build_dependencies(&shared.store, &consumer_identity, job.build_dependencies) {
+        Ok(verified) => verified,
+        Err(why) => return failed("the WASI build-dependency outputs disagree with their module", format_args!("the build script of {package}: {why}"), false),
+    };
     let native = match (runner, &shared.native) {
         // No SDK: a function of the run's key, which holds "no SDK" ([`Shared::no_sdk`]), so
         // filed. An SDK and the setting still refused (its shelf, its fact shim): a fact of the
@@ -1183,7 +1282,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
     // alone would keep it failed past the edit that fixes it (rule 21). Under
     // [`CheckoutReads::Hole`] its failure is filed.
     let failed_hole = is_checkout && matches!(job.checkout, CheckoutReads::Kept { .. });
-    let ran = match script_unit::outputs_given_for(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &given, job.consumer, alloc) {
+    let ran = match script_unit::outputs_given_for(&shared.runtime, &setting, graph, job.script, side_cfg.as_ref().map(|atoms| atoms.as_slice()), tree, root, &given, job.consumer, &build_dependencies, alloc) {
         Ok(ran) => ran,
         Err(error) => return failed("a build script failed", format_args!("the build script of {package} failed: {error}"), failed_hole),
     };

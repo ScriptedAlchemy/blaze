@@ -87,16 +87,13 @@ pub fn placed_in_store(
     .flatten()
     .is_some();
     if has_native {
-        let has_wasm = crate::script_unit::module_of(
+        let wasm = crate::script_unit::module_of(
             store,
             unit.name.as_str(),
             unit.version.as_str(),
             &features,
-        )
-        .ok()
-        .flatten()
-        .is_some();
-        if !has_wasm {
+        );
+        if matches!(wasm, Ok(None)) {
             return Runner::Native { because: script };
         }
     }

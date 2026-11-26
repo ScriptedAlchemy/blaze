@@ -1,7 +1,6 @@
-//! Script runs reachable from checked crates. A build dependency is compiled on the host,
-//! so its script can be a producer without having a crate in the check world. These are the
-//! resolved host units. D52's dependency compilation for WASI requires its own target
-//! projection before its module can take an output receipt from this planner.
+//! Script runs reachable from checked crates. Build dependencies can have producer scripts
+//! without a crate in the check world. A local D52 producer serves the WASI build that
+//! supplied its consumer's module, with a separate run from the normal host configuration.
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_manifest::lock::{Checksum, Lock};
@@ -18,15 +17,16 @@ pub(crate) struct RunId {
 }
 
 impl RunId {
-    fn host(unit: UnitId) -> Self {
-        Self { unit, side: Side::Target, consumer: Consumer::HostDependency }
+    fn dependency(unit: UnitId, side: Side) -> Self {
+        Self { unit, side, consumer: Consumer::HostDependency }
     }
 
     pub(crate) fn slot(self) -> usize {
         match (self.consumer, self.side) {
             (Consumer::Checked, Side::Target) => 0,
             (Consumer::Checked, Side::Macro) => 1,
-            (Consumer::HostDependency, _) => 2,
+            (Consumer::HostDependency, Side::Target) => 2,
+            (Consumer::HostDependency, Side::Macro) => 3,
         }
     }
 }
@@ -39,7 +39,7 @@ pub(crate) struct RunPlan<'a> {
 /// Each root and its reachable host producers. A run's inputs include its `links` reads and
 /// the scripts of the libraries compiled into it. Reading a build-dependency output does not
 /// make it `DEP_*` metadata. That still follows the separate `links` projection.
-pub(crate) fn runs<'a>(graph: &UnitGraph<'_>, roots: impl Iterator<Item = RunId>, alloc: Alloc<'a>) -> AVec<'a, RunPlan<'a>> {
+pub(crate) fn runs<'a>(graph: &UnitGraph<'_>, roots: impl Iterator<Item = RunId>, wasi_local: impl Fn(UnitId, UnitId) -> bool, alloc: Alloc<'a>) -> AVec<'a, RunPlan<'a>> {
     let mut plans = AVec::new_in(alloc);
     let mut pending = AVec::new_in(alloc);
     pending.extend(roots);
@@ -72,7 +72,8 @@ pub(crate) fn runs<'a>(graph: &UnitGraph<'_>, roots: impl Iterator<Item = RunId>
             *mark = walk;
             let lib = &graph.units[lib.index()];
             if let Some(unit) = lib.build_script {
-                inputs.push(RunId::host(unit));
+                let side = if wasi_local(id.unit, unit) { Side::Macro } else { Side::Target };
+                inputs.push(RunId::dependency(unit, side));
             }
             libraries.extend(lib.deps.iter().map(|dep| dep.unit));
         }
@@ -86,11 +87,12 @@ pub(crate) fn runs<'a>(graph: &UnitGraph<'_>, roots: impl Iterator<Item = RunId>
 
 /// A standalone producer has no crate key. Its source covers the pinned package, the script
 /// and its host configuration. Module bytes and the outputs of other scripts are task reads.
-pub(crate) fn host_source(graph: &UnitGraph<'_>, lock: &Lock<'_>, paths: &[CheckoutPath<'_>], unit: UnitId) -> Option<ContentId> {
+pub(crate) fn dependency_source(graph: &UnitGraph<'_>, lock: &Lock<'_>, paths: &[CheckoutPath<'_>], unit: UnitId, side: Side) -> Option<ContentId> {
     let script = &graph.units[unit.index()];
     let consumer = &graph.units[script_unit::served_for(graph, unit, Consumer::HostDependency)?.index()];
     let package = lock.package(script.package);
-    let mut hash = Hasher::new("blaze host build-dependency script source 1");
+    let mut hash = Hasher::new("blaze build-dependency script source 2");
+    hash.part(match side { Side::Target => b"host", Side::Macro => b"wasi" });
     hash.part(crate::graph::TRIPLE.as_bytes()).part(script.name.as_bytes()).part(script.version.as_bytes())
         .part(package.source_text.as_bytes()).part(script.root.as_bytes())
         .opt_part(script.links.as_ref().map(|links| links.as_bytes()));
@@ -119,7 +121,7 @@ pub(crate) fn host_source(graph: &UnitGraph<'_>, lock: &Lock<'_>, paths: &[Check
 }
 
 /// A distinct host run even if a checked crate's script has the same name and features.
-pub(crate) fn host_name(source: ContentId) -> blaze_drive::Name {
-    let subject = Hasher::new("blaze host build-dependency script subject 1").id(&source).finish();
+pub(crate) fn dependency_name(source: ContentId) -> blaze_drive::Name {
+    let subject = Hasher::new("blaze build-dependency script subject 2").id(&source).finish();
     blaze_drive::Name::new(blaze_drive::Kind::Script, subject)
 }
