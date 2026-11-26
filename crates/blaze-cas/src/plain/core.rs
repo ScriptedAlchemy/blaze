@@ -1931,6 +1931,12 @@ struct Base {
     manifest: Manifest,
 }
 
+/// A commit paused while checking mutable names in the manifest that replaced their segments.
+struct CarryCheck<A: Allocator + Clone> {
+    previous: Manifest,
+    change: Change<A>,
+}
+
 /// Compact `bloom` sidecar written to a unique temp file OUTSIDE the exclusive `flip` lock
 /// (`Phase::StagingBloom`), ready for an O(1) atomic `Effect::RenameUnsynced` inside the lock
 /// when `base.manifest.generation` still equals `base_gen`.
@@ -1974,9 +1980,8 @@ struct Flip<A: Allocator + Clone> {
     /// `(replaced, written_bytes)` for `bloom_effect`, cleared if `BLOOM_WRITE` fails and applied
     /// to `BloomIndex::mapped_bytes` when the flip commits.
     bloom_written: Option<(bool, u64)>,
-    /// Latest committed `(slot, manifest)` read under the flip lock when a compaction slice aborts
-    /// due to a concurrent commit, so [`Plain::flipped`] refreshes in-place while preserving all
-    /// existing `mmap`s and `ReachCache`.
+    /// The base read under the flip lock, reused to refresh an aborted slice or check pointers
+    /// whose old segments were replaced.
     refreshed: Option<(Option<Slot>, Manifest)>,
 }
 
@@ -2033,6 +2038,7 @@ enum Then {
     /// An aborted compaction slice refreshed to the newest manifest in place: maps only delta
     /// segments added by the concurrent commit while keeping `stats.aborted == true`.
     CompactAborted(Sliced),
+    CarryCheck,
     /// One row a probe asked ([`Plain::find`]).
     Probe,
     /// Bloom-matched rows for a foreground commit ([`Plain::map_for_commit`]): verified without
@@ -2216,8 +2222,9 @@ pub struct Plain<A: Allocator + Clone> {
     /// The commit in flight's reused records whose segment the flip found replaced: what its
     /// next round carries forward ([`Plain::carry`]).
     carrying: Vec<(u64, ContentId), A>,
-    /// Keys already carried into `segs` during earlier rounds of the current commit so
-    /// `missing_from_eviction` never carries the same key twice.
+    carry_check: Option<CarryCheck<A>>,
+    /// Keys already copied into `segs` or tracked in `touches` after a carry. The eviction
+    /// check must not add their original segment again.
     carried_in_commit: Option<blaze_own::Vec<ContentId, A>>,
     /// The rounds the commit in flight carried records forward: at most [`CARRY_ROUNDS`].
     carry_rounds: u32,
@@ -2618,6 +2625,7 @@ impl<A: Allocator + Clone> Plain<A> {
             reclaimed_leases: blaze_own::Vec::new_in(a()),
             folding: None,
             fold_asked: false,
+            carry_check: None,
             touches: Vec::new_in(a()),
             carrying: Vec::new_in(a()),
             carried_in_commit: None,
@@ -6712,6 +6720,10 @@ impl<A: Allocator + Clone> Plain<A> {
             flip.carry = carry;
             if aborted {
                 flip.refreshed = compact_refresh;
+            } else if carry && base_gen != self.manifest.generation {
+                // `m` still names the base's segments, minus any this process found lost.
+                m.generation = base_gen;
+                flip.refreshed = Some((base.slot, m));
             }
             self.phase = Phase::Flipping(flip);
             self.unlock(effects);
@@ -6912,8 +6924,14 @@ impl<A: Allocator + Clone> Plain<A> {
             return;
         }
         if flip.carry {
-            let Change::Commit { segs, started_ns, roots } = flip.change else { unreachable!("only a commit carries") };
-            self.carry(segs, started_ns, roots, effects);
+            let has_pointer = self.carrying.iter().any(|&(segment, key)| self.swept_entry(segment, key).is_some_and(|(_, entry)| ReservedTag::Pointer.is(entry.tag)));
+            if has_pointer && let Some((_, manifest)) = flip.refreshed {
+                let previous = std::mem::replace(&mut self.manifest, manifest);
+                self.carry_check = Some(CarryCheck { previous, change: flip.change });
+                self.map_new(Then::CarryCheck, effects);
+            } else {
+                self.carry(flip.change, effects);
+            }
             return;
         }
         if flip.aborted {
@@ -7042,13 +7060,19 @@ impl<A: Allocator + Clone> Plain<A> {
     /// then asked again, naming the commit's segments and it. The records are the commit's
     /// own from then on: no longer reused, so nothing more is checked of them. Counted in
     /// [`Plain::carried`].
-    fn carry(&mut self, segs: Vec<(Segment, FileName), A>, started_ns: u64, roots: Vec<RootEdit, A>, effects: &mut Vec<Effect>) {
+    fn swept_entry(&self, segment: u64, key: ContentId) -> Option<(usize, Entry)> {
+        let &at = self.by_id.get(&segment)?;
+        self.probe(at, &Key(key)).map(|(_, entry)| (at, entry))
+    }
+
+    fn carry(&mut self, change: Change<A>, effects: &mut Vec<Effect>) {
+        let Change::Commit { segs, started_ns, roots } = change else { unreachable!("only a commit carries") };
         self.carry_rounds += 1;
         let carrying = std::mem::replace(&mut self.carrying, Vec::new_in(self.alloc.clone()));
         let mut out = Batch::new(Namespace::LOCAL);
         for &(segment, key) in carrying.iter() {
             // Each key once: `reused` lists it with the one segment its lookup found.
-            let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(key)) else {
+            let Some((at, entry)) = self.swept_entry(segment, key) else {
                 // Not mapped here any more: nothing to carry from. The typed stop.
                 return self.commit_refused(StoreError::SweptUnder { key, segment }, roots);
             };
@@ -7061,15 +7085,10 @@ impl<A: Allocator + Clone> Plain<A> {
             }
         }
         self.touches.retain(|it| carrying.binary_search(it).is_err());
-        if self.carried_in_commit.is_none() {
-            self.carried_in_commit = Some(self.own_vec());
-        }
-        if let Some(done) = &mut self.carried_in_commit {
-            for &(_, key) in carrying.iter() {
-                done.push(key);
-            }
-            done.sort_unstable();
-            done.dedup();
+        self.note_carried(carrying.iter().map(|&(_, key)| key));
+        if out.entries.is_empty() {
+            self.start_flip(Change::Commit { segs, started_ns, roots }, effects);
+            return;
         }
         self.carried += out.entries.len() as u64;
         match laid_of(out, self.alloc.clone()) {
@@ -7079,6 +7098,53 @@ impl<A: Allocator + Clone> Plain<A> {
             }
             Err(why) => self.commit_refused(why, roots),
         }
+    }
+
+    fn note_carried(&mut self, keys: impl Iterator<Item = ContentId>) {
+        if self.carried_in_commit.is_none() {
+            self.carried_in_commit = Some(self.own_vec());
+        }
+        if let Some(done) = &mut self.carried_in_commit {
+            done.extend(keys);
+            done.sort_unstable();
+            done.dedup();
+        }
+    }
+
+    /// Check a mutable name against the manifest read at the failed flip. Keep any newly
+    /// verified maps, but restore the commit's original manifest: its reach and any parked
+    /// compaction were planned against that generation. The next flip checks the new row ID.
+    fn recheck_carried_pointers(&mut self, effects: &mut Vec<Effect>) {
+        let CarryCheck { previous, change } = self.carry_check.take().expect("a carry waiting for its view");
+        let mut moved = self.alloc_vec();
+        let mut missing = None;
+        for &(segment, key) in self.carrying.iter() {
+            if !self.swept_entry(segment, key).is_some_and(|(_, entry)| ReservedTag::Pointer.is(entry.tag)) {
+                continue;
+            }
+            match self.newest_mapped(Namespace::LOCAL, &Key(key)) {
+                Some((at, entry)) if ReservedTag::Pointer.is(entry.tag) => moved.push(((segment, key), (self.maps[at].seg().id, key))),
+                _ => {
+                    missing = Some(StoreError::SweptUnder { key, segment });
+                    break;
+                }
+            }
+        }
+        self.manifest = previous;
+        self.order_view();
+        if let Some(why) = missing {
+            let Change::Commit { roots, .. } = change else { unreachable!("only a commit carries") };
+            self.commit_refused(why, roots);
+            return;
+        }
+        let was_moved = |touch: &(u64, ContentId)| moved.binary_search_by_key(touch, |&(old, _)| old).is_ok();
+        self.carrying.retain(|touch| !was_moved(touch));
+        self.touches.retain(|touch| !was_moved(touch));
+        self.touches.extend(moved.iter().map(|&(_, new)| new));
+        self.touches.sort_unstable();
+        self.touches.dedup();
+        self.note_carried(moved.iter().map(|&(_, (_, key))| key));
+        self.carry(change, effects);
     }
 
     /// Records this process's commits carried forward, ever ([`CARRY_ROUNDS`]): the store's
@@ -7111,7 +7177,7 @@ impl<A: Allocator + Clone> Plain<A> {
         // reaches it (probe.rs). On `Then::Commit` we still map ONLY the segment(s) this commit
         // just wrote (`self.committing`, same boot = O(1), 0 BLAKE3) so `At::Held` lookups and
         // `open_files` stay valid without touching unrelated prior-boot segments.
-        if !self.eager && !(then == Then::Open && self.plant() == Plant::MapsAllAtOpen) {
+        if !self.eager && then != Then::CarryCheck && !(then == Then::Open && self.plant() == Plant::MapsAllAtOpen) {
             if then == Then::Commit && !self.committing.is_empty() {
                 let mut left = 0u32;
                 let len = self.manifest.segments.len();
@@ -7446,6 +7512,7 @@ impl<A: Allocator + Clone> Plain<A> {
         self.pending_map_files.clear();
         self.order_view();
         match then {
+            Then::CarryCheck => return self.recheck_carried_pointers(effects),
             Then::Commit => {
                 let segments = std::mem::replace(&mut self.committing, Vec::new_in(self.alloc.clone()));
                 for id in segments.iter() {

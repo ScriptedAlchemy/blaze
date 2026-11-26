@@ -447,6 +447,98 @@ fn concurrent_gc_merging_leased_segments_does_not_trigger_carry_or_swept_under()
     }
 }
 
+/// A writer must be able to root a mutable name whose old segment was replaced, while
+/// preserving the newest value when another writer updated that name before the merge.
+#[test]
+fn publication_preserves_the_newest_pointer_moved_by_compaction() {
+    use core::time::Duration;
+    use blaze_core::{Driver, wait::Deadline};
+    use blaze_keyed::kind::ReservedTag;
+    use super::core::{Plain, ROOT_LIFE_NS};
+
+    let root = test_root();
+    let mut sim = Sim::new(162, Faults::default());
+    let settle = |sim: &mut Sim, store: &mut Plain<&Frame>, effects: &mut _| {
+        let mut done = Vec::new_in(std::alloc::Global);
+        for _ in 0..10_000 {
+            sim.submit(effects);
+            if store.ready() && sim.in_flight() == 0 {
+                return;
+            }
+            let now = sim.now();
+            sim.poll(&mut done, Deadline::after(now, Duration::from_secs(1)));
+            let wall = sim.wall_ns();
+            for completion in done.drain(..) {
+                assert!(store.owns(completion.tag));
+                store.complete(completion, wall, effects);
+            }
+            assert!(store.broken().is_none(), "store stopped: {:?}", store.broken());
+        }
+        panic!("store did not settle");
+    };
+    let mut effects = core::iter::empty().collect();
+    let mut seed = Plain::new(reached_cfg(1, &root), &root);
+    seed.open_whole(&mut effects);
+    settle(&mut sim, &mut seed, &mut effects);
+    let targets = [record(70), record(71)];
+    let pointer = record(72);
+    let seeded = [targets[0], targets[1], pointer, record(73), record(74), record(75)];
+    for &key in &seeded {
+        if key == pointer {
+            seed.put(key, Namespace::LOCAL, ReservedTag::Pointer.tag(), &targets[0].0.0).expect("point to the old target");
+        } else {
+            seed.put(key, Namespace::LOCAL, TAG, b"target or filler").expect("seed record");
+        }
+        seed.commit(&[], sim.wall_ns(), &mut effects).expect("seed commit");
+        settle(&mut sim, &mut seed, &mut effects);
+        assert!(matches!(seed.take_committed(), Some(Ok(_))));
+    }
+    let life = Duration::from_secs(60);
+    seed.root_for("seed", &seeded, life.as_nanos() as u64).expect("temporary seed root");
+    seed.release_lease();
+    seed.commit(&[], sim.wall_ns(), &mut effects).expect("seed root commit");
+    settle(&mut sim, &mut seed, &mut effects);
+    assert!(matches!(seed.take_committed(), Some(Ok(_))));
+    assert_eq!(seed.leases_len(), 0);
+
+    let mut writer = Plain::new(reached_cfg(2, &root), &root);
+    writer.open_whole(&mut effects);
+    settle(&mut sim, &mut writer, &mut effects);
+    let (old_map, old_entry) = writer.newest_mapped(Namespace::LOCAL, &pointer).expect("writer's pointer");
+    let old_segment = writer.mapped_at(old_map).seg().id;
+    assert_eq!(writer.mapped_at(old_map).payload(&old_entry), &targets[0].0.0);
+
+    seed.put(pointer, Namespace::LOCAL, ReservedTag::Pointer.tag(), &targets[1].0.0).expect("update the pointer");
+    seed.commit(&[], sim.wall_ns(), &mut effects).expect("concurrent pointer commit");
+    settle(&mut sim, &mut seed, &mut effects);
+    assert!(matches!(seed.take_committed(), Some(Ok(_))));
+
+    let mut gc = Plain::new(reached_cfg(3, &root), &root);
+    gc.open_whole(&mut effects);
+    settle(&mut sim, &mut gc, &mut effects);
+    assert!(gc.compact(&mut effects));
+    settle(&mut sim, &mut gc, &mut effects);
+    let slice = gc.take_sliced().expect("compaction result");
+    assert!(slice.merged && !slice.aborted && slice.segments > 1, "{slice:?}");
+    assert!(!gc.segments().iter().any(|&(id, _)| id == old_segment));
+    let (map, entry) = gc.newest_mapped(Namespace::LOCAL, &pointer).expect("compacted pointer");
+    assert_eq!(gc.mapped_at(map).payload(&entry), &targets[1].0.0);
+
+    sim.advance(life);
+    let keys = [pointer, targets[0]];
+    let answer = writer.root_for("writer.answer", &keys, ROOT_LIFE_NS).expect("closing root");
+    writer.commit(&[], sim.wall_ns(), &mut effects).expect("closing commit");
+    settle(&mut sim, &mut writer, &mut effects);
+    let published = writer.take_committed().expect("closing verdict");
+    assert!(published.is_ok(), "closing commit must keep the relocated pointer: {published:?}");
+
+    let store = Driven::with(sim, Path::new("/sim"), reached_cfg(4, &root), &root).expect("reader open");
+    let reader = Lent::new(store, &root);
+    assert_eq!(reader.pointed(TAG, &pointer).expect("reader's pointer"), Some(targets[1]));
+    assert_eq!(reader.get(&targets[0]).expect("old target").expect("rooted record").bytes, b"target or filler");
+    assert_eq!(reader.root_named("writer.answer"), Some(answer));
+}
+
 /// Automatic tiered merging inside `commit_records` (`Plain::fold_tiered_slice`) MUST be strictly
 /// lossless (`Keep::All`) even under `Liveness::Reached` for segments whose lease has already been
 /// released and whose records are not yet covered by a committed root (e.g. records committed by
