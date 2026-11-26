@@ -54,7 +54,6 @@ blaze-launcher	2
 blaze-lint	6
 blaze-lint-defs	1
 blaze-lir	29
-blaze-llvm-abi	1
 blaze-lower	20
 blaze-manifest	243
 blaze-mem	5
