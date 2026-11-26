@@ -12,7 +12,7 @@ How blaze is now. Kept true: CI checks their links, paths and settings against t
 - [compiletest.md](compiletest.md): rustc's own test suites under blaze: which suites matter and why, and what of a test is held; the runner was deleted on 2026-11-15.
 - [const.md](const.md): Const evaluation: blaze's own interpreter for constants and const fns, and what it covers.
 - [contributing.md](contributing.md): How to build, test and change blaze: AI use, where new code goes, rules for code, working in parallel, landing.
-- [distributed.md](distributed.md): The retained distributed protocol, coordinator, pack cache and test controls; compiler integration awaits callbacks into the current compiler.
+- [distributed.md](distributed.md): The distributed protocol, coordinator, pack cache, dev export integration and acceptance controls.
 - [harness.md](harness.md): The harnesses that test blaze (real crates' own tests, and blaze held to itself), what each checks, and how CI runs them.
 - [install.md](install.md): Installing blaze: the install script, the release channels and what gets installed.
 - [ix-prof.md](ix-prof.md): Profiling any Rust program, not only blaze, like Go's pprof. Covers the ix-prof crate (CPU samples of every thread, tracing spans with their own CPU time and allocations, named waits, allocations by stack), `IX_PROF=<dir>`, the loopback `/debug/pprof` endpoint and live stream, and `blaze pprof` with top, peek, tree, list, flame, diff, export and --http.
