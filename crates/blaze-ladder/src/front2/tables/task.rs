@@ -5701,9 +5701,8 @@ pub fn entry(x: u8) -> u8 {
 
 /// D197 root 1, the `Typed` kind: a body whose types are clean and whose borrows were refused
 /// (D151 `Typed`, which runs) keeps its checked record, so a run reads it instead of checking
-/// it again. The fixture is borrows.rs `region_record_tests`'s shape: `calls_soft_refused`
-/// calls `m`, whose parameter is a type macro, so its borrows are refused `RegionsUnread`
-/// while its types are whole.
+/// it again. `reads_union` reads a union field, which type-checks but flow lowering refuses
+/// with `Form::Union`.
 #[cfg(test)]
 mod keeps_typed_tests {
     use super::keeps_typed;
@@ -5713,20 +5712,12 @@ mod keeps_typed_tests {
     use crate::refusal::SourceFile;
 
     const SOURCE: &str = r#"
-macro_rules! byte {
-    () => {
-        u8
-    };
+union Value {
+    byte: u8,
 }
 
-fn m(x: &u8, _y: byte!()) -> &u8 {
-    x
-}
-
-fn calls_soft_refused() {
-    let a = 1u8;
-    let r = m(&a, 2);
-    let _ = *r;
+unsafe fn reads_union(value: &Value) -> u8 {
+    unsafe { value.byte }
 }
 
 fn plain() -> u8 {
@@ -5746,7 +5737,7 @@ fn main() {}
     /// every such body to the run's second check. TWIN: a body with a type error keeps none
     /// under either (its columns are not clean, so there is no record to keep).
     ///
-    /// Prints: `keeps_typed: calls_soft_refused kept (borrows refused), plain kept, mistyped none`
+    /// Prints: `keeps_typed: reads_union kept (borrows refused), plain kept, mistyped none`
     #[test]
     fn a_body_whose_borrows_were_refused_keeps_its_typed_record() {
         let heap = blaze_own::testing::heap();
@@ -5775,11 +5766,11 @@ fn main() {}
         };
         let old = |types: &crate::front2::project::BodyVerdict<'_>, borrows: &crate::front2::borrows::BorrowVerdict<'_>| types.is_clean() && borrows.findings.is_empty() && borrows.refused.is_none();
 
-        let (types, borrows) = world.check_borrows(body("calls_soft_refused"), alloc);
-        assert!(types.is_clean(), "calls_soft_refused: types whole: {types:?}");
-        assert!(matches!(borrows.refused, Some(ref r) if !matches!(r, BorrowRefused::Untyped(_))), "calls_soft_refused: borrows refused by name (D151 `Typed`): {borrows:?}");
-        assert!(matches!(types.typed, Some(Ok(_))), "calls_soft_refused: the check encoded its record");
-        assert!(keeps_typed(&types), "calls_soft_refused: a `Typed` body keeps its record");
+        let (types, borrows) = world.check_borrows(body("reads_union"), alloc);
+        assert!(types.is_clean(), "reads_union: types whole: {types:?}");
+        assert!(matches!(borrows.refused, Some(BorrowRefused::Lower(blaze_flow_lower::Refusal { form: blaze_flow_lower::Form::Union, .. }))), "reads_union: the union field is refused by name (D151 `Typed`): {borrows:?}");
+        assert!(matches!(types.typed, Some(Ok(_))), "reads_union: the check encoded its record");
+        assert!(keeps_typed(&types), "reads_union: a `Typed` body keeps its record");
         assert!(!old(&types, &borrows), "CONTROL: the old filter kept none for it");
 
         let (types, borrows) = world.check_borrows(body("plain"), alloc);
@@ -5788,6 +5779,6 @@ fn main() {}
         let (types, borrows) = world.check_borrows(body("mistyped"), alloc);
         assert!(!keeps_typed(&types) && !old(&types, &borrows), "TWIN: a type error keeps no record: {types:?}");
         assert!(types.typed.is_none(), "TWIN: no record was encoded for a type error");
-        std::println!("keeps_typed: calls_soft_refused kept (borrows refused), plain kept, mistyped none");
+        std::println!("keeps_typed: reads_union kept (borrows refused), plain kept, mistyped none");
     }
 }

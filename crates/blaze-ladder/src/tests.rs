@@ -83,39 +83,37 @@ fn the_real_context_refuses_an_unmet_bound() {
     assert!(diags("fn main() { let b = B { n: 1 }; let _x = b.size(); }") > 0, "`B` has no method `size`");
 }
 
-/// A construct this build does not take is one refusal naming it, at its place, in the words
-/// a Rust programmer uses, whichever stage refuses it: the construct here passes the front
-/// end and the checker and is refused by the build. It is an or-pattern in a `let` (the
-/// Reference, "let statements": `let PatternNoTopAlt`, so the or-pattern is parenthesized,
-/// "Grouped patterns"; `let (A(x) | B(x)) = e;` is irrefutable), which the build refuses by
-/// name (blaze-build walk.rs, the `let` binder: "a pattern other than a binding, `_`, a tuple,
-/// .."), at the or-pattern inside the parentheses. The plain rendering says it on its line and closes with what this build runs
-/// today. Judge-changed 2026-11-16 (checks integrator, on the coordinator's decision): was
-/// `a_closure_is_a_named_refusal`; the build now builds an unused non-capturing closure, so a
-/// closure is no longer a refused construct. (An `f16` was tried first: the old front end
-/// refuses it as "the type `f16` names nothing" before the build sees it.) Judge-changed again
-/// 2026-11-16 18:2x (run-path integrator B): was `an_underscore_assignment_is_a_named_refusal`;
-/// blaze-build walk/discard.rs builds `_ = e` since the 17:22 snapshot, so it is no longer a
-/// refused construct.
+/// The type checker accepts `[..]` as an irrefutable pattern on a slice. The builder's
+/// irrefutable binder refuses it at the pattern. The plain rendering names the construct
+/// and its source location, then closes with what this build runs today.
 #[test]
-fn an_or_pattern_in_a_let_is_a_named_refusal() {
-    let text = "enum E { A(u8), B(u8) }\nfn main() { let (E::A(x) | E::B(x)) = E::A(1); }";
+fn a_slice_pattern_over_a_slice_in_a_let_is_a_named_refusal() {
+    let text = "fn main() {\n    let array = [1u8];\n    let slice: &[u8] = &array;\n    let [..] = slice;\n}";
     let files = [SourceFile { path: "src/main.rs", text }];
+    assert_eq!(diagnostics(&files), 0, "the slice pattern type-checks");
     let all = refusals(&files, "src/main.rs", OverflowChecks::On, Alloc::global());
     assert_eq!(all.len(), 1, "{all:?}");
     let r = &all[0];
+    let construct = "a slice pattern over a slice `[T]` in a `let` or parameter pattern";
     assert_eq!(r.rule, RefusalRule::Unsupported, "{r:?}");
-    assert!(r.construct.is_some_and(|c| c.starts_with("a pattern other than a binding, `_`,")), "{r:?}");
-    assert!(r.message.ends_with(NOT_YET), "{}", r.message);
+    assert_eq!(r.construct, Some(construct), "{r:?}");
+    assert_eq!(&*r.message, std::format!("{construct} {NOT_YET}"));
     let at = (r.place + r.start) as usize;
-    // The or-pattern inside its grouping parentheses (line 2, column 18).
-    assert!(text[at..].starts_with("E::A(x) | E::B(x))"), "{r:?}: at `{}`", &text[at..]);
-    let column = at - text.find('\n').expect("two lines");
+    let end = (r.place + r.end) as usize;
+    assert_eq!(text.get(at..end), Some("[..]"), "{r:?}");
     let shown = crate::run::plain(&files, &all);
     let lines: Vec<&str> = shown.lines().collect();
     assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(lines[0].starts_with(&std::format!("src/main.rs:2:{column}: ")) && lines[0].ends_with("is not supported by this build of blaze yet"), "{lines:?}");
+    assert_eq!(lines[0], std::format!("src/main.rs:4:9: {construct} {NOT_YET}"));
     assert_eq!(lines[1], crate::run::RUNS_TODAY);
+}
+
+#[test]
+fn an_irrefutable_or_pattern_in_a_let_builds() {
+    let text = "enum E { A(u8), B(u8) }\nfn main() { let (E::A(x) | E::B(x)) = E::A(1); }";
+    let files = [SourceFile { path: "src/main.rs", text }];
+    let all = refusals(&files, "src/main.rs", OverflowChecks::On, Alloc::global());
+    assert!(all.is_empty(), "{all:?}");
 }
 
 /// `#[blaze::..]` is inert: a known name is no refusal and is counted as unchecked; an unknown
