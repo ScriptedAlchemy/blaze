@@ -5557,7 +5557,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 self.tasks.push(Task::DerefDone(e, m));
                 self.tasks.push(Task::Eval(operand, m));
             }
-            Expr::Unary { operand, .. } | Expr::Cast { operand, .. } => {
+            Expr::Cast { operand, .. } => {
+                let (lo, hi) = self.adjust_rows(operand);
+                // The checker records a closure-to-fn coercion on the cast's operand. Its
+                // adjustment already produces the cast result, with the closure's signature
+                // requirements checked. A second aggregate would equate the pointer's regions.
+                let closure_coercion = hi - lo == 1
+                    && self.ck.adjusts.column::<1>()[lo] == AdjustKind::ClosureFnPointer
+                    && self.ck.adjusts.column::<2>()[lo] == ty.ty;
+                if !closure_coercion {
+                    self.tasks.push(Task::OpDone(e));
+                }
+                self.tasks.push(Task::Eval(operand, false));
+            }
+            Expr::Unary { operand, .. } => {
                 self.tasks.push(Task::OpDone(e));
                 self.tasks.push(Task::Eval(operand, false));
             }
