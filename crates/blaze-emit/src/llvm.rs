@@ -26,6 +26,8 @@ mod object_unwind;
 mod emit_tests;
 use abi::{LlType, Signature};
 
+const POSITION_PREFIX: &str = "blaze_pos_";
+
 /// The byte range is the LLVM operand of the constant-producing instruction. Float
 /// operands are bitcast from integers so every NaN payload and signed zero survives.
 #[derive(Debug)]

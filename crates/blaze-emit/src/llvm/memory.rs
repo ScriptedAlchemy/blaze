@@ -36,7 +36,7 @@ impl Lower<'_, '_> {
             let name = if placement {
                 format_in!(
                     self.alloc,
-                    "@blaze_pos_{}_{k}",
+                    "@{POSITION_PREFIX}{}_{k}",
                     LinkName(Target { space: Space::Func, symbol: self.symbol })
                 )
             } else {

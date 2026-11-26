@@ -928,11 +928,76 @@ define i64 @entry() uwtable {{
         assert!((0..view.sites()).any(|i| view.site(i).kind == SiteKind::Page21));
         assert!((0..view.sites()).any(|i| view.site(i).addend >= 8 && view.site(i).target == blaze_code::record::OWN_RELRO), "the interior data address survives");
 
-        let unrelated_ir = ir.replace("@blaze_pos_entry_0", "@ordinary_zero");
+        let unrelated_ir = ir
+            .replace("define i64 @entry()", "@ordinary_zero = hidden externally_initialized global [1 x i32] zeroinitializer, align 4\ndefine i64 @entry()")
+            .replace("%wide = zext i32 %line to i64", "%other = load volatile i32, ptr @ordinary_zero, align 4\n  %sum = add i32 %line, %other\n  %wide = zext i32 %sum to i64");
         let mut unrelated = object_fixture(&unrelated_ir);
         unrelated.references.push(Some(target));
+        unrelated.positions.extend_from_slice(&module.positions);
         let refused = emit_release(ReleaseTask { module: &unrelated, imports: &[], opt: 2, machine }, Alloc::global());
-        assert!(matches!(refused, Err(super::emit::EmitError::Read(super::object::ReadError::Writable { .. }))), "{os:?}: an ordinary writable global cannot become record data");
+        assert!(matches!(refused, Err(super::emit::EmitError::Read(super::object::ReadError::Writable { .. }))), "{os:?}: a known position slot cannot admit another writable global");
+    }
+}
+
+#[test]
+fn release_record_keeps_source_positions_from_an_inlined_import() {
+    use super::{emit::EmitError, object::ReadError};
+    use blaze_code::record::{OWN_RELRO, PositionField, PositionPart};
+    use blaze_lir::builder::{DataPosition, MemAttrs};
+
+    const ITEM: u128 = 0x1aba_2c23_3e25_429e;
+    const SITE: u32 = 17;
+    let alloc = blaze_own::testing::heap().alloc();
+    let root = prepare(Symbol([2; 32]), caller().verified(), &ByPlace, alloc).unwrap();
+    let middle_symbol = Symbol([7; 32]);
+    let mut b = Builder::<_, Full>::new_in(64, alloc);
+    let p = Param::of(Ty::I32);
+    let sig = b.sig(Conv::C, Variadic::No, &[p], &[p]);
+    b.set_signature(sig);
+    b.set_attrs(FnAttrs::default().with_inline(Inline::Always));
+    let fields = [
+        DataPosition { offset: 0, item: ITEM, site: SITE, field: blaze_lir::PositionField::Line },
+        DataPosition { offset: 4, item: ITEM, site: SITE, field: blaze_lir::PositionField::Col },
+    ];
+    let data = b.data_with_positions(&[0; 8], 2, &[], &fields);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    b.param(Ty::I32);
+    let address = b.data_addr(data);
+    let line = b.load(Ty::I32, Flags::VOLATILE, address, 0, MemAttrs::aligned(2));
+    let col = b.load(Ty::I32, Flags::VOLATILE, address, 4, MemAttrs::aligned(2));
+    let sum = b.binary(blaze_lir::Op::Add, Flags::NONE, line, col);
+    b.ret(&[sum]);
+    let body = b.finish_verified().unwrap();
+
+    for os in [blaze_tier::Os::Linux, blaze_tier::Os::MacOs] {
+        let machine = blaze_tier::Machine { os, ..machine() };
+        let before = emit_release(ReleaseTask { module: &root, imports: &[], opt: 2, machine }, alloc).unwrap();
+        let before = CodeView::read(&before.record).unwrap();
+        assert_eq!(before.positions(), 0, "{os:?}");
+        assert_eq!(before.targets(), 1, "{os:?}");
+        assert_eq!(before.target(0), Target { space: Space::Func, symbol: middle_symbol }, "{os:?}");
+
+        let mut middle = prepare(middle_symbol, body.verified(), &ByPlace, alloc).unwrap();
+        let made = emit_release(ReleaseTask { module: &root, imports: &[&middle], opt: 2, machine }, alloc).unwrap();
+        let view = CodeView::read(&made.record).unwrap();
+        assert_eq!(view.targets(), 0, "{os:?}: the call was inlined");
+        assert_eq!(view.positions(), 2, "{os:?}");
+        let line = view.position(0);
+        let col = view.position(1);
+        assert_eq!((line.part, line.item, line.site, line.field), (PositionPart::Relro, ITEM, SITE, PositionField::Line));
+        assert_eq!((col.part, col.item, col.site, col.field), (PositionPart::Relro, ITEM, SITE, PositionField::Col));
+        assert_eq!(col.at, line.at + 4, "{os:?}");
+        assert_eq!(&view.relro()[line.at as usize..col.at as usize + 4], &[0; 8], "{os:?}");
+        assert!((0..view.sites()).any(|i| {
+            let site = view.site(i);
+            site.kind == SiteKind::Page21 && site.target == OWN_RELRO && site.addend == line.at
+        }), "{os:?}: the inlined body reads its source-position data");
+
+        // LLVM sees identical IR, but the reader can no longer identify its writable global.
+        middle.positions.clear();
+        let refused = emit_release(ReleaseTask { module: &root, imports: &[&middle], opt: 2, machine }, alloc);
+        assert!(matches!(refused, Err(EmitError::Read(ReadError::Writable { .. }))), "{os:?}");
     }
 }
 

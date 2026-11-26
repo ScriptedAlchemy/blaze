@@ -14,12 +14,13 @@
 use blaze_code::record::{CodeRecord, Held, RecordError, Site, SiteKind, Space, Target, TrapRow, Word, PositionRow, PositionPart, PositionField, OWN_CODE, OWN_RELRO};
 use core::fmt;
 
-use blaze_own::{ABTreeSet, AVec, Alloc, BTreeSet, FixedString, String, Vec};
+use blaze_lir::func::DataPositionRec;
+use blaze_own::{ABTreeMap, ABTreeSet, AString, AVec, Alloc, BTreeMap, BTreeSet, FixedString, Vec, format_in};
 use object::{
     BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionIndex, SectionKind, SymbolSection, elf, macho,
 };
 
-use super::{LinkName, LlvmModule, object_unwind, traps::{Tag, Tags}};
+use super::{LinkName, LlvmModule, POSITION_PREFIX, object_unwind, traps::{Tag, Tags}};
 
 /// Why an object file could not be read back as a record.
 #[derive(Debug, PartialEq, Eq)]
@@ -84,10 +85,10 @@ impl fmt::Display for ReadError {
 impl core::error::Error for ReadError {}
 
 /// The symbol's name as the lowering lane spells it: `blaze_fn_<64 hex>`, without the `@`.
-fn function_name<'a>(module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Result<String<Alloc<'a>>, ReadError> {
+fn function_name<'m>(module: &'m LlvmModule<'_>) -> Result<&'m str, ReadError> {
     let range = module.definition_name.clone();
     let name = core::str::from_utf8(module.ir.get(range).ok_or(ReadError::NoFunction)?).map_err(|_| ReadError::NoFunction)?;
-    Ok(String::from_str_in(name.strip_prefix('@').unwrap_or(name), alloc))
+    Ok(name.strip_prefix('@').unwrap_or(name))
 }
 
 /// Where a relocation leads: a named symbol (an import, or the function's own) or a section.
@@ -120,7 +121,7 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, imports: &[&LlvmM
     if file.architecture() != object::Architecture::Aarch64 || !file.is_little_endian() {
         return Err(ReadError::Semantics { at: 0, what: "only little-endian AArch64 object code is supported" });
     }
-    let name = function_name(module, alloc)?;
+    let name = function_name(module)?;
     let macho = file.format() == BinaryFormat::MachO;
     if !macho && file.format() != BinaryFormat::Elf {
         return Err(ReadError::Unwind { at: 0, what: "unsupported native unwind object format" });
@@ -162,8 +163,20 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, imports: &[&LlvmM
     record.relro_align = blaze_code::record::LEAST_RELRO_ALIGN;
     unwind.write(&file, &mut record, alloc)?;
     let mut references = BTreeSet::new_in(alloc);
+    let mut position_names = BTreeMap::new_in(alloc);
     for linked in core::iter::once(module).chain(imports.iter().copied()) {
         references.extend(linked.references.iter().flatten().chain(&linked.implicit_references).copied());
+        if !linked.positions.is_empty() {
+            let function = function_name(linked)?;
+            // Lowering groups the patches by data row. Each group names one LLVM global.
+            for rows in linked.positions.chunk_by(|left, right| left.0 == right.0) {
+                let Some(&(row, _)) = rows.first() else { return Err(ReadError::CodeOutside) };
+                let symbol = format_in!(alloc, "{POSITION_PREFIX}{function}_{row}");
+                if position_names.insert(symbol, rows).is_some() {
+                    return Err(ReadError::Semantics { at: 0, what: "duplicate source-position global metadata" });
+                }
+            }
+        }
     }
 
     // Reach every local data section through both instruction and data relocations. Data
@@ -186,7 +199,7 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, imports: &[&LlvmM
                         name == ".data.rel.ro" || name.starts_with(".data.rel.ro.")
                     }
                 }) => {}
-                SectionKind::Data | SectionKind::UninitializedData if position_section(&file, index, module, alloc)? => {}
+                SectionKind::Data | SectionKind::UninitializedData if position_section(&file, index, &position_names)? => {}
                 _ => {
                     let mut spelled = FixedString::<32>::new();
                     spelled.try_push_str(section.name().unwrap_or("")).ok();
@@ -215,7 +228,7 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, imports: &[&LlvmM
         }
         for (at, relocation) in section.relocations() {
             if index == text && !range.contains(&at) { continue; }
-            if let Destination::Section { index: target, .. } = destination(&file, &relocation, at, &name, &references)? {
+            if let Destination::Section { index: target, .. } = destination(&file, &relocation, at, name, &references)? {
                 pending.push(target);
             }
         }
@@ -224,7 +237,7 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, imports: &[&LlvmM
         let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
         for (offset, relocation) in section.relocations() {
             if index == text && !range.contains(&offset) { continue; }
-            let dest = destination(&file, &relocation, offset, &name, &references)?;
+            let dest = destination(&file, &relocation, offset, name, &references)?;
             if index == text {
                 instruction(&file, &relocation, offset - range.start, dest, &placed, text, range.start, &mut record)?;
             } else {
@@ -232,7 +245,7 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, imports: &[&LlvmM
             }
         }
     }
-    positions(&file, module, &placed, &mut record, alloc)?;
+    positions(&file, &position_names, &placed, &mut record, alloc)?;
 
     // Visit the function's original instructions, excluding appended import veneers.
     // An ID may survive zero or several times, and may come from any linked import.
@@ -437,45 +450,54 @@ fn data_relocation(file: &object::File<'_>, relocation: &object::Relocation, at:
     Ok(())
 }
 
-fn position_name<'a>(module: &LlvmModule<'_>, row: u32, alloc: Alloc<'a>) -> Result<String<Alloc<'a>>, ReadError> {
-    let mut name = String::from_str_in("blaze_pos_", alloc);
-    name.push_str(&function_name(module, alloc)?);
-    blaze_own::format_into!(&mut name, "_{row}");
-    Ok(name)
-}
+type PositionNames<'a, 'm> = ABTreeMap<'a, AString<'a>, &'m [(u32, DataPositionRec)]>;
 
-fn position_section(file: &object::File<'_>, index: SectionIndex, module: &LlvmModule<'_>, alloc: Alloc<'_>) -> Result<bool, ReadError> {
-    // LLVM marks only source-position globals writable. Do not admit arbitrary writable
-    // globals just because they share a section with a position slot.
+fn position_section(file: &object::File<'_>, index: SectionIndex, names: &PositionNames<'_, '_>) -> Result<bool, ReadError> {
+    // Lowering uses writable storage for position globals so LLVM keeps their loads.
+    // Every data symbol in the section must belong to that placement data.
+    if names.is_empty() { return Ok(false); }
     let mut found = false;
     for symbol in file.symbols().filter(|symbol| symbol.section() == SymbolSection::Section(index) && symbol.kind() == object::SymbolKind::Data) {
         let name = plain(file.format() == BinaryFormat::MachO, symbol.name().map_err(|_| ReadError::Object)?);
-        let mut matches = false;
-        for (row, _) in &module.positions {
-            matches |= name == position_name(module, *row, alloc)?;
-        }
-        if !matches { return Ok(false); }
+        if !names.contains_key(name) { return Ok(false); }
         found = true;
     }
     Ok(found)
 }
 
-fn positions(file: &object::File<'_>, module: &LlvmModule<'_>, placed: &[(SectionIndex, u64)], record: &mut CodeRecord<'_>, alloc: Alloc<'_>) -> Result<(), ReadError> {
-    for &(row, patch) in &module.positions {
-        let name = position_name(module, row, alloc)?;
-        let symbol = file.symbols().find(|symbol| symbol.name().is_ok_and(|s| plain(file.format() == BinaryFormat::MachO, s) == name));
-        // An unused constant can be deleted by LLVM together with all its reads.
-        let Some(symbol) = symbol else { continue };
+fn positions(file: &object::File<'_>, names: &PositionNames<'_, '_>, placed: &[(SectionIndex, u64)], record: &mut CodeRecord<'_>, alloc: Alloc<'_>) -> Result<(), ReadError> {
+    if names.is_empty() { return Ok(()); }
+    let macho = file.format() == BinaryFormat::MachO;
+    let mut found = BTreeSet::new_in(alloc);
+    // Only a symbol that survived LLVM and lies in a placed section needs patches.
+    for symbol in file.symbols() {
+        let Ok(name) = symbol.name() else { continue };
+        let name = plain(macho, name);
+        let Some(&patches) = names.get(name) else { continue };
         let SymbolSection::Section(index) = symbol.section() else { return Err(ReadError::NoSection) };
         let Some(&(_, base)) = placed.iter().find(|p| p.0 == index) else { continue };
+        if symbol.kind() != object::SymbolKind::Data || !found.insert(name) {
+            return Err(ReadError::Semantics { at: base, what: "source-position global must have one data definition" });
+        }
         let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
-        let at = symbol.address().checked_sub(section.address()).and_then(|n| n.checked_add(base)).and_then(|n| n.checked_add(u64::from(patch.offset))).and_then(|n| u32::try_from(n).ok()).ok_or(ReadError::CodeOutside)?;
-        let field = match blaze_lir::func::PositionField::from_word(patch.field) {
-            Some(blaze_lir::func::PositionField::Line) => PositionField::Line,
-            Some(blaze_lir::func::PositionField::Col) => PositionField::Col,
-            None => return Err(ReadError::Semantics { at: u64::from(at), what: "unknown source-position field" }),
-        };
-        record.positions.push(PositionRow { part: PositionPart::Relro, at, item: patch.item_key(), site: patch.site, field });
+        let offset = symbol.address().checked_sub(section.address()).ok_or(ReadError::CodeOutside)?;
+        let remaining = section.size().checked_sub(offset).ok_or(ReadError::CodeOutside)?;
+        // Mach-O has no size on defined symbols. ELF's size must also contain every patch.
+        let size = if symbol.size() == 0 { remaining } else { symbol.size() };
+        if size > remaining { return Err(ReadError::CodeOutside); }
+        for &(_, patch) in patches {
+            let within = u64::from(patch.offset);
+            let at = base.checked_add(offset).and_then(|n| n.checked_add(within)).and_then(|n| u32::try_from(n).ok()).ok_or(ReadError::CodeOutside)?;
+            if within + 4 > size {
+                return Err(ReadError::Semantics { at: u64::from(at), what: "source position lies outside its data symbol" });
+            }
+            let field = match blaze_lir::func::PositionField::from_word(patch.field) {
+                Some(blaze_lir::func::PositionField::Line) => PositionField::Line,
+                Some(blaze_lir::func::PositionField::Col) => PositionField::Col,
+                None => return Err(ReadError::Semantics { at: u64::from(at), what: "unknown source-position field" }),
+            };
+            record.positions.push(PositionRow { part: PositionPart::Relro, at, item: patch.item_key(), site: patch.site, field });
+        }
     }
     Ok(())
 }
