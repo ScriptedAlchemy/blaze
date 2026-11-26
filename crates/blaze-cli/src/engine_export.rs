@@ -564,7 +564,7 @@ fn push_datum<'a>(
 
 /// Checks whether a `CodeView` references any Rust thread-local symbol (`Space::Tls`,
 /// `tls_getter_symbol`, or `tls_desc_symbol`).
-fn code_touches_tls(view: &CodeView<'_>, getter: CodeSymbol, descriptor: CodeSymbol) -> bool {
+pub(crate) fn code_touches_tls(view: &CodeView<'_>, getter: CodeSymbol, descriptor: CodeSymbol) -> bool {
     for i in 0..view.targets() {
         let t = view.target(i);
         match t.space {

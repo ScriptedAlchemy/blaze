@@ -320,6 +320,7 @@ pub enum ProductRoots<'a> {
 }
 
 impl ProductRoots<'_> {
+    #[cfg(feature = "llvm")]
     pub fn symbols(&self) -> &[Symbol] {
         match self {
             Self::Executable(roots) => roots.symbols(),
