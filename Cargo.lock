@@ -886,12 +886,16 @@ version = "0.0.0"
 dependencies = [
  "blaze-blake3",
  "blaze-code",
+ "blaze-ids",
  "blaze-inproc",
  "blaze-lir",
  "blaze-own",
+ "blaze-pins",
  "blaze-sim",
  "blaze-std",
  "blaze-tier",
+ "llvm-sys",
+ "object 0.40.0",
 ]
 
 [[package]]
@@ -3394,6 +3398,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
+name = "llvm-sys"
+version = "231.0.1"
+dependencies = [
+ "anyhow",
+ "cc",
+ "lazy_static",
+ "libc",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5369,10 +5383,6 @@ dependencies = [
 [[patch.unused]]
 name = "cranelift-object"
 version = "0.137.1"
-
-[[patch.unused]]
-name = "llvm-sys"
-version = "231.0.1"
 
 [[patch.unused]]
 name = "ra-ap-rustc_ast_ir"

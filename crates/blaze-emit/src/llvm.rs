@@ -18,6 +18,10 @@ mod memory;
 #[cfg(test)]
 mod tests;
 mod tls;
+pub mod emit;
+pub mod object;
+#[cfg(test)]
+mod emit_tests;
 use abi::{LlType, Signature};
 
 /// The byte range is the LLVM operand of the constant-producing instruction. Float
