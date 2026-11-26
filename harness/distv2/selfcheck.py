@@ -210,6 +210,13 @@ class ResultGateOracles(unittest.TestCase):
 
 
 class Oracles(unittest.TestCase):
+    def test_equal_source_rejects_split_plans(self):
+        planned = row(plan_names=[KEY, OTHER], plan_inputs=[OTHER, KEY])
+        e.same_unit_plans([planned], [dict(planned)])
+        for field, value in (("unit_digest", OTHER), ("plan_names", [OTHER, KEY]), ("plan_inputs", [KEY, OTHER])):
+            with self.assertRaisesRegex(e.Failed, f"same source: mathy \\({field}\\)"):
+                e.same_unit_plans([planned], [{**planned, field: value}])
+
     def test_final_export_cannot_hide_emission_outside_the_worker_reports(self):
         clean = "export stats: compiled=0 cached=20 unkeyed=0 lto=0 inlined=0"
         e.no_local_emission("cold", clean)

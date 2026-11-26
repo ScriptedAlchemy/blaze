@@ -94,6 +94,31 @@ def no_duplicate_compile(rows: list[dict]) -> None:
         seen.update(keys)
 
 
+def same_unit_plans(left: list[dict], right: list[dict]) -> None:
+    """Workers with the same source and profile ask for the same ordered unit inputs."""
+    def by_name(rows):
+        units = {row["unit"]: row for row in rows}
+        require(len(units) == len(rows), "duplicate unit names in a worker report")
+        return units
+
+    a, b = by_name(left), by_name(right)
+    require(bool(a) and a.keys() == b.keys(), "workers did not plan the same units")
+    keys = ("unit_digest", "plan_names", "plan_inputs")
+    differences = []
+    for name in sorted(a):
+        for row in (a[name], b[name]):
+            require(digest(row.get("unit_digest")), f"{name}: report needs a unit digest")
+            for key in keys[1:]:
+                values = row.get(key)
+                require(isinstance(values, list) and all(digest(value) for value in values),
+                        f"{name}: report needs digests in {key}")
+            require(bool(row["plan_inputs"]), f"{name}: plan_inputs must include its crate key")
+        changed = [key for key in keys if a[name][key] != b[name][key]]
+        if changed:
+            differences.append(f"{name} ({', '.join(changed)})")
+    require(not differences, f"workers planned different keys for the same source: {', '.join(differences)}")
+
+
 def lease(event: dict) -> tuple:
     for name in ("execution", "attempt", "generation", "seq"):
         require(type(event.get(name)) is int and event[name] >= 0, f"{event.get('event')}: needs real lease/batch {name}")

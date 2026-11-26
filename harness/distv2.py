@@ -847,8 +847,17 @@ def main(given: Input) -> None:
 
         if given.faults:
             faults(run, edited)
+        replay_failures = []
         for phase, output in (("cold", cold_export), ("warm", warm_export)):
-            evidence.no_local_emission(phase, output)
+            try:
+                evidence.no_local_emission(phase, output)
+            except Failed as error:
+                replay_failures.append(str(error))
+        try:
+            evidence.same_unit_plans(rows_a, rows_b)
+        except Failed as error:
+            replay_failures.append(str(error))
+        check(not replay_failures, "\n".join(replay_failures) if replay_failures else "both workers planned the same units and replay emitted no local code")
         for name, identity in run.identities.items():
             check(file_hash(Path(identity["path"])) == identity["sha256"], f"{name} binary did not change during acceptance")
         provenance = json.loads((run.root / "provenance.json").read_text())

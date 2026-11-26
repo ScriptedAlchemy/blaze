@@ -1,17 +1,16 @@
 ---
 status: current
-summary: The retained distributed protocol, coordinator, pack cache and test controls; compiler integration awaits callbacks into the current compiler.
+summary: The distributed protocol, coordinator, pack cache, dev export integration and acceptance controls.
 ---
 # Distributed protocol and cache
 
 The fork retains the distributed state machines, Unix transport, agent library and
 standalone pack server. They are in the active workspace and can be exercised without a
-compiler. The old compiler daemon and its distributed bridge were deleted by the upstream
-rewrite. The `blaze` executable is now built by `blaze-cli`; `blaze-engine` is now a library
-for the new execution engine. Neither restores the removed distributed bridge. The
-retained services need compiler callbacks on the current item and command layers before
-distributed compilation works end to end. The [deletion record](v2/plan/parked.md)
-describes which old implementations were removed.
+compiler. The current `blaze export` command plans distributed dev units in
+`crates/blaze-cli/src/engine_dist.rs` and imports the records returned by the worker.
+Distributed release export currently returns a named refusal while LLVM emission and
+fold work are being integrated. The [deletion record](v2/plan/parked.md) describes the old
+daemon bridge.
 
 This page describes the surviving implementation. The
 [publication design](v2/plan/design/distributed-publication.md),
@@ -73,9 +72,8 @@ Cleanup can find the current token of the same owned slot after promotion, witho
 claiming another slot. These transitions are implemented in the carrier and core, with
 their invariants stated in the [retirement design](v2/plan/design/distributed-retirement.md).
 
-The former compiler bridge supplied the real code generator, store import and final
-link/export callbacks. Those connections are absent from the current tree. An agent test
-with a stand-in compiler exercises this protocol but does not restore that bridge.
+The dev export callbacks compile or recover keyed code through the command's code store.
+The export command consumes those records during its reachability and layout passes.
 
 ## When something fails
 
@@ -122,18 +120,15 @@ Implementation and tests are in `crates/blaze-dist-local/src/result_gate.rs`,
 `crates/blaze-dist-local/src/result_gate/tests.rs` and
 `crates/blaze-dist-local/src/driver.rs`.
 
-The retained end-to-end harness still supplies the previous compiler bridge's input
-contract. These variables are present in `harness/distv2.py`; the deleted daemon bridge
-was their compiler-side reader, so setting them on the current CLI is not a
-working setup procedure:
+The dev export command and `harness/distv2.py` use these settings:
 
-| Harness variable | Contract to restore with compiler integration |
+| Variable | Behavior |
 |---|---|
 | `BLAZE_DIST_SOCKET` | Coordinator Unix socket. |
 | `BLAZE_DIST_BLOBS` | Pack-server address, `host:port`. |
 | `BLAZE_DIST_LOCAL` | `never` or explicit `fallback` policy. |
 | `BLAZE_DIST_PR`, `BLAZE_DIST_SOURCE` | Pull-request namespace and revision identity. |
-| `BLAZE_DIST_REPORT` | Per-unit JSON provenance used to prove where compiled and reused values came from. |
+| `BLAZE_DIST_REPORT` | Per-unit JSON provenance. `plan_names` holds the ordered work digests. `plan_inputs` holds the crate key followed by the prerequisite unit digests for a final unit. |
 
 The simulation tests in `crates/blaze-dist/tests/sim.rs` run 10,000 deterministic
 seeds per invariant set with `#![no_std]` and no environment reads.
@@ -162,7 +157,7 @@ compiler or a remote transport for the Unix coordinator.
 
 These are the shared version-5 schema types in `crates/blaze-wire/src/shapes.rs` and
 `crates/blaze-wire/src/calls.rs`, retained by the protocol library. They describe encoded
-values; their presence does not imply a working compiler bridge or an HTTP coordinator.
+values for the Unix coordinator and the separate pack service.
 The complete inventory is `blaze_wire::vectors::every`, with golden vectors under
 `crates/blaze-wire/tests/golden/`.
 
@@ -443,6 +438,4 @@ planted faults; those checks are not a substitute for running the compiler cases
 The required jobs in `.github/workflows/blaze.yaml` separate workspace and protocol tests,
 source-compiler smoke checks, and production distributed acceptance. They require a
 verified compiler built from the current source and complete dev/release acceptance
-receipts. The library suite provides partial validation while the compiler bridge is absent.
-It does not satisfy the compiler build or distributed acceptance requirements, and an
-absent receipt, skipped job or failed subprocess is not a pass.
+receipts. The library suite validates the protocol independently of compiler acceptance.

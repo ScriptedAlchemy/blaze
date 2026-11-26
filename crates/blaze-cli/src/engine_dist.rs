@@ -487,6 +487,7 @@ struct WorkItem<'a> {
 struct CratePlan<'a> {
     unit_name: AString<'static>,
     unit: Unit,
+    inputs: AVec<'a, Digest>,
     items: AVec<'a, WorkItem<'a>>,
     is_final: bool,
 }
@@ -677,8 +678,7 @@ fn json_digests(digests: &[Digest], alloc: WireAlloc) -> WireString {
 #[expect(clippy::too_many_arguments, reason = "explicit report row fields, zero hidden globals")]
 fn append_report_row(
     report_path: Option<&str>,
-    unit_name: &str,
-    unit: &Unit,
+    plan: &CratePlan<'_>,
     arrived: &Arrived,
     tail_compiled: usize,
     from_store: usize,
@@ -696,12 +696,19 @@ fn append_report_row(
     let pub_attempt = arrived.publication_attempt.and_then(|v| i64::try_from(v).ok()).unwrap_or(-1);
     let work_keys = json_digests(arrived.compiled_keys.as_slice(), alloc);
     let tail_keys = json_digests(tail_compiled_keys, alloc);
+    let plan_names = json_digests(plan.unit.names.as_slice(), alloc);
+    let plan_inputs = json_digests(plan.inputs.as_slice(), alloc);
 
     let mut line = WireString::new_in(alloc);
     let _ = write!(
         line,
-        "{{\"unit\":\"{}\",\"source\":\"{}\",\"execution\":{},\"joined\":{},\"grants\":{},\"compiled_for_work\":{},\"stored_for_work\":{},\"arrived\":{},\"tail_compiled\":{},\"from_store\":{},\"instances\":{},\"unit_digest\":\"{}\",\"attempt\":{},\"publication_attempt\":{},\"work_compiled_keys\":{},\"tail_compiled_keys\":{}}}\n",
-        unit_name,
+        concat!(
+            "{{\"unit\":\"{}\",\"source\":\"{}\",\"execution\":{},\"joined\":{},\"grants\":{},",
+            "\"compiled_for_work\":{},\"stored_for_work\":{},\"arrived\":{},\"tail_compiled\":{},\"from_store\":{},\"instances\":{},",
+            "\"unit_digest\":\"{}\",\"attempt\":{},\"publication_attempt\":{},\"work_compiled_keys\":{},\"tail_compiled_keys\":{},",
+            "\"plan_names\":{},\"plan_inputs\":{}}}\n",
+        ),
+        plan.unit_name.as_str(),
         source,
         execution,
         arrived.joined,
@@ -712,11 +719,13 @@ fn append_report_row(
         tail_compiled,
         from_store,
         instances,
-        hex(&unit.spec),
+        hex(&plan.unit.spec),
         attempt,
         pub_attempt,
         work_keys.as_str(),
         tail_keys.as_str(),
+        plan_names.as_str(),
+        plan_inputs.as_str(),
     );
     let _ = append_file(path, line.as_bytes());
 }
@@ -983,6 +992,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         plans.push(CratePlan {
             unit_name: own_str(cname, alloc),
             unit: Unit { spec, names: work_names },
+            inputs: extra,
             items,
             is_final,
         });
@@ -1050,8 +1060,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         store.merge_arrived(&arrived.values)?;
         append_report_row(
             dist.report.as_ref().map(|s| s.as_str()),
-            plan.unit_name.as_str(),
-            &plan.unit,
+            plan,
             &arrived,
             tail_compiled,
             tail_from_store,

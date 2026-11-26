@@ -40,16 +40,15 @@ python3 -m py_compile harness/distv2.py harness/distv2/evidence.py harness/distv
 python3 harness/distv2/selfcheck.py
 ```
 
-## Required product telemetry (API request to root)
+## Required product telemetry
 
-The exact base does **not** supply the telemetry below. Root must coordinate these additions with
-the compiler driver and the existing publication/lifecycle owner before full acceptance. The
-harness deliberately fails on missing evidence; these are not optional or skipped assertions.
-This is observation of the existing pipeline, not another compilation or protocol implementation.
+The acceptance harness reads these fields from the compiler, worker and coordinator.
 
 `BLAZE_DIST_REPORT` retains its existing JSONL fields and adds:
 
 - `unit_digest`: lowercase 64-character digest used for `manifests/<digest>`.
+- `plan_names`, `plan_inputs`: ordered work digests and remaining unit-key inputs as lowercase hex.
+  The inputs start with the crate key and include prerequisite unit digests for a final unit.
 - `attempt`: final successful attempt number, or `-1` when no execution was joined.
 - `publication_attempt`: the attempt that first accepted the immutable manifest; it can be
   older than `attempt` when a replacement lead delivers that accepted record.
