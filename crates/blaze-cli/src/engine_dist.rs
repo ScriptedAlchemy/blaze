@@ -66,7 +66,7 @@ const BLOBS_VAR: &str = "BLAZE_DIST_BLOBS";
 const LOCAL_VAR: &str = "BLAZE_DIST_LOCAL";
 /// JSONL report output path.
 const REPORT_VAR: &str = "BLAZE_DIST_REPORT";
-/// Per-unit execution deadline in seconds.
+/// Execution budget in seconds per main-line unit or per pull request export.
 const DEADLINE_VAR: &str = "BLAZE_DIST_DEADLINE_SECS";
 /// Pull request namespace number.
 const PR_VAR: &str = "BLAZE_DIST_PR";
@@ -75,7 +75,7 @@ const SOURCE_VAR: &str = "BLAZE_DIST_SOURCE";
 const RESULT_GATE_VAR: &str = "BLAZE_DIST_TEST_RESULT_GATE";
 const RESULT_UNIT_VAR: &str = "BLAZE_DIST_TEST_RESULT_UNIT";
 
-/// Default per-unit execution deadline.
+/// Default execution budget.
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(3_600);
 /// Pack entry kind for a plain `ReservedTag::Code` record.
 pub(crate) const KIND_CODE: u8 = 0;
@@ -1057,7 +1057,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
 }
 
 /// Builds the ordered per-workspace-crate distributed unit plans, checks the output no-op
-/// fingerprint, and executes every unit through `blaze_dist_local::agent::run`.
+/// fingerprint, and executes every unit through `blaze_dist_local::agent::ExportBudget`.
 #[expect(clippy::too_many_arguments, reason = "explicit distributed export capabilities")]
 pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>>(
     dist: &DistConfig,
@@ -1135,6 +1135,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
     }
 
     let cancelled = AtomicBool::new(false);
+    let mut budget = agent::ExportBudget::new(&dist.config);
     let mut total_compiled = 0usize;
     let mut total_cached = 0usize;
 
@@ -1158,7 +1159,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
                 .filter(|gate| gate.unit.as_ref().is_none_or(|unit| unit.as_str() == plan.unit_name.as_str()))
                 .map(|gate| gate.directory.as_str()),
         };
-        let arrived = match agent::run(&dist.config, &plan.unit, &mut exec, &cancelled) {
+        let arrived = match budget.run(&plan.unit, &mut exec, &cancelled) {
             Ok(arrived) => arrived,
             Err(err) => match agent::decide(&dist.config.local, err, wire_alloc) {
                 Ok(()) => return Ok((DistExportOutcome::FallbackLocal, fp)),

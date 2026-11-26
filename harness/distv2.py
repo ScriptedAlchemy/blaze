@@ -54,7 +54,11 @@ import socket
 import subprocess
 import sys
 import time
+from contextlib import closing, contextmanager
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Event, Thread
 
 from distv2 import evidence
 from distv2.evidence import Failed
@@ -318,6 +322,68 @@ class Run:
 
     def plan(self, home: str) -> list[dict] | None:
         return evidence.unit_plan(Path(f"{self.report_path(home)}.plans"))
+
+    @contextmanager
+    def hold_manifest_lookup(self, home: str, unit: str):
+        """Pause a real cache request after planning and before the unit can submit."""
+        Path(f"{self.report_path(home)}.plans").unlink(missing_ok=True)
+        requested, release = Event(), Event()
+        run = self
+
+        class Carrier(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def setup(self):
+                self.request.settimeout(run.given.command_timeout)
+                super().setup()
+
+            def do_GET(self):
+                if self.path.startswith("/v1/list/manifests/") and not requested.is_set():
+                    plan = run.plan(home) or []
+                    if any(row["unit"] == unit and self.path == f"/v1/list/manifests/{row['unit_digest']}"
+                           for row in plan):
+                        requested.set()
+                        if not release.wait(run.given.command_timeout):
+                            self.send_error(504, f"release did not arrive for the held {unit} manifest lookup")
+                            return
+                self.forward()
+
+            def do_PUT(self):
+                self.forward()
+
+            def forward(self):
+                size = int(self.headers["Content-Length"])
+                with closing(HTTPConnection("127.0.0.1", run.port, timeout=run.given.command_timeout)) as upstream:
+                    upstream.putrequest(self.command, self.path)
+                    upstream.putheader("Content-Length", str(size))
+                    upstream.putheader("Connection", "close")
+                    if "If-Match" in self.headers:
+                        upstream.putheader("If-Match", self.headers["If-Match"])
+                    upstream.endheaders()
+                    while size > 0:
+                        chunk = self.rfile.read(min(size, 64 << 10))
+                        if not chunk:
+                            self.send_error(400, "incomplete cache request body")
+                            return
+                        upstream.send(chunk)
+                        size -= len(chunk)
+                    with upstream.getresponse() as response:
+                        self.send_response_only(response.status)
+                        self.send_header("Content-Length", response.headers["Content-Length"])
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        shutil.copyfileobj(response, self.wfile)
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Carrier) as server:
+            driver = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05},
+                            name=f"distv2-{home}-{unit}-manifest", daemon=True)
+            driver.start()
+            try:
+                yield f"127.0.0.1:{server.server_port}", requested, release
+            finally:
+                release.set()
+                server.shutdown()
+                driver.join(timeout=self.given.command_timeout)
 
     def start_services(self) -> None:
         log = open(self.root / "logs" / "serve.log", "w")
@@ -839,22 +905,38 @@ def main(given: Input) -> None:
         code, text = run.build("pr", project=other, BLAZE_DIST_PR="17", BLAZE_DIST_SOURCE="rev1")
         check(code == 0 and len(run.report("pr")) == before, "nothing changed: no unit runs")
 
-        # A newer revision of the pull request while the older builds: the newer one finishes, and
-        # the older either finished first or stopped, naming why, with nothing of the newer lost.
+        # The older export has no live unit between finishing mathy and submitting app.
+        # The coordinator must still know which source the next old unit belongs to.
         older_at, newer_at = run.root / "project-older", run.root / "project-newer"
         for at, change in ((older_at, 'format!("6 older:{sum}'), (newer_at, 'format!("6 newer:{sum}')):
             shutil.copytree(run.project, at, ignore=shutil.ignore_patterns("target", ".git"))
             edit(at / "mathy" / "src" / "lib.rs", 'format!("6:{sum}', change)
-        older, older_log = run.build("a", wait=False, project=older_at, BLAZE_DIST_PR="18", BLAZE_DIST_SOURCE="old")
-        time.sleep(0.2)
-        newer, newer_log = run.build("b", wait=False, project=newer_at, BLAZE_DIST_PR="18", BLAZE_DIST_SOURCE="new")
-        code_newer, code_older = run.wait(newer), run.wait(older)
-        check(code_newer == 0, f"the newer revision builds: {Path(newer_log).read_text()[-800:] if code_newer else ''}")
+        mark = len(run.events())
+        revision_gate = run.root / "gates" / "newer-revision"
+        with run.hold_manifest_lookup("a", "app") as (carrier, requested, release):
+            older, older_log = run.build("a", wait=False, project=older_at, BLAZE_DIST_PR="18", BLAZE_DIST_SOURCE="old",
+                                         BLAZE_DIST_BLOBS=carrier)
+            run.until("the old export reaches app's manifest lookup with no live unit", requested.is_set, [older])
+            older_plan = run.plan("a")
+            check(older_plan is not None, "the held lookup belongs to the old export's complete plan")
+            old_mathy = next(row["unit_digest"] for row in older_plan if row["unit"] == "mathy")
+            old_app = next(row["unit_digest"] for row in older_plan if row["unit"] == "app")
+            check(any(row["event"] == "done" and row["unit_digest"] == old_mathy and row["outcome"] == "Passed"
+                      for row in run.events()[mark:]), "old mathy is terminal before the newer source is admitted")
+            newer, newer_log = run.build("b", wait=False, project=newer_at, result_gate=revision_gate, result_unit="mathy",
+                                         BLAZE_DIST_PR="18", BLAZE_DIST_SOURCE="new")
+            run.held_result("newer revision", newer, revision_gate, mark, suspend=False)
+            release.set()
+            code_older = run.wait(older)
+            old_error = Path(older_log).read_text()
+            check(code_older != 0 and "superseded:" in old_error,
+                  f"the old revision's next unit is refused as superseded: {older_log}")
+            check(not any(row["event"] == "grant" and row["unit_digest"] == old_app for row in run.events()[mark:]),
+                  "the superseded app received no grant")
+            (revision_gate / "release").touch()
+        code_newer = run.wait(newer)
+        require_build(code_newer, Path(newer_log).read_text() if code_newer else "", "the newer revision builds", Path(newer_log))
         check(run.behaviour("b", newer_at) == control(run, newer_at), "the newer revision equals its solo control")
-        if code_older == 0:
-            check(run.behaviour("a", older_at) == control(run, older_at), "the older revision finished as its own exact artifact")
-        else:
-            check("distributed build failed" in Path(older_log).read_text(), "the older revision stopped naming the distributed path")
 
         if given.faults:
             faults(run, edited)

@@ -34,6 +34,9 @@ mod ingress;
 /// The registry permits one lead reassignment; loss of its second attempt ends the execution.
 pub const MAX_ATTEMPTS: u32 = 2;
 
+/// The most distinct (pull request, source) pairs retained across live and idle exports.
+const PR_SOURCES_MOST: usize = 4_096;
+
 /// An execution's timings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionConfig {
@@ -992,6 +995,9 @@ pub struct Jobs {
     running: BTreeMap<JobContent, ExecutionId, WireAlloc>,
     platforms: BTreeMap<ExecutionId, (Digest, Reservation), WireAlloc>,
     pr_jobs: BTreeMap<u64, PrJobs, WireAlloc>,
+    pr_sources: usize,
+    /// The earliest retained deadline of an idle PR, or a lower bound if it became active.
+    pr_history_due: Option<Millis>,
     assignments: BTreeMap<WireString, Assignment, WireAlloc>,
     starts_on_claim: bool,
     next_execution: u64,
@@ -1000,11 +1006,14 @@ pub struct Jobs {
 
 #[derive(Clone, Debug)]
 struct PrJobs {
-    /// The source of the most recently pushed revision. Every unit of its build names it.
+    /// The most recently first admitted source. Every unit of its build names it.
     source: Digest,
     /// The sources it replaced: a unit of one of them is refused. A build is many jobs, so
     /// two revisions' builds overlap, and the older one's next unit is not a newer push.
     superseded: BTreeSet<Digest, WireAlloc>,
+    /// The latest accepted export deadline in this namespace. Between units there can be no
+    /// live execution even though that export can still submit work.
+    retain_through: Millis,
     /// Live executions of this pull request, including older revisions kept by subscribers.
     executions: BTreeMap<ExecutionId, Digest, WireAlloc>,
 }
@@ -1020,6 +1029,8 @@ impl Jobs {
             running: BTreeMap::new_in(alloc),
             platforms: BTreeMap::new_in(alloc),
             pr_jobs: BTreeMap::new_in(alloc),
+            pr_sources: 0,
+            pr_history_due: None,
             assignments: BTreeMap::new_in(alloc),
             starts_on_claim: false,
             next_execution: 1,
@@ -1282,13 +1293,22 @@ impl Jobs {
         need: Reservation,
         out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
     ) -> Result<JobAnswer, (Refusal, Option<u64>)> {
+        if matches!(&req.namespace, Namespace::Pr(_)) && now > req.deadline_ms {
+            return Err((Refusal::PrDeadlineExpired, None));
+        }
         // Coalescing is only for live executions. Expire prior subscribers before a new
         // deadline can extend their execution, even when the driver's timer has not run.
         self.tick(now, out);
-        if let Namespace::Pr(pr) = &req.namespace
-            && self.pr_jobs.get(&pr.n).is_some_and(|jobs| jobs.superseded.contains(&req.source))
-        {
-            return Err((Refusal::Superseded, None));
+        if let Namespace::Pr(pr) = &req.namespace {
+            let known = self.pr_jobs.get(&pr.n);
+            if known.is_some_and(|jobs| jobs.superseded.contains(&req.source)) {
+                return Err((Refusal::Superseded, None));
+            }
+            if known.is_none_or(|jobs| jobs.source != req.source)
+                && self.pr_sources >= PR_SOURCES_MOST
+            {
+                return Err((Refusal::PrSourceCapacity, None));
+            }
         }
         let content = JobContent::of(
             &JobContentInput {
@@ -1350,17 +1370,24 @@ impl Jobs {
     ) {
         let Namespace::Pr(pr) = &req.namespace else { return };
         let alloc = self.alloc;
-        let jobs = self.pr_jobs.entry(pr.n).or_insert_with(|| PrJobs {
-            source: req.source,
-            superseded: BTreeSet::new_in(alloc),
-            executions: BTreeMap::new_in(alloc),
+        let pr_sources = &mut self.pr_sources;
+        let jobs = self.pr_jobs.entry(pr.n).or_insert_with(|| {
+            *pr_sources += 1;
+            PrJobs {
+                source: req.source,
+                superseded: BTreeSet::new_in(alloc),
+                retain_through: req.deadline_ms,
+                executions: BTreeMap::new_in(alloc),
+            }
         });
+        jobs.retain_through = jobs.retain_through.max(req.deadline_ms);
         // A joined execution is the source's that last asked for it: its older subscriber may
         // leave, and that must not make it look like an obsolete job of the older revision.
         jobs.executions.insert(id, req.source);
         if jobs.source == req.source {
             return;
         }
+        *pr_sources += 1;
         jobs.superseded.insert(jobs.source);
         jobs.source = req.source;
         let previous = Vec::from_iter_in(
@@ -1383,6 +1410,27 @@ impl Jobs {
                 let _ = self.unsubscribe(now, previous, only_id, out);
             }
         }
+    }
+
+    /// Keeps revision order through inter-unit gaps without retaining finished executions.
+    fn expire_pr_history(&mut self, now: Millis) {
+        if self.pr_history_due.is_none_or(|deadline| now <= deadline) {
+            return;
+        }
+        let mut due: Option<Millis> = None;
+        let pr_sources = &mut self.pr_sources;
+        self.pr_jobs.retain(|_, jobs| {
+            if !jobs.executions.is_empty() {
+                return true;
+            }
+            if now > jobs.retain_through {
+                *pr_sources -= 1 + jobs.superseded.len();
+                return false;
+            }
+            due = Some(due.map_or(jobs.retain_through, |at| at.min(jobs.retain_through)));
+            true
+        });
+        self.pr_history_due = due;
     }
 
     /// `DELETE /v1/jobs/<execution>/subscribers/<id>`.
@@ -1515,6 +1563,7 @@ impl Jobs {
             self.after(now, admitted.execution, log, out);
         }
         self.offer_helpers(now, out);
+        self.expire_pr_history(now);
     }
 
     /// Offer idle executors to running executions as helpers of their current attempt:
@@ -1704,11 +1753,9 @@ impl Jobs {
                 && let Some(jobs) = self.pr_jobs.get_mut(&pr.n)
             {
                 jobs.executions.remove(&id);
-                // Supersession only needs the source while a PR still has live work.
-                // Retaining empty entries makes bounded execution retention leak one
-                // source record for every PR ever served.
                 if jobs.executions.is_empty() {
-                    self.pr_jobs.remove(&pr.n);
+                    let at = jobs.retain_through;
+                    self.pr_history_due = Some(self.pr_history_due.map_or(at, |due| due.min(at)));
                 }
             }
         }
@@ -1735,7 +1782,7 @@ mod retention_tests {
     }
 
     #[test]
-    fn ending_pr_executions_releases_the_source_index_and_preserves_live_siblings() {
+    fn ending_pr_executions_preserves_live_siblings_and_keeps_history_until_the_deadline() {
         let alloc = blaze_own::testing::heap().shared();
         let mut jobs = Jobs::new(
             Admission::new(AdmissionConfig::default(), alloc),
@@ -1744,29 +1791,121 @@ mod retention_tests {
         );
         let need = Reservation { memory: 4, cpus: 4, disk: 4 };
         for pr in 1..=128 {
+            let now = (pr - 1) * 4;
             let mut effects = Vec::new_in(alloc);
-            let first = jobs.submit(0, &request(pr, 1), need.clone(), &mut effects).unwrap();
+            let first = jobs.submit(now, &request(pr, 1), need.clone(), &mut effects).unwrap();
             let mut other_platform = request(pr, 1);
             other_platform.platform = [3; 32];
-            let sibling = jobs.submit(0, &other_platform, need.clone(), &mut effects).unwrap();
-            jobs.unsubscribe(1, first.execution, first.subscriber, &mut effects).unwrap();
+            let sibling = jobs.submit(now, &other_platform, need.clone(), &mut effects).unwrap();
+            jobs.unsubscribe(now + 1, first.execution, first.subscriber, &mut effects).unwrap();
             assert_eq!(jobs.pr_jobs.get(&pr).unwrap().executions.len(), 1);
             assert!(jobs.pr_jobs.get(&pr).unwrap().executions.contains_key(&sibling.execution));
 
-            let next = jobs.submit(2, &request(pr, 2), need.clone(), &mut effects).unwrap();
+            let mut next_source = request(pr, 2);
+            next_source.deadline_ms = 90_000;
+            let next = jobs.submit(now + 2, &next_source, need.clone(), &mut effects).unwrap();
             assert_eq!(
                 jobs.execution(sibling.execution).unwrap().state(),
                 ExecState::Ended(Outcome::Cancelled)
             );
             assert_eq!(jobs.pr_jobs.get(&pr).unwrap().executions.len(), 1);
             assert!(jobs.pr_jobs.get(&pr).unwrap().executions.contains_key(&next.execution));
-            jobs.unsubscribe(3, next.execution, next.subscriber, &mut effects).unwrap();
+            jobs.unsubscribe(now + 3, next.execution, next.subscriber, &mut effects).unwrap();
             for execution in [first.execution, sibling.execution, next.execution] {
                 assert!(jobs.forget_terminal(execution));
             }
             assert_eq!(jobs.executions().count(), 0);
-            assert!(jobs.pr_jobs.is_empty(), "finished PR {pr} retained its source index");
+            let held = jobs.pr_jobs.get(&pr).expect("the export can still submit its next unit");
+            assert!(held.executions.is_empty());
+            assert!(held.superseded.contains(&[1; 32]));
         }
+        let mut effects = Vec::new_in(alloc);
+        jobs.tick(100_000, &mut effects);
+        assert_eq!(jobs.pr_sources, 256, "the longest admitted deadline itself remains valid");
+        jobs.tick(100_001, &mut effects);
+        assert!(jobs.pr_jobs.is_empty(), "expired histories released their entries");
+        assert_eq!(jobs.pr_sources, 0);
+    }
+
+    #[test]
+    fn a_late_old_unit_cannot_supersede_a_new_revision_after_an_inter_unit_gap() {
+        let alloc = blaze_own::testing::heap().shared();
+        let mut jobs = Jobs::new(
+            Admission::new(AdmissionConfig::default(), alloc),
+            ExecutionConfig::default(),
+            alloc,
+        );
+        let need = Reservation { memory: 4, cpus: 4, disk: 4 };
+        let mut effects = Vec::new_in(alloc);
+        let mut old = request(7, 1);
+        let first = jobs.submit(0, &old, need.clone(), &mut effects).unwrap();
+        jobs.work_route(1, first.execution, &mut effects, |execution, log| {
+            execution.end(1, Outcome::Passed, EndWhy::Reported, log);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            jobs.execution(first.execution).unwrap().state(),
+            ExecState::Ended(Outcome::Passed)
+        );
+        assert!(jobs.forget_terminal(first.execution));
+        assert_eq!(jobs.executions().count(), 0, "the old build is between units");
+
+        let new = jobs.submit(2, &request(7, 2), need.clone(), &mut effects).unwrap();
+        old.unit = [3; 32];
+        assert_eq!(jobs.submit(3, &old, need.clone(), &mut effects).unwrap_err().0, Refusal::Superseded);
+        assert_eq!(jobs.execution(new.execution).unwrap().state(), ExecState::Queued);
+
+        effects.clear();
+        assert_eq!(
+            jobs.submit(100_001, &old, need, &mut effects).unwrap_err(),
+            (Refusal::PrDeadlineExpired, None)
+        );
+        assert!(effects.is_empty(), "an expired submit makes no transitions");
+        assert_eq!(jobs.execution(new.execution).unwrap().state(), ExecState::Queued);
+        jobs.tick(100_001, &mut effects);
+        assert!(jobs.pr_jobs.is_empty());
+    }
+
+    #[test]
+    fn a_full_pr_source_history_refuses_new_sources_without_forgetting_the_old_ones() {
+        let alloc = blaze_own::testing::heap().shared();
+        let mut jobs = Jobs::new(
+            Admission::new(AdmissionConfig::default(), alloc),
+            ExecutionConfig::default(),
+            alloc,
+        );
+        let need = Reservation { memory: 4, cpus: 4, disk: 4 };
+        let mut effects = Vec::new_in(alloc);
+        let mut current = request(7, 0);
+        for index in 0..PR_SOURCES_MOST {
+            let bytes = index.to_le_bytes();
+            current.source[..bytes.len()].copy_from_slice(&bytes);
+            let accepted = jobs.submit(0, &current, need.clone(), &mut effects).unwrap();
+            jobs.unsubscribe(0, accepted.execution, accepted.subscriber, &mut effects).unwrap();
+            assert!(jobs.forget_terminal(accepted.execution));
+            effects.clear();
+        }
+
+        let mut extra = request(8, 0);
+        assert_eq!(
+            jobs.submit(2, &extra, need.clone(), &mut effects).unwrap_err(),
+            (Refusal::PrSourceCapacity, None)
+        );
+        assert_eq!(
+            jobs.submit(2, &request(7, 0), need.clone(), &mut effects).unwrap_err().0,
+            Refusal::Superseded
+        );
+        let same_source = jobs.submit(2, &current, need.clone(), &mut effects).unwrap();
+        jobs.unsubscribe(3, same_source.execution, same_source.subscriber, &mut effects).unwrap();
+        assert_eq!(jobs.pr_sources, PR_SOURCES_MOST);
+
+        extra.deadline_ms += 10;
+        assert!(
+            jobs.submit(100_001, &extra, need, &mut effects).is_ok(),
+            "the expired history returns capacity"
+        );
+        assert_eq!(jobs.pr_sources, 1);
     }
 }
 

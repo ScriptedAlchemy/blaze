@@ -414,13 +414,14 @@ where
         }
         fingerprint = Some(fp);
         let cancelled = AtomicBool::new(false);
+        let mut budget = agent::ExportBudget::new(&dist.config);
         let mut store = DistStore::new(codes, wire);
         for krate in &plans {
             let result_gate = dist.result_gate.as_ref()
                 .filter(|gate| gate.unit.as_ref().is_none_or(|unit| unit.as_str() == krate.name))
                 .map(|gate| gate.directory.as_str());
             let mut holder = Holder { krate, work, backend, store: &mut store, alloc, wire, heap: request.heap, result_gate };
-            let arrived = match agent::run(&dist.config, &krate.unit, &mut holder, &cancelled) {
+            let arrived = match budget.run(&krate.unit, &mut holder, &cancelled) {
                 Ok(arrived) => arrived,
                 Err(err) => match agent::decide(&dist.config.local, err, wire) {
                     Ok(()) => {

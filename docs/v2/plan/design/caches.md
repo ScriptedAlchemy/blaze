@@ -113,6 +113,11 @@ The retained protocol's `BLAZE_DIST_SOCKET`, `BLAZE_DIST_BLOBS`, `BLAZE_DIST_LOC
 carrier, namespace, report, event telemetry and bounded test rendezvous. None selects a
 different local caching path.
 
+For a PR export, `BLAZE_DIST_DEADLINE_SECS` gives the distributed work one budget starting
+at its first coordinator handshake. The coordinator remembers the admitted PR sources
+through that budget, including gaps between units. A main-line export still has one budget
+per unit.
+
 `BLAZE_LAUNCH_BINS_SOCK_DIR` supplies the granted test-binary socket directory.
 `BLAZE_STUB_SLOT1` and `BLAZE_STUB_SLOT1UNPATCHED_CFG_01` are embedded test-binary stub
 configuration markers, not cache switches.

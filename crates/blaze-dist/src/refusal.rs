@@ -37,6 +37,10 @@ pub enum Refusal {
     NoSubscriber,
     /// A unit of a source its pull request has replaced: the build is obsolete.
     Superseded,
+    /// A pull-request build's deadline passed before its next unit was submitted.
+    PrDeadlineExpired,
+    /// Keeping another pull-request source would exceed the registry's bound.
+    PrSourceCapacity,
 }
 
 impl Refusal {
@@ -56,6 +60,8 @@ impl Refusal {
             Refusal::Busy => "busy",
             Refusal::NoSubscriber => "no-subscriber",
             Refusal::Superseded => "superseded",
+            Refusal::PrDeadlineExpired => "pr-deadline-expired",
+            Refusal::PrSourceCapacity => "pr-source-capacity",
         }
     }
 
@@ -70,10 +76,12 @@ impl Refusal {
             | Refusal::AttemptMoved
             | Refusal::DeadLease
             | Refusal::Ended
-            | Refusal::Superseded => ErrorCode::Conflict,
+            | Refusal::Superseded
+            | Refusal::PrDeadlineExpired => ErrorCode::Conflict,
             Refusal::NotHolder => ErrorCode::NotAllowed,
             Refusal::SeqReused | Refusal::Malformed(_) => ErrorCode::Malformed,
             Refusal::Busy => ErrorCode::Busy,
+            Refusal::PrSourceCapacity => ErrorCode::TooLarge,
         }
     }
 
@@ -94,6 +102,8 @@ impl Refusal {
             Refusal::Busy => "the queue is full",
             Refusal::NoSubscriber => "no such subscriber",
             Refusal::Superseded => "a newer source of this pull request replaced this one",
+            Refusal::PrDeadlineExpired => "the pull request build's deadline passed",
+            Refusal::PrSourceCapacity => "the pull request source history is full",
         };
         let error = WireError::new(self.code(), format_args!("{}: {text}", self.token()), alloc);
         match retry_after_ms {
@@ -122,6 +132,8 @@ impl Refusal {
             "busy" => Refusal::Busy,
             "no-subscriber" => Refusal::NoSubscriber,
             "superseded" => Refusal::Superseded,
+            "pr-deadline-expired" => Refusal::PrDeadlineExpired,
+            "pr-source-capacity" => Refusal::PrSourceCapacity,
             _ => return None,
         })
     }
@@ -149,6 +161,9 @@ mod tests {
             Refusal::Malformed(WireString::from_str_in("items: 3 for 4 processed", alloc)),
             Refusal::Busy,
             Refusal::NoSubscriber,
+            Refusal::Superseded,
+            Refusal::PrDeadlineExpired,
+            Refusal::PrSourceCapacity,
         ] {
             let wire = refusal.to_wire(Some(5), alloc);
             assert_eq!(Refusal::of(&wire), Some(refusal.clone()), "{wire:?}");

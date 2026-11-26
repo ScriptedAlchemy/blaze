@@ -76,7 +76,7 @@ pub struct Config {
     pub namespace: Namespace,
     /// Which build of a pull request this is ([`JobRequest::source`]).
     pub source: Digest,
-    /// How long one unit may wait for its execution.
+    /// Execution budget for one main-line unit or for an entire pull request export.
     pub deadline: Duration,
     /// The holder's timings.
     pub holder: HolderConfig,
@@ -236,6 +236,123 @@ fn elapsed_since(clock: SystemClock, started_ns: u64) -> Duration {
     Duration::from_nanos(now_ns.saturating_sub(started_ns))
 }
 
+/// The distributed execution budget of one export. For a pull request, all uncached units
+/// reuse the deadline established by the first coordinator handshake. That deadline bounds
+/// how long the coordinator must remember the source after it has been superseded.
+pub struct ExportBudget<'a> {
+    config: &'a Config,
+    pr: Option<PrBudget>,
+}
+
+struct PrBudget {
+    epoch: Digest,
+    deadline_ms: u64,
+    started_ns: u64,
+    limit: Duration,
+}
+
+impl PrBudget {
+    fn remaining(&self, now_ns: u64) -> Duration {
+        let elapsed = Duration::from_nanos(now_ns.saturating_sub(self.started_ns));
+        self.limit.saturating_sub(elapsed)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UnitBudget {
+    epoch: Option<Digest>,
+    deadline_ms: u64,
+    started_ns: u64,
+    limit: Duration,
+}
+
+impl<'a> ExportBudget<'a> {
+    /// A budget whose elapsed time starts when the export first needs the coordinator.
+    pub fn new(config: &'a Config) -> Self {
+        Self { config, pr: None }
+    }
+
+    fn admit(
+        &mut self,
+        unit: &Unit,
+        welcome: &carrier::LocalWelcome,
+        started_ns: u64,
+        now_ms: u64,
+    ) -> Result<UnitBudget, Error> {
+        let limit = self.config.deadline;
+        if matches!(self.config.namespace, Namespace::Main) {
+            return Ok(UnitBudget {
+                epoch: None,
+                deadline_ms: now_ms.saturating_add(duration_ms(limit)),
+                started_ns,
+                limit,
+            });
+        }
+        let pr = self.pr.get_or_insert_with(|| PrBudget {
+            epoch: welcome.epoch,
+            deadline_ms: welcome.now_ms.saturating_add(duration_ms(limit)),
+            started_ns,
+            limit,
+        });
+        let coordinator_left = Duration::from_millis(pr.deadline_ms.saturating_sub(welcome.now_ms));
+        let remaining = pr.remaining(started_ns).min(coordinator_left);
+        let budget = UnitBudget {
+            epoch: Some(pr.epoch),
+            deadline_ms: pr.deadline_ms,
+            started_ns,
+            limit: remaining,
+        };
+        let alloc = self.config.blobs.alloc;
+        budget.check_epoch(unit, &welcome.epoch, alloc)?;
+        if remaining.is_zero() {
+            return Err(pr_expired(unit, alloc));
+        }
+        Ok(budget)
+    }
+}
+
+impl UnitBudget {
+    fn remaining(self, clock: SystemClock) -> Duration {
+        self.limit.saturating_sub(elapsed_since(clock, self.started_ns))
+    }
+
+    fn check_epoch(self, unit: &Unit, epoch: &Digest, alloc: WireAlloc) -> Result<(), Error> {
+        if self.epoch.is_some_and(|expected| &expected != epoch) {
+            return Err(Error::Cancelled(format_in!(
+                alloc,
+                "unit {}: pull request export lost its coordinator epoch",
+                hex(&unit.spec)
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_active(self, unit: &Unit, clock: SystemClock, alloc: WireAlloc) -> Result<(), Error> {
+        if self.epoch.is_some() && self.remaining(clock).is_zero() {
+            return Err(pr_expired(unit, alloc));
+        }
+        Ok(())
+    }
+
+    fn poll_wait(self, clock: SystemClock, wait: Duration) -> Duration {
+        if self.epoch.is_some() { wait.min(self.remaining(clock)) } else { wait }
+    }
+
+    fn connect_worker(self, config: &Config, unit: &Unit) -> Result<Client, Error> {
+        let alloc = config.blobs.alloc;
+        let mut client = Client::connect(config.socket.as_str(), random_id()?, alloc)?;
+        if let Err(error) = self.check_epoch(unit, &client.welcome.epoch, alloc) {
+            let _ = client.release();
+            return Err(error);
+        }
+        Ok(client)
+    }
+}
+
+fn pr_expired(unit: &Unit, alloc: WireAlloc) -> Error {
+    Error::Cancelled(format_in!(alloc, "unit {}: pull request export deadline expired", hex(&unit.spec)))
+}
+
 /// The coordinator's work identity for an opaque compiler task in one unit.
 pub fn wire_name(unit: &Digest, name: &Digest, alloc: WireAlloc) -> WorkName {
     WorkName::of(&WorkKey::Item(ItemKey { unit: *unit, stable: *name, env: [0; 32] }), alloc)
@@ -259,13 +376,13 @@ pub fn root_set(unit: &Unit, alloc: WireAlloc) -> RootSet {
 }
 
 /// The job of a unit: what its executors agree on, and this subscriber's terms.
-fn request(unit: &Unit, config: &Config, now: u64) -> JobRequest {
+fn request(unit: &Unit, config: &Config, budget: UnitBudget) -> JobRequest {
     JobRequest {
         unit: unit.spec,
         platform: config.platform,
         namespace: config.namespace.clone(),
         source: config.source,
-        deadline_ms: now.saturating_add(duration_ms(config.deadline)),
+        deadline_ms: budget.deadline_ms,
         local: config.local.clone(),
     }
 }
@@ -577,37 +694,95 @@ pub fn run(
     granted: &mut (impl Granted + ?Sized),
     cancelled: &AtomicBool,
 ) -> Result<Arrived, Error> {
-    let alloc = config.blobs.alloc;
-    ensure_not_cancelled(unit, cancelled, alloc)?;
-    if let Some(list) = config.blobs.published(&unit.spec, alloc)? {
-        let packs = published_packs(unit, &list, alloc, alloc)?;
-        let values = import(&config.blobs, &packs, alloc)?;
+    ExportBudget::new(config).run(unit, granted, cancelled)
+}
+
+impl ExportBudget<'_> {
+    /// Runs one unit of this export. A published manifest requires no coordinator session.
+    pub fn run(
+        &mut self,
+        unit: &Unit,
+        granted: &mut (impl Granted + ?Sized),
+        cancelled: &AtomicBool,
+    ) -> Result<Arrived, Error> {
+        let config = self.config;
+        let alloc = config.blobs.alloc;
         ensure_not_cancelled(unit, cancelled, alloc)?;
-        return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None, alloc) });
+        if let Some(list) = config.blobs.published(&unit.spec, alloc)? {
+            let packs = published_packs(unit, &list, alloc, alloc)?;
+            let values = import(&config.blobs, &packs, alloc)?;
+            ensure_not_cancelled(unit, cancelled, alloc)?;
+            return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None, alloc) });
+        }
+        let clock = SystemClock;
+        let before_handshake = clock.monotonic_nanos()?;
+        if self.pr.as_ref().is_some_and(|pr| pr.remaining(before_handshake).is_zero()) {
+            return Err(pr_expired(unit, alloc));
+        }
+        let mut client = Client::connect(config.socket.as_str(), random_id()?, alloc)?;
+        let started_ns = if matches!(config.namespace, Namespace::Pr(_)) {
+            clock.monotonic_nanos()?
+        } else {
+            before_handshake
+        };
+        let origin = client.welcome.now_ms;
+        let now_ms = move || {
+            let elapsed_ms = duration_ms(elapsed_since(clock, started_ns));
+            origin.saturating_add(elapsed_ms)
+        };
+        let result = match self.admit(unit, &client.welcome, started_ns, now_ms()) {
+            Ok(budget) => {
+                run_connected(config, unit, granted, cancelled, clock, budget, &now_ms, &mut client)
+            }
+            Err(error) => Err(error),
+        };
+        let _ = client.release();
+        result
     }
-    let clock = SystemClock;
-    let started_ns = clock.monotonic_nanos()?;
-    let mut client = Client::connect(config.socket.as_str(), random_id()?, alloc)?;
-    let origin = client.welcome.now_ms;
-    let now_ms = move || {
-        let elapsed_ms = duration_ms(elapsed_since(clock, started_ns));
-        origin.saturating_add(elapsed_ms)
-    };
-    let job = request(unit, config, now_ms());
+}
+
+fn submission_error(unit: &Unit, error: &blaze_wire::WireError, alloc: WireAlloc) -> Error {
+    match Refusal::of(error) {
+        Some(Refusal::Superseded | Refusal::PrDeadlineExpired) => Error::Cancelled(format_in!(
+            alloc,
+            "unit {}: submit: {}",
+            hex(&unit.spec),
+            error.message
+        )),
+        _ => Error::Protocol(format_in!(alloc, "submit: {}", error.message)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_connected(
+    config: &Config,
+    unit: &Unit,
+    granted: &mut (impl Granted + ?Sized),
+    cancelled: &AtomicBool,
+    clock: SystemClock,
+    budget: UnitBudget,
+    now_ms: &(impl Fn() -> u64 + Sync),
+    client: &mut Client,
+) -> Result<Arrived, Error> {
+    let alloc = config.blobs.alloc;
+    let job = request(unit, config, budget);
     let binding = loop {
         ensure_not_cancelled(unit, cancelled, alloc)?;
+        budget.check_active(unit, clock, alloc)?;
         let submit = Command::Submit(carrier::submission(&job, NEED, alloc));
         match client.call(submit)? {
             Answer::Binding(binding) => break binding,
             Answer::Error(error) if error.code() == Some(blaze_wire::ErrorCode::Busy) => {
                 ensure_not_cancelled(unit, cancelled, alloc)?;
-                if elapsed_since(clock, started_ns) > config.deadline {
-                    return Err(Error::Protocol(format_in!(alloc, "submit: {}", error.message)));
+                budget.check_active(unit, clock, alloc)?;
+                if budget.epoch.is_none() && elapsed_since(clock, budget.started_ns) > budget.limit {
+                    return Err(submission_error(unit, &error, alloc));
                 }
-                sleep(Duration::from_millis(error.retry_after_ms.unwrap_or(100)));
+                let retry = Duration::from_millis(error.retry_after_ms.unwrap_or(100));
+                sleep(budget.poll_wait(clock, retry));
             }
             Answer::Error(error) => {
-                return Err(Error::Protocol(format_in!(alloc, "submit: {}", error.message)));
+                return Err(submission_error(unit, &error, alloc));
             }
             other => {
                 return Err(Error::Protocol(format_in!(alloc, "submit answered {other:?}")));
@@ -621,16 +796,16 @@ pub fn run(
         granted,
         cancelled,
         clock,
-        started_ns,
-        &now_ms,
+        budget,
+        now_ms,
         &binding,
-        &mut client,
+        client,
         &mut assignments,
         alloc,
     );
     let result = ensure_not_cancelled(unit, cancelled, alloc).and(result);
     if result.is_err() {
-        leave(&mut client, &binding);
+        leave(client, &binding);
     }
     // execute has joined every compiler/heartbeat scope. Only its recorded slots
     // can be cleaned up. An owned lookup observes a promotion that cancellation
@@ -640,7 +815,7 @@ pub fn run(
     // publication still requires its stop acknowledgment.
     let acknowledged = assignments.iter().try_for_each(|(executor, _)| {
         retire_owned(
-            &mut client,
+            client,
             binding.subscription.content,
             binding.subscription.execution,
             executor.as_str(),
@@ -648,10 +823,7 @@ pub fn run(
             alloc,
         )
     });
-    let result =
-        result.and_then(|arrived| after_publication(unit, acknowledged, alloc).map(|()| arrived));
-    let _ = client.release();
-    result
+    result.and_then(|arrived| after_publication(unit, acknowledged, alloc).map(|()| arrived))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -661,7 +833,7 @@ fn execute<A: AllocatorClone>(
     granted: &mut (impl Granted + ?Sized),
     cancelled: &AtomicBool,
     clock: SystemClock,
-    started_ns: u64,
+    budget: UnitBudget,
     now_ms: &(impl Fn() -> u64 + Sync),
     binding: &Binding,
     client: &mut Client,
@@ -675,12 +847,15 @@ fn execute<A: AllocatorClone>(
     let mut waited = config.poll;
     loop {
         ensure_not_cancelled(unit, cancelled, wire_alloc)?;
-        if elapsed_since(clock, started_ns) > config.deadline.saturating_add(GRACE) {
+        budget.check_active(unit, clock, wire_alloc)?;
+        if budget.epoch.is_none()
+            && elapsed_since(clock, budget.started_ns) > budget.limit.saturating_add(GRACE)
+        {
             return Err(Error::Protocol(format_in!(
                 wire_alloc,
                 "unit {}: its execution did not finish in {:?}",
                 hex(&unit.spec),
-                config.deadline
+                budget.limit
             )));
         }
         // Claim before reading phase completion: even a subscriber arriving after that
@@ -725,10 +900,13 @@ fn execute<A: AllocatorClone>(
             {
                 heartbeat_during(
                     config,
+                    unit,
                     content,
                     execution,
                     executor.as_str(),
                     claimed.attempt,
+                    budget,
+                    clock,
                     now_ms,
                     cancelled,
                     |_| take(),
@@ -743,7 +921,7 @@ fn execute<A: AllocatorClone>(
             return Err(ended(client, binding, wire_alloc));
         };
         let Some(executor) = claimed.executor else {
-            sleep(waited);
+            sleep(budget.poll_wait(clock, waited));
             waited = waited.saturating_mul(2).min(POLL_MOST);
             continue;
         };
@@ -775,22 +953,26 @@ fn execute<A: AllocatorClone>(
             if !claimed.lead {
                 // The helper's work is committed, but the whole unit is not. It must not
                 // independently compile the tail during the lead's publication window.
-                sleep(waited);
+                sleep(budget.poll_wait(clock, waited));
                 waited = waited.saturating_mul(2).min(POLL_MOST);
                 continue;
             }
             let publication_accepted = AtomicBool::new(false);
             let committed = heartbeat_during(
                 config,
+                unit,
                 content,
                 execution,
                 executor.as_str(),
                 claimed.attempt,
+                budget,
+                clock,
                 now_ms,
                 cancelled,
                 |lost| {
                     arrived.values = import(&config.blobs, &packs, wire_alloc)?;
                     ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                    budget.check_active(unit, clock, wire_alloc)?;
                     let mut refuse = |why: WireString| {
                         if !lost.load(Ordering::Acquire) {
                             let _ = verdict(
@@ -844,6 +1026,7 @@ fn execute<A: AllocatorClone>(
                     packs.sort();
                     packs.dedup();
                     ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                    budget.check_active(unit, clock, wire_alloc)?;
                     let commit = Command::CommitPublication(carrier::CommitPublication {
                         content,
                         execution,
@@ -924,7 +1107,8 @@ fn execute<A: AllocatorClone>(
             binding,
             executor.as_str(),
             claimed.lead,
-            config.deadline.saturating_sub(elapsed_since(clock, started_ns)),
+            budget,
+            clock,
             execution,
             claimed.attempt,
             now_ms,
@@ -1005,10 +1189,13 @@ fn completion_with_heartbeat<T>(
 #[allow(clippy::too_many_arguments)]
 fn heartbeat_during<T>(
     config: &Config,
+    unit: &Unit,
     content: blaze_wire::JobContent,
     execution: ExecutionId,
     executor: &str,
     attempt: Attempt,
+    budget: UnitBudget,
+    clock: SystemClock,
     now_ms: &(impl Fn() -> u64 + Sync),
     cancelled: &AtomicBool,
     complete: impl FnOnce(&AtomicBool) -> Result<T, Error>,
@@ -1025,19 +1212,28 @@ fn heartbeat_during<T>(
     scope(alloc, |s| {
         let (finished, lost) = (&finished, &lost);
         let heartbeat = s.spawn(move || {
-            let mut client = match Client::connect(config.socket.as_str(), random_id()?, alloc) {
+            let mut client = match budget.connect_worker(config, unit) {
                 Ok(client) => client,
                 Err(error) => {
                     lost.store(true, Ordering::Release);
                     return Err(error);
                 }
             };
-            let bound = now_ms().saturating_add(duration_ms(config.deadline));
+            let bound = if budget.epoch.is_some() {
+                budget.deadline_ms
+            } else {
+                now_ms().saturating_add(duration_ms(config.deadline))
+            };
             let mut next = now_ms();
             while !finished.load(Ordering::Acquire)
                 && !cancelled.load(Ordering::Acquire)
                 && now_ms() <= bound
             {
+                if let Err(error) = budget.check_active(unit, clock, alloc) {
+                    lost.store(true, Ordering::Release);
+                    let _ = client.release();
+                    return Err(error);
+                }
                 if now_ms() >= next {
                     let command = Command::WorkerEvents(carrier::WorkerEvents {
                         content,
@@ -1062,7 +1258,7 @@ fn heartbeat_during<T>(
                     }
                     next = now_ms().saturating_add(config.holder.heartbeat_ms);
                 }
-                sleep(config.poll.min(Duration::from_millis(50)));
+                sleep(budget.poll_wait(clock, config.poll.min(Duration::from_millis(50))));
             }
             let _ = client.release();
             Ok::<(), Error>(())
@@ -1121,7 +1317,8 @@ fn hold(
     binding: &Binding,
     executor: &str,
     lead: bool,
-    gate_timeout: Duration,
+    budget: UnitBudget,
+    clock: SystemClock,
     execution: ExecutionId,
     attempt: Attempt,
     now_ms: &(impl Fn() -> u64 + Sync),
@@ -1130,6 +1327,7 @@ fn hold(
     arrived: &mut Arrived,
 ) -> Result<StopWhy, Error> {
     let alloc = config.blobs.alloc;
+    budget.check_active(unit, clock, alloc)?;
     let content = binding.subscription.content;
     let mut holder = Holder::new(
         executor,
@@ -1141,8 +1339,10 @@ fn hold(
         config.holder.clone(),
         alloc,
     );
-    let mut client = Client::connect(config.socket.as_str(), random_id()?, alloc)?;
-    let mut watcher = Client::connect(config.socket.as_str(), random_id()?, alloc)?;
+    let mut client = budget.connect_worker(config, unit)?;
+    let mut watcher = budget.connect_worker(config, unit)?;
+    budget.check_active(unit, clock, alloc)?;
+    let gate_timeout = budget.remaining(clock);
     let leave = AtomicBool::new(false);
     let working = AtomicBool::new(true);
     let driver = DriverConfig {
@@ -1170,7 +1370,9 @@ fn hold(
         let watching = s.spawn(move || {
             let mut waited = config.poll;
             while working.load(Ordering::Acquire) {
-                if cancelled.load(Ordering::Acquire) {
+                if cancelled.load(Ordering::Acquire)
+                    || budget.epoch.is_some_and(|_| budget.remaining(clock).is_zero())
+                {
                     leave.store(true, Ordering::Release);
                     break;
                 }
@@ -1183,7 +1385,7 @@ fn hold(
                     // The holder's own calls say what this is; its heartbeat ends it.
                     Err(_) => {}
                 }
-                sleep(waited);
+                sleep(budget.poll_wait(clock, waited));
                 waited = waited.saturating_mul(2).min(POLL_MOST);
             }
             let _ = watcher.release();
@@ -1368,6 +1570,85 @@ mod tests {
 
     fn test_alloc() -> WireAlloc {
         blaze_own::testing::heap().shared()
+    }
+
+    #[test]
+    fn a_pull_request_export_reuses_the_first_deadline_in_its_epoch() {
+        let alloc = test_alloc();
+        let unit = Unit { spec: [3; 32], names: Vec::new_in(alloc) };
+        let mut config = Config {
+            socket: WireString::from_str_in("unused", alloc),
+            blobs: Blobs {
+                address: "127.0.0.1:1".parse().unwrap(),
+                timeout: Duration::from_secs(1),
+                alloc,
+            },
+            claimant: [4; 32],
+            platform: [5; 32],
+            local: LocalPolicy::Fallback,
+            namespace: Namespace::Pr(blaze_wire::PrNamespace { n: 81 }),
+            source: [6; 32],
+            deadline: Duration::from_secs(1),
+            holder: HolderConfig { heartbeat_ms: 100, retry_ms: 100, idle_ms: 10 },
+            poll: Duration::from_millis(5),
+        };
+        let welcome = carrier::LocalWelcome {
+            transport: carrier::TRANSPORT_VERSION,
+            codec: 1,
+            terminal: 1,
+            session: [7; 32],
+            epoch: [8; 32],
+            now_ms: 100,
+            expires_ms: 2_000,
+            max_frame: 4_096,
+            next_request: 1,
+            created: true,
+        };
+        let next = carrier::LocalWelcome { now_ms: 800, session: [9; 32], ..welcome.clone() };
+        let restarted = carrier::LocalWelcome { epoch: [10; 32], ..next.clone() };
+        let expired = carrier::LocalWelcome { now_ms: 1_100, ..next.clone() };
+        {
+            let mut export = ExportBudget::new(&config);
+            let first = export.admit(&unit, &welcome, 1_000_000, 100).unwrap();
+            let second = export.admit(&unit, &next, 501_000_000, 800).unwrap();
+            assert_eq!(request(&unit, &config, first).deadline_ms, 1_100);
+            assert_eq!(request(&unit, &config, second).deadline_ms, 1_100);
+            assert_eq!(second.limit, Duration::from_millis(300));
+            assert!(matches!(
+                export.admit(&unit, &restarted, 502_000_000, 800),
+                Err(Error::Cancelled(reason)) if reason.as_str().contains("coordinator epoch")
+            ));
+            assert!(matches!(
+                export.admit(&unit, &expired, 503_000_000, 1_100),
+                Err(Error::Cancelled(reason)) if reason.as_str().contains("deadline expired")
+            ));
+            assert!(matches!(
+                export.admit(&unit, &next, 1_001_000_000, 800),
+                Err(Error::Cancelled(reason)) if reason.as_str().contains("deadline expired")
+            ));
+        }
+
+        config.namespace = Namespace::Main;
+        let mut export = ExportBudget::new(&config);
+        let first = export.admit(&unit, &welcome, 1_000_000, 100).unwrap();
+        let second = export.admit(&unit, &restarted, 501_000_000, 800).unwrap();
+        assert_eq!(request(&unit, &config, first).deadline_ms, 1_100);
+        assert_eq!(request(&unit, &config, second).deadline_ms, 1_800);
+        assert_eq!(second.limit, config.deadline);
+    }
+
+    #[test]
+    fn a_superseded_request_cannot_fall_back_to_local_compilation() {
+        let alloc = test_alloc();
+        let unit = Unit { spec: [3; 32], names: Vec::new_in(alloc) };
+        for refusal in [Refusal::Superseded, Refusal::PrDeadlineExpired] {
+            let wire = refusal.to_wire(None, alloc);
+            let error = submission_error(&unit, &wire, alloc);
+            assert!(matches!(
+                decide(&LocalPolicy::Fallback, error, alloc),
+                Err(Error::Cancelled(reason)) if reason.as_str().contains(refusal.token())
+            ));
+        }
     }
 
     #[test]

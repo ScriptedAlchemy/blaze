@@ -7,10 +7,14 @@ import importlib.util
 import json
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from blake3 import blake3
 import sys
 import tempfile
+from threading import Thread
 import unittest
 from unittest.mock import patch
 
@@ -99,6 +103,47 @@ def fixture_answer(gate, value):
 
 
 class ResultGateOracles(unittest.TestCase):
+
+    def test_only_the_planned_manifest_waits_for_release(self):
+        selected = f"/v1/list/manifests/{UNIT}"
+        other = f"/v1/list/manifests/{OTHER}"
+
+        class Origin(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        with tempfile.TemporaryDirectory() as tmp, ThreadingHTTPServer(("127.0.0.1", 0), Origin) as origin:
+            worker = Thread(target=origin.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            worker.start()
+            try:
+                given = h.Input(blaze="blaze", dist_local="local", serve="serve", scratch=tmp, command_timeout=3)
+                with patch.dict(os.environ, HOME=tmp):
+                    run = h.Run(given)
+                run.port = origin.server_port
+                with run.hold_manifest_lookup("a", "app") as (proxy, requested, release), ThreadPoolExecutor(1) as reader:
+                    Path(f"{run.report_path('a')}.plans").write_text(json.dumps([{"unit": "app", "unit_digest": UNIT}]) + "\n")
+
+                    def get(path):
+                        client = HTTPConnection(proxy, timeout=3)
+                        try:
+                            client.request("GET", path, headers={"Content-Length": "0", "Connection": "close"})
+                            return client.getresponse().status
+                        finally:
+                            client.close()
+
+                    self.assertEqual(get(other), 404)
+                    self.assertFalse(requested.is_set())
+                    held = reader.submit(get, selected)
+                    self.assertTrue(requested.wait(2))
+                    self.assertFalse(held.done())
+                    release.set()
+                    self.assertEqual(held.result(timeout=2), 404)
+            finally:
+                origin.shutdown()
+                worker.join(timeout=3)
+
     def test_peer_must_commit_disjoint_work_in_the_held_execution_and_attempt(self):
         held = grant(work=[KEY])
         other = grant(pid=124, holder="b", generation=4, work=[OTHER])
