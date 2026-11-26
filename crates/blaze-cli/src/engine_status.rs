@@ -295,6 +295,12 @@ impl<'r> Board<'r> {
         counts.known.fetch_add(known, Ordering::AcqRel);
         counts.phase_from.store(now.saturating_add(1), Ordering::Release);
         self.stage.store(stage.index() as u8 + 1, Ordering::Release);
+        #[cfg(test)]
+        if let Plant::StopAfter { stage: planted, done: 0, by } = self.plant
+            && planted == stage && known > 0 && counts.done.load(Ordering::Acquire) == 0
+        {
+            self.own.ask_stop(by);
+        }
         PhaseMark { stage, started: counts.started.load(Ordering::Acquire), done: counts.done.load(Ordering::Acquire), refused: counts.refused.load(Ordering::Acquire) }
     }
 

@@ -404,6 +404,10 @@ pub trait Facts {
         let _ = (trait_, name);
         false
     }
+    /// The `future_trait` lang item, when present.
+    fn future_trait(&self) -> Option<ItemKey> {
+        None
+    }
     /// The trait bounds with lifetime arguments of fn `item` ([`Ties`]): a callee's tie its
     /// trait lifetimes to what the call's arguments answer them with, the body's own say what
     /// its type parameters answer them with (trait_ties.rs). Whoever answers files the read of
@@ -450,6 +454,15 @@ pub trait Facts {
     /// `PhantomData<&'a T>`), `[true]` for `Option<T>`. Read only when
     /// [`AdtFacts::needs_drop`] is `false`. `None`: every argument may be dropped.
     fn drop_args(&self, _adt: ItemKey) -> Option<&[bool]> {
+        None
+    }
+    /// For each generic argument of `adt`, whether dropping `adt` may directly inspect arbitrary
+    /// lifetimes inside that argument via a non-`#[may_dangle]` `Drop` impl (RFC 1327):
+    /// `[true]` for `BufWriter<W>` (and `struct Outer<W>(BufWriter<W>)`), `[false, true]` for
+    /// `Arc<T, A>` / `Vec<T, A>` / `Box<T, A>` (`#[may_dangle] T`), `[false, false]` for
+    /// `Map<S, F>` (holds `Arc<F>`). `None`: conservative (`true` when `drop_impl`, `false` when
+    /// structural).
+    fn drop_strict(&self, _adt: ItemKey) -> Option<&[bool]> {
         None
     }
     /// The number of fields of `variant`.
@@ -2584,18 +2597,29 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         if n == 0 {
             return Ok(());
         }
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DropMode {
+            /// Behind `&`/`&mut`/`*const`/`fn(..)`/union/non-dropping field: no drop runs.
+            None,
+            /// Structural drop glue or `#[may_dangle]` `Drop` parameter: only inner `Drop` impls
+            /// keep origins live; references and by-ref closure captures are `OriginLive::NoDrop`.
+            Glue,
+            /// Inside a non-`#[may_dangle]` parameter of a `Drop` impl (e.g. `BufWriter<W>`):
+            /// `Drop::drop` may dereference any lifetime inside `W`, so every origin is `Full`.
+            Strict,
+        }
         enum Step {
-            Ty(PTy, bool),
+            Ty(PTy, DropMode),
             Pos(OriginLive),
         }
         let mut todo: Vec<Step, A> = Vec::new_in(self.alloc);
         if t.wrap.is_some() {
             // A reference itself never runs a destructor on its referent, while inner opaques
             // still respect their item outlives bounds.
-            todo.push(Step::Ty(t.ty, false));
+            todo.push(Step::Ty(t.ty, DropMode::None));
             todo.push(Step::Pos(OriginLive::NoDrop));
         } else {
-            todo.push(Step::Ty(t.ty, true));
+            todo.push(Step::Ty(t.ty, DropMode::Glue));
         }
         let mut steps = 0u32;
         while let Some(step) = todo.pop() {
@@ -2603,62 +2627,95 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             if steps > MOST_POSITIONS || out.len() as u32 > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
             }
-            let (ty, active) = match step {
+            let (ty, mode) = match step {
                 Step::Pos(m) => {
                     out.push(m);
                     continue;
                 }
-                Step::Ty(ty, active) => (ty, active),
+                Step::Ty(ty, mode) => (ty, mode),
             };
-            let live = if active { OriginLive::Full } else { OriginLive::NoDrop };
+            let live = match mode {
+                DropMode::None => OriginLive::NoDrop,
+                DropMode::Glue | DropMode::Strict => OriginLive::Full,
+            };
             match self.node(ty, e)? {
                 PNode::Ref(_, i) => {
-                    todo.push(Step::Ty(i, false));
-                    todo.push(Step::Pos(OriginLive::NoDrop));
-                }
-                PNode::Ptr(_, i) => todo.push(Step::Ty(i, false)),
-                PNode::FnPtr(l, _) => {
-                    let xs = self.list(l, e)?;
-                    for &x in xs.iter().rev() {
-                        todo.push(Step::Ty(x, false));
+                    if mode == DropMode::Strict {
+                        todo.push(Step::Ty(i, DropMode::Strict));
+                        todo.push(Step::Pos(OriginLive::Full));
+                    } else {
+                        todo.push(Step::Ty(i, DropMode::None));
+                        todo.push(Step::Pos(OriginLive::NoDrop));
                     }
                 }
-                PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => todo.push(Step::Ty(i, active)),
+                PNode::Ptr(_, i) => {
+                    todo.push(Step::Ty(i, if mode == DropMode::Strict { DropMode::Strict } else { DropMode::None }));
+                }
+                PNode::FnPtr(l, _) => {
+                    let next = if mode == DropMode::Strict { DropMode::Strict } else { DropMode::None };
+                    let xs = self.list(l, e)?;
+                    for &x in xs.iter().rev() {
+                        todo.push(Step::Ty(x, next));
+                    }
+                }
+                PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => todo.push(Step::Ty(i, mode)),
                 PNode::Tuple(l) | PNode::Record(_, l) => {
                     for &x in self.list(l, e)?.iter().rev() {
-                        todo.push(Step::Ty(x, active));
+                        todo.push(Step::Ty(x, mode));
                     }
                 }
                 PNode::Union(l) => {
+                    let next = if mode == DropMode::Strict { DropMode::Strict } else { DropMode::None };
                     for &x in self.list(l, e)?.iter().rev() {
-                        todo.push(Step::Ty(x, false));
+                        todo.push(Step::Ty(x, next));
                     }
                 }
                 PNode::Adt(k, l) => {
                     let af = self.adt_facts(k, e)?;
                     let args = self.list(l, e)?;
-                    if af.drop_impl || af.needs_drop {
+                    if mode == DropMode::Strict {
                         for &x in args.iter().rev() {
-                            todo.push(Step::Ty(x, active));
+                            todo.push(Step::Ty(x, DropMode::Strict));
                         }
                         for _ in 0..af.lifetimes {
-                            todo.push(Step::Pos(live));
+                            todo.push(Step::Pos(OriginLive::Full));
                         }
-                    } else if af.union {
+                    } else if mode == DropMode::None || af.union {
                         for &x in args.iter().rev() {
-                            todo.push(Step::Ty(x, false));
+                            todo.push(Step::Ty(x, DropMode::None));
                         }
                         for _ in 0..af.lifetimes {
                             todo.push(Step::Pos(OriginLive::NoDrop));
                         }
+                    } else if af.drop_impl || af.needs_drop {
+                        let strict = self.facts.drop_strict(k);
+                        for (j, &x) in args.iter().enumerate().rev() {
+                            let is_strict = match strict {
+                                Some(s) if s.len() == args.len() => s.get(j).copied().unwrap_or(true),
+                                _ => af.drop_impl && !(af.is_box && j == 0),
+                            };
+                            todo.push(Step::Ty(x, if is_strict { DropMode::Strict } else { DropMode::Glue }));
+                        }
+                        for _ in 0..af.lifetimes {
+                            todo.push(Step::Pos(OriginLive::Full));
+                        }
                     } else {
                         let drop_args = self.facts.drop_args(k);
+                        let strict = self.facts.drop_strict(k);
                         for (j, &x) in args.iter().enumerate().rev() {
-                            let arg_drops = active && match drop_args {
-                                Some(d) if d.len() == args.len() => d[j],
+                            let arg_drops = match drop_args {
+                                Some(d) if d.len() == args.len() => d.get(j).copied().unwrap_or(true),
                                 _ => true,
                             };
-                            todo.push(Step::Ty(x, arg_drops));
+                            let arg_strict = strict.is_some_and(|s| s.len() == args.len() && s.get(j).copied().unwrap_or(false));
+                            let next = if !arg_drops {
+                                DropMode::None
+                            } else if arg_strict {
+                                DropMode::Strict
+                            } else {
+                                DropMode::Glue
+                            };
+                            todo.push(Step::Ty(x, next));
                         }
                         for _ in 0..af.lifetimes {
                             todo.push(Step::Pos(OriginLive::NoDrop));
@@ -2670,22 +2727,57 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         let ol = self.opaque_live(k);
                         let args = self.list(l, e)?;
                         for &x in args.iter().rev() {
-                            todo.push(Step::Ty(x, active));
+                            todo.push(Step::Ty(x, mode));
                         }
                         for j in (0..caps).rev() {
-                            let mode = match ol {
+                            let m = match ol {
                                 OpaqueLive::Nothing => OriginLive::None,
                                 OpaqueLive::Only(Region::Param(p)) if p < caps => {
                                     if j == p { live } else { OriginLive::None }
                                 }
                                 _ => live,
                             };
-                            todo.push(Step::Pos(mode));
+                            todo.push(Step::Pos(m));
                         }
                     } else {
                         let cnt = self.npos(ty, e)?;
                         for _ in 0..cnt {
                             out.push(live);
+                        }
+                    }
+                }
+                PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
+                    let Some(&ce) = self.ck.closures.column::<0>().get(usize::try_from(ordinal).unwrap_or(usize::MAX)) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    // Matches `npos` and `closure_value` pre-order: capture fields first, then
+                    // owner-bound signature positions. Under `DropMode::Strict` (non-`#[may_dangle]`
+                    // `Drop` impl), every origin is `Full`; under `DropMode::Glue`, only by-value
+                    // captures drop; reference captures and signature slots are `OriginLive::NoDrop`.
+                    let nsig = self.owner_sig_count(usize::try_from(ordinal).unwrap_or(usize::MAX), e)?;
+                    let sig_live = if mode == DropMode::Strict { OriginLive::Full } else { OriginLive::NoDrop };
+                    for _ in 0..nsig {
+                        todo.push(Step::Pos(sig_live));
+                    }
+                    let mut fields: Vec<blaze_typeck::EnvField, A> = Vec::new_in(self.alloc);
+                    for f in self.ck.env_fields_by::<blaze_typeck::Places>(ce) {
+                        fields.push(f);
+                    }
+                    for f in fields.iter().rev() {
+                        let Some(ft) = f.place_ty(self.ck) else {
+                            return self.refuse(Form::Malformed, e);
+                        };
+                        match f.how {
+                            blaze_typeck::CaptureKind::ByValue => todo.push(Step::Ty(ft, mode)),
+                            blaze_typeck::CaptureKind::ByRef | blaze_typeck::CaptureKind::ByMutRef => {
+                                if mode == DropMode::Strict {
+                                    todo.push(Step::Ty(ft, DropMode::Strict));
+                                    todo.push(Step::Pos(OriginLive::Full));
+                                } else {
+                                    todo.push(Step::Ty(ft, DropMode::None));
+                                    todo.push(Step::Pos(OriginLive::NoDrop));
+                                }
+                            }
                         }
                     }
                 }

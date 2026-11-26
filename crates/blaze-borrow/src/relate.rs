@@ -978,6 +978,49 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
         res
     }
 
+    /// A caller may forward its own bound on `P::Assoc`. The receiver must resolve to
+    /// that same caller parameter. A GAT or trait with more arguments needs their proof too.
+    fn caller_projection_outlives(&mut self, alias: Side<'c>, subject: Side<'c>, region: Reg) -> Result<bool, Refused> {
+        let PNode::Param(param) = self.node(subject)? else { return Ok(false) };
+        if self.own(alias)? != SlotCount::ZERO {
+            return Ok(false);
+        }
+        let owner: &'c dyn Owner = self.owner;
+        let node = self.node(alias)?;
+        for clause in owner.clauses() {
+            let Some(rhs) = clause.outlives else { continue };
+            let rhs = if rhs == Region::Static { Reg::Static } else { Reg::Owner(rhs) };
+            if clause.binders != 0 || (rhs != Reg::Static && rhs != region) || !clause.col.as_slice().is_empty() {
+                continue;
+            }
+            let ty = clause.col.ty();
+            let declared = self.sig_types.node(ty).map_err(|u| self.count_err(u))?;
+            if !head_eq(declared, node) {
+                continue;
+            }
+            let kids = self.sig_types.kids(ty).map_err(|u| self.count_err(u))?;
+            if kids.len() == 1 && let Some(receiver) = kids.get(0)
+                && self.sig_types.node(receiver).map_err(|u| self.count_err(u))? == PNode::Param(param)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// An async block's capture slots belong to the future. Its zero-slot output can be
+    /// checked directly in the body's type table, including any caller type parameters.
+    fn future_output(&self, subject: Side<'c>, trait_: ItemKey, name: blaze_typeck::Name) -> Result<Option<Side<'c>>, Refused> {
+        if Some(trait_) != self.selected.future_trait() || name != blaze_typeck::Name::of("Output")
+            || !matches!(subject.slots, Slots::Caller(_))
+        {
+            return Ok(None);
+        }
+        let PNode::Future(_, output, _) = self.node(subject)? else { return Ok(None) };
+        let count = self.types.count(output).map_err(|u| self.count_err(u))?;
+        Ok((count == SlotCount::ZERO).then_some(Side { ty: output, slots: Slots::Caller(crate::SlotRange::EMPTY) }))
+    }
+
     fn components_loop(&mut self, s: Side<'c>, region: Reg, depth: u32, base_sp: usize) -> Result<(), Refused> {
         let mut enter = Some((s, depth));
         loop {
@@ -1002,6 +1045,20 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                             let value = self.normalize(cur, n, d)?;
                             enter = Some((value, d + 1));
                             continue;
+                        }
+                        let kids = self.kids_of(cur)?;
+                        if kids.len() == 1 {
+                            let (_, rest) = cur.slots.split(self.own(cur)?).ok_or(self.malformed(cur.ty, Bad::StepBound))?;
+                            let (receiver, _) = self.kid(cur, &kids, rest, 0)?;
+                            if let Resolved::Side(subject) = self.resolve(receiver)? {
+                                if self.caller_projection_outlives(cur, subject, region)? {
+                                    continue;
+                                }
+                                if let Some(output) = self.future_output(subject, trait_, name)? {
+                                    enter = Some((output, d + 1));
+                                    continue;
+                                }
+                            }
                         }
                         // Not selected: the alias outlives `'r` if its arguments do (RFC 1214's
                         // projection rule, its sufficient half).
@@ -2339,6 +2396,9 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
             if let Some(out) = self.builtin_fn_trait(subject, args_tuple, None, trait_, want.ty)? {
                 return Ok(Some(out));
             }
+        }
+        if want_arg_count == 1 && let Some(output) = self.future_output(subject, trait_, name)? {
+            return Ok(Some(output));
         }
         let owner: &'c dyn Owner = self.owner;
         let clauses = owner.clauses();

@@ -393,7 +393,8 @@ impl Arity for Decls {
 /// both live as long as the views handed out (`RegionFacts::clauses` returns a slice of views).
 fn leak(item: ItemKey, head: HeadRegions<Alloc<'static>>) -> (ItemKey, &'static HeadRegions<Alloc<'static>>, &'static [ClauseView<'static>]) {
     let head: &'static HeadRegions<Alloc<'static>> = Box::leak(Box::new(head));
-    let views: vec::Vec<ClauseView<'static>> = head.clauses.iter().map(ClauseView::of).collect();
+    let mut views: vec::Vec<ClauseView<'static>> = head.clauses.iter().map(ClauseView::of).collect();
+    ClauseView::bind_outlives(&mut views, &head.outlives);
     (item, head, Box::leak(views.into_boxed_slice()))
 }
 
@@ -573,6 +574,9 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
         self.base.is_zero_slot_builtin_assoc(trait_, name)
     }
+    fn future_trait(&self) -> Option<ItemKey> {
+        self.base.future_trait()
+    }
     fn ties(&self, item: ItemKey) -> Option<Ties<'_>> {
         self.base.ties(item)
     }
@@ -593,6 +597,9 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     }
     fn drop_args(&self, adt: ItemKey) -> Option<&[bool]> {
         self.base.drop_args(adt)
+    }
+    fn drop_strict(&self, adt: ItemKey) -> Option<&[bool]> {
+        self.base.drop_strict(adt)
     }
     fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32> {
         self.base.field_count(adt, variant)
