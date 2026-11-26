@@ -144,7 +144,7 @@ struct Setup {
     area: AString<'static>,
     /// The shelf's digest: its folder's name.
     compiler: [u8; 32],
-    sdk_key: [u8; blaze_apple_sdk::SdkId::KEY_LEN],
+    sdk_key: AVec<'static, u8>,
     sdk_digest: [u8; 32],
 }
 
@@ -153,7 +153,7 @@ struct Setup {
 /// compile results cross worker threads there, native_c_tasks.rs `CTasksSetting::heap`).
 pub(crate) struct CTasks<'e> {
     home: Option<&'e str>,
-    sdk: blaze_apple_sdk::Sdk<'e>,
+    sdk: Option<blaze_apple_sdk::Sdk<'e>>,
     fs: &'e bstd::fs::Fs,
     checkout: Option<&'e str>,
     leaves: &'e crate::sweep::Leaves<'e>,
@@ -164,7 +164,7 @@ pub(crate) struct CTasks<'e> {
 }
 
 impl<'e> CTasks<'e> {
-    pub(crate) fn new(home: Option<&'e str>, sdk: blaze_apple_sdk::Sdk<'e>, fs: &'e bstd::fs::Fs, workers: u32, heap: &'static blaze_own::Heap, checkout: Option<&'e str>, leaves: &'e crate::sweep::Leaves<'e>) -> CTasks<'e> {
+    pub(crate) fn new(home: Option<&'e str>, sdk: Option<blaze_apple_sdk::Sdk<'e>>, fs: &'e bstd::fs::Fs, workers: u32, heap: &'static blaze_own::Heap, checkout: Option<&'e str>, leaves: &'e crate::sweep::Leaves<'e>) -> CTasks<'e> {
         CTasks { home, sdk, fs, workers, heap, checkout, leaves, setup: None, dirs: PackDirs::default() }
     }
 
@@ -181,16 +181,24 @@ fn kept<'s>(scratch: &'s Frame, words: fmt::Arguments<'_>) -> &'s str {
     crate::work::held_str(bstd::mem::format_in!(scratch, "{words}").as_str(), scratch)
 }
 
-fn set_up<'w>(home: Option<&str>, sdk: blaze_apple_sdk::Sdk<'_>, alloc: Alloc<'static>, scratch: &'w Frame) -> Result<Setup, CTaskWhy<'w>> {
+fn set_up<'w>(home: Option<&str>, sdk: Option<blaze_apple_sdk::Sdk<'_>>, alloc: Alloc<'static>, scratch: &'w Frame) -> Result<Setup, CTaskWhy<'w>> {
     let words = |what: fmt::Arguments<'_>| CTaskWhy::Setup { words: kept(scratch, what) };
     let Some(home) = home else { return Err(words(format_args!("HOME is not set, and the shelf and the work folder are beneath it"))) };
-    let setting = command_native_setting(home, sdk.folder(), WORK, crate::graph::TRIPLE, alloc).map_err(|e| words(format_args!("{e}")))?;
+    let setting = command_native_setting(home, sdk.map_or("", |sdk| sdk.folder()), WORK, crate::graph::TRIPLE, alloc).map_err(|e| words(format_args!("{e}")))?;
     let mut clang = String::from_str_in(setting.shelf.as_str(), alloc);
     clang.push_str("/bin/clang");
     let real = std::fs::canonicalize(clang.as_str()).map_err(|e| words(format_args!("{}: {e}", clang.as_str())))?;
     let real = real.to_str().ok_or_else(|| words(format_args!("{}: its real path is not UTF-8", clang.as_str())))?;
     let clang = String::from_str_in(real, alloc);
-    let compiler = hex32(setting.shelf.as_str().rsplit('/').next().unwrap_or("")).ok_or_else(|| words(format_args!("the shelf {} is not named by its digest", setting.shelf.as_str())))?;
+    let archive = hex32(setting.shelf.as_str().rsplit('/').next().unwrap_or("")).ok_or_else(|| words(format_args!("the shelf {} is not named by its digest", setting.shelf.as_str())))?;
+    let compiler = match setting.pinned {
+        None => archive,
+        Some(roots) => {
+            let mut digest = Hasher::new("blaze-cli pinned native compiler tree 1");
+            digest.update(&archive).update(&roots.shelf());
+            digest.finish().0
+        }
+    };
     let mut area = String::from_str_in(home, alloc);
     area.push('/');
     area.push_str(crate::scripts::STORE_UNDER_HOME);
@@ -200,7 +208,12 @@ fn set_up<'w>(home: Option<&str>, sdk: blaze_apple_sdk::Sdk<'_>, alloc: Alloc<'s
     let real = std::fs::canonicalize(area.as_str()).map_err(|e| words(format_args!("{}: {e}", area.as_str())))?;
     let real = real.to_str().ok_or_else(|| words(format_args!("{}: its real path is not UTF-8", area.as_str())))?;
     let area = String::from_str_in(real, alloc);
-    let sdk_key = sdk.identity().key();
+    let mut sdk_key = Vec::new_in(alloc);
+    match (sdk, setting.pinned) {
+        (Some(sdk), None) => sdk_key.extend_from_slice(&sdk.identity().key()),
+        (None, Some(roots)) => sdk_key.extend_from_slice(&roots.sysroot()),
+        _ => return Err(words(format_args!("the C sysroot proof does not match {}", crate::graph::TRIPLE))),
+    }
     let mut digest = Hasher::new("blaze-cli c tasks sdk root 1");
     digest.update(&sdk_key);
     Ok(Setup { setting, clang, area, compiler, sdk_key, sdk_digest: digest.finish().0 })
@@ -289,13 +302,16 @@ pub(crate) fn built_for<'s, 'm: 's>(
     demand_text.extend(demand.iter().map(|d| d.as_str()));
     let (compiler, sdk_key) = {
         let setup = c.setup(scratch)?;
-        (setup.compiler, setup.sdk_key)
+        (setup.compiler, setup.sdk_key.clone())
     };
     let toolchain = Toolchain { kind: CompilerKind::ShelfClang, compiler, sdk: &sdk_key, target: crate::graph::TRIPLE };
     // A crate with process-tree requests (`sh configure`, `make`): the host tools the table
     // grants it and the OS build, read and keyed once (native_c_tasks.rs `tree_tools`); their
     // digest is in the built key, so a changed tool is another built record (rule 21).
     let has_tree = outputs.c_requests().any(|text| c_tasks::is_tree(text.split('\0').next().unwrap_or("")));
+    if has_tree && crate::graph::TRIPLE == "aarch64-unknown-linux-gnu" {
+        return Err(CTaskWhy::NotPinned { why: "Linux shell/make process trees have no pinned host-tool runtime; only deferred C compile/archive requests are supported" });
+    }
     let erased_scratch = blaze_own::Erased::new(scratch);
     let trees = match has_tree {
         false => None,
@@ -358,7 +374,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
     let setting = CTasksSetting {
         clang: setup.clang.as_str(),
         shelf: Laid { guest: GUEST_SHELF, host: setup_shelf, digest: setup.compiler, name: "the pinned clang's shelf" },
-        sdk: Laid { guest: GUEST_SDK, host: setup.setting.sdk.as_str(), digest: setup.sdk_digest, name: "the macOS SDK" },
+        sdk: Laid { guest: GUEST_SDK, host: setup.setting.sdk.as_str(), digest: setup.sdk_digest, name: "the C sysroot" },
         work: setup.setting.work.as_str(),
         area: setup.area.as_str(),
         workers: c.workers,

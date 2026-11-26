@@ -11,6 +11,8 @@ One JSON object, inline, a file, or `-`:
     only     case names to run (empty: all 23)
     timeout  seconds bounding each source command (1800 by default)
     source   the compiler source checkout (defaults to this checkout)
+    module_builder  the D52 proc_macro_modules executable for fixtures with macros or scripts
+    clang_shelf  pinned C toolchains directory for the archive fixture (defaults to shelf/clang)
     workers  worker count passed explicitly to check/run/test/export (optional)
     stall_bound  accepted for compatibility with the legacy harness input; the v2
              checkout daemon has no such tuning and the value is reported as ignored
@@ -26,11 +28,12 @@ is used. Independent semantic failures are collected. A timeout or an ownership 
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import signal
@@ -47,6 +50,7 @@ from typed_input import parse  # noqa: E402
 
 RESOURCE_ENV = ("BLAZE_LIBRARY", "BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB", "BLAZE_HUGE_PAGES",
                 "BLAZE_TESTS", "BLAZE_STORE_MAX_BYTES", "BLAZE_STORE_MAX_GB")
+LOCKS = Path(__file__).resolve().parent / "forkfixes/locks"
 
 
 class Failed(ValueError):
@@ -67,6 +71,8 @@ class Input:
     source: str | None = None
     workers: int | None = None
     stall_bound: int | None = None
+    module_builder: str | None = None
+    clang_shelf: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("timeout", "workers", "stall_bound"):
@@ -103,10 +109,14 @@ def validate(given: Input, harness_home: str | None) -> Input:
     shelf_path = Path(shelf)
     if not shelf_path.is_dir() or not any(shelf_path.iterdir()):
         raise Failed(f"shelf {shelf_path} is not a nonempty toolchain shelf")
-    if any(path.is_symlink() for path in shelf_path.rglob("*")):
-        raise Failed(f"shelf {shelf_path} contains a symlink; copy the canonical shelf")
-    return Input(str(blaze.absolute()), str(scratch.absolute()), str(shelf_path.resolve()),
-                 given.only, given.timeout, given.source, given.workers, given.stall_bound)
+    for entry in shelf_path.iterdir():
+        if entry.is_symlink() or (entry.is_dir() and entry.name not in ("clang", "sysroot") and any(p.is_symlink() for p in entry.rglob("*"))):
+            raise Failed(f"shelf {shelf_path} contains a symlink outside the pinned C toolchain")
+    builder = Path(given.module_builder).resolve() if given.module_builder else None
+    if builder and (not builder.is_file() or not os.access(builder, os.X_OK)):
+        raise Failed(f"D52 module builder {builder} is not executable")
+    return replace(given, blaze=str(blaze.absolute()), scratch=str(scratch.absolute()),
+                   shelf=str(shelf_path.resolve()), module_builder=str(builder) if builder else None)
 
 
 def binary_digests(blaze: Path) -> dict[str, str]:
@@ -134,12 +144,14 @@ def provenance(given: Input) -> dict:
             if not path.is_relative_to(Path(given.scratch).resolve()):
                 untracked[os.fsdecode(name)] = digest(path) if path.is_file() else os.readlink(path)
     harness = [Path(__file__).resolve(), root / "harness/forkfixes/cases.py",
+               *sorted(LOCKS.glob("*.lock")),
                root / ".github/scripts/forkfixes_acceptance.py",
                *sorted((root / "tools/typed-input/src").rglob("*.py"))]
     return {"source": str(source), "source_head": git("rev-parse", "HEAD").decode().strip(),
             "git_tree": git("rev-parse", "HEAD^{tree}").decode().strip(),
             "patch_sha256": hashlib.sha256(git("diff", "--no-ext-diff", "--binary", "HEAD")).hexdigest(),
             "untracked_sha256": tree_identity(untracked), "binaries": binary_digests(Path(given.blaze)),
+            "module_builder_sha256": digest(Path(given.module_builder)) if given.module_builder else None,
             "harness": {str(path.relative_to(root)): digest(path) for path in harness},
             "resources": {name: os.environ[name] for name in RESOURCE_ENV if name in os.environ},
             "workers": given.workers, "shelf": shelf_provenance(Path(given.shelf))}
@@ -194,16 +206,59 @@ def copy_shelf(shelf: Path, home: Path) -> None:
     """Place the immutable shelf in a fresh HOME, hard-linking its read-only packs when possible."""
     destination = home / ".blaze/v2/toolchain"
     destination.mkdir(parents=True)
-    for source in sorted(shelf.rglob("*")):
-        target = destination / source.relative_to(shelf)
+    for source in sorted(shelf.iterdir()):
+        if source.name in ("clang", "sysroot"):
+            continue
+        target = destination / source.name
         if source.is_dir():
-            target.mkdir()
+            shutil.copytree(source, target, copy_function=link_or_copy)
         elif source.is_file():
-            try:
-                os.link(source, target)
-            except OSError:
-                shutil.copy2(source, target)
+            link_or_copy(source, target)
     (home / "tmp").mkdir()
+
+
+def link_or_copy(source: Path, target: Path) -> None:
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+
+
+def copy_pinned_directory(source: Path, target: Path) -> None:
+    require(source.is_dir() and not source.is_symlink(), f"unpacked pinned C toolchain is missing at {source}")
+    real = source.resolve()
+    for path in source.rglob("*"):
+        if path.is_symlink() and (path.readlink().is_absolute() or not path.resolve(strict=True).is_relative_to(real)):
+            raise CaseFailed(f"C toolchain link escapes its pinned directory: {path}")
+    shutil.copytree(source, target, symlinks=True, copy_function=link_or_copy)
+
+
+def copy_clang(given: Input, home: Path) -> dict:
+    """Copy the host's unpacked pin, preserving its internal compiler and linker links."""
+    shelf = Path(given.clang_shelf) if given.clang_shelf else Path(given.shelf) / "clang"
+    source = Path(given.source or Path(__file__).resolve().parents[1])
+    pins = json.loads((source / "pins/clang.json").read_text())
+    arch = platform.machine().replace("arm64", "aarch64")
+    system = {"darwin": "apple-darwin", "linux": "unknown-linux-gnu"}.get(sys.platform, sys.platform)
+    host = f"{arch}-{system}"
+    require(host in pins["targets"], f"pins/clang.json has no C toolchain for {host}")
+    archive = shelf / pins["targets"][host]["sha256"]
+    destination = home / ".blaze/v2/toolchain"
+    copy_pinned_directory(archive, destination / "clang" / archive.name)
+    members = pins["shelf_programs"][host]
+    verified = {}
+    for name in members["names"].split():
+        row = members[name]
+        relative = Path(row["member"])
+        member = destination / "clang" / archive.name / relative.relative_to(relative.parts[0])
+        require(member.is_file() and digest(member) == row["sha256"], f"{member} differs from pins/clang.json")
+        verified[name] = row["sha256"]
+    sysroot = pins["sysroots"][host]
+    if sysroot != "macos-sdk":
+        require(isinstance(sysroot, str) and re.fullmatch(r"[0-9a-f]{64}", sysroot) is not None,
+                f"pins/clang.json has no pinned sysroot for {host}")
+        copy_pinned_directory(shelf.parent / "sysroot" / sysroot, destination / "sysroot" / sysroot)
+    return {"host": host, "archive": archive.name, "members": verified, "sysroot": sysroot}
 
 
 def write_files(root: Path, files: dict[str, str]) -> dict[str, str]:
@@ -218,6 +273,8 @@ def write_files(root: Path, files: dict[str, str]) -> dict[str, str]:
 
 def initial_files(case: dict) -> dict[str, str]:
     files = dict(case["files"])
+    if "proc_macros" in case or "build_scripts" in case:
+        files["Cargo.lock"] = (LOCKS / (case["name"] + ".lock")).read_text()
     if "Cargo.toml" not in files:
         package = case["name"].replace("-", "_")
         files["Cargo.toml"] = (f'[package]\nname = "{package}"\nversion = "0.1.0"\n'
@@ -466,7 +523,10 @@ def diagnostic_matches(rows: list[dict], expected: str) -> bool:
         message = row.get("message") if isinstance(row.get("message"), str) else ""
         code = row.get("code") if isinstance(row.get("code"), str) else ""
         if re.fullmatch(r"E\d+", expected):
-            if code == expected or (code == "types" and re.search(r"\(" + expected + r" [A-Za-z]+\)$", message)):
+            if "diagnostic_code" in row:
+                if row["diagnostic_code"] == expected:
+                    return True
+            elif code == expected or (code == "types" and re.search(r"\(" + expected + r" [A-Za-z]+\)$", message)):
                 return True
         elif expected in message or expected in code:
             return True
@@ -819,10 +879,62 @@ def step_environment(base: dict[str, str], step: dict) -> dict[str, str]:
     return env
 
 
+def prepare_modules(root: Path, case: dict, given: Input, log: CommandLog, state: dict) -> None:
+    """Build changed fixture modules into their owning HOME before Blaze sees the edit."""
+    for field, kind in (("proc_macros", "proc-macro"), ("build_scripts", "build-script")):
+        packages = case.get(field)
+        if not packages:
+            continue
+        require(bool(given.module_builder), f"{case['name']} requires the D52 proc_macro_modules executable in module_builder")
+        declared = initial_files(case)
+        # Script closures can include a local dependency's build.rs. This snapshot includes
+        # every declared dependency input; the proc macro fixture's app is only a consumer.
+        if field == "proc_macros":
+            declared = {name: value for name, value in declared.items()
+                        if name in ("Cargo.toml", "Cargo.lock") or Path(name).parts[0] in packages}
+        revision = tree_identity({name: digest(root / name) for name in declared})
+        prepared = state.setdefault("modules", {})
+        if revision in prepared:
+            continue
+        tree = Path(given.source or Path(__file__).resolve().parents[1]).resolve()
+        staging = root.parent / "bootstrap" / kind / revision
+        store = staging / "records"
+        request = {"checkout": str(root), "store": str(store), "work": str(staging / "work"),
+                   "tree": str(tree), "crates": [{"name": name, "version": "0.1.0", "features": []} for name in packages],
+                   "unsandboxed_build_scripts": False, "build_seconds": given.timeout}
+        payload = {"build_scripts": request} if field == "build_scripts" else request
+        env = {"HOME": os.environ["HOME"], "PATH": os.environ["PATH"], "RUST_BACKTRACE": "0"}
+        label = f"bootstrap-{kind}-{revision[:12]}"
+        command = log([given.module_builder, json.dumps(payload)], tree, env, given.timeout, label)
+        require(command["returncode"] == 0, f"{label} exited {command['returncode']}; see {log.directory}")
+        found = {}
+        destination = state["physical_home"] / ".blaze/v2" / kind / "modules"
+        for record in sorted((store / kind / "modules").glob("*")):
+            require(record.is_dir() and not record.is_symlink(), f"invalid D52 module directory {record}")
+            files = list(record.iterdir())
+            require(all(path.is_file() and not path.is_symlink() for path in files), f"invalid D52 record files in {record}")
+            identity = record / "identity"
+            require(identity.is_file() and digest(identity) == record.name, f"invalid D52 identity {identity}")
+            names = re.findall(r"^name (.+)$", identity.read_text(), re.MULTILINE)
+            require(len(names) == 1 and names[0] in packages and names[0] not in found, f"unexpected D52 package in {identity}")
+            wasm = record / "module.wasm"
+            checksum = record / "wasm-sha256"
+            require(wasm.is_file() and checksum.is_file() and checksum.read_text().strip() == digest(wasm), f"invalid D52 module {wasm}")
+            target = destination / record.name
+            if target.exists():
+                require(tree_hashes(target) == tree_hashes(record), f"immutable D52 record differs at {target}")
+            else:
+                shutil.copytree(record, target)
+            found[names[0]] = record.name
+        require(set(found) == set(packages), f"{label} produced {sorted(found)}, expected {sorted(packages)}")
+        prepared[revision] = found
+
+
 def perform_step(root: Path, case: dict, step: dict, given: Input, log: CommandLog,
                  state: dict, daemon: CheckoutDaemon, scratch_case: Path) -> CheckoutDaemon:
     daemon.check_alive()
     write_files(root, step.get("files", {}))
+    prepare_modules(root, case, given, log, state)
     step_env = step_environment(daemon.env, step)
     if "diagnostic" in step:
         perform_diagnostic(given, root, step_env, log, step["diagnostic"])
@@ -851,6 +963,8 @@ def run_case(case: dict, given: Input, scratch: Path) -> dict:
     try:
         root.mkdir(parents=True)
         copy_shelf(Path(given.shelf), home)
+        if case.get("clang"):
+            result["clang"] = copy_clang(given, home)
         logical, container = logical_home(home)
         state["home_containers"].append(container)
         env = environment(logical)
@@ -879,6 +993,8 @@ def run_case(case: dict, given: Input, scratch: Path) -> dict:
         result["why"] = str(error)
         result["errors"] = [str(error)]
     finally:
+        if "modules" in state:
+            result["modules"] = state["modules"]
         for owned in reversed(state["daemons"]):
             try:
                 owned.stop()
@@ -907,6 +1023,7 @@ def main(given: Input) -> int:
         "blaze": given.blaze, "scratch": given.scratch, "shelf": given.shelf,
         "only": list(given.only), "timeout": given.timeout, "source": given.source,
         "workers": given.workers, "stall_bound": given.stall_bound,
+        "module_builder": given.module_builder, "clang_shelf": given.clang_shelf,
     }, "warnings": warnings, "errors": [], "complete": False, "cases": {}}
     selected = [case for case in CASES if not given.only or case["name"] in given.only]
     results = {case["name"]: {"ok": False, "fixes": case["fixes"], "why": "not run"} for case in selected}

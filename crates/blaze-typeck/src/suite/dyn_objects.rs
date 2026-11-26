@@ -323,6 +323,35 @@ fn a_borrow_of_an_opaque_local_unsizes_at_a_call() {
     assert!(got.ends_with("unsize -> &mut dyn Tr"), "adjustments `{got}`");
 }
 
+#[test]
+fn an_inferred_numeric_local_unsizes_only_to_a_trait_it_implements() {
+    let mut fx = objects_world(&[
+        ("consume", |fx, o| fx.r(Mutbl::Not, o.dyn_tr), |fx, _| fx.unit()),
+        ("caller", |fx, _| fx.unit(), |fx, _| fx.unit()),
+    ]);
+    let tr = fx.key_of("Tr");
+    let i32_ = fx.ty(PNode::Int(crate::ids::IntTy::I32));
+    fx.imp("tr_i32", 0, i32_, Some((tr, &[])), &[], [].into());
+    fx.finish();
+    for implements in [true, false] {
+        let mut b = Bb::new();
+        b.param("_");
+        let init = if implements { b.int(None) } else { b.float(None) };
+        let local = b.bind("value");
+        let bind = b.let_(local, None, init);
+        let consume = b.path(&["consume"]);
+        let value = b.local(local);
+        let arg = b.borrow(Mutbl::Not, value);
+        let call = b.call(consume, &[arg]);
+        let root = b.block(&[bind], Some(call));
+        let checked = check_body(&fx, &b, fx.key_of("caller"), root, Plant::None, InferPlant::None);
+        assert_eq!(checked.diags.is_empty(), implements, "{:?}", checked.diags);
+        if implements {
+            assert!(adjusts(&fx, &checked, arg).ends_with("unsize -> &dyn Tr"));
+        }
+    }
+}
+
 /// The planted bug: the coercion does not ask the solver, so it invents `+ Send`.
 #[test]
 fn control_coercion_invents_auto() {

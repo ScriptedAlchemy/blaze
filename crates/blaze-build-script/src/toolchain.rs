@@ -137,7 +137,7 @@ pub enum Sysroot {
     /// The machine's installed macOS SDK, granted read-only, keyed by its version and the
     /// headers read (Apple's SDK cannot be redistributed).
     MacosSdk,
-    /// A sysroot fetched by its SHA-256 (the Linux row's shape; none is pinned yet).
+    /// A Linux sysroot's complete installed tree, pinned by its v1 SHA-256 tree digest.
     Pinned { sha256: [u8; 32] },
 }
 
@@ -200,6 +200,21 @@ impl<'s> Shelf<'s> {
 /// resource folder. `bin/clang.cfg` and `bin/clang++.cfg` are written on the shelf, not unpacked.
 pub const SHELF_MEMBERS: [&str; 9] =
     ["bin/clang", "bin/clang++", "bin/clang-23", "bin/ld64.lld", "bin/lld", "bin/llvm-ar", "bin/llvm-nm", "lib/clang", "lib/libclang.dylib"];
+
+/// The Linux deferred-C shelf: its runtime libraries and resource headers are covered by
+/// `shelf_trees`, not the Darwin-only dylib/ld64 member list.
+pub const LINUX_SHELF_MEMBERS: [&str; 12] = [
+    "bin/clang", "bin/clang++", "bin/clang-23", "bin/llvm-ar", "bin/llvm-nm", "lib/clang",
+    "runtime/ld-linux-aarch64.so.1", "runtime/libc.so.6", "runtime/libgcc_s.so.1",
+    "runtime/libm.so.6", "runtime/libstdc++.so.6", "runtime/libz.so.1",
+];
+
+/// Content identity of the installed Linux shelf, including resources and loader libraries.
+pub fn shelf_tree<'t>(text: &'t str, target: &'t str) -> Result<[u8; 32], PinError<'t>> {
+    let missing = PinError::Malformed { target, field: "shelf_trees" };
+    let (rows, _) = object(text, "shelf_trees", 0).ok_or(missing)?;
+    scalar(rows, target).and_then(hex32).ok_or(missing)
+}
 
 /// The first of [`SHELF_MEMBERS`] that `present` (the caller's look at `<shelf>/<member>`) says
 /// the shelf lacks, by name: a shelf unpacked before a member was added is refused naming it,

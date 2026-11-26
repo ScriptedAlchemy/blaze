@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import signal
@@ -130,6 +131,10 @@ class ForkfixHarness(unittest.TestCase):
         self.assertEqual(summary["errors"], 1)
         self.assertTrue(runner.diagnostic_matches(rows, "E0425"))
         self.assertFalse(runner.diagnostic_matches(rows, "E0252"))
+        reported = [{"severity": "error", "code": "borrows", "diagnostic_code": "E0515", "message": "reference to local data returned"}]
+        self.assertTrue(runner.diagnostic_matches(reported, "E0515"))
+        self.assertFalse(runner.diagnostic_matches(reported, "E0597"))
+        self.assertFalse(runner.diagnostic_matches([dict(rows[0], diagnostic_code="E0308")], "E0425"))
         incomplete = {"stdout": '{"errors":1,"not_checked":["types"]}\n'}
         rows, summary = runner.check_rows(incomplete)
         self.assertEqual(summary["not_checked"], ["types"])
@@ -410,10 +415,14 @@ class ForkfixHarness(unittest.TestCase):
         case = next(case for case in runner.CASES if case["name"] == "caller-environment-changes-and-becomes-unset")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            given = runner.Input(**self.fixture_input(root))
+            given = runner.Input(**self.fixture_input(root), module_builder="/fixture/module-builder")
             observed = []
             daemon_environment = []
             def command(argv, cwd, env, timeout, evidence, label):
+                if argv[0] == given.module_builder:
+                    self.assertNotIn("FORKFIXES_CALLER_VALUE", env)
+                    self.make_modules(json.loads(argv[1]))
+                    return {"returncode": 0, "timed_out": False}
                 value = env.get("FORKFIXES_CALLER_VALUE", "unset")
                 observed.append(value)
                 return {"returncode": 0, "stdout": f"{value} {value}\n", "stderr": "", "timed_out": False}
@@ -424,7 +433,120 @@ class ForkfixHarness(unittest.TestCase):
                 result = runner.run_case(case, given, root)
             self.assertTrue(result["ok"], result)
             self.assertEqual(observed, ["unset", "first", "second", "unset", "first"])
+            self.assertEqual(len(result["modules"]), 1)
             self.assertEqual([env["FORKFIXES_CALLER_VALUE"] for env in daemon_environment], ["ambient"])
+
+    def make_modules(self, payload, plant=None):
+        request = payload.get("build_scripts", payload)
+        self.assertIs(request["unsandboxed_build_scripts"], False)
+        kind = "build-script" if "build_scripts" in payload else "proc-macro"
+        for krate in request["crates"]:
+            name = krate["name"]
+            self.assertEqual(krate, {"name": name, "version": "0.1.0", "features": []})
+            changed = Path(request["checkout"]) / "dep/build.rs"
+            source = runner.digest(changed) if changed.exists() else ""
+            identity = f"name {name}\nrevision {source}\n"
+            key = hashlib.sha256(identity.encode()).hexdigest()
+            if plant == "missing":
+                continue
+            record = Path(request["store"]) / kind / "modules" / key
+            record.mkdir(parents=True)
+            (record / "identity").write_text(identity)
+            (record / "module.wasm").write_bytes(b"test record")
+            (record / "wasm-sha256").write_text("bad" if plant == "corrupt" else runner.digest(record / "module.wasm"))
+
+    def test_d52_reprovisions_changed_local_build_dependency_and_reuses_restored_records(self):
+        case = next(c for c in runner.CASES if c["name"] == "a-script-searches-where-its-build-dependencys-script-said")
+        for plant in (None, "missing", "corrupt"):
+            with self.subTest(plant=plant), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                root = base / "project"
+                runner.write_files(root, runner.initial_files(case))
+                state = {"physical_home": base / "home"}
+                given = runner.Input(**self.fixture_input(base), module_builder="/fixture/module-builder")
+                def command(argv, *args):
+                    payload = json.loads(argv[1])
+                    self.assertEqual([k["name"] for k in payload["build_scripts"]["crates"]], ["dep", "app"])
+                    self.make_modules(payload, plant)
+                    return {"returncode": 0}
+                log = Mock(side_effect=command)
+                if plant:
+                    with self.assertRaises(runner.CaseFailed):
+                        runner.prepare_modules(root, case, given, log, state)
+                    self.assertEqual(state["modules"], {})
+                    continue
+                for step in runner.steps_for(case):
+                    runner.write_files(root, step.get("files", {}))
+                    runner.prepare_modules(root, case, given, log, state)
+                self.assertEqual(log.call_count, 2)
+                records = state["physical_home"] / ".blaze/v2/build-script/modules"
+                self.assertEqual({p.name for p in records.iterdir()},
+                                 {key for event in state["modules"].values() for key in event.values()})
+                self.assertEqual(len(list(records.iterdir())), 4)
+
+    def test_archive_fixture_locks_real_cc_and_its_registry_dependencies(self):
+        case = next(c for c in runner.CASES if c.get("clang"))
+        lock = tomllib.loads(runner.initial_files(case)["Cargo.lock"])
+        packages = {p["name"]: p for p in lock["package"]}
+        self.assertEqual(packages["cc"]["version"], "1.4.3")
+        self.assertEqual(packages["cc"]["checksum"], "509591b7bcd67f4ef775afad7662703b4935daaa6ec0e5605cfb1090b32a2b6d")
+        self.assertEqual(packages["cc"]["dependencies"], ["find-msvc-tools", "shlex"])
+        for name in ("package_a", "package_b"):
+            self.assertEqual(packages[name]["dependencies"], ["cc"])
+        for name in ("cc", *packages["cc"]["dependencies"]):
+            self.assertEqual(packages[name]["source"], "registry+https://github.com/rust-lang/crates.io-index")
+            self.assertRegex(packages[name]["checksum"], r"^[a-f0-9]{64}$")
+
+    def test_clang_copies_the_verified_host_pin_and_internal_links_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            given = runner.Input(**self.fixture_input(root), source=str(root))
+            archive = Path(given.shelf) / "clang" / ("a" * 64)
+            clang = archive / "bin/clang-23"
+            clang.parent.mkdir(parents=True)
+            clang.write_text("pinned clang")
+            link = archive / "bin/clang"
+            link.symlink_to("clang-23")
+            host = "aarch64-apple-darwin"
+            linux = "aarch64-unknown-linux-gnu"
+            pins = {"targets": {host: {"sha256": archive.name}}, "sysroots": {host: "macos-sdk"}, "shelf_programs": {host: {
+                "names": "clang-23", "clang-23": {"member": "LLVM/bin/clang-23", "sha256": runner.digest(clang)}}}}
+            (root / "pins").mkdir()
+            sysroot = Path(given.shelf) / "sysroot" / ("b" * 64)
+            sysroot.mkdir(parents=True)
+            (sysroot / "stdlib.h").write_text("library")
+            pins["targets"][linux] = pins["targets"][host]
+            pins["shelf_programs"][linux] = pins["shelf_programs"][host]
+            pins["sysroots"][linux] = sysroot.name
+            (root / "pins/clang.json").write_text(json.dumps(pins))
+            with patch.object(runner.platform, "machine", return_value="aarch64"), patch.object(sys, "platform", "linux"):
+                home = root / "linux-home"
+                runner.copy_shelf(Path(given.shelf), home)
+                self.assertFalse((home / ".blaze/v2/toolchain/sysroot").exists())
+                self.assertEqual(runner.copy_clang(given, home)["sysroot"], sysroot.name)
+                self.assertEqual((home / ".blaze/v2/toolchain/sysroot" / sysroot.name / "stdlib.h").read_text(), "library")
+            with patch.object(runner.platform, "machine", return_value="arm64"), patch.object(sys, "platform", "darwin"):
+                runner.validate(given, directory)
+                home = root / "home"
+                runner.copy_shelf(Path(given.shelf), home)
+                self.assertFalse((home / ".blaze/v2/toolchain/clang").exists())
+                installed = runner.copy_clang(given, home)
+                self.assertEqual(installed["members"], {"clang-23": runner.digest(clang)})
+                copied = home / ".blaze/v2/toolchain/clang" / archive.name / "bin/clang"
+                self.assertEqual(copied.readlink(), Path("clang-23"))
+                self.assertEqual(copied.read_text(), "pinned clang")
+                link.unlink()
+                link.symlink_to(root / "blaze")
+                with self.assertRaisesRegex(runner.CaseFailed, "escapes its pinned directory"):
+                    runner.copy_clang(given, root / "escape")
+                link.unlink()
+                clang.write_text("different compiler")
+                with self.assertRaisesRegex(runner.CaseFailed, "differs from pins/clang.json"):
+                    runner.copy_clang(given, root / "changed")
+                archive.rename(archive.with_name("wrong-host"))
+                with self.assertRaisesRegex(runner.CaseFailed, "missing at"):
+                    runner.copy_clang(given, root / "missing")
+
     def test_replay_requires_independent_store_homes_complete_identical_artifacts_and_cache_hits(self):
         case = next(case for case in runner.CASES if case["name"] == "cdylib-allocates")
         for plant in (None, "missing-library", "missing-program", "library-bytes", "extra", "compiled-library",

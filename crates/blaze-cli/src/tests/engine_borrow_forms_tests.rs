@@ -12,7 +12,7 @@
 //! A child of main.rs's tests, beside engine_check_tests.rs, whose helpers it uses.
 
 use super::*;
-use super::engine_check_tests::{engine_opts, error_lines, opts};
+use super::engine_check_tests::{engine_opts, engine_view, error_lines, opts};
 
 /// clap's `Cmd` match, the derive's `(a, Self::V { x })` against `(&u8, &Self)`, and a variant
 /// inside a wrapper's field.
@@ -157,6 +157,28 @@ fn engine_check_finds_a_borrow_error_in_a_visitor() {
     println!("serde miniature, wrong: codes {codes:?}, notes {notes:?}\n{said}");
     notes_say_why("serde wrong", &notes, &said);
     assert!(codes.iter().any(|c| c == "borrows"), "the visitor's injected borrow error is found: {codes:?}\n{said}");
+}
+
+#[test]
+fn json_reports_the_type_and_borrow_checkers_codes() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    write(&io, "Cargo.toml", MANIFEST);
+    write(&io, "src/lib.rs", "pub fn wrong() -> u8 { false }\n\
+        pub fn escapes<'a>() -> &'a u8 { let n = 1u8; &n }\n\
+        pub fn independent<'a, 'b>(_: &'a u8, y: &'b u8) -> &'a u8 { y }\n\
+        pub fn too_short(x: &u8) -> &'static u8 { x }\n");
+    let mut o = opts(&io, 2, true);
+    o.toolchain = shelf_with_langs(&io, o.heap.alloc());
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let _ = engine_view(&cx, &io, o, View::Json);
+    let said = stdout(&io);
+    for (rule, code, row) in [("types", "E0308", 1), ("borrows", "E0515", 2)] {
+        assert!(said.contains(&format!(r#""severity":"error","code":"{rule}","diagnostic_code":"{code}","path":"src/lib.rs","line":{row},"#)), "{said}");
+    }
+    for (row, bound) in [(3, "signature lifetime 2 must outlive signature lifetime 1"), (4, "signature lifetime 1 must outlive `'static`")] {
+        assert!(said.lines().any(|line| line.contains(&format!(r#""diagnostic_code":"outlives","path":"src/lib.rs","line":{row},"#))
+            && line.contains(bound)), "{said}");
+    }
 }
 
 /// (C) thiserror's `Display` and an `Arguments<'_>` builder: every note says why, the clean text

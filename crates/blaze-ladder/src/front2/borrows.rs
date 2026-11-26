@@ -28,7 +28,7 @@ use super::body::Body;
 use super::borrow_reads::{AdtAnswer, HeadAnswer, adt_read, clauses_read, copy_supertrait_read, file_borrow_reads, head_read, impl_read};
 use super::check::{Records, answer_impls, eval_len};
 use super::reads::Read;
-use super::borrows_nested::{FlowOf, NestedFacts, Requirements, closure_flow_of, flow_of, nested_inner_first, nested_range, next_nested};
+use super::borrows_nested::{BodyFlow, FlowOf, NestedFacts, Requirements, closure_flow_of, flow_of, nested_inner_first, nested_range, next_nested};
 use super::stalled_goals::{AsyncInteriors, Decision, Stalls, decide_stalled_goals};
 use super::borrows_unmade::{AdtUnmade, HeadClass};
 use super::heads::{HeadError, Want, member_fn_want};
@@ -112,12 +112,65 @@ pub struct BorrowDiagnostic {
     pub end: u32,
     pub code: &'static str,
     pub text: &'static str,
+    /// The unproved signature bound, with both endpoints identified by the flow that found it.
+    pub outlives: Option<Outlives>,
     /// An `Invalidated` finding's borrow: the item-relative range of the statement that took
     /// it (blaze-flow `LoanParts::issued`, rule 71); `None` for any other finding.
     pub borrowed: Option<(u32, u32)>,
     /// What keeps that loan live at the conflict (blaze-flow `LoanParts::kept`); `None` for any
     /// other finding.
     pub kept: Option<KeptAt>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Outlives {
+    longer: Lifetime,
+    shorter: Lifetime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Lifetime {
+    Static,
+    Parameter(u32),
+    Bound { binder: u32, var: u32 },
+    Argument(blaze_flow::Local),
+    Return,
+    Placeholder(blaze_flow::Origin),
+}
+
+impl Lifetime {
+    fn of<A: Allocator>(origin: blaze_flow::Origin, signature: &[(tc::regions::Region, blaze_flow::Origin)], flow: &Flow<A>) -> Self {
+        use tc::regions::Region;
+        match signature.iter().find(|(_, o)| *o == origin).map(|(r, _)| *r) {
+            Some(Region::Static) => Self::Static,
+            Some(Region::Param(i)) => Self::Parameter(i),
+            Some(Region::Late { binder, var }) => Self::Bound { binder, var },
+            None => match flow.local_origins.iter().find(|(local, o)| local.0 <= flow.args && *o == origin) {
+                Some((blaze_flow::Local(0), _)) => Self::Return,
+                Some((arg, _)) => Self::Argument(*arg),
+                None => Self::Placeholder(origin),
+            },
+        }
+    }
+}
+
+impl core::fmt::Display for Lifetime {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::Static => f.write_str("`'static`"),
+            Self::Parameter(i) => write!(f, "signature lifetime {}", i + 1),
+            Self::Bound { binder, var } => write!(f, "lifetime {} of binder {}", var + 1, binder + 1),
+            Self::Argument(arg) => write!(f, "a lifetime of argument {}", arg.0),
+            Self::Return => f.write_str("a lifetime of the return type"),
+            Self::Placeholder(origin) => write!(f, "lifetime {origin}"),
+        }
+    }
+}
+
+impl core::fmt::Display for Outlives {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} must outlive {}", self.longer, self.shorter)
+    }
 }
 
 /// What keeps a loan live where it is invalidated (blaze-flow `Kept`), its range item-relative.
@@ -2851,7 +2904,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
         // The control (FactsPlant::NoClosureRequirements): no externals, so no requirement is
         // mapped and each outlives result stays the refusal.
         let externals = if plant == FactsPlant::NoClosureRequirements { None } else { Some(&externals[..]) };
-        if file_flow(&flow, &params, of, &view, externals, &mut needs, &mut verdict, alloc) {
+        if file_flow(&flow, &params, &[], of, &view, externals, &mut needs, &mut verdict, alloc) {
             break;
         }
         let made = match of {
@@ -2871,7 +2924,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
             next = next_nested(&view, of);
             continue;
         }
-        let (flow, params, flow_coarse) = match flow_of(of, &view, done, &nested, alloc) {
+        let BodyFlow { flow, params, signature_origins, coarse: flow_coarse } = match flow_of(of, &view, done, &nested, alloc) {
             Ok(f) => f,
             Err(refusal) => {
                 verdict.refused = Some(lower_refused(r, &facts, refusal));
@@ -2885,7 +2938,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
         if let Some(out) = show.as_deref_mut() {
             let _ = show_flow(&flow, of, out);
         }
-        if file_flow(&flow, &params, of, &view, None, &mut needs, &mut verdict, alloc) {
+        if file_flow(&flow, &params, &signature_origins, of, &view, None, &mut needs, &mut verdict, alloc) {
             break;
         }
         next = next_nested(&view, of);
@@ -2935,6 +2988,7 @@ fn lower_refused<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, facts: &BorrowF
 pub(super) fn file_flow<'a>(
     flow: &Flow<Alloc<'a>>,
     params: &[blaze_flow_lower::ParamOrigin],
+    signature_origins: &[(tc::regions::Region, blaze_flow::Origin)],
     of: FlowOf,
     view: &tc::BodyView<'_>,
     externals: Option<&[(blaze_flow::Origin, blaze_flow_lower::External)]>,
@@ -2953,12 +3007,13 @@ pub(super) fn file_flow<'a>(
     {
         for m in record.moves.iter() {
             let (code, text) = move_words(m.kind);
-            verdict.findings.push(BorrowDiagnostic { start: m.span.lo, end: m.span.hi, code, text, borrowed: None, kept: None });
+            verdict.findings.push(BorrowDiagnostic { start: m.span.lo, end: m.span.hi, code, text, outlives: None, borrowed: None, kept: None });
         }
         for b in record.borrows.iter() {
             // An `Invalidated` finding's parts: its row of `loan_parts`, sorted by `(at, loan)`
             // as the findings are; a finding with no row says so (`KeptAt::Unfound`).
             let mut parts: Option<Option<blaze_flow::LoanParts>> = None;
+            let mut outlives = None;
             let (span, (code, text)) = match *b {
                 BorrowFinding::Invalidated { at, loan, span, returned } => {
                     parts = Some(record.loan_parts.binary_search_by_key(&(at, loan), |p| (p.at, p.loan)).ok().map(|i| record.loan_parts[i]));
@@ -2990,7 +3045,7 @@ pub(super) fn file_flow<'a>(
                 // From a placeholder of the body's type parameter (blaze-flow-lower
                 // param_outlives.rs): E0310 when every bound on it was read; else not checked,
                 // by name (as the nested arm above: findings already made are kept).
-                BorrowFinding::UnprovenOutlives { span, from, .. } => match params.iter().find(|p| p.origin == from) {
+                BorrowFinding::UnprovenOutlives { span, from, into, .. } => match params.iter().find(|p| p.origin == from) {
                     Some(p) if p.certain => {
                         (span, ("E0310", "the parameter type may not live long enough: the callee needs a bound the caller does not declare"))
                     }
@@ -3003,7 +3058,13 @@ pub(super) fn file_flow<'a>(
                         }
                         continue;
                     }
-                    None => (span, ("outlives", "a lifetime must outlive another and the signature does not say so")),
+                    None => {
+                        outlives = Some(Outlives {
+                            longer: Lifetime::of(from, signature_origins, flow),
+                            shorter: Lifetime::of(into, signature_origins, flow),
+                        });
+                        (span, ("outlives", "lifetime may not live long enough"))
+                    }
                 },
             };
             let borrowed = parts.flatten().map(|p| (p.issued.lo, p.issued.hi));
@@ -3012,7 +3073,7 @@ pub(super) fn file_flow<'a>(
                 Some(blaze_flow::Kept::Signature { .. }) => KeptAt::Signature,
                 Some(blaze_flow::Kept::Unfound) | None => KeptAt::Unfound,
             });
-            verdict.findings.push(BorrowDiagnostic { start: span.lo, end: span.hi, code, text, borrowed, kept });
+            verdict.findings.push(BorrowDiagnostic { start: span.lo, end: span.hi, code, text, outlives, borrowed, kept });
         }
     }
     if verdict.refused.is_some() {
