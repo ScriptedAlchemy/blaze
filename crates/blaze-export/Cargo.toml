@@ -32,6 +32,8 @@ blaze-tier.workspace = true
 blaze-native.workspace = true
 
 [dev-dependencies]
+# The host tests' scoped temporary directories and the pinned toolchain's home.
+blaze-core.workspace = true
 # `Alloc::global()`, the handle the tests hand every function.
 blaze-own = { workspace = true, features = ["std", "testing"] }
 # The example's entry frame and each test's top frame: memory from the OS, handed down.

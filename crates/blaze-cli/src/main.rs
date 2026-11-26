@@ -312,7 +312,7 @@ impl fmt::Display for CliError {
             CliError::BuildEnv(error) => write!(f, "{error}"),
             CliError::Usage(what) => write!(
                 f,
-                "usage: blaze check [dir] [--color ...] [--view ...] [--each] [--workers N] [--status-every S], blaze ci [dir] [--format ...] [--todo ...], blaze inspect <file.rs[::fn]> [--json] [--all-exprs], blaze run [dir] [--open] [--stats] [--workers N], blaze test [dir] [--stats] [--workers N], blaze export [dir] [-p pkg] [--bin name] [-o path] [--workers N] [--stats], blaze clean|gc|explain: {what}"
+                "usage: blaze check [dir] [--color ...] [--view ...] [--each] [--workers N] [--status-every S], blaze ci [dir] [--format ...] [--todo ...], blaze inspect <file.rs[::fn]> [--json] [--all-exprs], blaze run [dir] [--open] [--stats] [--workers N], blaze test [dir] [--stats] [--workers N], blaze export [dir] [-p pkg] [--bin name | --lib] [-o path] [--workers N] [--stats], blaze clean|gc|explain: {what}"
             ),
             CliError::NotOnEngine { flag, why } => write!(f, "`blaze check {flag}`: the engine's check does not take {flag} yet ({why}; check_command.rs)"),
             CliError::NoSuchCommand { command, instead } => write!(f, "blaze has no `{command}` command: {instead}"),
@@ -421,6 +421,8 @@ struct Flags<'a> {
     open: blaze_run::viewer::OpenExplore,
     /// `-o <path>` / `--output <path>`: where `blaze export` writes the standalone executable.
     output: Option<&'a str>,
+    /// Explicit shared-library product selection for `blaze export`.
+    export_kind: run_package::ExportKind,
     /// `--names-oracle`: `check` decides every crate's names twice and compares them (D158 step
     /// 1, engine_names.rs `NamesOracle`).
     names_oracle: engine_names::NamesOracle,
@@ -461,6 +463,7 @@ impl<'a> Flags<'a> {
             select: run_package::Select::NONE,
             open: blaze_run::viewer::OpenExplore::No,
             output: None,
+            export_kind: run_package::ExportKind::Binary,
             names_oracle: engine_names::NamesOracle::Off,
             driver: engine_ready_edit::Driver::Auto,
             block_scopes: blaze_scope::surface::BlockScopes::Modules,
@@ -558,6 +561,7 @@ fn parse_flags_with<'a>(args: &'a Args, mut package: impl FnMut(&'a str), mut fe
                 flags.block_scopes = blaze_scope::surface::BlockScopes::parse(&arg["--block-scopes=".len()..]).ok_or(CliError::Usage("--block-scopes is bodies or modules"))?
             }
             "--bin" => flags.select.bin = Some(value()?),
+            "--lib" if args.get(1) == Some("export") => flags.export_kind = run_package::ExportKind::Cdylib,
             _ if arg.starts_with("--bin=") => flags.select.bin = Some(&arg["--bin=".len()..]),
             "-o" | "--output" => flags.output = Some(value()?),
             _ if let Some(path) = arg.strip_prefix("--output=") => flags.output = Some(path),
@@ -737,7 +741,7 @@ fn command_help(sub: &str) -> Option<&'static str> {
             "blaze test [dir] [options] [-- <test args>...]\n\nRun workspace tests incrementally.\n\nOPTIONS\n  -p, --package <name>        Package to test\n      --workers <N>           Maximum concurrent workers\n      --stats                 Print telemetry report at exit",
         ),
         "export" => Some(
-            "blaze export [dir] [options]\n\nExport a standalone native executable (PGO-optimized by default).\n\nOPTIONS\n  -p, --package <name>        Package to export\n      --bin <name>            Binary target to export\n  -o, --output <path>         Destination executable path\n      --workers <N>           Maximum concurrent workers\n      --stats                 Print telemetry report at exit",
+            "blaze export [dir] [options]\n\nExport a standalone native executable or a C ABI shared library.\n\nOPTIONS\n  -p, --package <name>        Package to export\n      --bin <name>            Binary target to export\n      --lib                   Export the package's cdylib target\n  -o, --output <path>         Destination artifact path\n      --workers <N>           Maximum concurrent workers\n      --stats                 Print telemetry report at exit",
         ),
         "ci" => Some(
             "blaze ci [dir] [options]\n\nRun workspace CI checks.\n\nOPTIONS\n  --format <fmt>              Output format\n  --todo <mode>               TODO handling policy\n  --workers <N>               Maximum concurrent workers",

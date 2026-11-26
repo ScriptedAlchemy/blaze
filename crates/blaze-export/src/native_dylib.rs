@@ -308,8 +308,8 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
         let row = image.imports[index];
         ChainImport { lead: b"", name: row.name, ordinal: FLAT_LOOKUP, weak: row.weak, addend }
     };
-    let (blob, slots) = macho::chained_fixups(&chains, |c: &(u64, Chain)| *c, &chain_segs, ImportRows::Addend64, n_imports + extra.len(), import, alloc)
-        .map_err(|e| match e.at {
+    let (blob, slots) =
+        macho::chained_fixups(&chains, |c: &(u64, Chain)| *c, &chain_segs, ImportRows::Addend64, n_imports + extra.len(), import, alloc).map_err(|e| match e.at {
             Some(at) => DylibError::Slot { what: e.what, value: e.len, at },
             None => DylibError::TooLarge { what: e.what, len: e.len },
         })?;
@@ -381,7 +381,18 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
         return Err(DylibError::TooLarge { what: "the file past 32-bit load command offsets", len: code_limit + sig_len });
     }
     let link_len = link.len() as u64 + sig_len;
-    segs.push(Seg { name: "__LINKEDIT", vm: vm_end, vm_size: up(link_len, PAGE), file: file_end, file_size: link_len, prot: macho::VM_PROT_READ, flags: 0, first: sects.len(), count: 0, fixups: false });
+    segs.push(Seg {
+        name: "__LINKEDIT",
+        vm: vm_end,
+        vm_size: up(link_len, PAGE),
+        file: file_end,
+        file_size: link_len,
+        prot: macho::VM_PROT_READ,
+        flags: 0,
+        first: sects.len(),
+        count: 0,
+        fixups: false,
+    });
 
     // The load commands, built first as a list (commands.rs): `ncmds` and `sizeofcmds` are the
     // list's, never a hand count (one short once left LC_CODE_SIGNATURE unread: every image
@@ -473,10 +484,20 @@ struct Node<'n, 'b> {
 /// in name order), nodes are laid in preorder by an explicit stack, and offsets are found by
 /// passes until no uleb grows.
 fn export_trie<'a, 'b>(image: &Image<'a>, thread_vars: &Placed, alloc: Alloc<'b>) -> Result<AVec<'b, u8>, DylibError<'a>> {
+    let mut exports = Vec::new_in(alloc);
+    for &(name, at) in image.exports.iter() {
+        let flags = if at >= thread_vars.at && at < end_of(thread_vars) { EXPORT_KIND_THREAD_LOCAL } else { EXPORT_KIND_REGULAR };
+        exports.push((name, flags, at));
+    }
+    export_trie_rows(&exports, alloc)
+}
+
+/// Shared deterministic radix trie for native and Rust libraries. Names include Mach-O's `_`.
+pub(crate) fn export_trie_rows<'a, 'b>(exports: &[(&'a [u8], u64, u64)], alloc: Alloc<'b>) -> Result<AVec<'b, u8>, DylibError<'a>> {
     let mut nodes: AVec<'b, Node<'a, 'b>> = Vec::new_in(alloc);
     nodes.push(Node { terminal: None, edges: Vec::new_in(alloc) });
     let mut previous: Option<&[u8]> = None;
-    for &(name, at) in image.exports.iter() {
+    for &(name, flags, at) in exports {
         if name.is_empty() || name.contains(&0) {
             return Err(shape("an export name that is empty or holds a NUL", at));
         }
@@ -484,8 +505,7 @@ fn export_trie<'a, 'b>(image: &Image<'a>, thread_vars: &Placed, alloc: Alloc<'b>
             return Err(shape("exports not sorted by name, or one name twice", at));
         }
         previous = Some(name);
-        let in_tlv = at >= thread_vars.at && at < end_of(thread_vars);
-        let terminal = Some((if in_tlv { EXPORT_KIND_THREAD_LOCAL } else { EXPORT_KIND_REGULAR }, at));
+        let terminal = Some((flags, at));
         let mut node = 0usize;
         let mut rest: &'a [u8] = name;
         loop {

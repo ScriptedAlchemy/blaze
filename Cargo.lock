@@ -960,6 +960,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-build-script",
  "blaze-code",
+ "blaze-core",
  "blaze-hash",
  "blaze-ids",
  "blaze-int",
