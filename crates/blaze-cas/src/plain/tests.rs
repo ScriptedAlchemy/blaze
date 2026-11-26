@@ -505,7 +505,7 @@ fn publication_keeps_a_reused_key_after_the_old_root_is_retargeted() {
 #[test]
 fn publication_replaces_a_pointer_swept_from_the_current_generation() {
     use blaze_keyed::kind::ReservedTag;
-    use super::core::{Batch, LentRecord};
+    use super::core::Batch;
 
     for streamed in [true, false] {
         let root = test_root();
@@ -541,13 +541,14 @@ fn publication_replaces_a_pointer_swept_from_the_current_generation() {
         let target = key(85);
         let target_bytes = b"replacement target";
         writer.store.put(target, Namespace::LOCAL, TAG, target_bytes).expect("stage replacement target");
-        let answer = writer.store.root("answer", &[pointer, target]).expect("stage answer root");
-        writer.store.release_lease();
         let bytes = &target.0.0;
         if streamed {
-            writer.store.set_stream_commits(true);
-            let record = LentRecord { key: pointer, namespace: Namespace::LOCAL, tag: pointer_tag, bytes, crc: format::record_crc(&pointer.0, pointer_tag, bytes) };
-            writer.store.commit_records(&[], &[record], sim.wall_ns(), &mut writer.effects).expect("start streamed publication");
+            writer.store.put(pointer, Namespace::LOCAL, pointer_tag, bytes).expect("stage replacement pointer");
+        }
+        let answer = writer.store.root("answer", &[pointer, target]).expect("stage answer root");
+        writer.store.release_lease();
+        if streamed {
+            writer.store.commit(&[], sim.wall_ns(), &mut writer.effects).expect("start streamed publication");
         } else {
             let mut batch = Batch::new(Namespace::LOCAL);
             batch.put(pointer, pointer_tag, bytes).expect("stage replacement pointer");
