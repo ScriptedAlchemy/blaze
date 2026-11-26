@@ -37,21 +37,26 @@ const PIN_HEX: &str = "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb
 
 use crate::tests::folder;
 
+/// Lay out the requested members of a test shelf without running any tool.
+pub(super) fn make_shelf(dir: &Path, members: impl IntoIterator<Item = &'static str>) {
+    for member in members {
+        let path = dir.join(member);
+        if member == "lib/clang" {
+            std::fs::create_dir_all(&path).expect("the resource folder");
+        } else {
+            std::fs::create_dir_all(path.parent().expect("bin/ or lib/")).expect("the shelf folder");
+            std::fs::write(&path, b"").expect("a shelf member");
+        }
+    }
+}
+
 /// A home with the pin's shelf (when `shelf`) and an SDK folder giving `Version` 15.2.
 fn fake_home(name: &str, shelf: bool) -> (std::string::String, std::string::String) {
     let home = folder(name);
     if shelf {
         // nm-row: every member the setting looks for (toolchain::SHELF_MEMBERS), empty.
         let dir = home.join(SHELF_DIR).join(PIN_HEX);
-        for member in blaze_build_script::toolchain::SHELF_MEMBERS {
-            let path = dir.join(member);
-            if member == "lib/clang" {
-                std::fs::create_dir_all(&path).expect("the resource folder");
-            } else {
-                std::fs::create_dir_all(path.parent().expect("bin/ or lib/")).expect("the shelf folder");
-                std::fs::write(&path, b"").expect("a shelf member");
-            }
-        }
+        make_shelf(&dir, blaze_build_script::toolchain::SHELF_MEMBERS);
     }
     let sdk = home.join("MacOSX.sdk");
     std::fs::create_dir_all(&sdk).expect("the SDK folder");

@@ -19,15 +19,7 @@ fn a_shelf_without_llvm_nm_is_refused_by_name() {
     let digest: std::string::String = pin.sha256.iter().map(|b| std::format!("{b:02x}")).collect();
     let root = crate::tests::folder("nm-row");
     let shelf = root.join(&digest);
-    for member in SHELF_MEMBERS.iter().filter(|m| **m != "bin/llvm-nm") {
-        let path = shelf.join(member);
-        if member.starts_with("lib/clang") {
-            std::fs::create_dir_all(&path).expect("a member folder");
-        } else {
-            std::fs::create_dir_all(path.parent().expect("a parent")).expect("bin/ and lib/");
-            std::fs::write(&path, b"").expect("a member file");
-        }
-    }
+    crate::native_setting_tests::make_shelf(&shelf, SHELF_MEMBERS.into_iter().filter(|m| *m != "bin/llvm-nm"));
     let shelf_text = shelf.to_str().expect("a UTF-8 temp folder");
     let work = root.join("work");
     let work_text = work.to_str().expect("a UTF-8 temp folder");

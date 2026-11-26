@@ -25,6 +25,14 @@ blaze-own.workspace = true
 blaze-tier.workspace = true
 # The template table's digest (`TableHead::digest`): BLAKE3 of its bytes.
 blaze-blake3.workspace = true
+# The release tier's backend: LLVM's `O2` pipeline and AArch64 code generator (llvm/emit.rs).
+llvm-sys.workspace = true
+# The object file LLVM wrote, read back as a record (llvm/object.rs).
+object.workspace = true
+# The backend's identity (llvm/emit.rs `identity`): the content id the driver keys a recipe on.
+blaze-ids.workspace = true
+# The pinned LLVM's version and commit, in that identity.
+blaze-pins.workspace = true
 
 [build-dependencies]
 # build.rs: the committed table's BLAKE3, against table/arm64.json.

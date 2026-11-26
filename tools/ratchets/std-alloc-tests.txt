@@ -83,7 +83,7 @@ blaze-int	4	0	0	1	0	0	0	0	0	0
 blaze-json	3	0	0	0	0	0	1	0	0	0
 blaze-keyed	6	0	1	124	0	0	0	0	0	0
 blaze-kit	2	0	0	0	0	0	0	0	0	0
-blaze-ladder	731	285	0	2315	62	53	8	250	0	86
+blaze-ladder	730	285	0	2315	62	53	8	250	0	86
 blaze-launch	19	0	0	158	0	0	0	0	0	1
 blaze-launch-rt	114	2	0	99	7	5	17	1	0	0
 blaze-launcher	20	1	0	17	8	0	0	1	0	0
@@ -108,7 +108,7 @@ blaze-pack	3	0	0	39	0	0	0	0	0	0
 blaze-parquet	49	2	2	40	26	1	0	3	0	0
 blaze-pg	9	0	2	140	0	0	0	0	0	0
 blaze-phf	5	0	0	9	0	0	0	0	0	1
-blaze-proc-macro	252	3	0	269	148	1	2	12	0	1
+blaze-proc-macro	251	3	0	269	146	1	2	12	0	1
 blaze-producers	8	0	0	0	0	0	0	0	0	0
 blaze-profile	196	0	0	443	19	35	47	15	0	3
 blaze-protocol	23	0	0	116	10	0	0	0	0	2
