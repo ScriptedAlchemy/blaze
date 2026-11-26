@@ -34,14 +34,15 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 mod host;
+use core::time::Duration;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::time::Duration;
 
 use blaze_build_script::toolchain::clang_pin;
 use blaze_pins::CLANG_JSON as PIN;
 use blaze_code::record::{CodeRecord, CodeView, Site, SiteKind, Symbol, Target};
 use blaze_code::unwind::{self, Action, Frame, Row};
+use blaze_core::temp::TempDir;
 use blaze_export::{CExport, Entry, Function, Panic, Platform, ProgramIn, Tier, export};
 use blaze_hash::FixedState;
 use blaze_native::Platform as NativePlatform;
@@ -81,11 +82,10 @@ const THROW_CATCH_ROOTS: &[&[u8]] = &[b"_native_throw_catch"];
 /// libc++.1.dylib re-exports.
 /// `-lc++` linked as the macOS 27.2 SDK's `usr/lib/libc++.tbd` states it (blaze-native
 /// libraries.rs: a macOS library's install name is its stub's, read).
-fn throw_catch_libraries() -> &'static [Linked<'static>] {
+fn throw_catch_libraries() -> [Linked<'static>; 1] {
     let Ok(Source::Stub(at)) = source(NativePlatform::MacosArm64, Library { kind: LibraryKind::Dylib, name: "c++" }) else { panic!("`c++` is named by its stub") };
     let stub: &'static [u8] = b"--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64e-macos ]\ninstall-name: '/usr/lib/libc++.1.dylib'\n...\n";
-    let linked = at.linked(stub).unwrap_or_else(|e| panic!("the stub of `c++`: {e}"));
-    Box::leak(Box::new([linked]))
+    [at.linked(stub).unwrap_or_else(|e| panic!("the stub of `c++`: {e}"))]
 }
 
 /// Test 2's native code: the callback's caller keeps a frame (the `return 1` after the call is
@@ -130,19 +130,12 @@ fn rec(code: &[u32], sites: &[(u32, SiteKind, Target)], outside: &[(u32, &str)],
     out
 }
 
-/// A fresh folder of this process for one test's files.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-export-native-run-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-    dir
-}
-
 /// The pinned clang++ on blaze's shelf: `$HOME/.blaze/v2/toolchain/clang/<sha256 hex>/bin/clang++`.
 fn clangxx() -> PathBuf {
     let pin = clang_pin(PIN, HOST).unwrap_or_else(|e| panic!("{e}"));
     let hex: std::string::String = pin.sha256.iter().map(|b| format!("{b:02x}")).collect();
-    let home = std::env::var_os("HOME").expect("HOME names the home the shelf is under");
-    let path = Path::new(&home).join(".blaze/v2/toolchain/clang").join(hex).join("bin/clang++");
+    let home = blaze_core::home::user().unwrap_or_else(|e| panic!("{e}"));
+    let path = home.join(".blaze/v2/toolchain/clang").join(hex).join("bin/clang++");
     assert!(
         path.is_file(),
         "{}: the pinned C toolchain is not unpacked on the shelf (D69: `cargo run -p blaze-proc-macro --example clang_shelf -- $HOME/.blaze/v2/toolchain/clang`, then unpack)",
@@ -188,9 +181,10 @@ fn export_and_run(program: &ProgramIn<'_>) -> ExitStatus {
 #[test]
 #[ignore = "needs the pinned clang on the shelf and runs the exported file; the integrator runs it by name on an arm64 Mac"]
 fn cxx_throw_is_caught_inside_the_native_code() {
-    let dir = scratch("throw-catch");
+    let dir = TempDir::for_test("blaze-export-throw-catch-");
     let object = compile(THROW_CATCH, "throw_catch", &dir);
-    let image = native(&object, "throw_catch.o", Wanted { roots: THROW_CATCH_ROOTS, rust: &[], libraries: throw_catch_libraries() });
+    let libraries = throw_catch_libraries();
+    let image = native(&object, "throw_catch.o", Wanted { roots: THROW_CATCH_ROOTS, rust: &[], libraries: &libraries });
     // main: w0 = 42; w0 = native_throw_catch(w0); exit(w0).
     let main = rec(
         &[
@@ -218,7 +212,6 @@ fn cxx_throw_is_caught_inside_the_native_code() {
         exports: &[],
     };
     let status = export_and_run(&program);
-    std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(status.code(), Some(42), "the exported program ended with {status}, not by the C++ catch's value");
     println!("native_run: the C++ throw was caught inside the native code and main exited 42");
 }
@@ -304,7 +297,7 @@ fn drop_unwind(image: &mut Image<'_>) {
 
 /// Exports and runs the callback program; `without_rows` removes the image's unwind facts.
 fn run_callback_program(name: &str, without_rows: bool) -> ExitStatus {
-    let dir = scratch(name);
+    let dir = TempDir::for_test("blaze-export-callback-");
     let object = compile(CALLS_BACK, "calls_back", &dir);
     let mut image = native(&object, "calls_back.o", Wanted { roots: CALLS_BACK_ROOTS, rust: CALLS_BACK_RUST, libraries: &[] });
     if without_rows {
@@ -326,9 +319,7 @@ fn run_callback_program(name: &str, without_rows: bool) -> ExitStatus {
         natives: Some(&image),
         exports: &exports,
     };
-    let status = export_and_run(&program);
-    std::fs::remove_dir_all(&dir).unwrap();
-    status
+    export_and_run(&program)
 }
 
 /// Prints `native_run: the panic in rust_panics unwound through c_calls_back into main's landing and exited 42`.
