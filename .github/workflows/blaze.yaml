@@ -78,6 +78,7 @@ jobs:
               BLAZE_ALLOC_TRACE=1 timeout -k 5 20 "$binary" "${selection[@]}" 2>&1 | tee -a "$evidence/test.log"
             done
             test "$(timeout 10 grep -Fc '1 passed; 0 failed' "$evidence/test.log")" -eq 32
+            timeout -k 15 240 "$binary" --test-threads=4 2>&1 | tee "$evidence/blaze-core.log"
           else
             timeout -k 20 480 /usr/bin/time -v "$binary" --nocapture "${selection[@]}" 2>&1 | tee "$evidence/test.log"
             if [[ "$SUITE" == closure-* ]]; then
