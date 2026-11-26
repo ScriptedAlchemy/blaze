@@ -417,6 +417,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let source_text;
+        let git_path;
         let source = match &package_lock.source {
             LockSource::Path => {
                 let dir = member_dirs.get(&unit.package).ok_or("the path package has no captured directory")?;
@@ -429,8 +430,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 module::Source::Registry { checksum: checksum.as_str() }
             }
             LockSource::Git { commit, .. } => {
-                source_text = sources.files(unit.package).map_err(|why| format!("{why}"))?.1.as_str().to_owned();
-                module::Source::Git { commit: commit.as_str(), path: &source_text }
+                git_path = sources.files(unit.package).map_err(|why| format!("{why}"))?.1;
+                module::Source::Git { commit: commit.as_str(), path: git_path.as_str() }
             }
         };
         let deps = match package_lock.source {

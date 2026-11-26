@@ -48,7 +48,7 @@ fn records_at(store: &Path) -> DirStore {
 }
 
 /// A fresh folder under the system's temporary one, by this process and a count.
-fn folder(name: &str) -> PathBuf {
+pub(crate) fn folder(name: &str) -> PathBuf {
     // One count for the process: tests run on several threads at once.
     static COUNT: AtomicU32 = AtomicU32::new(0);
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
@@ -59,7 +59,7 @@ fn folder(name: &str) -> PathBuf {
 }
 
 /// Code: the bytes of a function body's instructions.
-mod op {
+pub(crate) mod op {
     pub fn uleb(mut value: u64, out: &mut Vec<u8>) {
         loop {
             let byte = (value & 0x7f) as u8;
@@ -124,13 +124,13 @@ const PATH_OPEN: u32 = 2;
 /// The first of [`wasm_importing`]'s extra imports.
 const FIRST_EXTRA: u32 = 3;
 
-fn section(id: u8, body: &[u8], out: &mut Vec<u8>) {
+pub(crate) fn section(id: u8, body: &[u8], out: &mut Vec<u8>) {
     out.push(id);
     op::uleb(body.len() as u64, out);
     out.extend_from_slice(body);
 }
 
-fn name(text: &str, out: &mut Vec<u8>) {
+pub(crate) fn name(text: &str, out: &mut Vec<u8>) {
     op::uleb(text.len() as u64, out);
     out.extend_from_slice(text.as_bytes());
 }
@@ -873,8 +873,8 @@ fn a_kept_answer_that_read_the_calls_file_is_found_only_in_that_file() {
 fn a_range_in_an_attribute_lexes_as_rustc_lexes_it() {
     let stream = lex("num_args(0..=1)", EDITION, Alloc::global()).expect("lexes");
     let shown: Vec<String> = (0..stream.len()).map(|i| format!("{:?} {:?}", stream.tokens()[i].kind, stream.text_at(i))).collect();
-    let text: Vec<&str> = (0..stream.len()).map(|i| stream.text_at(i)).collect();
-    assert!(text.contains(&"0") && text.contains(&"1"), "{shown:#?}");
+    let has = |text| (0..stream.len()).any(|i| stream.text_at(i) == text);
+    assert!(has("0") && has("1"), "{shown:#?}");
     let dots: Vec<_> = stream.tokens().iter().filter(|t| matches!(t.kind, blaze_expand::TokenKind::Punct { char: '.', .. })).map(|t| t.kind).collect();
     assert!(
         matches!(

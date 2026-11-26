@@ -178,12 +178,9 @@ fn keep<'a>(names: &Names<'_>, frame: &'a Frame, alloc: blaze_own::Alloc<'a>) ->
     frame.alloc(Kept(crates))
 }
 
-fn on_checker_stack<R: Send + 'static>(run: impl FnOnce() -> R + Send + 'static) -> R {
-    match std::thread::Builder::new().stack_size(256 << 20).spawn(run).expect("fixture thread").join() {
-        Ok(result) => result,
-        Err(panic) => std::panic::resume_unwind(panic),
-    }
-}
+#[path = "support/checker_stack.rs"]
+mod checker_stack;
+use checker_stack::on_checker_stack;
 
 /// Every field of a declaration's function facts, plus the seam questions keyed by its head.
 #[derive(Debug, PartialEq, Eq)]

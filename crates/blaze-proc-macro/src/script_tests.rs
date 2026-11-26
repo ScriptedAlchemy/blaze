@@ -5,10 +5,7 @@
 
 use std::{
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::Arc,
 };
 
 use blaze_build_script::{
@@ -28,15 +25,7 @@ fn runtime_at(store: &std::path::Path) -> Result<ScriptRuntime, std::string::Str
     ScriptRuntime::new(store).map_err(|error| error.to_string())
 }
 
-/// A fresh folder under the system's temporary one, by this process and a count.
-fn folder(name: &str) -> PathBuf {
-    static COUNT: AtomicU32 = AtomicU32::new(0);
-    let n = COUNT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("blaze-build-script-test-{}-{name}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a temporary folder");
-    dir
-}
+use crate::tests::folder;
 
 fn uleb(mut value: u64, out: &mut Vec<u8>) {
     loop {

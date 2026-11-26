@@ -51,7 +51,7 @@ blaze-ed25519	5
 blaze-emit	568
 blaze-engine	92
 blaze-expand	284
-blaze-export	415
+blaze-export	408
 blaze-facts	12
 blaze-fetch	213
 blaze-file-items	94

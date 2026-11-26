@@ -41,7 +41,7 @@ blaze-cbor	3	0	0	0	0	0	1	0	0	0
 blaze-cc	6	0	0	1	0	0	0	0	0	0
 blaze-cert	7	0	0	2	0	0	0	0	0	2
 blaze-check	7	0	0	31	0	0	48	0	0	0
-blaze-cli	1047	29	3	641	214	91	3	6	0	0
+blaze-cli	1037	29	3	639	211	91	3	6	0	0
 blaze-code	1	0	0	1	0	0	0	0	0	0
 blaze-columns	27	0	0	35	0	0	0	0	0	0
 blaze-comptime	2	0	0	26	0	0	0	0	0	0
@@ -58,7 +58,7 @@ blaze-ed25519	5	3	0	16	0	0	0	0	0	0
 blaze-emit	167	0	0	111	6	15	7	2	0	0
 blaze-engine	66	0	0	219	0	2	1	0	0	0
 blaze-expand	40	8	0	78	0	0	0	0	0	0
-blaze-export	28	5	0	6	12	6	0	1	0	0
+blaze-export	27	5	0	6	9	3	0	1	0	0
 blaze-fetch	89	0	0	90	0	0	0	0	0	0
 blaze-file-items	48	5	0	81	6	0	0	0	0	0
 blaze-flow	27	0	1	46	0	1	0	0	0	0
@@ -83,7 +83,7 @@ blaze-int	4	0	0	1	0	0	0	0	0	0
 blaze-json	3	0	0	0	0	0	1	0	0	0
 blaze-keyed	6	0	1	124	0	0	0	0	0	0
 blaze-kit	2	0	0	0	0	0	0	0	0	0
-blaze-ladder	735	285	0	2315	62	53	8	250	0	86
+blaze-ladder	731	285	0	2315	62	53	8	250	0	86
 blaze-launch	19	0	0	158	0	0	0	0	0	1
 blaze-launch-rt	114	2	0	99	7	5	17	1	0	0
 blaze-launcher	20	1	0	17	8	0	0	1	0	0
@@ -108,7 +108,7 @@ blaze-pack	3	0	0	39	0	0	0	0	0	0
 blaze-parquet	49	2	2	40	26	1	0	3	0	0
 blaze-pg	9	0	2	140	0	0	0	0	0	0
 blaze-phf	5	0	0	9	0	0	0	0	0	1
-blaze-proc-macro	261	3	0	269	154	1	2	12	0	1
+blaze-proc-macro	252	3	0	269	148	1	2	12	0	1
 blaze-producers	8	0	0	0	0	0	0	0	0	0
 blaze-profile	196	0	0	443	19	35	47	15	0	3
 blaze-protocol	23	0	0	116	10	0	0	0	0	2

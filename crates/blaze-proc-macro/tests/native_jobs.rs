@@ -37,15 +37,14 @@ use blaze_proc_macro::{
 };
 
 const CHILD: &str = "BLAZE_JOBS_CHILD";
-const CERT_MODE: &str = "BLAZE_CERT_MODE";
 
 fn main() {
-    if let Ok(mode) = env::var(CERT_MODE) {
-        cert_child(&mode);
-        return;
-    }
-    if env::var_os(CHILD).is_some() {
-        child();
+    if let Ok(mode) = env::var(CHILD) {
+        let out_dir = env::var_os("OUT_DIR").map(PathBuf::from).unwrap_or_else(|| process::exit(3));
+        match mode.as_str() {
+            "jobs" => child(&out_dir),
+            _ => cert_child(&mode, &out_dir),
+        }
         return;
     }
     a_native_script_shares_the_commands_workers();
@@ -54,10 +53,8 @@ fn main() {
 
 /// The build script: what `cc`'s `parallel` reads, and one token taken as the `jobserver` crate
 /// takes it (`fifo:` opened read and write, read without blocking).
-fn child() {
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
-    let jobs = std::env::var("NUM_JOBS").unwrap_or_else(|_| "unset".to_owned());
-    let flags = std::env::var("CARGO_MAKEFLAGS").unwrap_or_else(|_| "unset".to_owned());
+fn child(out_dir: &Path) {
+    let [jobs, flags] = ["NUM_JOBS", "CARGO_MAKEFLAGS"].map(|key| env::var(key).unwrap_or_else(|_| "unset".to_owned()));
     let token = match flags.rsplit_once("--jobserver-auth=fifo:") {
         None => "no jobserver".to_owned(),
         Some((_, path)) => match std::fs::OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open(path) {
@@ -75,7 +72,7 @@ fn child() {
         },
     };
     let said = format!("NUM_JOBS={jobs}\nCARGO_MAKEFLAGS={flags}\ntoken={token}");
-    std::fs::write(format!("{out_dir}/jobs"), said).expect("OUT_DIR/jobs");
+    std::fs::write(out_dir.join("jobs"), said).expect("OUT_DIR/jobs");
 }
 
 fn run_once(name: &str, workers: Option<u32>) -> (std::string::String, Option<(std::string::String, u64)>) {
@@ -100,7 +97,7 @@ fn run_once(name: &str, workers: Option<u32>) -> (std::string::String, Option<(s
         let pair: (AString<'_>, AString<'_>) = (String::from_str_in(n, alloc), String::from_str_in(v, alloc));
         pair
     };
-    vars.push(pair(CHILD, "1"));
+    vars.push(pair(CHILD, "jobs"));
     vars.push(pair("CARGO_MANIFEST_DIR", "/package"));
     vars.push(pair("OUT_DIR", "/target/debug/build/jobs-0/out"));
     let env = Env { vars };
@@ -161,14 +158,10 @@ fn a_native_script_shares_the_commands_workers() {
     println!("native jobs: NUM_JOBS=6, CARGO_MAKEFLAGS={flags}, a token taken in the sandbox and returned by count; without a jobserver NUM_JOBS=1");
 }
 
-fn cert_child(mode: &str) {
+fn cert_child(mode: &str, out_dir: &Path) {
     let manifest_dir = match env::var("CARGO_MANIFEST_DIR") {
         Ok(v) => PathBuf::from(v),
         Err(_) => process::exit(2),
-    };
-    let out_dir = match env::var("OUT_DIR") {
-        Ok(v) => PathBuf::from(v),
-        Err(_) => process::exit(3),
     };
     match mode {
         "vergen" => {
@@ -255,7 +248,7 @@ fn cert_scenario<'a>(
     let shown_pkg = blaze_own::format_in!(alloc, "/workspace/{pkg_rel}");
     let mut vars: AVec<'a, (AString<'a>, AString<'a>)> = Vec::new_in(alloc);
     for &(k, v) in &[
-        (CERT_MODE, mode),
+        (CHILD, mode),
         ("CARGO_MANIFEST_DIR", shown_pkg.as_str()),
         ("OUT_DIR", "/target/debug/build/demo-0/out"),
         ("TARGET", "aarch64-apple-darwin"),

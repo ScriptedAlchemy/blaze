@@ -1009,28 +1009,18 @@ mod tests {
         std::vec![blaze_core::sim::SimAbove { toward: toward.into(), files: std::vec![(name, manifest.as_bytes().to_vec())] }]
     }
 
-    /// A member's manifest that inherits its edition from the root.
-    fn inheriting(name: &str) -> std::string::String {
-        std::format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition.workspace = true\n")
-    }
-
     const TWO: &str = "[workspace]\nmembers = [\"a\", \"b\"]\n\n[workspace.package]\nedition = \"2021\"\n";
+    const MEMBER_A: &str = "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition.workspace = true\n";
 
     /// A virtual root over `a` (a binary) and `b` (a library), both with `edition.workspace =
     /// true`, the root's `[workspace.package]` giving 2021.
-    fn two_members() -> std::vec::Vec<(&'static str, std::string::String)> {
-        std::vec![
-            ("Cargo.toml", TWO.into()),
-            ("a/Cargo.toml", inheriting("a")),
-            ("a/src/main.rs", "fn main() {}".into()),
-            ("b/Cargo.toml", inheriting("b")),
-            ("b/src/lib.rs", std::string::String::new()),
-        ]
-    }
-
-    fn as_files<'a>(files: &'a [(&'static str, std::string::String)]) -> std::vec::Vec<(&'static str, &'a str)> {
-        files.iter().map(|(path, text)| (*path, text.as_str())).collect()
-    }
+    const TWO_MEMBERS: [(&str, &str); 5] = [
+        ("Cargo.toml", TWO),
+        ("a/Cargo.toml", MEMBER_A),
+        ("a/src/main.rs", "fn main() {}"),
+        ("b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition.workspace = true\n"),
+        ("b/src/lib.rs", ""),
+    ];
 
     /// Run.md R3's first test: `test` given a member's folder of a two-member workspace whose
     /// members write `edition.workspace = true` walks up to the root and reads its
@@ -1041,8 +1031,7 @@ mod tests {
     /// `[workspace]` does not offer it").
     #[test]
     fn a_member_folder_reads_the_roots_workspace_package() {
-        let files = two_members();
-        started(&as_files(&files), std::vec::Vec::new(), |cx, fs| {
+        started(&TWO_MEMBERS, std::vec::Vec::new(), |cx, fs| {
             for given in ["a", "a/src"] {
                 let checkout = Checkout::Under(Path::new(given).expect("a path"));
                 let located = locate(cx, fs, &checkout, cx.frame()).unwrap_or_else(|error| panic!("{given}: {error}"));
@@ -1077,9 +1066,9 @@ mod tests {
     fn a_workspace_root_at_the_start_is_found_from_its_own_manifest() {
         let rooted = std::format!("{}\n{TWO}", package("here"));
         for root in [TWO, rooted.as_str()] {
-            let mut files = two_members();
-            files[0].1 = root.into();
-            started(&as_files(&files), std::vec::Vec::new(), |cx, fs| {
+            let mut files = TWO_MEMBERS;
+            files[0].1 = root;
+            started(&files, std::vec::Vec::new(), |cx, fs| {
                 let located = locate(cx, fs, &Checkout::Here, cx.frame()).unwrap_or_else(|error| panic!("{error}"));
                 let laid = with_layout(cx, &fs.root(), "", cx.frame(), |units, _| Ok(units.manifests[units.root.0 as usize].as_str() == MANIFEST)).expect("the layout");
                 assert!(laid, "the oracle: the layout's root is the start folder's manifest");
@@ -1087,9 +1076,9 @@ mod tests {
             });
         }
         // `b`'s manifest is no TOML: the root is still found, and the layout refuses it.
-        let mut files = two_members();
-        files[3].1 = "[package\n".into();
-        started(&as_files(&files), std::vec::Vec::new(), |cx, fs| {
+        let mut files = TWO_MEMBERS;
+        files[3].1 = "[package\n";
+        started(&files, std::vec::Vec::new(), |cx, fs| {
             let located = locate(cx, fs, &Checkout::Here, cx.frame()).unwrap_or_else(|error| panic!("{error}"));
             assert_eq!((located.at, located.member), ("", ""));
             assert!(with_layout(cx, &fs.root(), "", cx.frame(), |_, _| Ok(())).is_err(), "the layout refuses `b`");
@@ -1102,9 +1091,8 @@ mod tests {
     /// `a` from it.
     #[test]
     fn a_root_beneath_the_start_folder_is_the_checkout() {
-        let files = two_members();
-        let placed: std::vec::Vec<(std::string::String, &str)> = files.iter().map(|(path, text)| (std::format!("ws/{path}"), text.as_str())).collect();
-        let placed: std::vec::Vec<(&str, &str)> = placed.iter().map(|(path, text)| (path.as_str(), *text)).collect();
+        let placed = TWO_MEMBERS.map(|(path, text)| (std::format!("ws/{path}"), text));
+        let placed = placed.each_ref().map(|(path, text)| (path.as_str(), *text));
         started(&placed, std::vec::Vec::new(), |cx, fs| {
             let located = locate(cx, fs, &Checkout::Under(Path::new("ws/b").expect("a path")), cx.frame()).unwrap_or_else(|error| panic!("{error}"));
             assert_eq!((located.at, located.member), ("ws", "b"));
@@ -1117,8 +1105,7 @@ mod tests {
     /// was given; an unknown `-p` is refused naming the candidates; `run` refuses two `-p`.
     #[test]
     fn packages_are_selected_by_every_p() {
-        let files = two_members();
-        started(&as_files(&files), std::vec::Vec::new(), |cx, fs| {
+        started(&TWO_MEMBERS, std::vec::Vec::new(), |cx, fs| {
             let root = fs.root();
             let both = test_packages(cx, &root, asked(&["b", "a", "b"]), cx.frame()).unwrap_or_else(|error| panic!("{error}"));
             assert_eq!(both.as_slice(), ["a", "b"]);
@@ -1146,8 +1133,7 @@ mod tests {
     /// refused with the binaries there are.
     #[test]
     fn test_bin_keeps_the_packages_with_it() {
-        let files = two_members();
-        started(&as_files(&files), std::vec::Vec::new(), |cx, fs| {
+        started(&TWO_MEMBERS, std::vec::Vec::new(), |cx, fs| {
             let root = fs.root();
             let kept = test_packages(cx, &root, Select { bin: Some("a"), ..Select::NONE }, cx.frame()).unwrap_or_else(|error| panic!("{error}"));
             assert_eq!(kept.as_slice(), ["a"]);
@@ -1164,8 +1150,7 @@ mod tests {
     /// a lone package is its own root.
     #[test]
     fn a_root_above_the_start_folder_is_named() {
-        let member = inheriting("a");
-        let files = [("Cargo.toml", member.as_str()), ("src/lib.rs", "")];
+        let files = [("Cargo.toml", MEMBER_A), ("src/lib.rs", "")];
         let claims = "[workspace]\nmembers = [\"a\"]\n\n[workspace.package]\nedition = \"2021\"\n";
         started(&files, above_with("a", claims), |cx, fs| match locate(cx, fs, &Checkout::Here, cx.frame()) {
             Err(CliError::RunPackage(why)) => assert_eq!(why, PickError::RootAboveStart { manifest: owned("../Cargo.toml"), package: owned(".") }),

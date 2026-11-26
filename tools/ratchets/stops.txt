@@ -48,11 +48,11 @@ blaze-ed25519	62
 blaze-emit	443
 blaze-engine	212
 blaze-expand	469
-blaze-export	209
+blaze-export	206
 blaze-fetch	175
 blaze-file-items	280
 blaze-flow	280
-blaze-flow-lower	270
+blaze-flow-lower	269
 blaze-fmt	352
 blaze-format	24
 blaze-format-core	103

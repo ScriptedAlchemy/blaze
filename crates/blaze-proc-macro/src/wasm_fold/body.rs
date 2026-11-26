@@ -1,7 +1,7 @@
 use super::{Error, Function, count, offset};
 use blaze_format::cursor::Put;
 use blaze_own::{AVec, Alloc};
-use wasmparser::{FuncType, FunctionBody, Operator};
+use wasmtime::wasmparser::{FuncType, FunctionBody, Operator};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Constant { I32(i32), I64(i64) }

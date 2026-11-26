@@ -12,7 +12,7 @@
 //! "native: with a setting NoModule for zstd-sys 1.0.0, without NoNativeSetting".
 
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
@@ -35,13 +35,7 @@ const HOST: &str = "aarch64-apple-darwin";
 /// The aarch64-apple-darwin row's sha256 in pins/clang.json.
 const PIN_HEX: &str = "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef";
 
-/// A fresh folder under the system's temporary one, by this process and `name`.
-fn folder(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-native-setting-test-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a fresh test folder");
-    dir
-}
+use crate::tests::folder;
 
 /// A home with the pin's shelf (when `shelf`) and an SDK folder giving `Version` 15.2.
 fn fake_home(name: &str, shelf: bool) -> (std::string::String, std::string::String) {

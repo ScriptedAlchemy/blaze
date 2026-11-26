@@ -1,35 +1,38 @@
 use super::{Error, Plan, Record};
-use wasm_encoder::{CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module, TypeSection, ValType};
+use crate::tests::{name, op, section};
 
 fn fixture(lose_constant: bool) -> std::vec::Vec<u8> {
-    let mut module = Module::new();
-    let mut types = TypeSection::new();
-    types.ty().function([ValType::I64], [ValType::I64]);
-    let mut functions = FunctionSection::new();
-    let mut exports = ExportSection::new();
-    let mut code = CodeSection::new();
-    for n in 1..=64 {
-        functions.function(0);
-        exports.export(&format!("member{n}"), ExportKind::Func, n - 1);
-        let mut function = Function::new([(1, ValType::I64)]);
-        function.instruction(&Instruction::LocalGet(0));
-        function.instruction(&Instruction::LocalSet(1));
+    const COUNT: u8 = 64;
+    const I64: u8 = 0x7e;
+    const GET: u8 = 0x20;
+    const SET: u8 = 0x21;
+    const CONST: u8 = 0x42;
+    const XOR: u8 = 0x85;
+    const MUL: u8 = 0x7e;
+    const ROTL: u8 = 0x89;
+    let mut module = b"\0asm\x01\0\0\0".to_vec();
+    section(1, &[1, 0x60, 1, I64, 1, I64], &mut module);
+    let mut functions = [0; COUNT as usize + 1]; // Every function has type 0.
+    functions[0] = COUNT;
+    section(3, &functions, &mut module);
+    let mut exports = vec![COUNT];
+    let mut code = vec![COUNT];
+    for n in 1..=COUNT {
+        name(&format!("member{n}"), &mut exports);
+        exports.extend_from_slice(&[0, n - 1]); // An exported function and its index.
+        let mut function = vec![1, 1, I64, GET, 0, SET, 1]; // One i64 local, initialized from the argument.
         for _ in 0..16 {
-            function.instruction(&Instruction::LocalGet(1));
-            function.instruction(&Instruction::I64Const(if lose_constant { 1 } else { i64::from(n) }));
-            function.instruction(&Instruction::I64Xor);
-            function.instruction(&Instruction::I64Const(3));
-            function.instruction(&Instruction::I64Mul);
-            function.instruction(&Instruction::I64Const(5));
-            function.instruction(&Instruction::I64Rotl);
-            function.instruction(&Instruction::LocalSet(1));
+            function.extend_from_slice(&[GET, 1, CONST]);
+            op::sleb(if lose_constant { 1 } else { i64::from(n) }, &mut function);
+            function.extend_from_slice(&[XOR, CONST, 3, MUL, CONST, 5, ROTL, SET, 1]);
         }
-        function.instruction(&Instruction::LocalGet(1));
-        function.instruction(&Instruction::End);
-        code.function(&function);
+        function.extend_from_slice(&[GET, 1, op::END]);
+        op::uleb(function.len() as u64, &mut code);
+        code.extend_from_slice(&function);
     }
-    module.section(&types).section(&functions).section(&exports).section(&code);
-    module.finish()
+    section(7, &exports, &mut module);
+    section(10, &code, &mut module);
+    module
 }
 
 fn oracle(wasm: &[u8]) {

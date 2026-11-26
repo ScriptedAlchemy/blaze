@@ -17,9 +17,8 @@ fn a_shelf_without_llvm_nm_is_refused_by_name() {
     let alloc = blaze_own::testing::heap().alloc();
     let pin = toolchain::clang_pin(PIN, HOST).expect("the macOS pin");
     let digest: std::string::String = pin.sha256.iter().map(|b| std::format!("{b:02x}")).collect();
-    let root = std::env::temp_dir().join(std::format!("blaze-nm-row-{}", std::process::id()));
+    let root = crate::tests::folder("nm-row");
     let shelf = root.join(&digest);
-    let _ = std::fs::remove_dir_all(&root);
     for member in SHELF_MEMBERS.iter().filter(|m| **m != "bin/llvm-nm") {
         let path = shelf.join(member);
         if member.starts_with("lib/clang") {

@@ -99,12 +99,9 @@ fn keep<'a>(names: &Names<'_>, frame: &'a Frame, alloc: blaze_own::Alloc<'a>) ->
     frame.alloc(Kept(crates))
 }
 
-fn on_checker_stack<R: Send + 'static>(run: impl FnOnce() -> R + Send + 'static) -> R {
-    match std::thread::Builder::new().stack_size(256 << 20).spawn(run).expect("fixture thread").join() {
-        Ok(result) => result,
-        Err(panic) => std::panic::resume_unwind(panic),
-    }
-}
+#[path = "support/checker_stack.rs"]
+mod checker_stack;
+use checker_stack::on_checker_stack;
 
 /// The whole front over the solved names and the lazy front over the records written from them.
 fn with_programs<R: Send + 'static>(text: &'static str, inspect: impl for<'n> FnOnce(&'n Names<'n>, &dyn FrontEnd, &mut dyn FrontEnd) -> R + Send + 'static) -> R {
@@ -512,14 +509,14 @@ fn an_expansion_record_without_a_call_part_is_a_typed_answer_and_no_records_erro
         let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("fixture inputs: {e}"));
         let crates = inputs.crates();
         let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("fixture names: {e}"));
-        let calls: Vec<LibKey> = names.krate(0).expansions.iter().filter(|(_, e)| e.made.is_some()).map(|(call, _)| *call).collect();
-        assert!(!calls.is_empty(), "the derive made a text");
+        let calls = || names.krate(0).expansions.iter().filter(|(_, e)| e.made.is_some()).map(|(call, _)| *call);
+        assert!(calls().next().is_some(), "the derive made a text");
         let kept = keep(&names, frame, a);
         let dropped: &'static Kept<'static> = frame.alloc(without_call_parts(kept));
         for (drop, served) in [(true, dropped), (false, kept)] {
             let log = frame.alloc(Log::new(&["ladder"], a));
             let records: &'static Records<'static> = frame.alloc(Records::new(frame.alloc_slice_copy(&[names.krate(0).key]), served, log, frame, a));
-            for &call in &calls {
+            for call in calls() {
                 let origin = records.call_origin(0, call).map(|_| ());
                 let calling = records.call_text(0, call);
                 if drop {

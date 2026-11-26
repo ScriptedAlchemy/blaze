@@ -588,18 +588,18 @@ fn tempo_classes_and_controls() {
         };
         names.item_text(k).expect("the body's item text").text
     };
-    let mut wrong: Vec<String> = Vec::new();
-    let mut flows_of_wrong: Vec<String> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
+    let mut wrong = blaze_own::AVec::new_in(heap.alloc());
+    let mut flows_of_wrong = blaze_own::AVec::new_in(heap.alloc());
+    let mut seen = [false; EXPECTED.len()];
     for (b, _) in bodies.iter() {
         let n = name_of(b);
         if n == "main" {
             continue;
         }
-        let Some(&(_, want)) = EXPECTED.iter().find(|(e, _)| *e == n) else {
+        let Some((index, &(_, want))) = EXPECTED.iter().enumerate().find(|(_, (e, _))| *e == n) else {
             panic!("a body this test does not expect: {n}");
         };
-        seen.push(n.clone());
+        seen[index] = true;
         let mut flows = String::new();
         let (types, v) = world.check_borrows_shown(*b, &mut flows, heap.alloc());
         let item = text_of(*b);
@@ -634,8 +634,8 @@ fn tempo_classes_and_controls() {
             flows_of_wrong.push(line);
         }
     }
-    for (e, _) in EXPECTED {
-        assert!(seen.iter().any(|s| s == e), "an expected body was not checked: {e}");
+    for ((e, _), checked) in EXPECTED.iter().zip(seen) {
+        assert!(checked, "an expected body was not checked: {e}");
     }
     assert!(wrong.is_empty(), "{} bodies not as Rust has them:\n{}\n{}", wrong.len(), wrong.join("\n"), flows_of_wrong.join("\n"));
 }

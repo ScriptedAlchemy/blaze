@@ -84,13 +84,13 @@ fn reader_in_kept(dir: &std::path::Path, module: &crate::module::ModuleRecord) -
 struct Preparation {
     identity: &'static [u8],
     refused: bool,
-    calls: std::sync::atomic::AtomicU64,
+    calls: core::sync::atomic::AtomicU64,
 }
 
 impl crate::host::Preparation for Preparation {
     fn identity(&self) -> &[u8] { self.identity }
     fn prepare<'a>(&self, _: &crate::module::ModuleRecord, wasm: &'a [u8], alloc: blaze_own::Alloc<'a>) -> Result<blaze_own::AVec<'a, u8>, crate::host::PreparationError<'a>> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.calls.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if self.refused { return Err(crate::host::PreparationError::Distributed { detail: blaze_own::AString::from_str_in("preparation refused by test", alloc) }); }
         Ok(blaze_own::AVec::from_slice_in(wasm, alloc))
     }

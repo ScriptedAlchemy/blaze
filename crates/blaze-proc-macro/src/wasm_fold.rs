@@ -3,7 +3,7 @@
 
 use blaze_format::cursor::Put;
 use blaze_own::{AVec, Alloc};
-use wasmparser::{FuncType, Parser, Payload, TypeRef, Validator};
+use wasmtime::wasmparser::{self, FuncType, Parser, Payload, TypeRef, Validator};
 
 mod body;
 use body::Candidate;

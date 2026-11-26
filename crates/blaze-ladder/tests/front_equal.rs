@@ -427,16 +427,9 @@ fn each_twin(w: &World, mut each: impl FnMut(&str, &[SourceFile<'_>], &str, Over
     }
 }
 
-/// Runs `body` on a thread with room for the build's frames (the check and the builder recurse
-/// by the program's depth: a test thread's 2 MiB stack overflowed), as
-/// crates/blaze-emit/src/reach_tests.rs `on_big_stack` does (256 MiB); a panic of `body` is
-/// the test's, its payload resumed unchanged.
-fn on_big_stack(body: fn()) {
-    let ran = std::thread::Builder::new().stack_size(256 << 20).spawn(body).expect("a thread for the test's body").join();
-    if let Err(payload) = ran {
-        std::panic::resume_unwind(payload);
-    }
-}
+#[path = "support/checker_stack.rs"]
+mod checker_stack;
+use checker_stack::on_checker_stack as on_big_stack;
 
 #[test]
 fn whole_and_lazy_answer_alike() {
