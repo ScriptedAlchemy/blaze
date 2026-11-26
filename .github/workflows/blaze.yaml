@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 87eca7e66c6c1984de1119d042bee7321c0f55b2
+          ref: 6e4caa7822e64de0f443bc5818e94bedc3b7e6f0
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
@@ -42,10 +42,13 @@ jobs:
           grep -Fq 'llvm::emit_tests::release_record_runs ... ok' "$log"
           grep -Fq 'llvm::emit_tests::native_call_and_tail_branch_execute_with_the_original_return_address ... ok' "$log"
           grep -Fq 'llvm::emit_tests::folded_body_and_each_member_thunk_execute_their_own_constants ... ok' "$log"
+          grep -Fq 'llvm::emit_tests::optimized_import_keeps_its_trap_source_when_the_roots_trap_is_deleted ... ok' "$log"
       - name: execute exported ARM64 relocations
         if: ${{ !cancelled() && steps.emitter.outcome == 'success' }}
         run: |
-          timeout -k 20 900 cargo +"$(cat pins/toolchain)" test --locked -p blaze-export --test arm64_relocations -- --nocapture 2>&1 | tee "$RUNNER_TEMP/llvm-evidence/export.txt"
+          log="$RUNNER_TEMP/llvm-evidence/export.txt"
+          timeout -k 20 900 cargo +"$(cat pins/toolchain)" test --locked -p blaze-export --test arm64_relocations -- --nocapture 2>&1 | tee "$log"
+          grep -Fq 'native_exports_call_an_indirect_veneer_and_read_a_scaled_constant ... ok' "$log"
       - name: keep the exact source and test logs
         if: always()
         uses: actions/upload-artifact@v7
