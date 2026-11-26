@@ -2903,7 +2903,11 @@ fn overlapping_publishes_from_two_worlds_keep_their_bytes() {
     let (first, _) = a_dir.place(&a_cx, &name, Content::bytes(b"first")).expect("stage first publish");
     let (second, _) = b_dir.place(&b_cx, &name, Content::bytes(b"second")).expect("stage second publish");
     rename_unsynced(&a, &a_cx, FsOp::Publish, &first, &name, Unsynced::No).expect("publish first write");
-    assert_eq!(std::fs::read(scratch.join("start.txt")).expect("read first publish"), b"first", "the second world overwrote the first stage");
+    let mut first_bytes = a_cx.bytes();
+    a_dir.read_all(&a_cx, &path, &mut first_bytes).expect("read first publish");
+    assert_eq!(first_bytes.as_slice(), b"first", "the second world overwrote the first stage");
     rename_unsynced(&b, &b_cx, FsOp::Publish, &second, &name, Unsynced::No).expect("publish second write");
-    assert_eq!(std::fs::read(scratch.join("start.txt")).expect("read second publish"), b"second");
+    let mut second_bytes = b_cx.bytes();
+    b_dir.read_all(&b_cx, &path, &mut second_bytes).expect("read second publish");
+    assert_eq!(second_bytes.as_slice(), b"second");
 }

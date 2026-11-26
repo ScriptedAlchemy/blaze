@@ -219,6 +219,18 @@ class ResultGateOracles(unittest.TestCase):
 
 
 class Oracles(unittest.TestCase):
+    def test_release_reports_reached_native_crates(self):
+        native = [row(unit=name) for name in ("shapes", "mathy", "app")]
+        with_macro = [*native, row(unit="pm")]
+        e.fixture_units("a", native, release=True)
+        e.fixture_units("b", with_macro, release=False)
+        with self.assertRaisesRegex(e.Failed, "omitted fixture units: mathy"):
+            e.fixture_units("a", [native[0], native[2]], release=True)
+        with self.assertRaisesRegex(e.Failed, "native release unit for the Wasm proc macro pm"):
+            e.fixture_units("a", with_macro, release=True)
+        with self.assertRaisesRegex(e.Failed, "omitted fixture units: pm"):
+            e.fixture_units("b", native, release=False)
+
     def test_unit_plan_waits_for_the_end_of_the_snapshot(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "worker.plans"

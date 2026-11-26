@@ -139,6 +139,17 @@ def same_unit_plans(left: list[dict], right: list[dict]) -> None:
     require(not differences, f"workers planned different keys for the same source: {', '.join(differences)}")
 
 
+def fixture_units(worker: str, rows: list[dict], *, release: bool) -> None:
+    """Native release plans contain reachable code. The fixture's proc macro runs as Wasm."""
+    present = {row["unit"] for row in rows}
+    required = {"shapes", "mathy", "app"}
+    if not release:
+        required.add("pm")
+    missing = required - present
+    require(not missing, f"worker {worker} omitted fixture units: {', '.join(sorted(missing))}")
+    require(not release or "pm" not in present, f"worker {worker} planned a native release unit for the Wasm proc macro pm")
+
+
 def lease(event: dict) -> tuple:
     for name in ("execution", "attempt", "generation", "seq"):
         require(type(event.get(name)) is int and event[name] >= 0, f"{event.get('event')}: needs real lease/batch {name}")

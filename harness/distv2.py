@@ -741,7 +741,8 @@ def main(given: Input) -> None:
         print(f"     a compiled {compiled_a} for the work, b {compiled_b}", flush=True)
         check(compiled_a > 0 and compiled_b > 0, "both workers compiled functions for the others")
         for name, rows in (("a", rows_a), ("b", rows_b)):
-            check({"pm", "shapes", "mathy", "app"} <= {r["unit"] for r in rows}, f"{name} reports every fixture crate")
+            evidence.fixture_units(name, rows, release="--release" in given.args)
+            check(True, f"worker {name} reports the fixture units for this backend")
         evidence.no_duplicate_compile(rows_a + rows_b)
         by_a = {row["unit_digest"]: row for row in rows_a}
         shared = [
