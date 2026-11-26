@@ -48,7 +48,8 @@ The acceptance harness reads these fields from the compiler, worker and coordina
 
 - `unit_digest`: lowercase 64-character digest used for `manifests/<digest>`.
 - `plan_names`, `plan_inputs`: ordered work digests and remaining unit-key inputs as lowercase hex.
-  The inputs start with the crate key and include prerequisite unit digests for a final unit.
+  The inputs start with the crate key. The final unit adds prerequisite unit digests and a digest
+  of the selected entry, ordered roots and panic strategy.
 - `attempt`: final successful attempt number, or `-1` when no execution was joined.
 - `publication_attempt`: the attempt that first accepted the immutable manifest; it can be
   older than `attempt` when a replacement lead delivers that accepted record.

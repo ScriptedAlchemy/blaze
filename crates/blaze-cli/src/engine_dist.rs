@@ -33,11 +33,11 @@ use blaze_dist_local::pack::{Value, ValueRef};
 use blaze_dist_local::sys::{append_file, path_is_file, random_id, read_file, write_file};
 use blaze_ids::ContentId;
 use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
-use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, StoreError};
+use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, PanicStrategy, StoreError};
 use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::run::RunError;
 use blaze_ladder::run::make_one::{MOST_WALKED, Maker, NamesRecords, RecordsProgram, Typing};
-use blaze_ladder::run::special::Roots;
+use blaze_ladder::run::special::{EntryForm, Roots};
 use blaze_ladder::symbols::{encode_instance, fn_symbol_of_name};
 use blaze_own::{AString, AVec, Alloc, BTreeMap, BTreeSet, String, Vec};
 use blaze_scope::items_record::{ItemsRecord, TextSpan};
@@ -560,6 +560,27 @@ fn unit_digest_of(
     digest_of_encoded_name("blaze/dist-unit", buf.as_slice())
 }
 
+/// Distinguishes the selected start and the explicit root closure of a final unit.
+fn program_roots_digest(name: &str, roots: &Roots<'_>, panic: PanicStrategy) -> Digest {
+    let form = match roots.form {
+        EntryForm::Unit => b"unit".as_slice(),
+        EntryForm::CMain => b"c-main".as_slice(),
+        EntryForm::Hosted => b"hosted".as_slice(),
+        EntryForm::Comptime => b"comptime".as_slice(),
+    };
+    let panic = match panic {
+        PanicStrategy::Unwind => b"unwind".as_slice(),
+        PanicStrategy::Abort => b"abort".as_slice(),
+    };
+    let mut hash = blaze_ids::Hasher::new("blaze distributed program roots 1");
+    hash.part(name.as_bytes()).part(form).part(panic).part(&roots.entry.0);
+    for index in 0..roots.len() {
+        let (item, instance) = roots.row(index);
+        hash.part(&item.0.0).part(instance);
+    }
+    hash.finish().0
+}
+
 /// Reads a `TextSpan` from `names` for crate `krate` without any lossy casts.
 fn slice_span<'a>(names: &NamesRecords<'a>, krate: usize, span: TextSpan) -> Option<&'a str> {
     let whole = names.records.whole_text(krate, span.at)?;
@@ -981,11 +1002,12 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         for item in items.iter() {
             work_names.push(item.key.0.0);
         }
-        let is_final = idx == 0 || cname == program_crate_name;
-        let mut extra: AVec<'a, Digest> = Vec::with_capacity_in(1 + if is_final { prior_digests.len() } else { 0 }, scratch_alloc);
+        let is_final = idx == 0;
+        let mut extra: AVec<'a, Digest> = Vec::with_capacity_in(1 + if is_final { prior_digests.len() + 1 } else { 0 }, scratch_alloc);
         extra.push(key.0.0);
         if is_final {
             extra.extend_from_slice(prior_digests.as_slice());
+            extra.push(program_roots_digest(program_crate_name, roots, builder.settings.panic));
         }
         let spec = unit_digest_of(cname, builder, release, work_names.as_slice(), extra.as_slice(), scratch_alloc);
         prior_digests.push(spec);
