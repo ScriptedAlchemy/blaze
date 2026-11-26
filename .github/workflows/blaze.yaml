@@ -95,14 +95,61 @@ jobs:
               heads = set()
               states = set()
               run_ids = set()
+              observation_rows = {}
+              targets = [bytes.fromhex(s) for s in ["b206845dd5dbb70504a826b5", "7910d31c7ae10069bdb30949"]]
+
+              def page(at):
+                  if len(raw) < at + 57 or raw[at+4] > 20:
+                      return
+                  names, cells, ids, *counts = struct.unpack_from("<11I", raw, at + 9)
+                  if not 0 < names < 10000 or cells > 100000 or ids > 100000 or max(counts) > 40000:
+                      return
+                  n = sum(counts)
+                  starts = at + 53
+                  names_at = starts + 4*(n+1)
+                  cells_at = names_at + names*33
+                  ids_at = cells_at + cells*20
+                  first_row = ids_at + ids*32
+                  if first_row > len(raw) or struct.unpack_from("<I", raw, starts)[0] != first_row-at:
+                      return
+                  checks = {i: raw[names_at+i*33+1:names_at+(i+1)*33] for i in range(names)
+                            if raw[names_at+i*33] == 10 and any(raw[names_at+i*33+1:].startswith(t) for t in targets)}
+                  if not checks:
+                      return
+                  for i in range(counts[0]):
+                      lo, hi = struct.unpack_from("<2I", raw, starts+4*i)
+                      if not first_row-at <= lo < hi <= len(raw)-at or hi-lo < 44:
+                          continue
+                      row = at + lo
+                      name = struct.unpack_from("<I", raw, row)[0]
+                      if name not in checks:
+                          continue
+                      defs, reads = struct.unpack_from("<2I", raw, row+36)
+                      if 44+(defs+reads)*8 > hi-lo:
+                          continue
+                      pairs = []
+                      for j in range(reads):
+                          cell, digest = struct.unpack_from("<2I", raw, row+44+8*(defs+j))
+                          if cell >= cells or digest >= ids:
+                              break
+                          owner = struct.unpack_from("<I", raw, cells_at+20*cell)[0]
+                          if owner >= names:
+                              break
+                          pairs.append(raw[names_at+33*owner:names_at+33*(owner+1)] +
+                                       raw[cells_at+20*cell+4:cells_at+20*(cell+1)] +
+                                       raw[ids_at+32*digest:ids_at+32*(digest+1)])
+                      if len(pairs) == reads:
+                          observation_rows.setdefault(checks[name].hex()[:24], set()).add(tuple(pairs))
               for path in store.rglob("*"):
                   if not path.is_file() or path.is_symlink():
                       continue
                   raw = path.read_bytes()
-                  for magic in [b"BZTH", b"BZTS", b"BZRI"]:
+                  for magic in [b"BZTH", b"BZTS", b"BZRI", b"BEP6"]:
                       cursor = 0
                       while (at := raw.find(magic, cursor)) != -1:
                           cursor = at + len(magic)
+                          if magic == b"BEP6":
+                              page(at)
                           if magic == b"BZTH" and len(raw) >= at + 24:
                               version, rows, asks, reads, pad = struct.unpack_from("<IIIII", raw, at + 4)
                               if (version, rows, pad) != (1, 5, 0) or asks > 300 or reads > 300:
@@ -135,11 +182,11 @@ jobs:
                               if len(rows) == count:
                                   states.add(tuple(rows))
               assert len(heads) == 1, f"expected one normalized five-test head, got {len(heads)}"
-              return heads.pop(), states, run_ids
+              return heads.pop(), states, run_ids, observation_rows
 
           captured = {label: records(root / label / ".blaze/v2/store") for label, _, _ in modes}
-          serial, serial_states, _ = captured["serial-a"]
-          for label, (head, states, tables) in captured.items():
+          serial, serial_states, _, _ = captured["serial-a"]
+          for label, (head, states, tables, observations) in captured.items():
               addresses = [head[24+i*88+40:24+i*88+72].hex()[:12] for i in range(5)]
               print(label, "head matches serial-a:", head == serial,
                     "addresses:", addresses, "suite states:", len(states), flush=True)
@@ -153,6 +200,12 @@ jobs:
                   targets = [bytes.fromhex(row[1])[::-1] for row in new_rows.values() if row[1] in [
                       "fcfd138d1faffa46bb0f359347d7d939", "6258445410a0f012bb0f359347d7d939"]]
                   print(label, "run ids tables:", len(tables))
+                  for check, rows in sorted(observations.items()):
+                      for pairs in sorted(rows):
+                          order = hashlib.sha256(b"".join(pairs)).hexdigest()[:16]
+                          canonical = hashlib.sha256(b"".join(sorted(pairs))).hexdigest()[:16]
+                          print(label, "body observations", check, len(pairs), "recorded:", order,
+                                "canonical:", canonical, "already sorted:", list(pairs) == sorted(pairs))
                   for table in sorted(tables):
                       nc, nb = struct.unpack_from("<II", table, 8)
                       for i in range(nc):
