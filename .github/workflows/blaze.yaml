@@ -1,26 +1,35 @@
-name: PR 81 origin of extra BodyCheck observation
-on: workflow_dispatch
+name: PR 81 focused protocol execution diagnosis
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        required: true
+        type: string
 permissions:
-  actions: read
   contents: read
 defaults:
   run:
     shell: bash
 env:
-  BLAZE_CORES: all
-  RUST_BACKTRACE: "0"
+  BLAZE_CORES: "2"
+  BLAZE_TESTS: verify
   CARGO_BUILD_JOBS: "2"
   CARGO_PROFILE_DEV_DEBUG: "0"
+  RUST_BACKTRACE: "0"
 jobs:
-  address:
+  protocol:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 46
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source }}
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
+      - uses: ./.github/actions/apt
+        with:
+          packages: strace bubblewrap
       - name: Enable sandbox user namespaces
         run: |
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
@@ -29,213 +38,38 @@ jobs:
       - uses: ./.github/actions/toolchain
       - uses: ./.github/actions/script
         with:
-          job: cargo
+          job: source-compiler
       - uses: ./.github/actions/toolchain-shelf
-      - name: Build the instrumented source and run isolated fixtures
+      - name: Build exact compiler and launcher
         run: |
-          mkdir -p "$RUNNER_TEMP/source-shelf" "$RUNNER_TEMP/address-evidence"
-          timeout 15 git rev-parse HEAD 'HEAD^{tree}' > "$RUNNER_TEMP/address-evidence/source.txt"
+          evidence="$RUNNER_TEMP/diagnostics"
+          mkdir -p "$evidence"
+          timeout 15 git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
           tc=$(timeout 10 cat pins/toolchain)
-          timeout -k 20 1980 cargo +"$tc" build --locked --bins -p blaze-cli -p blaze-launcher \
-            2>&1 | tee "$RUNNER_TEMP/address-evidence/build.log"
-          ln -s "$CARGO_TARGET_DIR/debug" "$RUNNER_TEMP/source-binaries"
-          ln -s "$HOME/.blaze/v2/toolchain" "$RUNNER_TEMP/source-shelf/toolchain"
-          timeout 30 sha256sum "$RUNNER_TEMP/source-binaries"/{blaze,blaze-launcher,blaze-fact-shim} > "$RUNNER_TEMP/address-evidence/binaries.txt"
-          timeout -k 15 720 python3 - <<'PY' | tee "$RUNNER_TEMP/address-evidence/result.log"
-          import ast
-          import hashlib
-          import os
-          import shutil
-          import struct
-          import subprocess
-          import tempfile
-          from pathlib import Path
-
-          temp = Path(os.environ["RUNNER_TEMP"])
-          evidence = temp / "address-evidence"
-          root = Path(tempfile.mkdtemp(prefix="pa."))
-          project = root / "project"
-          (project / "src").mkdir(parents=True)
-          fixture = Path("crates/blaze-cli/tests/test_command_runs.rs").read_text()
-          manifest = fixture.split("const MANIFEST: &str = ", 1)[1].split(";\n", 1)[0]
-          body = fixture.split("fn pooled_workers_match_serial_bztr_and_purity() {", 1)[1]
-          library = body.split('let lib = r#"', 1)[1].split('"#;', 1)[0]
-          (project / "Cargo.toml").write_text(ast.literal_eval(manifest))
-          (project / "src/lib.rs").write_text(library)
-
-          def run(home, label, args, project=project):
-              env = {**os.environ, "PWD": str(project), "HOME": str(home), "CARGO_HOME": str(home / ".cargo")}
-              exe = temp / "source-binaries/blaze"
-              child = subprocess.run([exe, "test", *args], cwd=project, env=env, capture_output=True, timeout=75)
-              (evidence / (label + ".stdout")).write_bytes(child.stdout)
-              (evidence / (label + ".stderr")).write_bytes(child.stderr)
-              if child.returncode:
-                  raise RuntimeError(f"{label} returned {child.returncode}: {child.stderr[-1500:]!r}")
-              return child.stdout
-
-          other = root / "independent" / "project"
-          shutil.copytree(project, other)
-          modes = [("serial-a", "1", project), ("pooled", "4", project),
-                   ("serial-b", "1", project), ("pooled-first", "4", other)]
-          modes.extend((f"serial-extra-{i:02}", "1", project) for i in range(9))
-          modes.extend((f"pooled-extra-{i:02}", "4", other) for i in range(5))
-
-          def files(dir):
-              return {str(p.relative_to(dir)): hashlib.sha256(p.read_bytes()).hexdigest()[:12]
-                      for p in dir.rglob("*") if p.is_file() and not p.is_symlink()}
-
-          for label, _, checkout in modes:
-              home = root / label
-              shutil.copytree(temp / "source-shelf/toolchain", home / ".blaze/v2/toolchain", symlinks=True)
-              assert b"5 tests, 0 benchmarks" in run(home, label + ".list", ["--", "--list"], checkout)
-          for label, width, checkout in modes:
-              before = files(checkout)
-              print(label, "checkout before:", sorted(before.items()), flush=True)
-              stdout = run(root / label, label + ".cold", ["--workers", width, "--", "--deadline", "20s"], checkout)
-              after = files(checkout)
-              print(label, "checkout additions and changes:", sorted((name, digest) for name, digest in after.items()
-                    if before.get(name) != digest), "removed:", sorted(before.keys() - after.keys()), flush=True)
-              assert b"ran 5: 5 passed, 0 failed; 0 reused from kept results; 1 not kept" in stdout
-
-          def records(store):
-              heads = set()
-              states = set()
-              run_ids = set()
-              observation_rows = {}
-              targets = [bytes.fromhex(s) for s in ["b206845dd5dbb70504a826b5", "7910d31c7ae10069bdb30949"]]
-
-              def page(at):
-                  if len(raw) < at + 57 or raw[at+4] > 20:
-                      return
-                  names, cells, ids, *counts = struct.unpack_from("<11I", raw, at + 9)
-                  if not 0 < names < 10000 or cells > 100000 or ids > 100000 or max(counts) > 40000:
-                      return
-                  n = sum(counts)
-                  starts = at + 53
-                  names_at = starts + 4*(n+1)
-                  cells_at = names_at + names*33
-                  ids_at = cells_at + cells*20
-                  first_row = ids_at + ids*32
-                  if first_row > len(raw) or struct.unpack_from("<I", raw, starts)[0] != first_row-at:
-                      return
-                  checks = {i: raw[names_at+i*33+1:names_at+(i+1)*33] for i in range(names)
-                            if raw[names_at+i*33] == 10 and any(raw[names_at+i*33+1:].startswith(t) for t in targets)}
-                  if not checks:
-                      return
-                  for i in range(counts[0]):
-                      lo, hi = struct.unpack_from("<2I", raw, starts+4*i)
-                      if not first_row-at <= lo < hi <= len(raw)-at or hi-lo < 44:
-                          continue
-                      row = at + lo
-                      name = struct.unpack_from("<I", raw, row)[0]
-                      if name not in checks:
-                          continue
-                      defs, reads = struct.unpack_from("<2I", raw, row+36)
-                      if 44+(defs+reads)*8 > hi-lo:
-                          continue
-                      pairs = []
-                      for j in range(reads):
-                          cell, digest = struct.unpack_from("<2I", raw, row+44+8*(defs+j))
-                          if cell >= cells or digest >= ids:
-                              break
-                          owner = struct.unpack_from("<I", raw, cells_at+20*cell)[0]
-                          if owner >= names:
-                              break
-                          pairs.append(raw[names_at+33*owner:names_at+33*(owner+1)] +
-                                       raw[cells_at+20*cell+4:cells_at+20*(cell+1)] +
-                                       raw[ids_at+32*digest:ids_at+32*(digest+1)])
-                      if len(pairs) == reads:
-                          observation_rows.setdefault(checks[name].hex()[:24], set()).add(tuple(pairs))
-              for path in store.rglob("*"):
-                  if not path.is_file() or path.is_symlink():
-                      continue
-                  raw = path.read_bytes()
-                  for magic in [b"BZTH", b"BZTS", b"BZRI", b"BEP6"]:
-                      cursor = 0
-                      while (at := raw.find(magic, cursor)) != -1:
-                          cursor = at + len(magic)
-                          if magic == b"BEP6":
-                              page(at)
-                          if magic == b"BZTH" and len(raw) >= at + 24:
-                              version, rows, asks, reads, pad = struct.unpack_from("<IIIII", raw, at + 4)
-                              if (version, rows, pad) != (1, 5, 0) or asks > 300 or reads > 300:
-                                  continue
-                              blob = bytearray(raw[at:at+24+rows*88+asks*40+reads*64])
-                              for i in range(rows):
-                                  start = 24 + 88*i + 72
-                                  blob[start:start+8] = bytes(8)
-                              heads.add(bytes(blob))
-                          if magic == b"BZRI" and len(raw) >= at + 96:
-                              ver, nc, nb, nr, ne = struct.unpack_from("<IIIII", raw, at + 4)
-                              if ver != 5 or not 0 < nc < 200 or not 0 < nb < 200 or nr > 1000 or ne > 1000:
-                                  continue
-                              end = at + 96 + 112*nc + 192*nb + 72*ne + 64*nr
-                              if end <= len(raw) and not any(raw[at+24:at+32]):
-                                  run_ids.add(raw[at:end])
-                          if magic == b"BZTS" and len(raw) >= at + 184:
-                              version = struct.unpack_from("<I", raw, at + 4)[0]
-                              count, results, crates, pad = struct.unpack_from("<IIII", raw, at + 168)
-                              if version != 3 or pad or not 0 < count < 300 or results != 4 or crates > 64:
-                                  continue
-                              rows = []
-                              off = at + 184
-                              for _ in range(count):
-                                  if off + 88 > len(raw):
-                                      break
-                                  length = struct.unpack_from("<I", raw, off + 84)[0]
-                                  rows.append((raw[off:off+32].hex(), raw[off+32:off+64].hex(), raw[off+64:off+80].hex(), raw[off+80]))
-                                  off += 88 + length
-                              if len(rows) == count:
-                                  states.add(tuple(rows))
-              assert len(heads) == 1, f"expected one normalized five-test head, got {len(heads)}"
-              return heads.pop(), states, run_ids, observation_rows
-
-          captured = {label: records(root / label / ".blaze/v2/store") for label, _, _ in modes}
-          serial, serial_states, _, serial_observations = captured["serial-a"]
-          for label, (head, states, tables, observations) in captured.items():
-              addresses = [head[24+i*88+40:24+i*88+72].hex()[:12] for i in range(5)]
-              print(label, "head matches serial-a:", head == serial,
-                    "addresses:", addresses, "suite states:", len(states), flush=True)
-              if len(states) == len(serial_states) == 1:
-                  old_rows = {row[0]: row[1:] for row in next(iter(serial_states))}
-                  new_rows = {row[0]: row[1:] for row in next(iter(states))}
-                  moved = [sym for sym in sorted(old_rows.keys() & new_rows.keys()) if old_rows[sym] != new_rows[sym]]
-                  for sym in moved:
-                      print(label, "changed code identity", sym, old_rows[sym], new_rows[sym])
-                  print(label, "symbol sets equal:", old_rows.keys() == new_rows.keys(), "moved:", len(moved))
-                  targets = [bytes.fromhex(row[1])[::-1] for row in new_rows.values() if row[1] in [
-                      "fcfd138d1faffa46bb0f359347d7d939", "6258445410a0f012bb0f359347d7d939"]]
-                  print(label, "run ids tables:", len(tables))
-                  for check, rows in sorted(observations.items()):
-                      for pairs in sorted(rows):
-                          order = hashlib.sha256(b"".join(pairs)).hexdigest()[:16]
-                          canonical = hashlib.sha256(b"".join(sorted(pairs))).hexdigest()[:16]
-                          print(label, "body observations", check, len(pairs), "recorded:", order,
-                                "canonical:", canonical, "already sorted:", list(pairs) == sorted(pairs))
-                          baseline = serial_observations.get(check, set())
-                          if len(baseline) == 1:
-                              old = set(next(iter(baseline)))
-                              current = set(pairs)
-                              for transition, changed in [("added", current-old), ("removed", old-current)]:
-                                  for pair in sorted(changed):
-                                      print(label, "body observation diff", check, transition, "kind", pair[0],
-                                            "owner", pair[1:33].hex(), "cell", pair[33:49].hex(), "digest", pair[49:].hex())
-                  for table in sorted(tables):
-                      nc, nb = struct.unpack_from("<II", table, 8)
-                      for i in range(nc):
-                          off = 96 + i*112
-                          if any(item.startswith(table[off:off+8]) for item in targets):
-                              print(label, "crate scope", table[off+80:off+112].hex()[:24])
-                      for i in range(nb):
-                          off = 96 + nc*112 + i*192
-                          if table[off:off+16] in targets:
-                              print(label, "body tabled:", table[off:off+16].hex(),
-                                    "body key:", table[off+16:off+48].hex()[:24], "kind:", table[off+48],
-                                    "name:", table[off+96:off+128].hex()[:24], "text:", table[off+128:off+160].hex()[:24])
-          PY
+          timeout -k 20 1200 cargo +"$tc" build --locked --bins -p blaze-cli -p blaze-launcher 2>&1 | tee "$evidence/build.log"
+          timeout 30 sha256sum "$CARGO_TARGET_DIR/debug"/{blaze,blaze-launcher,blaze-fact-shim} > "$evidence/binaries.txt"
+      - name: Observe the exact affected protocol cases
+        run: |
+          evidence="$RUNNER_TEMP/diagnostics"
+          status=0
+          for name in absent_invalid_and_expired_connections_are_named_refusals \
+            fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries \
+            versions_content_session_and_terminal_bindings_fail_closed \
+            the_coordinator_owns_and_removes_its_actual_socket \
+            the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls; do
+            timeout 20 jq -n --arg blaze "$CARGO_TARGET_DIR/debug/blaze" --arg cwd "$GITHUB_WORKSPACE" \
+              --arg home "$RUNNER_TEMP/blaze-fs/protocol-home-$name" --arg out "$evidence/$name" \
+              --arg shelf "$HOME/.blaze/v2/toolchain" --arg name "$name" \
+              '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:235,commands:[{name:$name,args:["test","-p","blaze-dist-local","--view","json","--","--run-all","--format","json",$name]}]}' \
+              > "$evidence/$name.json"
+            timeout -k 15 265 python3 harness/v2/exec_observer.py "$evidence/$name.json" || status=$?
+            timeout 10 jq -rc 'select(.event=="failed" or .event=="not_run" or .event=="summary")' "$evidence/$name/$name.log" || status=$?
+          done
+          timeout 30 sha256sum --check "$evidence/binaries.txt"
+          exit "$status"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: pooled-cache-address-evidence
-          path: ${{ runner.temp }}/address-evidence
-          if-no-files-found: error
+          name: focused-protocol-execution
+          path: ${{ runner.temp }}/diagnostics
+          if-no-files-found: warn
