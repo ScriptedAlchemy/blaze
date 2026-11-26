@@ -184,7 +184,10 @@ fn scripts_a_native_runs_key_holds_the_sdks_version_not_its_folder() {
     let tools = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", r#"{"Version":"27.2"}"#, b118);
     let older = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk", r#"{"Version":"26.5"}"#, "<key>ProductBuildVersion</key><string>25F70</string>");
     let beta = sdk("/Library/Developer/CommandLineTools/SDKs/MacOSX27.2.sdk", r#"{"Version":"27.2"}"#, "<key>ProductBuildVersion</key><string>26B5044k</string>");
-    let key = |ran_as: RanAs, sdk: Option<&Sdk<'_>>| parts([(ContentId([1; 32]), ContentId([2; 32]), ran_as)].into_iter(), sdk.map(|sdk| sdk.identity()))[0].1;
+    let alloc = blaze_own::testing::heap().alloc();
+    let key = |ran_as: RanAs, sdk: Option<&Sdk<'_>>| {
+        parts([(ContentId([1; 32]), ContentId([2; 32]), ran_as)].into_iter(), sdk.map(|sdk| sdk.identity()), alloc)[0].1
+    };
 
     assert_eq!(key(RanAs::Native, Some(&xcode)), key(RanAs::Native, Some(&tools)), "one SDK version in two folders keyed two native runs");
     assert_ne!(key(RanAs::Native, Some(&xcode)), key(RanAs::Native, Some(&older)), "two SDK versions keyed one native run");
