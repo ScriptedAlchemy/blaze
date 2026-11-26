@@ -7,6 +7,7 @@
 #![deny(blaze::sans_io_core)]
 
 use blaze_id::ItemKey;
+use blaze_own::btree::Entry;
 use blaze_own::{ABTreeMap, AVec, Alloc, Vec};
 use blaze_surface::{
     AnonImport, Binding, Def, DefKind, GlobEdge, Namespace, Origin, Path, ScopeBuilder,
@@ -41,7 +42,7 @@ pub(crate) struct BindingConflicts<'a, N> {
 
 struct SeenBinding {
     def: Def,
-    imported: bool,
+    first_import: Option<UseSite>,
 }
 
 impl<'a, N: Name> BindingConflicts<'a, N> {
@@ -49,11 +50,17 @@ impl<'a, N: Name> BindingConflicts<'a, N> {
         Self { seen: ABTreeMap::new_in(alloc) }
     }
 
-    /// A named import conflicts with an earlier named import in this namespace even
-    /// when both resolve to the same target. Other bindings conflict on different targets.
+    /// Distinct named imports conflict in one namespace, even if their target is the same.
+    /// Other bindings conflict on different targets.
     pub(crate) fn bind<P>(&mut self, ns: Namespace, name: N, def: Def, site: Option<UseSite>) -> Option<ScopeError<N, P>> {
-        let first = self.seen.entry((ns, name)).or_insert(SeenBinding { def, imported: site.is_some() });
-        let import = site.filter(|_| first.imported);
+        let first = match self.seen.entry((ns, name)) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                entry.insert(SeenBinding { def, first_import: site });
+                return None;
+            }
+        };
+        let import = site.filter(|&site| *first.first_import.get_or_insert(site) != site);
         (first.def != def || import.is_some()).then_some(ScopeError::Duplicate { ns, name, first: first.def, second: def, import })
     }
 }

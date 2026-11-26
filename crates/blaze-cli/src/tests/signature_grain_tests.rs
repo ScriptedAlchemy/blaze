@@ -464,6 +464,13 @@ fn a_name_that_does_not_exist_is_an_error() {
 fn duplicate_import_is_drawn_at_the_second_use_in_its_namespace() {
     let io = Io::simulated(SimWorld::new(106, Limits::USUAL));
     write(&io, "Cargo.toml", MANIFEST);
+    write(
+        &io,
+        "src/lib.rs",
+        "mod a { pub fn x() {} pub fn y() {} }\nuse a::{r#x, y};\npub fn call() { x(); y(); }\n",
+    );
+    let grouped = check_view::<fix::Atomic>(&io, View::Json, None);
+    assert_eq!((grouped.errors, grouped.failures), (0, 0), "{:?}\n{}", grouped.words, grouped.profile);
     // The later use conflicts whether or not the two uses resolve to the same function.
     for module in ["b", "a"] {
         let before = stdout(&io).len();
@@ -476,7 +483,9 @@ fn duplicate_import_is_drawn_at_the_second_use_in_its_namespace() {
         assert_eq!((duplicate.status, duplicate.failures), (Some(1), 0), "{:?}\n{}", duplicate.words, duplicate.profile);
         let out = stdout(&io);
         let drawn = &out[before..];
-        assert!(drawn.lines().any(|line| line.contains("\"code\":\"E0252\"") && line.contains("\"path\":\"src/lib.rs\",\"line\":4,\"col\":1")), "{drawn}");
+        let mut findings = drawn.lines().filter(|line| line.contains("\"code\":\"E0252\""));
+        assert!(findings.next().is_some_and(|line| line.contains("\"path\":\"src/lib.rs\",\"line\":4,\"col\":1")), "{drawn}");
+        assert!(findings.next().is_none(), "{drawn}");
     }
 
     // A type alias and a function of the same name occupy separate namespaces.
