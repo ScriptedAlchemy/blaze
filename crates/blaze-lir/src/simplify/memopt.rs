@@ -7,10 +7,11 @@
 //!   never aliases any external pointer; same-base non-overlapping `[off, off + size)` byte
 //!   intervals never alias.
 //! - **Memory LICM**: hoists non-volatile loop-invariant loads out of natural loops into the
-//!   dominating `Jump` preheader when no aliasing store/call/atomic occurs in the loop AND the
-//!   load is guaranteed dereferenceable (in `header` or from a `SlotAddr`).
+//!   dominating `Jump` preheader when no aliasing store or opaque memory effect (a call or
+//!   invoke, bulk/atomic memory op, fence, inline `asm!`, or target intrinsic) occurs in the
+//!   loop AND the load is guaranteed dereferenceable (in `header` or from a `SlotAddr`).
 //! - **Dead Store Elimination (DSE)**: removes overwritten non-volatile stores to the exact same
-//!   `(base, offset, size)` with no intervening aliasing load/call/atomic/fence.
+//!   `(base, offset, size)` with no intervening aliasing load or opaque memory effect.
 //!
 //! Pure sans-IO, `#![forbid(unsafe_code)]`, explicit allocator only.
 
@@ -377,7 +378,11 @@ fn hoist_invariant_loads<A: Allocator + Copy>(
                     | Op::AtomicStore
                     | Op::AtomicRmw
                     | Op::Cmpxchg
-                    | Op::Fence => {
+                    | Op::Fence
+                    // Inline asm and target intrinsics are opaque without a `nomem` promise.
+                    | Op::Asm
+                    | Op::AsmBr
+                    | Op::TargetIntrinsic => {
                         has_opaque_clobber = true;
                     }
                     _ => {}
@@ -547,7 +552,10 @@ fn eliminate_dead_stores<A: Allocator + Copy>(
                 | Op::AtomicStore
                 | Op::AtomicRmw
                 | Op::Cmpxchg
-                | Op::Fence => {
+                | Op::Fence
+                | Op::Asm
+                | Op::AsmBr
+                | Op::TargetIntrinsic => {
                     // Only non-escaping local stack slots survive calls/fences.
                     let mut i = 0;
                     while i < killed_locs.len() {
@@ -771,7 +779,7 @@ mod tests {
             if indirect {
                 b.invoke_indirect(Flags::NONE, callee_ptr, callee_sig, &[ptr], normal, unwind);
             } else {
-                let callee = b.reference(crate::RefKind::Func, 0);
+                let callee = b.reference(crate::func::RefKind::Func, 0);
                 b.invoke(Flags::NONE, callee, callee_sig, &[ptr], normal, unwind);
             }
             b.begin(normal);
@@ -815,5 +823,47 @@ mod tests {
 
         let out = optimize_memory(func.view(), TestHeap).unwrap();
         assert_eq!(out.stats.dead_stores_eliminated, 1, "overwritten store across non-aliasing ext load must be eliminated");
+    }
+
+    /// A store feeding an invoke's argument slot must survive: the callee reads its
+    /// argument, so the store is live until the call. The slot escapes (it is passed as
+    /// an argument), so neither the invoke clobber nor a later store may kill it.
+    #[test]
+    fn dead_store_elimination_keeps_store_feeding_invoke_argument() {
+        for indirect in [false, true] {
+            let mut b = Builder::<TestHeap, Full>::new_in(64, TestHeap);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(Ty::I64)]);
+            let callee_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            let normal = b.create_block(BlockKind::Normal);
+            let unwind = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let callee_ptr = b.param(Ty::PTR);
+            let s = b.slot(8, 3, SlotKind::Named);
+            let sp = b.slot_addr(s);
+            let k1 = b.iconst(Ty::I64, 111);
+            b.store(Flags::NONE, k1, sp, 0, MemAttrs::aligned(8));
+            if indirect {
+                b.invoke_indirect(Flags::NONE, callee_ptr, callee_sig, &[sp], normal, unwind);
+            } else {
+                let callee = b.reference(crate::func::RefKind::Func, 0);
+                b.invoke(Flags::NONE, callee, callee_sig, &[sp], normal, unwind);
+            }
+            b.begin(normal);
+            // The callee may have written the slot; this store must not be treated as
+            // overwriting the pre-invoke store, which the callee observed.
+            let k2 = b.iconst(Ty::I64, 222);
+            b.store(Flags::NONE, k2, sp, 0, MemAttrs::aligned(8));
+            let loaded = b.load(Ty::I64, Flags::NONE, sp, 0, MemAttrs::aligned(8));
+            b.ret(&[loaded]);
+            b.begin(unwind);
+            let _exception = b.param(Ty::PTR);
+            b.trap(1);
+            let func = b.finish_checked().unwrap();
+            let out = optimize_memory(func.view(), TestHeap).unwrap();
+            assert_eq!(out.stats.dead_stores_eliminated, 0, "invoke reads its escaped argument slot");
+            assert_eq!(out.stats.loads_hoisted, 0);
+        }
     }
 }
