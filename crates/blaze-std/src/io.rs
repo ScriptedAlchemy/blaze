@@ -147,6 +147,7 @@ impl Limits {
 /// What the simulation's generator of [`Io::rng`] starts from, besides the seed: so it draws
 /// other numbers than the simulation's own scheduler.
 const RNG_SALT: u64 = 0x6273_7464_2e72_6e67;
+const STAGING_SALT: u64 = 0x6273_7464_2e74_6d70;
 
 /// The driver inside an [`Io`].
 enum Backend {
@@ -303,6 +304,9 @@ struct World {
     /// The generator [`Io::rng`] forks from: `None` in a native world until its first fork,
     /// which draws its seed from the host then (std.md, "What a program pays for at start").
     rng: Option<SplitMix64>,
+    /// The world's private sequence for staging files in shared directories. Separate from
+    /// effect tags and from the random numbers the program asks for.
+    staging: Option<SplitMix64>,
     /// Every file an effect named, and whether the effect changes it, while `record` is on: a
     /// test's view of where its capabilities reached.
     touched: Vec<(FileName, bool)>,
@@ -885,6 +889,11 @@ fn written(
 impl World {
     fn new(start: Start) -> World {
         let Start { driver, seed, above, env: _, args: _, host, offers: _, limits, hosted, disk, plant: _ } = start;
+        let staging = if matches!(driver, Backend::Sim(_)) {
+            seed.map(|seed| SplitMix64::new(seed ^ STAGING_SALT))
+        } else {
+            None
+        };
         World {
             driver,
             above,
@@ -898,6 +907,7 @@ impl World {
             // alloc: the tags of waits that stopped.
             abandoned: Vec::new(),
             rng: seed.map(SplitMix64::new),
+            staging,
             // alloc: none until a test records.
             touched: Vec::new(),
             asked: Vec::new(),
@@ -1763,8 +1773,18 @@ impl Io {
         self.world().lock().changed.get(name).copied().unwrap_or(0)
     }
 
-    /// A number no other call of this world was given: a tag's, taken for a name made beside
-    /// another (a publish's temporary file).
+    /// Reserves the next staging identity. Real worlds seed their sequence from the driver
+    /// at first use, even when the program provided its own reproducible random seed.
+    pub(crate) fn staging_id<E>(&self, seed: impl FnOnce() -> Result<u64, E>) -> Result<u64, E> {
+        if let Some(staging) = &mut self.world().lock().staging {
+            return Ok(staging.next_u64());
+        }
+        let seed = seed()?;
+        let mut world = self.world().lock();
+        Ok(world.staging.get_or_insert_with(|| SplitMix64::new(seed)).next_u64())
+    }
+
+    /// A world-local ordinal for a reservation's PID-qualified scratch name.
     pub(crate) fn fresh(&self) -> u64 {
         let mut world = self.world().lock();
         let fresh = world.next;

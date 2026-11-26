@@ -1097,17 +1097,26 @@ fn copy_file(
     }
 }
 
-/// A name beside `name`, in its directory, that no other call of this world was given: a
-/// publish's temporary file, `.<leaf>.<n>.bstd-new`.
-fn beside(io: &Io, name: &FileName) -> FileName {
-    let fresh = io.fresh();
+/// A publish's temporary file in the same directory as `name`.
+fn beside(io: &Io, cx: &Cx, name: &FileName) -> Result<FileName, FsError> {
+    let fresh = io.staging_id(|| {
+        let cx = cx.span("bstd.fs: seed staging names");
+        match call(io, &cx, FsOp::Publish, name, |tag| Effect::Random { len: 8, tag })? {
+            Done::Random(bytes) if bytes.len() == 8 => {
+                let mut seed = [0; 8];
+                seed.copy_from_slice(&bytes);
+                Ok(u64::from_le_bytes(seed))
+            }
+            done => Err(unexpected(FsOp::Publish, name, done)),
+        }
+    })?;
     let joined = match name.as_str().rsplit_once('/') {
         // alloc: once per publish, its temporary file's name.
         Some((dir, leaf)) => format!("{dir}/.{leaf}.{fresh}.bstd-new"),
         // alloc: once per publish, its temporary file's name.
         None => format!(".{name}.{fresh}.bstd-new"),
     };
-    FileName::new(&joined).expect("a name beside a name is a name")
+    Ok(FileName::new(&joined).expect("a name beside a name is a name"))
 }
 
 /// What is at `name`, or `None`.
@@ -1915,7 +1924,7 @@ impl Dir<ReadWrite> {
     /// A temporary file beside `name` made to hold `content`, not flushed: its name, and how
     /// it was made. A failure leaves the temporary file where it is; the error names it.
     fn place(&self, cx: &Cx, name: &FileName, content: Content<'_>) -> Result<(FileName, How), FsError> {
-        let temp = beside(&self.io, name);
+        let temp = beside(&self.io, cx, name)?;
         let quota = self.quota.as_deref();
         let how = match content.kind {
             Kind::Bytes(bytes) => {
@@ -2874,4 +2883,27 @@ impl fmt::Debug for Buffered<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Buffered({} of {} bytes held for {})", self.held.len(), self.capacity, self.file.name)
     }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn overlapping_publishes_from_two_worlds_keep_their_bytes() {
+    let scratch = blaze_core::temp::TempDir::for_test("bstd-publish-");
+    let a = crate::test::native(&scratch).expect("first publishing world");
+    let b = crate::test::native(&scratch).expect("second publishing world");
+    let budget = core::time::Duration::from_secs(10);
+    let a_cx = a.cx(budget, crate::mem::TASK_FRAME).expect("first publishing context");
+    let b_cx = b.cx(budget, crate::mem::TASK_FRAME).expect("second publishing context");
+    let a_dir = a.need_fs().expect("first filesystem").root();
+    let b_dir = b.need_fs().expect("second filesystem").root();
+    let path = Path::new("start.txt").expect("publish destination");
+    let name = a_dir.beneath(&path);
+
+    // Stage both writes before either rename. Each world must still own its staged bytes.
+    let (first, _) = a_dir.place(&a_cx, &name, Content::bytes(b"first")).expect("stage first publish");
+    let (second, _) = b_dir.place(&b_cx, &name, Content::bytes(b"second")).expect("stage second publish");
+    rename_unsynced(&a, &a_cx, FsOp::Publish, &first, &name, Unsynced::No).expect("publish first write");
+    assert_eq!(std::fs::read(scratch.join("start.txt")).expect("read first publish"), b"first", "the second world overwrote the first stage");
+    rename_unsynced(&b, &b_cx, FsOp::Publish, &second, &name, Unsynced::No).expect("publish second write");
+    assert_eq!(std::fs::read(scratch.join("start.txt")).expect("read second publish"), b"second");
 }
