@@ -206,10 +206,13 @@ def run(given: Input) -> None:
         signer = directory / "seed"
         signer.touch(mode=0o600)
         signer.write_text(secrets.token_hex(32))
-        checkout, home, (status, _, cold_log) = check("cold", blaze)
+        _, home, (status, _, cold_log) = check("cold", blaze)
         require(status == 0, "the publisher's cold check failed")
         cold = entered(cold_log, "cold")
-        status, publication, _ = command("publish", blaze, checkout, home, "store", "publish", str(origin), "--signer", str(signer))
+        status, publication, _ = command(
+            "publish", blaze, scratch, home, "store", "publish", str(origin.relative_to(scratch)),
+            "--signer", str(signer.relative_to(scratch)),
+        )
         made = re.search(r"published: set [0-9a-f]+ generation 1: ([1-9]\d*) records, ([1-9]\d*) objects written .* signed by ([0-9a-f]{64})", publication)
         if status != 0 or made is None:
             raise ValueError("the trusted builder did not publish a nonempty signed set")
@@ -249,13 +252,15 @@ def run(given: Input) -> None:
             require(status == 0 and stdout == "signed origin: 6\n", "the HTTPS consumer did not run the expected program")
             comparison = None
             if alternate is not None:
-                alt_checkout, alt_home, (status, _, stderr) = check("alternate-cold", alternate)
+                _, alt_home, (status, _, stderr) = check("alternate-cold", alternate)
                 require(status == 0, "the alternate reader's cold check failed")
                 alternate_cold = entered(stderr, "alternate-cold")
                 private_origin = scratch / "from-developer-home"
                 private_origin.mkdir()
-                status, private_publication, _ = command("publish-developer-home", blaze, alt_checkout, alt_home,
-                                                          "store", "publish", str(private_origin), "--signer", str(signer))
+                status, private_publication, _ = command(
+                    "publish-developer-home", blaze, scratch, alt_home, "store", "publish",
+                    str(private_origin.relative_to(scratch)), "--signer", str(signer.relative_to(scratch)),
+                )
                 excluded = re.search(r"generation 1: 0 records, \d+ objects written .*; ([1-9]\d*) left out \(local\)", private_publication)
                 if status != 0 or excluded is None:
                     raise ValueError("the trusted publisher did not exclude the developer home’s local records")
