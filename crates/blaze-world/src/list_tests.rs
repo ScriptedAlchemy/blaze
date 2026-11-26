@@ -696,6 +696,46 @@ fn a_flipped_test_flag_differs_from_its_world() {
     std::println!("crate list test flags: {tests} of {} rows test; control: {control} differences", w.crates.len());
 }
 
+#[test]
+fn a_standalone_wasi_producer_and_its_edge_round_trip_in_the_crate_list() {
+    use crate::crate_list::{CrateList, ListError, ListFacts, Module, Run, RunInputs, encode_with};
+
+    const APP: [u8; 32] = [0x71; 32];
+    const DEP: [u8; 32] = [0x72; 32];
+    struct Runs<'a>(&'a [Run<'a>]);
+    impl ListFacts for Runs<'_> {
+        fn script(&self, _: usize) -> Option<[u8; 33]> { None }
+        fn public(&self, _: usize) -> bool { false }
+        fn module(&self, _: usize) -> Option<Module<'_>> { None }
+        fn macros(&self, _: &mut dyn FnMut([u8; 32])) {}
+
+        fn runs(&self, each: &mut dyn FnMut(Run<'_>)) {
+            for &run in self.0 {
+                each(run);
+            }
+        }
+    }
+
+    let checked = RunInputs { host_dependency: false, member: true, ran_as: 1, source: [0x31; 32], module: [0x41; 32] };
+    let standalone = RunInputs { host_dependency: true, source: [0x32; 32], module: [0x42; 32], ..checked };
+    let runs = [
+        Run { subject: APP, unit: 0, side: Side::Target, name: "app", version: "0.1.0", inputs: checked, producers: &[DEP] },
+        Run { subject: DEP, unit: 1, side: Side::Macro, name: "dep", version: "0.1.0", inputs: standalone, producers: &[] },
+    ];
+    let mut bytes = encode_with(&hello(BLAZE), &Runs(&runs), a()).unwrap_or_else(|error| panic!("{error}"));
+    let list = CrateList::open(&bytes).unwrap_or_else(|error| panic!("{error}"));
+    let app = list.run(APP).expect("the checked run");
+    assert!(app.producers().eq([DEP]));
+    let producer = list.run(DEP).expect("the standalone producer");
+    assert_eq!(producer.side, Side::Macro);
+    assert_eq!(producer.inputs, standalone);
+    assert_eq!(producer.producers().count(), 0);
+
+    let app_at = bytes.windows(APP.len()).position(|candidate| candidate == APP).expect("the run's subject");
+    bytes[app_at + 56..app_at + 60].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(CrateList::open(&bytes), Err(ListError::Form { at, .. }) if at == app_at));
+}
+
 /// The bytes of a list's dependency table: its entries counted over every row.
 fn bytes_of_deps(list: &crate::crate_list::CrateList<'_>) -> usize {
     use crate::crate_list::CrateGraph as _;

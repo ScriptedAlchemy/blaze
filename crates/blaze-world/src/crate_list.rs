@@ -57,7 +57,7 @@ const MAGIC: &[u8; 4] = b"BZCL";
 /// so a reader of the list knows a tree's kind without mapping its pack; a version-6 list is
 /// refused by name and made again. 8: each row's package binaries ([`BIN_EXES_AT`]: an
 /// integration test's `CARGO_BIN_EXE_<name>`); a version-7 list is refused by name and made
-/// again. 9: runs name their own module, source and role, including host build-dependency
+/// again. 9: runs name their own module, source and role, including standalone build-dependency
 /// producers with no checked crate row.
 pub const VERSION: u16 = 9;
 /// magic 4, version 2, pad 2, `n` 4, `d` 4, heap 4, sysroot 16, `t` 4, `c` 4, `m` 4, `u` 4,
@@ -160,7 +160,7 @@ pub struct Module<'s> {
 /// Inputs of a build-script run carried by the planner's record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunInputs {
-    /// A run serving a host build dependency uses the resolved host unit's configuration.
+    /// A standalone build-dependency run. Its side selects the host or WASI configuration.
     pub host_dependency: bool,
     /// Only a workspace member can be given the caller's environment.
     pub member: bool,
@@ -764,7 +764,7 @@ impl<'b> CrateList<'b> {
         for e in 0..u {
             let run = &list.runs[e * RUN..(e + 1) * RUN];
             let (start, count) = (le32(run, 56) as usize, le32(run, 60) as usize);
-            if run[36] > 1 || run[37] > 1 || run[38] > 1 || !matches!(run[39], 1 | 2) || (run[37] == 1 && run[36] != 0)
+            if run[36] > 1 || run[37] > 1 || run[38] > 1 || !matches!(run[39], 1 | 2)
                 || !text_ok(run, 40) || !text_ok(run, 48) || start.checked_add(count).is_none_or(|end| end > q)
             {
                 return Err(form("a run's side, flags, placement, text or producer range is invalid", modules_end + e * RUN));
