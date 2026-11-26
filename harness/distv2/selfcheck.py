@@ -167,6 +167,9 @@ class ResultGateOracles(unittest.TestCase):
             self.assertEqual(e.lease(captured), e.lease(old))
             self.assertEqual(captured["capture_sha256"], ready["command_sha256"])
             self.assertIsNone(e.held_result(gate, events[:1], old["pid"]))
+            self.assertIsNone(e.held_result(gate, [], old["pid"]))
+            with self.assertRaisesRegex(e.Failed, "no matching actual issued grant"):
+                e.held_result(gate, events[1:], old["pid"])
             for field, value in (("holder", "other"), ("generation", 30), ("seq", 40), ("attempt", 20), ("execution", 70), ("work", [KEY])):
                 with self.assertRaises(e.Failed, msg=field):
                     e.held_result(gate, [{**old, field: value}, events[1]], old["pid"])

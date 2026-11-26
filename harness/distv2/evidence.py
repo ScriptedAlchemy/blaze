@@ -367,11 +367,13 @@ def held_result(gate: Path, events: list[dict], pid: int) -> dict | None:
         raise Failed(f"{gate}: malformed actual Result view") from why
     require(valid and lease(actual) == lease(captured) and work == captured["work"] and bool(work),
             f"{gate}: captured identity/items differ from its real Result carrier")
-    matching = [e for e in events if e["event"] == "grant" and e["pid"] == pid and lease(e) == lease(captured)]
-    require(bool(matching) and all(e["work"] == work for e in matching), f"{gate}: capture has no matching actual issued grant")
     if not any(e["event"] == "result_held" and e["pid"] == pid and e["work"] == work and lease(e) == lease(captured)
                and e["command_sha256"] == captured["command_sha256"] for e in events):
-        return None  # ready.json is named immediately before the real append becomes visible.
+        # The event snapshot was taken before reading ready.json. Until it includes the
+        # worker's matching append, the earlier grant may also be outside that snapshot.
+        return None
+    matching = [e for e in events if e["event"] == "grant" and e["pid"] == pid and lease(e) == lease(captured)]
+    require(bool(matching) and all(e["work"] == work for e in matching), f"{gate}: capture has no matching actual issued grant")
     grant = {**matching[-1], "capture_sha256": captured["command_sha256"]}
     require(not accepted(events, grant), f"{gate}: the gate did not hold an uncommitted result")
     return grant
