@@ -1417,11 +1417,11 @@ mod tests {
         let store = Store::new(sized, frame, a());
         let keys = Keys::new_in(a());
 
-        let observes_members = |store: &Store<'_>, keys: &Keys| {
+        let observes_members = || {
             let recorder = Recorder::new(RecorderOpts { alloc: a() });
             let names = Tables::new(TablesOpts { records, impls: None, lang_crates: &[], reads: &recorder });
             let world = BodyWorld {
-                names, keys, index: &index, store, buckets: None, owner, module,
+                names, keys: &keys, index: &index, store: &store, buckets: None, owner, module,
                 params: &[], self_: &SelfTy::None, spell: &spell, traits: &[], blocks: &blocks,
                 path_marks: &[], path_ns: &[], fills: RefCell::new(Vec::new_in(Global)),
                 gaps: RefCell::new(Vec::new_in(Global)), reveal: super::super::opaque_auto::Reveal::InBody,
@@ -1432,13 +1432,13 @@ mod tests {
             seen
         };
 
-        assert!(observes_members(&store, &keys), "a cold probe observes the member list");
+        assert!(observes_members(), "a cold probe observes the member list");
         let frozen = crate::front2::tables::head::freeze(
             records, sized, super::super::receiver::Pointers::NOT_LOOKED_UP, trait_, frame, a(), a(),
         ).expect("freeze Score's head");
         let frozen = crate::front2::tables::head::FrozenHead::read(&frozen.bytes).expect("read Score's head");
         crate::front2::tables::head::file_frozen(records, trait_, frozen, &store, &keys, a()).expect("file Score's head");
         assert!(store.made(trait_), "Score's head is resident");
-        assert!(observes_members(&store, &keys), "a probe using the imported head observes the same member list");
+        assert!(observes_members(), "a probe using the imported head observes the same member list");
     }
 }
