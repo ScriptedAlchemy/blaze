@@ -289,14 +289,32 @@ struct Slot {
 /// portable records from accepted distributed grants; native Wasmtime objects never cross it.
 pub trait Preparation: Send + Sync {
     fn identity(&self) -> &[u8];
-    fn prepare<'a>(&self, module: &ModuleRecord, wasm: &'a [u8], alloc: Alloc<'a>) -> Result<blaze_own::AVec<'a, u8>, String>;
+    fn prepare<'a>(&self, module: &ModuleRecord, wasm: &'a [u8], alloc: Alloc<'a>) -> Result<blaze_own::AVec<'a, u8>, PreparationError<'a>>;
 }
+
+#[derive(Debug)]
+pub enum PreparationError<'a> {
+    Fold(crate::wasm_fold::Error),
+    Distributed { detail: blaze_own::AString<'a> },
+    RecordKind,
+}
+impl core::fmt::Display for PreparationError<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Fold(error) => write!(f, "{error}"),
+            Self::Distributed { detail } => write!(f, "distributed wasm preparation: {detail}"),
+            Self::RecordKind => f.write_str("wasm preparation received a non-wasm body record"),
+        }
+    }
+}
+impl core::error::Error for PreparationError<'_> {}
+pub type SharedPreparation = blaze_own::Arc<dyn Preparation, blaze_own::SharedAlloc<'static>>;
 
 pub struct Opts {
     pub heap: &'static blaze_own::Heap,
     pub settings: Settings,
     pub clock: Option<Clock>,
-    pub preparation: Option<Arc<dyn Preparation>>,
+    pub preparation: Option<SharedPreparation>,
 }
 
 impl Opts {
@@ -325,7 +343,7 @@ pub struct Runtime {
     /// The heap each call's server lexes in (D102: handed in by the runtime's maker; a `&Heap`,
     /// not an `Alloc`, so the runtime stays `Sync` for its load workers).
     heap: &'static blaze_own::Heap,
-    preparation: Option<Arc<dyn Preparation>>,
+    preparation: Option<SharedPreparation>,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -565,7 +583,7 @@ impl Runtime {
                 // (module.rs `ModuleRecord::wasm`).
                 let wasm = module.wasm().map_err(RuntimeError::Wasm)?;
                 let prepared = match &self.preparation {
-                    Some(preparation) => Some(preparation.prepare(module, &wasm, self.heap.alloc()).map_err(&compile)?),
+                    Some(preparation) => Some(preparation.prepare(module, &wasm, self.heap.alloc()).map_err(|error| compile(error.to_string()))?),
                     None => None,
                 };
                 let code = self.engine.precompile_module(prepared.as_deref().unwrap_or(&wasm)).map_err(|e| compile(format!("{e:#}")))?;

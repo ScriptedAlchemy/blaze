@@ -1,10 +1,9 @@
 //! One portable body per granted work name. A group consists of one template and its thunks.
-use super::{Error, Plan, count};
-use blaze_format::cursor::Put;
+use super::{Error, Plan, count, index};
+use blaze_format::cursor::{Put, Reader};
 use blaze_own::AVec;
 
 const MAGIC: &[u8; 4] = b"BWF1";
-const HEADER: usize = 41;
 
 /// An immutable recipe tied to one canonical group; callers cannot invent its indices.
 pub struct Work {
@@ -41,7 +40,7 @@ impl<'a> Plan<'a> {
         let mut out = AVec::new_in(self.alloc);
         for (group, family) in self.groups.iter().enumerate() {
             out.push(self.template_work(group)?);
-            for member in 0..family.members.len() { out.push(self.member_work(group, member)?); }
+            for member in 0..family.member_count() { out.push(self.member_work(group, member)?); }
         }
         out.sort_unstable_by_key(Work::key);
         Ok(out)
@@ -53,7 +52,7 @@ impl<'a> Plan<'a> {
     fn make_work(&self, group: usize, member: Option<usize>) -> Result<Work, Error> {
         let family = self.groups.get(group).ok_or(Error::Record("unknown fold group"))?;
         let function = match member {
-            Some(member) => family.members.get(member).ok_or(Error::Record("unknown fold member"))?.function.0,
+            Some(member) => family.member(member)?.function.0,
             None => self.imported.checked_add(count(self.functions.len())?)
                 .and_then(|index| index.checked_add(u32::try_from(group).ok()?))
                 .ok_or(Error::Limit("template function index"))?,
@@ -70,12 +69,12 @@ impl<'a> Plan<'a> {
     pub fn emit(&self, work: &Work) -> Result<Record<'a>, Error> {
         let expected = self.make_work(work.group, work.member)?;
         if expected.key != work.key { return Err(Error::Record("work belongs to another module or recipe")); }
-        let group = &self.groups[work.group];
-        let first = &group.members[0];
-        let ty = &self.types[first.ty as usize];
+        let group = self.groups.get(work.group).ok_or(Error::Record("unknown fold group"))?;
+        let first = &group.first;
+        let ty = self.types.get(index(first.ty)?).ok_or(Error::Record("unknown template type"))?;
         let body = match work.member {
             None => first.template(ty, &group.varying, self.alloc)?,
-            Some(member) => group.members[member].thunk(ty, &group.varying, self.template_work(work.group)?.function, self.alloc)?,
+            Some(member) => group.member(member)?.thunk(ty, &group.varying, self.template_work(work.group)?.function, self.alloc)?,
         };
         let mut bytes = AVec::new_in(self.alloc);
         bytes.put_bytes(MAGIC);
@@ -90,9 +89,10 @@ impl<'a> Plan<'a> {
 pub(super) fn body<'r>(records: &[RecordView<'r>], work: &Work) -> Result<&'r [u8], Error> {
     let found = records.binary_search_by_key(&work.key, |record| record.key)
         .map_err(|_| Error::Record("required template or member thunk is missing"))?;
-    let bytes = records[found].bytes;
-    if bytes.len() <= HEADER || &bytes[..4] != MAGIC || bytes[4..36] != work.proof
-        || bytes[36] != u8::from(work.member.is_some()) || bytes[37..41] != work.function.to_le_bytes()
+    let bytes = records.get(found).ok_or(Error::Record("missing body record"))?.bytes;
+    let mut reader = Reader::new(bytes);
+    if reader.take(4)? != MAGIC || reader.take(32)? != work.proof
+        || reader.u8()? != u8::from(work.member.is_some()) || reader.u32()? != work.function || reader.is_done()
     { return Err(Error::Record("body record does not name its expected group, role and function")); }
-    Ok(&bytes[HEADER..])
+    Ok(reader.take_rest())
 }

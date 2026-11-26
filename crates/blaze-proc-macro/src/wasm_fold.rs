@@ -23,6 +23,7 @@ pub enum Error {
     Metadata,
     Unsupported(&'static str),
     Record(&'static str),
+    Cursor(blaze_format::cursor::Error),
 }
 
 impl core::fmt::Display for Error {
@@ -31,10 +32,14 @@ impl core::fmt::Display for Error {
             Self::Invalid(error) => write!(f, "portable wasm folding: {error}"),
             Self::Limit(why) | Self::Unsupported(why) | Self::Record(why) => write!(f, "portable wasm folding: {why}"),
             Self::Metadata => f.write_str("portable wasm folding: custom metadata may contain code offsets"),
+            Self::Cursor(error) => write!(f, "portable wasm body record: {error}"),
         }
     }
 }
 impl core::error::Error for Error {}
+impl From<blaze_format::cursor::Error> for Error {
+    fn from(error: blaze_format::cursor::Error) -> Self { Self::Cursor(error) }
+}
 
 impl From<wasmparser::BinaryReaderError> for Error {
     fn from(value: wasmparser::BinaryReaderError) -> Self { Self::Invalid(value) }
@@ -42,17 +47,23 @@ impl From<wasmparser::BinaryReaderError> for Error {
 
 /// One equivalent family; order and identity are derived only from the original module.
 pub struct Group<'a> {
-    members: AVec<'a, Candidate<'a>>,
+    first: Candidate<'a>,
+    rest: AVec<'a, Candidate<'a>>,
     varying: AVec<'a, usize>,
     key: [u8; 32],
 }
 
-impl Group<'_> {
+impl<'a> Group<'a> {
     pub fn key(&self) -> [u8; 32] { self.key }
     pub fn members(&self) -> impl Iterator<Item = Function> + '_ {
-        self.members.iter().map(|member| member.function)
+        self.candidates().map(|member| member.function)
     }
     pub fn parameters(&self) -> usize { self.varying.len() }
+    fn candidates(&self) -> impl Iterator<Item = &Candidate<'a>> { core::iter::once(&self.first).chain(self.rest.iter()) }
+    fn member_count(&self) -> usize { 1 + self.rest.len() }
+    fn member(&self, index: usize) -> Result<&Candidate<'a>, Error> {
+        if index == 0 { Ok(&self.first) } else { self.rest.get(index - 1).ok_or(Error::Record("unknown group member")) }
+    }
 }
 
 /// Validated input plus a deterministic partition. No IO, cache access or grant is implied.
@@ -100,9 +111,10 @@ impl<'a> Plan<'a> {
                 Payload::CodeSectionEntry(body) => {
                     let defined = count(plan.bodies.len())?;
                     let function = Function(plan.imported.checked_add(defined).ok_or(Error::Limit("function index"))?);
-                    let ty = plan.functions[plan.bodies.len()];
+                    let ty = *plan.functions.get(plan.bodies.len()).ok_or(Error::Record("missing function type"))?;
+                    let signature = plan.types.get(index(ty)?).ok_or(Error::Record("unknown function type"))?;
                     match Candidate::read(function, ty, &body, alloc)? {
-                        Some(candidate) if numeric(&plan.types[ty as usize]) => candidates.push(candidate),
+                        Some(candidate) if numeric(signature) => candidates.push(candidate),
                         _ => plan.ineligible.push(function),
                     }
                     plan.bodies.push(body.as_bytes());
@@ -120,25 +132,24 @@ impl<'a> Plan<'a> {
         let mut pending = candidates.into_iter().peekable();
         let input_key = blaze_sha256::digest(input);
         while let Some(first) = pending.next() {
-            let mut members = AVec::new_in(alloc);
-            members.push(first);
-            while pending.peek().is_some_and(|next| next.shape == members[0].shape) {
-                if let Some(next) = pending.next() { members.push(next); }
+            let mut rest = AVec::new_in(alloc);
+            while pending.peek().is_some_and(|next| next.shape == first.shape) {
+                if let Some(next) = pending.next() { rest.push(next); }
             }
-            if members.len() < 2 { continue; }
+            if rest.is_empty() { continue; }
             let mut varying = AVec::new_in(alloc);
-            for slot in 0..members[0].constants.len() {
-                if members.iter().any(|member| member.constants[slot] != members[0].constants[slot]) {
+            for (slot, value) in first.constants.iter().enumerate() {
+                if rest.iter().any(|member| member.constants.get(slot) != Some(value)) {
                     varying.push(slot);
                 }
             }
             let mut key = blaze_sha256::Sha256::new();
             key.update(b"blaze portable wasm fold 1\0");
             key.update(&input_key);
-            for member in &members { key.update(&member.function.0.to_le_bytes()); }
-            plan.groups.push(Group { members, varying, key: key.finish() });
+            for member in core::iter::once(&first).chain(rest.iter()) { key.update(&member.function.0.to_le_bytes()); }
+            plan.groups.push(Group { first, rest, varying, key: key.finish() });
         }
-        plan.groups.sort_unstable_by_key(|group| group.members[0].function.0);
+        plan.groups.sort_unstable_by_key(|group| group.first.function.0);
         if !plan.groups.is_empty() && !metadata_safe { return Err(Error::Metadata); }
         Ok(plan)
     }
@@ -160,46 +171,47 @@ impl<'a> Plan<'a> {
     /// The transport must authenticate and digest-check the records before calling this.
     pub fn assemble_records(&self, records: &[RecordView<'_>]) -> Result<AVec<'a, u8>, Error> {
         let expected = self.groups.iter().try_fold(0usize, |count, group| {
-            count.checked_add(group.members.len() + 1).ok_or(Error::Limit("fold output count"))
+            count.checked_add(group.member_count() + 1).ok_or(Error::Limit("fold output count"))
         })?;
-        if records.len() != expected || records.windows(2).any(|pair| pair[0].key >= pair[1].key) {
+        if records.len() != expected || records.iter().zip(records.iter().skip(1)).any(|(a, b)| a.key >= b.key) {
             return Err(Error::Record("output set is missing, duplicated, extraneous or unsorted"));
         }
         if self.groups.is_empty() { return Ok(AVec::from_slice_in(self.input, self.alloc)); }
-        let mut out = AVec::from_slice_in(&self.input[..8], self.alloc);
+        let mut out = AVec::from_slice_in(self.input.get(..8).ok_or(Error::Record("wasm header"))?, self.alloc);
         let mut extra_types = AVec::new_in(self.alloc);
         let mut extra_functions = AVec::new_in(self.alloc);
         let mut extra_bodies = AVec::new_in(self.alloc);
         let mut replacements = AVec::from_iter_in((0..self.bodies.len()).map(|_| None), self.alloc);
         for (number, group) in self.groups.iter().enumerate() {
-            let first = &group.members[0];
-            let ty = &self.types[first.ty as usize];
+            let first = &group.first;
+            let ty = self.types.get(index(first.ty)?).ok_or(Error::Record("template type"))?;
             extra_types.push(0x60);
             extra_types.put_uleb(u64::from(count(ty.params().len() + group.varying.len())?));
             for param in ty.params() { extra_types.push(numeric_byte(*param)?); }
-            for &slot in &group.varying { extra_types.push(first.constants[slot].ty()); }
+            for &slot in &group.varying { extra_types.push(first.constant(slot)?.ty()); }
             extra_types.put_uleb(u64::from(count(ty.results().len())?));
             for result in ty.results() { extra_types.push(numeric_byte(*result)?); }
             extra_functions.put_uleb(u64::from(count(self.types.len() + number)?));
             let template = records::body(records, &self.template_work(number)?)?;
             extra_bodies.put_bytes_uleb(template);
-            for (member_index, member) in group.members.iter().enumerate() {
+            for (member_index, member) in group.candidates().enumerate() {
                 let thunk = records::body(records, &self.member_work(number, member_index)?)?;
-                replacements[(member.function.0 - self.imported) as usize] = Some(thunk);
+                let defined = member.function.0.checked_sub(self.imported).ok_or(Error::Record("imported fold member"))?;
+                *replacements.get_mut(index(defined)?).ok_or(Error::Record("fold member body"))? = Some(thunk);
             }
         }
         for payload in Parser::new(0).parse_all(self.input) {
             let payload = payload?;
             if let Some((id, range)) = payload.as_section() {
-                let raw = &self.input[offset(range.start)?..offset(range.end)?];
+                let raw = self.input.get(offset(range.start)?..offset(range.end)?).ok_or(Error::Record("section range"))?;
                 let changed = match id {
                     1 => Some(append(raw, &extra_types, self.groups.len(), self.alloc)?),
                     3 => Some(append(raw, &extra_functions, self.groups.len(), self.alloc)?),
                     10 => {
                         let mut code = AVec::new_in(self.alloc);
                         code.put_uleb(u64::from(count(self.bodies.len() + self.groups.len())?));
-                        for (index, raw) in self.bodies.iter().enumerate() {
-                            code.put_bytes_uleb(replacements[index].unwrap_or(raw));
+                        for (replacement, raw) in replacements.iter().zip(self.bodies.iter()) {
+                            code.put_bytes_uleb(replacement.unwrap_or(raw));
                         }
                         code.put_bytes(&extra_bodies);
                         Some(code)
@@ -228,6 +240,7 @@ fn append<'a>(raw: &[u8], suffix: &[u8], extra: usize, alloc: Alloc<'a>) -> Resu
 
 fn count(value: usize) -> Result<u32, Error> { u32::try_from(value).map_err(|_| Error::Limit("wasm count exceeds u32")) }
 fn offset(value: u64) -> Result<usize, Error> { usize::try_from(value).map_err(|_| Error::Limit("wasm offset")) }
+fn index(value: u32) -> Result<usize, Error> { usize::try_from(value).map_err(|_| Error::Limit("wasm index")) }
 fn numeric(ty: &FuncType) -> bool { ty.params().iter().chain(ty.results()).all(|ty| numeric_byte(*ty).is_ok()) }
 fn numeric_byte(ty: wasmparser::ValType) -> Result<u8, Error> {
     match ty {

@@ -803,6 +803,7 @@ fn edge_at<'l, R>(
     let wasm_dist = if flags.release {
         crate::engine_dist::DistConfig::from_env(env, crate::graph::TRIPLE, heap)
             .map_err(|error| CliError::Export(blaze_own::Box::new_in(crate::engine_export::ExportCliError::Dist(error), heap.alloc())))?
+            .map(|config| blaze_own::Arc::new_in(config, heap.shared()))
     } else { None };
     let place = Place {
         checkout: served.root_text().unwrap_or(checkout_at),
@@ -1268,7 +1269,7 @@ pub(crate) struct Place<'f> {
     pub(crate) exe_dir: Result<&'f str, crate::fetch::ExeDirWhy>,
     pub(crate) lan_peer: crate::fetch::LanPeerConfig,
     /// Release-mode portable macro preparation, captured at the command edge.
-    pub(crate) wasm_dist: Option<&'f crate::engine_dist::DistConfig>,
+    pub(crate) wasm_dist: Option<&'f crate::engine_dist::wasm::SharedConfig>,
 }
 
 impl<'f> Place<'f> {

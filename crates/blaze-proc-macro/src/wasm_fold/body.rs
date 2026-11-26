@@ -36,7 +36,7 @@ impl<'a> Candidate<'a> {
         if body.as_bytes().len() > 65536 { return Ok(None); }
         let mut reader = body.get_operators_reader()?;
         let start = body.range().start;
-        let locals = &body.as_bytes()[..offset(reader.original_position() - start)?];
+        let locals = body.as_bytes().get(..offset(reader.original_position() - start)?).ok_or(Error::Record("locals range"))?;
         let mut out = Self {
             function, ty, shape: AVec::new_in(alloc), constants: AVec::new_in(alloc),
             locals, pieces: AVec::new_in(alloc),
@@ -46,7 +46,7 @@ impl<'a> Candidate<'a> {
         while !reader.eof() {
             let begin = reader.original_position();
             let op = reader.read()?;
-            let raw = &body.as_bytes()[offset(begin - start)?..offset(reader.original_position() - start)?];
+            let raw = body.as_bytes().get(offset(begin - start)?..offset(reader.original_position() - start)?).ok_or(Error::Record("operator range"))?;
             let constant = match op {
                 Operator::I32Const { value } => Some(Constant::I32(value)),
                 Operator::I64Const { value } => Some(Constant::I64(value)),
@@ -62,7 +62,7 @@ impl<'a> Candidate<'a> {
             }
             let piece = match op {
                 Operator::LocalGet { local_index } | Operator::LocalSet { local_index }
-                | Operator::LocalTee { local_index } => Piece::Local { opcode: raw[0], index: local_index },
+                | Operator::LocalTee { local_index } => Piece::Local { opcode: *raw.first().ok_or(Error::Record("local opcode"))?, index: local_index },
                 Operator::End if reader.eof() => Piece::Raw(raw),
                 // No memory, globals, calls, branches, exceptions or reference instructions:
                 // substituting a constant by an immutable parameter preserves operand values.
@@ -115,7 +115,7 @@ impl<'a> Candidate<'a> {
                         out.push(0x20);
                         out.put_uleb(u64::from(index));
                     }
-                    None => self.constants[*slot].write(&mut out),
+                    None => self.constant(*slot)?.write(&mut out),
                 },
             }
         }
@@ -129,10 +129,14 @@ impl<'a> Candidate<'a> {
             out.push(0x20);
             out.put_uleb(u64::from(parameter));
         }
-        for &slot in varying { self.constants[slot].write(&mut out); }
+        for &slot in varying { self.constant(slot)?.write(&mut out); }
         out.push(0x10);
         out.put_uleb(u64::from(template));
         out.push(0x0b);
         Ok(out)
+    }
+
+    pub fn constant(&self, slot: usize) -> Result<Constant, Error> {
+        self.constants.get(slot).copied().ok_or(Error::Record("constant parameter slot"))
     }
 }

@@ -89,32 +89,33 @@ struct Preparation {
 
 impl crate::host::Preparation for Preparation {
     fn identity(&self) -> &[u8] { self.identity }
-    fn prepare<'a>(&self, _: &crate::module::ModuleRecord, wasm: &'a [u8], alloc: blaze_own::Alloc<'a>) -> Result<blaze_own::AVec<'a, u8>, std::string::String> {
+    fn prepare<'a>(&self, _: &crate::module::ModuleRecord, wasm: &'a [u8], alloc: blaze_own::Alloc<'a>) -> Result<blaze_own::AVec<'a, u8>, crate::host::PreparationError<'a>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.refused { return Err("preparation refused by test".to_owned()); }
+        if self.refused { return Err(crate::host::PreparationError::Distributed { detail: blaze_own::AString::from_str_in("preparation refused by test", alloc) }); }
         Ok(blaze_own::AVec::from_slice_in(wasm, alloc))
     }
 }
 
 #[test]
 fn prepared_modules_hit_without_wasm_or_preparation_and_changes_are_keyed() {
-    use std::sync::{Arc, atomic::Ordering};
+    use blaze_own::{Arc, Share};
+    use core::sync::atomic::Ordering;
     let dir = folder("prepared-warm");
     let module = reader_in(&dir);
     let heap = blaze_own::testing::heap();
-    let cold = Arc::new_in(Preparation { identity: b"fold1", refused: false, calls: 0.into() }, std::alloc::Global);
-    let first = Runtime::new(crate::host::Opts { preparation: Some(cold.clone()), ..crate::host::Opts::new(heap) }).unwrap();
+    let cold = Arc::new_in(Preparation { identity: b"fold1", refused: false, calls: 0.into() }, heap.shared());
+    let first = Runtime::new(crate::host::Opts { preparation: Some(cold.share()), ..crate::host::Opts::new(heap) }).unwrap();
     assert!(first.load(&module).unwrap().compiled);
     assert_eq!(cold.calls.load(Ordering::Relaxed), 1);
     std::fs::remove_file(dir.join("module.wasm")).unwrap();
 
-    let warm = Arc::new_in(Preparation { identity: b"fold1", refused: true, calls: 0.into() }, std::alloc::Global);
-    let second = Runtime::new(crate::host::Opts { preparation: Some(warm.clone()), ..crate::host::Opts::new(heap) }).unwrap();
+    let warm = Arc::new_in(Preparation { identity: b"fold1", refused: true, calls: 0.into() }, heap.shared());
+    let second = Runtime::new(crate::host::Opts { preparation: Some(warm.share()), ..crate::host::Opts::new(heap) }).unwrap();
     assert_eq!(first.code_key(&module), second.code_key(&module));
     assert!(!second.load(&module).unwrap().compiled);
     assert_eq!(warm.calls.load(Ordering::Relaxed), 0, "warm AOT hit performs no preparation or distributed work");
 
-    let changed = Arc::new_in(Preparation { identity: b"fold2", refused: true, calls: 0.into() }, std::alloc::Global);
+    let changed = Arc::new_in(Preparation { identity: b"fold2", refused: true, calls: 0.into() }, heap.shared());
     let third = Runtime::new(crate::host::Opts { preparation: Some(changed), ..crate::host::Opts::new(heap) }).unwrap();
     assert_ne!(first.code_key(&module), third.code_key(&module));
     assert!(matches!(third.load(&module), Err(RuntimeError::Wasm(_))), "another strategy cannot reuse the earlier code");

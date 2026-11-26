@@ -224,7 +224,7 @@ pub struct FetchEnv<'f> {
     /// Optional LAN UDP peer-to-peer `.crate` fetch configuration, read at the edge (rule 75:
     /// `BLAZE_NO_LAN_PEER=1` disables it; disabled in offline unit tests).
     pub lan_peer: LanPeerConfig,
-    pub(crate) wasm_dist: Option<&'f crate::engine_dist::DistConfig>,
+    pub(crate) wasm_dist: Option<&'f crate::engine_dist::wasm::SharedConfig>,
     /// The process's heap, handed from `main` (D102, D120; never reached for deeper): what the
     /// command keeps beyond a task's frame (the lock, its plan, the fetch machine) and what a
     /// task hands to the store is made on it.

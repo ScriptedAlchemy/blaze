@@ -44,7 +44,7 @@ pub(crate) struct MacroSide<'s, 'p, 'r> {
     pub place: crate::macros::Place<'p, 'r>,
     /// The process's heap, handed from `main` (`FetchEnv::heap`): the runtime's.
     pub heap: &'static blaze_own::Heap,
-    pub wasm_dist: Option<&'p crate::engine_dist::DistConfig>,
+    pub wasm_dist: Option<&'p crate::engine_dist::wasm::SharedConfig>,
 }
 
 /// Why the runner could not be made: names what and where (rule 19).
@@ -330,8 +330,8 @@ mod with_sandbox {
         let folders = git_folders(&modules).map_err(|e| MakeError::Store(e.to_string()))?;
         // The process's heap, handed from `main` through the side (D102, D120).
         let preparation = side.wasm_dist.map(|dist| {
-            let prepare: std::sync::Arc<dyn blaze_proc_macro::host::Preparation> =
-                std::sync::Arc::new_in(crate::engine_dist::wasm::Prepare::new(dist), Global);
+            let prepare: blaze_proc_macro::host::SharedPreparation =
+                blaze_own::Arc::new_in(crate::engine_dist::wasm::Prepare::new(dist), side.heap.shared());
             prepare
         });
         let runtime = blaze_proc_macro::host::Runtime::new(blaze_proc_macro::host::Opts {
