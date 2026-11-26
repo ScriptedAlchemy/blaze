@@ -212,6 +212,8 @@ pub(super) fn script_manifest(
     features: &[String],
     alloc: blaze_own::Alloc<'_>,
 ) -> Result<String, Failure> {
+    let anchored = super::member_dependencies::anchor_paths(original, path, alloc)?;
+    let original = anchored.as_str();
     let doc = super::member_dependencies::parse(original, path, alloc)?;
     // Only the build-dependencies are in the script's manifest: an optional normal dependency's
     // implicit feature names nothing there, so it is declared empty (`cfg!(feature)` holds).
@@ -488,7 +490,7 @@ impl Plan<'_> {
         let path = source.join("Cargo.toml");
         let manifest = super::member_dependencies::filtered_manifest(&script_only(&original), &path, &features, alloc)?;
         write(&ws.join("script/Cargo.toml"), script_manifest(manifest.as_str(), &path, &script, &wanted.name, &wanted.version, &features, alloc)?)?;
-        write(&ws.join("Cargo.lock"), member_lock(&read(&self.work.join("fetch/Cargo.lock"))?, &wanted.name, &wanted.version))?;
+        write(&ws.join("Cargo.lock"), member_lock(&read(&self.fetch_dir(at, origin).join("Cargo.lock"))?, &wanted.name, &wanted.version))?;
         write(
             &ws.join(".cargo/config.toml"),
             format!("[source.crates-io]\nreplace-with = \"vendored\"\n\n[source.vendored]\ndirectory = {:?}\n", self.work.join("vendor").display().to_string()),
@@ -566,7 +568,11 @@ impl Plan<'_> {
         };
         let mut env = self.env(&self.work.join("cargo-home"));
         env.push(("SOURCE_DATE_EPOCH".to_owned(), "0".into()));
-        let mut flags = vec![format!("--remap-path-prefix={}=/build", self.work.display()), "-Cdebuginfo=0".to_owned()];
+        let mut flags = vec![
+            format!("--remap-path-prefix={}=/build/checkout", self.args.checkout.display()),
+            format!("--remap-path-prefix={}=/build", self.work.display()),
+            "-Cdebuginfo=0".to_owned(),
+        ];
         if let Origin::Path { dir, .. } = origin {
             flags.push(format!("--remap-path-prefix={}=/build/path/{}-{}", dir.display(), wanted.name, wanted.version));
         }
@@ -632,13 +638,14 @@ impl Plan<'_> {
 
 /// The mode's run: every script asked for built and kept; 1 when any failed.
 pub(super) fn main_with(text: &str, heap: &blaze_own::Heap) -> i32 {
-    let Wrapped(args, native) = input::parse::<Wrapped>(text, SCRIPT);
-    let args = &args;
+    let Wrapped(mut args, native) = input::parse::<Wrapped>(text, SCRIPT);
     let native = native.as_ref();
     let env = |name: &str| std::env::var(name).unwrap_or_default();
     let home = env("HOME");
     let fail = |failure: Failure| -> ! { blaze_script::fail(SCRIPT, &failure.to_string()) };
     let canon = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|error| fail(Failure::Io { path: path.to_owned(), error }));
+    args.checkout = canon(&args.checkout);
+    let args = &args;
     std::fs::create_dir_all(&args.work).unwrap_or_else(|error| fail(Failure::Io { path: args.work.clone(), error }));
     std::fs::create_dir_all(&args.store).unwrap_or_else(|error| fail(Failure::Io { path: args.store.clone(), error }));
     let work = canon(&args.work);

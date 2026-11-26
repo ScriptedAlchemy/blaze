@@ -952,7 +952,8 @@ fn crate_name(name: &str) -> String {
 /// than the library, its dev-dependencies and its file references dropped.
 fn member_manifest(original: &str, source: &Path, path: &Path, features: &[String], alloc: blaze_own::Alloc<'_>) -> Result<String, Failure> {
     let filtered = member_dependencies::filtered_manifest(original, path, features, alloc)?;
-    let original = filtered.as_str();
+    let anchored = member_dependencies::anchor_paths(filtered.as_str(), path, alloc)?;
+    let original = anchored.as_str();
     let mut out = String::with_capacity(original.len() + 256);
     let mut section = String::new();
     let mut lib_path = false;
@@ -1646,6 +1647,8 @@ struct Plan<'a> {
     me: OsString,
 }
 
+type Located<'a> = (usize, &'a Wanted, &'a Origin);
+
 impl Plan<'_> {
     /// The folder of a path package's manifest as the fetch depends on it.
     fn path_member(&self, wanted: &Wanted) -> PathBuf {
@@ -1673,8 +1676,24 @@ impl Plan<'_> {
     }
 
     /// The crates whose sources were found: the ones the fetch and the builds take.
-    fn located(&self) -> impl Iterator<Item = (usize, &Wanted, &Origin)> {
+    fn located(&self) -> impl Iterator<Item = Located<'_>> {
         self.args.crates.iter().zip(&self.origins).enumerate().filter_map(|(at, (wanted, origin))| Some((at, wanted, origin.as_ref().ok()?)))
+    }
+
+    fn separates_path_roots(&self) -> bool {
+        self.args.vendor_from.is_none()
+            && self.located().filter(|(_, _, origin)| !matches!(origin, Origin::Registry { .. })).nth(1).is_some()
+    }
+
+    /// Cargo treats a staged root and a dependency's real checkout as distinct
+    /// path sources. Solve local roots separately, under their own lock, so a
+    /// requested build-script package can also be another script's dependency.
+    fn fetch_dir(&self, at: usize, origin: &Origin) -> PathBuf {
+        let fetch = self.work.join("fetch");
+        if self.separates_path_roots() && !matches!(origin, Origin::Registry { .. }) {
+            return fetch.join(format!("path-{at}"));
+        }
+        fetch
     }
 
     /// The environment of every cargo this tool starts: nothing inherited but `HOME` and `PATH`.
@@ -1696,7 +1715,33 @@ impl Plan<'_> {
     /// Step one: `cargo vendor` of every crate asked for, with its dependencies as the lock
     /// pins them, and of std's own dependencies. The network; no code of theirs runs.
     fn fetch(&self, alloc: blaze_own::Alloc<'_>) -> Result<(), Failure> {
-        let dir = self.work.join("fetch");
+        let shim = self.work.join("path/shim");
+        for (_, wanted, origin) in self.located() {
+            if let Origin::Path { dir, manifest, .. } | Origin::Git { dir, manifest, .. } = origin {
+                let path = dir.join("Cargo.toml");
+                let features = wanted.features.clone().unwrap_or_else(|| vec!["default".to_owned()]);
+                write(&self.path_member(wanted).join("Cargo.toml"), member_manifest(manifest, dir, &path, &features, alloc)?)?;
+            }
+        }
+        write(&shim.join("Cargo.toml"), SHIM_MANIFEST)?;
+        write(&shim.join("shim.rs"), &self.shim_text)?;
+
+        let common = self.work.join("fetch");
+        let roots: Vec<_> = self.located().collect();
+        if !self.separates_path_roots() {
+            return self.fetch_roots(&common, &roots, false);
+        }
+        let (registry, paths): (Vec<_>, Vec<_>) = roots.into_iter().partition(|(_, _, origin)| matches!(origin, Origin::Registry { .. }));
+        if !registry.is_empty() {
+            self.fetch_roots(&common, &registry, true)?;
+        }
+        for root in paths {
+            self.fetch_roots(&self.fetch_dir(root.0, root.2), std::slice::from_ref(&root), true)?;
+        }
+        Ok(())
+    }
+
+    fn fetch_roots(&self, dir: &Path, roots: &[Located<'_>], keep_vendor: bool) -> Result<(), Failure> {
         // Each macro crate with the features asked for and `more`: an optional dependency
         // deeper down that a feature turns on (`alloy-sol-macro/json` -> `alloy-json-abi`) is
         // fetched only then.
@@ -1704,7 +1749,7 @@ impl Plan<'_> {
             let mut manifest = String::from(
                 "[package]\nname = \"blaze-proc-macro-fetch\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[lib]\npath = \"lib.rs\"\n\n[dependencies]\n",
             );
-            for (at, wanted, origin) in self.located() {
+            for &(at, wanted, origin) in roots {
                 let mut features = wanted.features.clone().unwrap_or_else(|| vec!["default".to_owned()]);
                 features.extend(more.get(at).into_iter().flatten().cloned());
                 features.sort();
@@ -1728,46 +1773,35 @@ impl Plan<'_> {
             }
             manifest
         };
-        // A path or git package is a dependency by its manifest as the build's member has it,
-        // so the fetch vendors what it depends on.
-        for (_, wanted, origin) in self.located() {
-            if let Origin::Path { dir, manifest, .. } | Origin::Git { dir, manifest, .. } = origin {
-                // The member's `../shim`, as in the build's workspace.
-                let shim = self.work.join("path/shim");
-                write(&shim.join("Cargo.toml"), SHIM_MANIFEST)?;
-                write(&shim.join("shim.rs"), &self.shim_text)?;
-                let path = dir.join("Cargo.toml");
-                let features = wanted.features.clone().unwrap_or_else(|| vec!["default".to_owned()]);
-                write(&self.path_member(wanted).join("Cargo.toml"), member_manifest(manifest, dir, &path, &features, alloc)?)?;
-            }
-        }
         let mut manifest = manifest_with(&[]);
         write(&dir.join("lib.rs"), "")?;
         write(&dir.join("Cargo.lock"), &self.lock)?;
         let vendor = self.work.join("vendor");
-        let argv: Vec<OsString> = vec![
+        let mut argv: Vec<OsString> = vec![
             self.tool.cargo(),
             "vendor".into(),
             "--versioned-dirs".into(),
             "--sync".into(),
             self.tool.library().join("Cargo.toml").into_os_string(),
-            vendor.clone().into_os_string(),
         ];
+        if keep_vendor {
+            argv.push("--no-delete".into());
+        }
+        argv.push(vendor.into_os_string());
         let home = PathBuf::from(&self.home).join(".cargo");
         write(&dir.join("Cargo.toml"), format!("{manifest}\n[workspace]\n"))?;
-        let ran = run(&argv, &dir, &self.env(&home), Duration::from_secs(600), "cargo vendor")?;
+        let ran = run(&argv, dir, &self.env(&home), Duration::from_secs(600), "cargo vendor")?;
         ran_ok(ran, "cargo vendor")?;
         // Cargo resolves every feature and optional dependency of a workspace member, active
         // or not, and the build's members are the macro crates: what those turn on is fetched
         // too, in a second pass, though only the requested features build.
         let mut every = vec![Vec::new(); self.args.crates.len()];
-        let located: Vec<usize> = self.located().map(|it| it.0).collect();
-        for &at in &located {
+        for &(at, _, _) in roots {
             every[at] = feature_names(&self.manifest_of(at)?);
         }
         manifest = manifest_with(&every);
         let mut optional = 0;
-        for &at in &located {
+        for &(at, _, _) in roots {
             for (package, version) in optional_dependencies(&self.manifest_of(at)?) {
                 manifest.push_str(&format!("o{optional} = {{ package = {package:?}, version = {version:?}, default-features = false }}\n"));
                 optional += 1;
@@ -1777,7 +1811,7 @@ impl Plan<'_> {
             return Ok(());
         }
         write(&dir.join("Cargo.toml"), format!("{manifest}\n[workspace]\n"))?;
-        let ran = run(&argv, &dir, &self.env(&home), Duration::from_secs(600), "cargo vendor (optional dependencies)")?;
+        let ran = run(&argv, dir, &self.env(&home), Duration::from_secs(600), "cargo vendor (optional dependencies)")?;
         ran_ok(ran, "cargo vendor (optional dependencies)").map(drop)
     }
 
@@ -1824,7 +1858,7 @@ impl Plan<'_> {
         write(&ws.join("macro/Cargo.toml"), member_manifest(&original, &source, &original_path, &features, alloc)?)?;
         write(&ws.join("shim/Cargo.toml"), SHIM_MANIFEST)?;
         write(&ws.join("shim/shim.rs"), &self.shim_text)?;
-        write(&ws.join("Cargo.lock"), member_lock(&read(&self.work.join("fetch/Cargo.lock"))?, &wanted.name, &wanted.version))?;
+        write(&ws.join("Cargo.lock"), member_lock(&read(&self.fetch_dir(at, origin).join("Cargo.lock"))?, &wanted.name, &wanted.version))?;
         let vendor = self.work.join("vendor");
         write(
             &ws.join(".cargo/config.toml"),
@@ -1870,6 +1904,7 @@ impl Plan<'_> {
         };
         let mut env = self.env(&self.work.join("cargo-home"));
         let mut flags = vec![
+            format!("--remap-path-prefix={}=/build/checkout", self.args.checkout.display()),
             format!("--remap-path-prefix={}=/build", self.work.display()),
             format!("--remap-path-prefix={}=/rustc/src", self.tool.sysroot.join("lib/rustlib/src/rust").display()),
             "-Cdebuginfo=0".to_owned(),
@@ -2007,11 +2042,13 @@ fn decls_export(wasm: &[u8]) -> Option<String> {
     None
 }
 
-fn main_with(args: &Args, heap: &blaze_own::Heap) -> i32 {
+fn main_with(mut args: Args, heap: &blaze_own::Heap) -> i32 {
     let env = |name: &str| std::env::var(name).unwrap_or_default();
     let home = env("HOME");
     let fail = |failure: Failure| -> ! { blaze_script::fail(SCRIPT, &failure.to_string()) };
     let canon = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|error| fail(Failure::Io { path: path.to_owned(), error }));
+    args.checkout = canon(&args.checkout);
+    let args = &args;
     std::fs::create_dir_all(&args.work).unwrap_or_else(|error| fail(Failure::Io { path: args.work.clone(), error }));
     std::fs::create_dir_all(&args.store).unwrap_or_else(|error| fail(Failure::Io { path: args.store.clone(), error }));
     let work = canon(&args.work);
@@ -2128,7 +2165,7 @@ fn main() {
     match args.as_slice() {
         [one] if build_scripts::asked(one) => blaze_script::exit(build_scripts::main_with(one, heap)),
         [one] => {
-            let status = main_with(&input::parse::<Args>(one, SCRIPT), heap);
+            let status = main_with(input::parse::<Args>(one, SCRIPT), heap);
             blaze_script::exit(status);
         }
         _ => {
@@ -2175,6 +2212,13 @@ mod tests {
         let made = member_manifest(manifest, Path::new("/crate"), path, &requested, alloc).unwrap_or_else(|failure| panic!("{failure}"));
         member_dependencies::parse(&made, path, alloc).unwrap_or_else(|failure| panic!("generated member: {failure}\n{made}"));
         made
+    }
+
+    #[test]
+    fn generated_fetch_member_uses_the_checkout_dependency() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\n\n[build-dependencies]\nhostdep = { path = \"../hostdep\", features = [\"extra\"] }\n";
+        let made = generated_member(manifest, &[]);
+        assert!(made.contains("hostdep = { path = \"/crate/../hostdep\", features = [\"extra\"] }"), "{made}");
     }
 
     fn optional_member(features: &[&str]) -> String {

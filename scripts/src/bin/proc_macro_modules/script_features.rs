@@ -156,6 +156,17 @@ native = [\"cc?/parallel\", \"dep:cc\", \"extra?/x\", \"dep:extra\"]\n";
         script_manifest(package, &dir.join("Cargo.toml"), &dir.join("build.rs"), name, version, &features, alloc).unwrap_or_else(|failure| panic!("{failure}"))
     }
 
+    #[test]
+    fn generated_script_keeps_the_checkout_paths_and_dependency_features() {
+        const SOURCE: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[build-dependencies.hostdep]\npath = \"../hostdep\"\nfeatures = [\"extra\"]\n\n[dependencies]\nnormal = { path = \"../normal\" }\n";
+        let manifest_path = Path::new("/checkout/app/Cargo.toml");
+        let script = Path::new("/checkout/app/build.rs");
+        let alloc = blaze_own::testing::heap().alloc();
+        let rendered = script_manifest(SOURCE, manifest_path, script, "app", "0.1.0", &[], alloc).unwrap();
+        assert!(rendered.contains("[dependencies.hostdep]\npath = \"/checkout/app/../hostdep\"\nfeatures = [\"extra\"]"), "{rendered}");
+        assert!(!rendered.contains("normal ="), "{rendered}");
+    }
+
     fn written(features: &[&str]) -> String {
         made(PACKAGE, "sys", "0.1.0", features)
     }

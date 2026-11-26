@@ -301,6 +301,36 @@ fn corresponding<'d, 't, 'a>(source: Node<'_, '_, '_>, root: Node<'d, 't, 'a>) -
     }
 }
 
+/// Rebase paths only in the manifest given to Cargo in a staging directory. The
+/// original manifest still supplies the dependency closure and module identity.
+pub(super) fn anchor_paths<'a>(text: &str, path: &Path, alloc: Alloc<'a>) -> Result<AString<'a>, Failure> {
+    let doc = parse(text, path, alloc)?;
+    let mut edit = Edit::new_in(&doc, alloc);
+    let refuse = |why: String| Failure::Manifest { path: path.to_owned(), why };
+    let root = doc.root();
+    let targets = root.get("target").into_iter().flat_map(|table| table.children());
+    for scope in std::iter::once(root).chain(targets) {
+        for table in ALL_KINDS.into_iter().filter_map(|kind| scope.get(kind)) {
+            for dep in table.children() {
+                let Some(node) = dep.get("path") else { continue };
+                let relative = node.as_str().ok_or_else(|| refuse(format!("dependency `{}` needs a string path", dep.key())))?;
+                if Path::new(relative).is_absolute() {
+                    continue;
+                }
+                let dir = path.parent().filter(|parent| parent.is_absolute()).ok_or_else(|| {
+                    refuse(format!("cannot anchor dependency `{}` at `{relative}` without an absolute source manifest", dep.key()))
+                })?;
+                // Cargo normalizes path components during resolution.
+                let anchored = dir.join(relative);
+                let anchored = anchored.to_str().ok_or_else(|| refuse(format!("dependency `{}` path is not UTF-8", dep.key())))?;
+                let value = blaze_data::Value::Text(AString::from_str_in(anchored, alloc));
+                edit.replace(node, &value).map_err(|why| refuse(why.to_string()))?;
+            }
+        }
+    }
+    edit.finish().map_err(|why| refuse(why.to_string()))
+}
+
 /// Apply the same selection used by the store. TOML node removal covers the complete
 /// declaration, including multi-line arrays, inline tables and dotted keys.
 pub(super) fn filtered_manifest<'a>(text: &str, path: &Path, requested: &[String], alloc: Alloc<'a>) -> Result<AString<'a>, Failure> {
@@ -387,6 +417,38 @@ fn written<'d, 't, 'a>(doc: &'d Document<'t, Alloc<'a>>, selected: &MemberDepend
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_staged_manifest_anchors_dependency_paths_at_the_source_manifest() {
+        const SOURCE: &str = r#"
+[dependencies]
+alias = { package = "real-dep", path = "../dep", features = ["extra"], default-features = false }
+absolute = { path = "/already/absolute" }
+
+[target.'cfg(unix)'.build-dependencies.hostdep]
+path = '../hostdep'
+features = ["extra"]
+
+[package.metadata]
+path = "keep/relative"
+"#;
+        let alloc = blaze_own::testing::heap().alloc();
+        let path = Path::new("/checkout/app/Cargo.toml");
+        let made = anchor_paths(SOURCE, path, alloc).unwrap();
+        let doc = parse(made.as_str(), path, alloc).unwrap();
+        let root = doc.root();
+        let dependencies = root.get("dependencies").unwrap();
+        let alias = dependencies.get("alias").unwrap();
+        assert_eq!(alias.get("path").and_then(|path| path.as_str()), Some("/checkout/app/../dep"));
+        assert_eq!(alias.get("package").and_then(|package| package.as_str()), Some("real-dep"));
+        assert_eq!(alias.get("default-features").and_then(|setting| setting.as_bool()), Some(false));
+        assert_eq!(dependencies.get("absolute").and_then(|dep| dep.get("path")).and_then(|path| path.as_str()), Some("/already/absolute"));
+        let cfg = root.get("target").unwrap().get("cfg(unix)").unwrap();
+        let hostdep = cfg.get("build-dependencies").unwrap().get("hostdep").unwrap();
+        assert_eq!(hostdep.get("path").and_then(|path| path.as_str()), Some("/checkout/app/../hostdep"));
+        assert!(made.as_str().contains("path = \"keep/relative\""));
+        assert!(anchor_paths(SOURCE, Path::new("app/Cargo.toml"), alloc).is_err());
+    }
 
     /// A dependency U (not the member) with an optional dependency in the inline form that only
     /// its feature `include-exclude` turns on.
