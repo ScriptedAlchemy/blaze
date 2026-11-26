@@ -786,7 +786,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         let nout = self.npos(output, e)?;
         let facts: &'b F = self.facts;
         let arity = crate::one_call::FactsArity { facts };
-        let heads = blaze_borrow::Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+        let ce = ck.closures.column::<0>().get(row).copied();
+        let cast = ce.and_then(|ce| self.body.closure_cast_type(ce));
+        let decl_tys = if from == SigFrom::FnPtr && cast.is_some() {
+            self.body.types
+        } else {
+            facts.region_tys().unwrap_or(self.tys)
+        };
+        let heads = blaze_borrow::Columns::new(decl_tys, &arity, &arity);
         // Each part: the clause's or expecting fn-pointer's slots over it, and its declared
         // type(s) in the heads' table.
         type InPart<'s> = Option<(&'s [Region], Option<PTy>, Option<&'s [PTy]>)>;
@@ -817,9 +824,15 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 (Some((in_s, in_d, None)), outs)
             }
             SigFrom::FnPtr => {
-                if let Some((in_s, decl_ins, out_s, decl_out, binder)) =
-                    ck.closures.column::<0>().get(row).copied().and_then(|ce| self.fn_ptr_expectation(ce, inputs.len(), &heads, e))
-                {
+                let expecting = if let Some((ty, regions)) = cast {
+                    let Some(parts) = Self::fn_ptr_parts(ty, regions, 0, inputs.len(), &heads) else {
+                        return self.refuse(Form::ClosureSigUnaligned { part: 0, why: ClosureSigWhy::ColumnUnread }, e);
+                    };
+                    Some(parts)
+                } else {
+                    ce.and_then(|ce| self.fn_ptr_expectation(ce, inputs.len(), &heads, e))
+                };
+                if let Some((in_s, decl_ins, out_s, decl_out, binder)) = expecting {
                     outer_binder = binder;
                     static_as_static = true;
                     (Some((in_s, None, Some(decl_ins))), Some((out_s, Some(decl_out))))
@@ -907,7 +920,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         heads: &'h blaze_borrow::Columns<'h>,
         e: ExprId,
     ) -> Option<(&'b [Region], &'h [PTy], &'b [Region], PTy, u32)> {
-        use blaze_borrow::RegionTypes;
         use blaze_typeck::Def;
 
         let unwrap_parens = |mut cur: ExprId| -> ExprId {
@@ -981,6 +993,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             }
         }
         let (fn_ty, fn_slots, outer_binder) = found?;
+        Self::fn_ptr_parts(fn_ty, fn_slots, outer_binder, n_inputs, heads)
+    }
+
+    /// The input and output portions of a written fn pointer's column.
+    fn fn_ptr_parts<'h, 's>(
+        fn_ty: PTy,
+        fn_slots: &'s [Region],
+        outer_binder: u32,
+        n_inputs: usize,
+        heads: &'h blaze_borrow::Columns<'h>,
+    ) -> Option<(&'s [Region], &'h [PTy], &'s [Region], PTy, u32)> {
+        use blaze_borrow::RegionTypes;
+
         let Ok(PNode::FnPtr(_, _)) = heads.node(fn_ty) else { return None };
         let Ok(blaze_borrow::Kids::List(fn_kids)) = heads.kids(fn_ty) else { return None };
         let (in_kids, rest_kids) = fn_kids.split_at_checked(n_inputs)?;

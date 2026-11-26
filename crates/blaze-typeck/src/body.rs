@@ -434,6 +434,17 @@ pub struct BodyView<'b> {
     /// (`|lock: &'static str|`, `|t: Typed<'c>|`, `|buf: &mut Vec<(A, B), Alloc<'a>>|`), sorted
     /// ascending by `(closure, param, path, own)`.
     pub closure_param_regions: &'b [ClosureParamRegion],
+    /// Written region columns for explicit closure-to-fn-pointer casts, ascending by closure.
+    pub closure_cast_regions: &'b [ClosureCastRegions],
+    pub closure_cast_region_slots: &'b [crate::regions::Region],
+}
+
+/// A closure's explicit cast target and its span in the body's region slots.
+#[derive(Clone, Copy, Debug)]
+pub struct ClosureCastRegions {
+    pub closure: ExprId,
+    pub cast: ExprId,
+    pub slots: List,
 }
 
 /// What kind of explicit non-elided lifetime a closure parameter type wrote at a region slot.
@@ -491,6 +502,15 @@ fn slice<'b, T>(column: &'static str, all: &'b [T], l: List) -> Result<&'b [T], 
 }
 
 impl<'b> BodyView<'b> {
+    /// The written fn pointer and its region slots, with the pointer itself as binder 0.
+    /// Region parameters are local to the written type.
+    pub fn closure_cast_type(&self, closure: ExprId) -> Option<(PTy, &'b [crate::regions::Region])> {
+        let row = self.closure_cast_regions.binary_search_by_key(&closure.0, |r| r.closure.0).ok()?;
+        let info = self.closure_cast_regions.get(row)?;
+        let &Expr::Cast { ty, .. } = self.exprs.get(info.cast.ix())? else { return None };
+        Some((ty, self.closure_cast_region_slots.get(info.slots.range())?))
+    }
+
     /// The written non-elided lifetime at `(closure, param, path, own)`, if any.
     pub fn closure_param_region(&self, closure: ExprId, param: u32, path: u64, own: u32) -> Option<WrittenRegion> {
         let key = (closure.0, param, path, own);

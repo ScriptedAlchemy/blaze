@@ -466,6 +466,8 @@ fn empty_body_view<'b>(owner: ItemKey, types: blaze_typeck::PTys<'b>, root: Expr
         pat_editions: &[],
         record_expr_schemas: &[],
         closure_param_regions: &[],
+        closure_cast_regions: &[],
+        closure_cast_region_slots: &[],
     }
 }
 

@@ -60,6 +60,8 @@ fn empty_body<'b>(owner: ItemKey, types: PTys<'b>, root: ExprId) -> BodyView<'b>
         pat_editions: &[],
         record_expr_schemas: &[],
         closure_param_regions: &[],
+        closure_cast_regions: &[],
+        closure_cast_region_slots: &[],
     }
 }
 

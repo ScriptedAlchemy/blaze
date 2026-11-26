@@ -849,6 +849,73 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         }
         cursor == slots.len()
     }
+
+    fn closure_cast_regions(
+        &mut self,
+        view: &View<'_>,
+        source: lf::TypeId,
+        ty: PTy,
+        tys: &mut PortableTys<'_>,
+        out: &mut blaze_own::AVec<'_, blaze_typeck::regions::Region>,
+    ) -> Result<bool, Refused> {
+        use super::types::{RegionSink, SlotKind};
+        use blaze_typeck::regions::Region;
+
+        let range = view.type_range(source)?;
+        let mut env = self.env;
+        if let Some(r) = view.item_relative(range)
+            && let Some(body) = self.locals.body(self.owner)
+            && let Some(block) = body.blocks.iter().rev().find(|b| b.open <= r.start && r.start < b.close)
+        {
+            env.module = block.module;
+        }
+        let mut sink = RegionSink::new_in(self.mark_alloc);
+        match self.builder.ty_regions(tys, &env, view, source, &mut sink) {
+            Ok(made) if made == ty => {}
+            Err(why @ (Why::Need(_) | Why::NeedConst(..))) => {
+                self.failed = Some(why);
+                return Err(Refused::Form { what: "a closure cast's written type", range: view.site(range)? });
+            }
+            _ => return Ok(false),
+        }
+        let [frag] = sink.frags() else { return Ok(false) };
+        if sink.refused().is_some() {
+            return Ok(false);
+        }
+        let slots = sink.slots_of(*frag);
+        // Named regions outside this pointer's binders belong to its owner. Give them
+        // identities within this column, distinct from parameter slots given by the head.
+        let first_named = slots
+            .iter()
+            .filter_map(|s| match s.kind {
+                SlotKind::Given(Region::Param(i)) => Some(i),
+                _ => None,
+            })
+            .max()
+            .map_or(0, |i| i.saturating_add(1));
+        let start = out.len();
+        for (i, slot) in slots.iter().enumerate() {
+            let region = match slot.kind {
+                SlotKind::Static => Region::Static,
+                SlotKind::Late { binder, var } => Region::Late { binder, var },
+                SlotKind::Given(region) => region,
+                SlotKind::Named(name, _) => {
+                    let first = slots.iter().position(|s| matches!(s.kind, SlotKind::Named(n, _) if n == name)).unwrap_or(i);
+                    let Some(param) = u32::try_from(first).ok().and_then(|n| first_named.checked_add(n)) else {
+                        out.truncate(start);
+                        return Ok(false);
+                    };
+                    Region::Param(param)
+                }
+                _ => {
+                    out.truncate(start);
+                    return Ok(false);
+                }
+            };
+            out.push(region);
+        }
+        Ok(true)
+    }
 }
 
 /// The gap a refused const term of a BODY is, when blaze cannot value it yet (the body goes

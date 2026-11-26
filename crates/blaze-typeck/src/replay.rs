@@ -244,6 +244,8 @@ mod tests {
             pat_editions: &[],
             record_expr_schemas: &[],
             closure_param_regions: &[],
+            closure_cast_regions: &[],
+            closure_cast_region_slots: &[],
         }
     }
 

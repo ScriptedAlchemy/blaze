@@ -184,6 +184,19 @@ pub trait Types {
         let _ = (view, t, tys, closure, param, out);
         false
     }
+
+    /// Appends the written target's region column for a closure cast.
+    fn closure_cast_regions(
+        &mut self,
+        view: &View<'_>,
+        source: TypeId,
+        ty: PTy,
+        tys: &mut PortableTys<'_>,
+        out: &mut AVec<'_, tc::regions::Region>,
+    ) -> Result<bool, Refused> {
+        let _ = (view, source, ty, tys, out);
+        Ok(false)
+    }
 }
 
 impl ConstGapWhy {
@@ -434,6 +447,8 @@ pub struct TypeckBody<'a> {
     /// Explicit written non-elided lifetimes in closure parameter type annotations
     /// (`|lock: &'static str|`, `|t: Typed<'c>|`), sorted ascending by `(closure, param, slot)`.
     pub closure_param_regions: AVec<'a, tc::ClosureParamRegion>,
+    pub closure_cast_regions: AVec<'a, tc::ClosureCastRegions>,
+    pub closure_cast_region_slots: AVec<'a, tc::regions::Region>,
     /// Unexpanded `inline for pat in iter { body }` sites lowered in this body (ascending by
     /// [`ExprId`]); `front2` uses each site's checked `iter` type to unroll the body before
     /// final checking and codegen.
@@ -503,6 +518,8 @@ impl<'a> TypeckBody<'a> {
             pat_editions: &self.pat_editions,
             record_expr_schemas: &self.record_expr_schemas,
             closure_param_regions: &self.closure_param_regions,
+            closure_cast_regions: &self.closure_cast_regions,
+            closure_cast_region_slots: &self.closure_cast_region_slots,
         }
     }
 }
@@ -1435,7 +1452,27 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::AssignOp { op, lhs, rhs } => tc::Expr::AssignOp { op, lhs, rhs },
             Expr::Ref { mutbl, operand, raw: true } => tc::Expr::RawRef { mutbl, operand },
             Expr::Ref { mutbl, operand, raw: false } => tc::Expr::Ref { mutbl, operand },
-            Expr::Cast { operand, ty } => tc::Expr::Cast { operand, ty: self.ty(ty)? },
+            Expr::Cast { operand, ty } => {
+                let made = self.ty(ty)?;
+                if matches!(self.tys.view().node(made), Ok(tc::PNode::FnPtr(..))) {
+                    let mut inner = operand;
+                    while let Expr::Paren(next) = self.v.expr(inner)? {
+                        inner = next;
+                    }
+                    if matches!(self.v.expr(inner)?, Expr::Closure { .. }) {
+                        let start = self.out.closure_cast_region_slots.len();
+                        if self.types.closure_cast_regions(self.v, ty, made, self.tys, &mut self.out.closure_cast_region_slots)? {
+                            let count = self.out.closure_cast_region_slots.len() - start;
+                            self.out.closure_cast_regions.push(tc::ClosureCastRegions {
+                                closure: inner,
+                                cast: e,
+                                slots: List { start: len(start), len: len(count) },
+                            });
+                        }
+                    }
+                }
+                tc::Expr::Cast { operand, ty: made }
+            }
             Expr::Tuple { elems } => tc::Expr::Tuple { elems: self.exprs(elems)? },
             Expr::Array { elems } => tc::Expr::Array { elems: self.exprs(elems)? },
             Expr::Repeat { elem, len } => {
@@ -1761,6 +1798,8 @@ pub fn to_typeck<'a>(
         const_gaps: Vec::new_in(alloc),
         record_expr_schemas: Vec::new_in(alloc),
         closure_param_regions: Vec::new_in(alloc),
+        closure_cast_regions: Vec::new_in(alloc),
+        closure_cast_region_slots: Vec::new_in(alloc),
         inline_fors: Vec::new_in(alloc),
     };
     let mut slice_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(view.pats.len(), alloc);
@@ -1830,6 +1869,7 @@ pub fn to_typeck<'a>(
     // one call's, so no id repeats.
     c.out.legacy_args.sort_unstable_by_key(|&(x, _)| x);
     c.out.closure_param_regions.sort_unstable();
+    c.out.closure_cast_regions.sort_unstable_by_key(|r| r.closure.0);
     for i in 0..view.pats.len() {
         let id = PatId(len(i));
         let ed = view.mark_of_pat(id)?.map_or(body_edition, |m| edition(m.edition));

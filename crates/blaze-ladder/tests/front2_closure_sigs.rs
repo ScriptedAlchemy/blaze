@@ -97,6 +97,34 @@ fn mapped_value_escapes(xs: &[Vec<u8>]) -> Option<Value<'static>> {
     let mut it = xs.iter().map(|x| Value(x.as_slice()));
     first_value(&mut it)
 }
+
+struct Token<'a>(&'a [u8]);
+type StaticToken = Token<'static>;
+struct Entry {
+    convert: fn(&[u8], StaticToken) -> Result<StaticToken, ()>,
+}
+
+fn convert<'a>(_: &[u8], token: Token<'a>, _: Token<'a>) -> Result<Token<'a>, ()> {
+    Ok(token)
+}
+
+fn cast_static_token() -> Entry {
+    Entry {
+        convert: (|data, token| convert(data, token, Token(b\"scratch\")))
+            as fn(&[u8], StaticToken) -> Result<StaticToken, ()>,
+    }
+}
+
+fn cast_static_token_escapes() -> Entry {
+    Entry {
+        convert: (|data, _token| Ok(Token(data)))
+            as fn(&[u8], StaticToken) -> Result<StaticToken, ()>,
+    }
+}
+
+fn cast_returns_elided_input() {
+    let _ = (|data| data) as fn(&[u8]) -> &[u8];
+}
 ";
 
 fn shown(item: &str, v: &BorrowVerdict<'_>) -> String {
@@ -138,7 +166,10 @@ fn closure_and_projection_signatures_are_laid_and_checked() {
 
     // Print every verdict first, so one run shows them all, whichever assertion fails.
     let mut verdicts = Vec::new();
-    for n in ["user", "user_keeps", "peek", "get", "get_static", "mapped_value", "mapped_value_escapes"] {
+    for n in [
+        "user", "user_keeps", "peek", "get", "get_static", "mapped_value", "mapped_value_escapes",
+        "cast_static_token", "cast_static_token_escapes", "cast_returns_elided_input",
+    ] {
         let b = find(n);
         let (types, v) = world.check_borrows(b, heap.alloc());
         let line = shown(text_of(b), &v);
@@ -147,12 +178,14 @@ fn closure_and_projection_signatures_are_laid_and_checked() {
     }
     let of = |n: &str| verdicts.iter().find(|row| row.0 == n).expect("checked above");
 
-    for n in ["user", "peek", "mapped_value"] {
+    for n in ["user", "peek", "mapped_value", "cast_static_token", "cast_returns_elided_input"] {
         let (_, types, checked, found, line) = of(n);
         assert!(*types, "`{n}`: its types are not clean: {line}");
         assert!(*checked, "`{n}` not borrow-checked (refused): {line}");
         assert_eq!(*found, 0, "ORACLE `{n}`: rustc accepts it: {line}");
     }
+    let (_, types, checked, found, line) = of("cast_static_token_escapes");
+    assert!(*types && *checked && *found > 0 && line.contains("E0521"), "the cast's late-bound input escapes into its static result: {line}");
     for n in ["user_keeps", "get_static", "mapped_value_escapes"] {
         let (_, types, checked, found, line) = of(n);
         assert!(*types, "CONTROL `{n}`: its types are not clean: {line}");
