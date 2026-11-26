@@ -1,4 +1,4 @@
-name: PR 81 focused Linux verification
+name: PR 81 distributed native compiler verification
 on: workflow_dispatch
 permissions:
   contents: read
@@ -9,50 +9,32 @@ env:
   CARGO_BUILD_JOBS: "2"
   RUST_BACKTRACE: "0"
 jobs:
-  ci-runner:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: fde961c3cc44a6a8aa142f6ab9c312867eb309ce
-          persist-credentials: false
-      - uses: ./.github/actions/toolchain
-      - name: verify the runner and partial-inventory recovery
-        run: |
-          timeout -k 15 900 cargo +"$(cat pins/toolchain)" test --locked -p scripts --bin ci_test -- --nocapture
-          timeout -k 15 240 cargo +"$(cat pins/toolchain)" run --locked -p scripts --bin ci_test -- selftest
-  linux-compiler:
+  native:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 85
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 43ee81853f4c5ffb2a02f789a7ff84ba9de659b6
+          ref: 567e2e2dcfd999428cc333e465bf43282c62ceeb
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
       - uses: ./.github/actions/toolchain
       - uses: ./.github/actions/llvm-prefix
-      - name: test the ARM64 library in the real host loader
-        run: timeout -k 15 600 cargo +"$(cat pins/toolchain)" test --locked -p blaze-export --test native_so -- --nocapture
-      - name: test pinned native toolchain planning
-        if: ${{ !cancelled() }}
-        run: timeout -k 15 600 cargo +"$(cat pins/toolchain)" test --locked -p blaze-build-script --lib toolchain::tests -- --nocapture
-      - name: compile and run the compiler regression controls
+      - name: compile native planner and CLI integration
+        run: |
+          timeout -k 30 2400 cargo +"$(cat pins/toolchain)" check --locked -p blaze-cli --bins --message-format short
+      - name: compile and execute LLVM-emitted code
         if: ${{ !cancelled() }}
         run: |
-          tc=$(cat pins/toolchain)
-          set -o pipefail
-          run_control() {
-            local package=$1 test=$2
-            timeout -k 20 2100 cargo +"$tc" test --locked -p "$package" --lib "$test" -- --exact --nocapture | tee "$RUNNER_TEMP/$package.txt"
-            grep -Fq '1 passed; 0 failed' "$RUNNER_TEMP/$package.txt"
-          }
-          run_control blaze-typeck suite::dyn_objects::an_inferred_numeric_local_unsizes_only_to_a_trait_it_implements
-      - name: compile the Linux CLI and run its JSON diagnostic control
+          timeout -k 30 1500 cargo +"$(cat pins/toolchain)" test --locked -p blaze-emit --lib llvm::emit_tests -- --nocapture | tee "$RUNNER_TEMP/emit.txt"
+          grep -Fq 'llvm::emit_tests::release_record_runs ... ok' "$RUNNER_TEMP/emit.txt"
+      - name: verify imported and folded module planning
         if: ${{ !cancelled() }}
         run: |
-          tc=$(cat pins/toolchain)
-          timeout -k 20 2400 cargo +"$tc" test --locked -p blaze-cli --bin blaze tests::engine_borrow_forms_tests::json_reports_the_type_and_borrow_checkers_codes -- --exact --nocapture | tee "$RUNNER_TEMP/blaze-cli.txt"
-          grep -Fq '1 passed; 0 failed' "$RUNNER_TEMP/blaze-cli.txt"
+          timeout -k 30 900 cargo +"$(cat pins/toolchain)" test --locked -p blaze-emit --lib llvm:: -- --nocapture
+      - name: execute exported Rust cdylibs with glibc
+        if: ${{ !cancelled() }}
+        run: |
+          timeout -k 20 600 cargo +"$(cat pins/toolchain)" test --locked -p blaze-export --test native_dylib rust_cdylib:: -- --nocapture | tee "$RUNNER_TEMP/dlopen.txt"
+          grep -Fq 'rust_cdylib::cdylib_loader_rebases_data_binds_allocator_and_initializes_rust_tls ... ok' "$RUNNER_TEMP/dlopen.txt"
