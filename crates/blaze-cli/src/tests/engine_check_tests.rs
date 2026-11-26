@@ -2453,7 +2453,7 @@ fn engine_check_scoped_skips_unrelated_sibling_and_preserves_whole_answer() {
     write(&io, "dep/src/tests.rs", "pub fn dep_submod_helper() -> u8 {\n    super::one()\n}\n");
     write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n");
     write(&io, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::one() + 1\n}\n");
-    write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[[bench]]\nname = \"external\"\npath = \"../a/src/lib.rs\"\n");
     write(&io, "b/src/lib.rs", "pub fn wrong() -> u8 {\n    true\n}\n");
 
     // Verify scoped_root_name keeps Whole, Test, and Bin root names disjoint.
@@ -2495,9 +2495,17 @@ fn engine_check_scoped_skips_unrelated_sibling_and_preserves_whole_answer() {
     assert_eq!(again.entered, 0, "certificate hit enters 0 tasks");
     assert!(again_ids.is_empty(), "repeated scoped check still has 0 findings: {again_ids:?}");
 
+    // An edit resumes the scoped answer, including the empty block for the unrelated manifest.
+    write(&io, "a/src/lib.rs", "pub fn two() -> u8 {\n    dep::one() + 2\n}\n");
+    let mut edited_opts = opts(&io, 2, false);
+    edited_opts.scope = scope;
+    let (edited_ids, edited) = engine_opts(&io, edited_opts);
+    assert!(!edited.certified && edited_ids.is_empty(), "the scoped edit must stay clean: {edited_ids:?}");
+
     // 3. Whole-workspace check right after scoped check was NOT poisoned and reports `b`'s error.
     let (whole_ids, whole) = engine_from(&io, 2, false);
     assert!(whole_ids.iter().any(|(code, _)| code == "types"), "whole-workspace check must report `b`'s types error: {whole_ids:?}");
+    assert!(whole_ids.iter().any(|(code, _)| code == "target-refused"), "whole-workspace check must report `b`'s refused benchmark: {whole_ids:?}");
     let whole_bodies = whole.stages[blaze_engine::Stage::Bodies.index()].entered;
     assert!(whole_bodies > scoped_bodies, "whole-workspace bodies ({whole_bodies}) must exceed scoped bodies ({scoped_bodies})");
 

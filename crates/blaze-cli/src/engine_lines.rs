@@ -444,13 +444,23 @@ impl<'a> Lines<'a> {
     /// order. Used to keep manifest task findings separate from tail-computed `UNUSED_DEPENDENCY`
     /// warnings across incremental runs.
     pub(crate) fn keep_split_rule(&mut self, name: Name, entries: &'a [u8], rule: u16, matching: bool) -> Result<usize, LinesError> {
+        self.keep_entries(name, entries, |one| matches!(one, Entry::Finding { rule: r, .. } if *r == rule) == matching)
+    }
+
+    pub(crate) fn keep_findings(&mut self, name: Name, entries: &'a [u8], include: impl Fn(u16, &[u8]) -> bool) -> Result<usize, LinesError> {
+        self.keep_entries(name, entries, |one| match one {
+            Entry::Finding { rule, words, .. } => include(*rule, words),
+            _ => true,
+        })
+    }
+
+    fn keep_entries(&mut self, name: Name, entries: &'a [u8], include: impl Fn(&Entry<'a>) -> bool) -> Result<usize, LinesError> {
         let mut reader = Reader { bytes: entries, at: 0 };
         let mut kept = 0usize;
         let mut total = 0usize;
         while reader.at < entries.len() {
-            let is_rule = matches!(entry(&mut reader)?, Entry::Finding { rule: r, .. } if r == rule);
             total += 1;
-            if is_rule == matching {
+            if include(&entry(&mut reader)?) {
                 kept += 1;
             }
         }
@@ -464,8 +474,7 @@ impl<'a> Lines<'a> {
         let mut reader = Reader { bytes: entries, at: 0 };
         while reader.at < entries.len() {
             let from = reader.at;
-            let is_rule = matches!(entry(&mut reader)?, Entry::Finding { rule: r, .. } if r == rule);
-            if is_rule == matching
+            if include(&entry(&mut reader)?)
                 && let Some(slice) = entries.get(from..reader.at)
             {
                 self.block(name).extend_from_slice(slice);

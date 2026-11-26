@@ -915,6 +915,20 @@ impl CheckScope<'_> {
     pub(crate) fn is_whole(self) -> bool {
         matches!(self, CheckScope::Whole)
     }
+
+    /// Refused extra targets have no graph row. Their finding names the package that
+    /// declared them, so a scoped test can report the requested packages' refusals.
+    fn includes_unit_finding(self, rule: u16, words: &[u8]) -> bool {
+        if rule != crate::units::TARGET_REFUSED {
+            return true;
+        }
+        match self {
+            CheckScope::Whole => true,
+            CheckScope::Bin { .. } => false,
+            CheckScope::Test { packages, .. } => words.splitn(4, |&byte| byte == b'\x1f').nth(2)
+                .is_none_or(|package| packages.iter().any(|name| name.as_bytes() == package)),
+        }
+    }
 }
 
 /// How a start command (`blaze run`, `blaze test`, `blaze export`) asks [`check_for_start`] to
@@ -1231,7 +1245,8 @@ fn filter_whole_lines_for_scope<'a, 'm, D: blaze_core::Driver, S: crate::store::
                     filtered.keep(name, block);
                 } else if let Some(&dir) = manifest_name_to_dir.get(&name) {
                     if pkg_status.get(dir).is_some_and(|&(has_allowed, _)| has_allowed) {
-                        filtered.keep(name, block);
+                        filtered.keep_findings(name, block, |rule, words| check_scope.includes_unit_finding(rule, words))
+                            .map_err(EngineCheckError::Lines)?;
                     }
                 } else {
                     return Ok(Skipped("whole-lines cert skipped: unknown Units manifest"));
@@ -4084,7 +4099,7 @@ fn checking<'f, 's: 'f>(
             || base != crate::engine_ready_edit::StoredBase::Own
             || followed_kept.as_ref().is_none_or(|f| f.layout_moved)
             || serving.served.get().is_some();
-        let made = lines_of(cx, root, &mut store, laid_now, topology_changed, &finished, last_lines.as_ref(), (names.as_ref(), &*scripts, &mut *bodies, &*heads, &*lints), (outlined, unread_notes.as_slice()), discovered, rows, skipped, heap, alloc, frame)?;
+        let made = lines_of(cx, root, &mut store, laid_now, topology_changed, &finished, last_lines.as_ref(), (names.as_ref(), &*scripts, &mut *bodies, &*heads, &*lints), (outlined, unread_notes.as_slice()), discovered, rows, skipped, check_scope, heap, alloc, frame)?;
         phases.mark_cx(cx, "lines made", frame);
         let heap_lines_made = crate::engine_phase_mem::heap_now();
         // The closing line's count: every file the request has an outline of (on the ready setup,
@@ -4441,6 +4456,7 @@ fn lines_of<'a, 'f>(
     // The sweep's rows: where a units record's manifest is ([`manifest_path`]).
     rows: &Rows<'_>,
     skipped: &Skipped<'_>,
+    check_scope: CheckScope<'_>,
     heap: &'static blaze_own::Heap,
     alloc: SharedAlloc<'a>,
     frame: &Frame,
@@ -4489,7 +4505,14 @@ fn lines_of<'a, 'f>(
                             lines.keep_split(*name, block, false).map_err(EngineCheckError::Lines)?;
                         }
                         blaze_drive::Kind::Units => {
-                            lines.keep_split_rule(*name, block, crate::unused_deps::UNUSED_DEPENDENCY, false).map_err(EngineCheckError::Lines)?;
+                            let kept = lines.keep_findings(*name, block, |rule, words| {
+                                rule != crate::unused_deps::UNUSED_DEPENDENCY && check_scope.includes_unit_finding(rule, words)
+                            }).map_err(EngineCheckError::Lines)?;
+                            if kept == 0 && !check_scope.is_whole() {
+                                // The full Units record still has findings. Keep the empty scoped
+                                // block so a later edit can distinguish it from a missing block.
+                                lines.keep(*name, &[]);
+                            }
                         }
                         blaze_drive::Kind::BodyCheck if refresh_standing_view => {
                             let file = finished.answer.row_facts(*name).map_err(EngineError::from)?.map(|row| row.file);
@@ -4561,7 +4584,12 @@ fn lines_of<'a, 'f>(
                         _ => None,
                     };
                     for &(rule, start, end, from, to) in record.findings.iter() {
-                        lines.finding(*name, rule, start, end, manifest, &record.messages[from..to]);
+                        let words = &record.messages[from..to];
+                        if name.kind != Kind::Units || check_scope.includes_unit_finding(rule, words) {
+                            lines.finding(*name, rule, start, end, manifest, words);
+                        } else {
+                            lines.keep(*name, &[]);
+                        }
                     }
                 }
                 Err(failed) => match failed.failure.why {
