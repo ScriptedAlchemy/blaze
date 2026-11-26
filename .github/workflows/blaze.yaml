@@ -10,6 +10,11 @@ on:
         description: Workflow run that sealed the exact source compiler
         type: string
         required: true
+      suite:
+        description: Protocol packages to exercise
+        type: choice
+        options: [wire-and-serve, local]
+        default: wire-and-serve
 permissions:
   actions: read
   contents: read
@@ -27,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [blaze-wire, blaze-serve]
+        package: ${{ fromJSON(inputs.suite == 'local' && '["blaze-dist-local"]' || '["blaze-wire", "blaze-serve"]') }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -57,6 +62,7 @@ jobs:
           timeout 45 tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries"
           timeout 45 tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$RUNNER_TEMP/source-shelf"
           timeout 90 python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+          # shellcheck disable=SC2016
           timeout 20 jq -n --arg blaze "$RUNNER_TEMP/source-binaries/blaze" --arg cwd "$GITHUB_WORKSPACE" \
             --arg home "$RUNNER_TEMP/blaze-fs/protocol-home" --arg out "$RUNNER_TEMP/package-evidence" \
             --arg shelf "$RUNNER_TEMP/source-shelf/toolchain" --arg package "$PACKAGE" \
