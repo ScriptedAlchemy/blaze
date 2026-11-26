@@ -1,5 +1,5 @@
 use super::*;
-use blaze_lir::{Scalar, ty::Form};
+use blaze_lir::{FlagClass, Scalar, ty::Form};
 
 pub(super) fn bits(words: &[u32]) -> u128 {
     words.iter().rev().fold(0u128, |value, &word| (value << 32) | u128::from(word))
@@ -76,7 +76,15 @@ impl<'a> Lower<'a, '_> {
         if ret.1 != Ty::NONE {
             format_into!(&mut self.ir, "%v{i} = ");
         }
-        format_into!(&mut self.ir, "call {ret} @{name}(");
+        self.ir.push_str("call ");
+        if matches!(self.view.op(i), Op::ReduceFadd | Op::ReduceFmul) {
+            for &(flag, spelling, _) in FlagClass::Float.named() {
+                if self.view.flags(i).contains(flag) {
+                    format_into!(&mut self.ir, "{spelling} ");
+                }
+            }
+        }
+        format_into!(&mut self.ir, "{ret} @{name}(");
         for (k, (ty, value)) in args.iter().enumerate() {
             if k != 0 {
                 self.ir.push_str(", ");
@@ -88,6 +96,22 @@ impl<'a> Lower<'a, '_> {
         self.ir.push_str(")\n");
         decl.push(')');
         self.declaration(format_in!(self.alloc, "@{name}"), decl)
+    }
+
+    fn reduction(&mut self, i: usize, op: Op) -> Result<(), LowerError> {
+        let view = self.view;
+        let mut operands = view.operands(i);
+        let start = matches!(op, Op::ReduceFadd | Op::ReduceFmul).then(|| operands.value());
+        let vector = operands.value();
+        let kind = op.name().strip_prefix("reduce_").ok_or_else(|| self.error(op.name()))?;
+        let name = format_in!(self.alloc, "llvm.vector.reduce.{kind}.{}", suffix(view.ty(vector)));
+        let ret = LlType(view, self.result_type(i)?);
+        let operand = |v: Value| (LlType(view, view.ty(v)), format_in!(self.alloc, "%v{}", v.0));
+        match start {
+            // LangRef: with no `reassoc`, the reduction starts here and visits lanes in order.
+            Some(start) => self.intrinsic(i, name, ret, &[operand(start), operand(vector)]),
+            None => self.intrinsic(i, name, ret, &[operand(vector)]),
+        }
     }
 
     fn math(&mut self, i: usize, op: Op) -> Result<(), LowerError> {
@@ -297,6 +321,17 @@ impl<'a> Lower<'a, '_> {
             | Op::Fmuladd
             | Op::FptoUi
             | Op::FptoSi => return self.math(i, op),
+            Op::ReduceAdd
+            | Op::ReduceMul
+            | Op::ReduceAnd
+            | Op::ReduceOr
+            | Op::ReduceXor
+            | Op::ReduceUmin
+            | Op::ReduceUmax
+            | Op::ReduceSmin
+            | Op::ReduceSmax
+            | Op::ReduceFadd
+            | Op::ReduceFmul => return self.reduction(i, op),
             Op::Icmp | Op::Fcmp => {
                 let cond = if op == Op::Icmp { o.int_cond().name() } else { o.float_cond().name() };
                 format_into!(

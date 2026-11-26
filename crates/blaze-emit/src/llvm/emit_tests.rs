@@ -396,11 +396,9 @@ fn release_record_stores_a_splat_to_every_lane() {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[test]
-fn release_record_packs_bitmask_lanes_low_to_high() {
+fn place_leaf(view: &CodeView<'_>, symbol: Symbol) -> blaze_inproc::exec::Executable {
     use blaze_code::{image::ImageError, place::{At, Words, place}};
     use blaze_inproc::exec::Executable;
-    use blaze_lir::{IntCond, Op, Scalar, builder::MemAttrs};
 
     struct NoImports;
     impl Words for NoImports {
@@ -411,6 +409,18 @@ fn release_record_packs_bitmask_lanes_low_to_high() {
             Err(ImageError::Unbound { target })
         }
     }
+
+    assert_eq!(view.targets(), 0);
+    Executable::written(view.code().len(), view.relro().len(), |code, data| {
+        let at = At { code: code.as_ptr().addr().try_into().unwrap(), relro: data.as_ptr().addr().try_into().unwrap() };
+        place(view, symbol, at, &mut NoImports, code, data).expect("the leaf and its own data place");
+    }).expect("the code maps")
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn release_record_packs_bitmask_lanes_low_to_high() {
+    use blaze_lir::{IntCond, Op, Scalar, builder::MemAttrs};
 
     let alloc = blaze_own::testing::heap().alloc();
     let mut b = Builder::<_, Full>::new_in(64, alloc);
@@ -438,11 +448,7 @@ fn release_record_packs_bitmask_lanes_low_to_high() {
     let module = prepare(symbol, func.verified(), &ByPlace, alloc).unwrap();
     let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, alloc).unwrap();
     let view = CodeView::read(&emission.record).unwrap();
-    assert_eq!(view.targets(), 0);
-    let code = Executable::written(view.code().len(), view.relro().len(), |code, data| {
-        let at = At { code: code.as_ptr().addr().try_into().unwrap(), relro: data.as_ptr().addr().try_into().unwrap() };
-        place(&view, symbol, at, &mut NoImports, code, data).expect("the leaf and its own data place");
-    }).expect("the code maps");
+    let code = place_leaf(&view, symbol);
     // SAFETY: the placed leaf has the declared C ABI.
     let pack: unsafe extern "C" fn(*const u8, *mut u8) = unsafe { code.as_fn() };
     let mut input = [0xd5; 20];
@@ -452,6 +458,65 @@ fn release_record_packs_bitmask_lanes_low_to_high() {
     unsafe { pack(input.as_ptr(), output.as_mut_ptr()) };
     assert_eq!(output[..16], 0x0du128.to_le_bytes());
     assert_eq!(output[16..], input[4..]);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn release_record_reduces_integer_and_ordered_float_vectors() {
+    use blaze_lir::{Op, Scalar, builder::MemAttrs};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut b = Builder::<_, Full>::new_in(64, alloc);
+    let ptr = Param::of(Ty::PTR);
+    let sig = b.sig(Conv::C, Variadic::No, &[ptr, ptr, ptr, Param::of(Ty::F32)], &[]);
+    b.set_signature(sig);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    let integers = b.param(Ty::PTR);
+    let floats = b.param(Ty::PTR);
+    let output = b.param(Ty::PTR);
+    let start = b.param(Ty::F32);
+    let vector = b.load(Ty::vector(Scalar::I32, 4).unwrap(), Flags::NONE, integers, 0, MemAttrs::aligned(2));
+    for (op, offset) in [
+        (Op::ReduceAdd, 0), (Op::ReduceMul, 4), (Op::ReduceAnd, 8),
+        (Op::ReduceOr, 12), (Op::ReduceXor, 16), (Op::ReduceSmin, 20),
+        (Op::ReduceSmax, 24), (Op::ReduceUmin, 28), (Op::ReduceUmax, 32),
+    ] {
+        let result = b.convert(op, Flags::NONE, Ty::I32, vector);
+        b.store(Flags::NONE, result, output, offset, MemAttrs::aligned(2));
+    }
+    let vector = b.load(Ty::vector(Scalar::F32, 4).unwrap(), Flags::NONE, floats, 0, MemAttrs::aligned(2));
+    for (op, flags, offset) in [
+        (Op::ReduceFadd, Flags::NONE, 36),
+        (Op::ReduceFadd, Flags::REASSOC, 40),
+        (Op::ReduceFmul, Flags::NONE, 44),
+    ] {
+        let result = b.reduce_ordered(op, flags, start, vector);
+        b.store(Flags::NONE, result, output, offset, MemAttrs::aligned(2));
+    }
+    b.ret(&[]);
+
+    let func = b.finish_verified().unwrap();
+    let symbol = Symbol([17; 32]);
+    let module = prepare(symbol, func.verified(), &ByPlace, alloc).unwrap();
+    let ir = core::str::from_utf8(&module.ir).unwrap();
+    assert!(ir.contains("call float @llvm.vector.reduce.fadd.v4f32"));
+    assert!(ir.contains("call reassoc float @llvm.vector.reduce.fadd.v4f32"));
+    let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, alloc).unwrap();
+    let view = CodeView::read(&emission.record).unwrap();
+    let code = place_leaf(&view, symbol);
+    // SAFETY: the placed leaf has the declared C ABI.
+    let reduce: unsafe extern "C" fn(*const u32, *const f32, *mut u32, f32) = unsafe { code.as_fn() };
+    let integers = [0xffff_fff1, 3, 0x8000_0005, 9];
+    let mut output = [0; 12];
+    // SAFETY: each input holds four readable lanes and output holds twelve writable words.
+    unsafe { reduce(integers.as_ptr(), [-1e20, 1.0, 2.0, 3.0].as_ptr(), output.as_mut_ptr(), 1e20) };
+    assert_eq!(output[..9], [0x8000_0002, 0x7fff_f817, 1, 0xffff_ffff, 0x7fff_fffe, 0x8000_0005, 9, 3, 0xffff_fff1]);
+    // This is (((start + lane0) + lane1) + lane2) + lane3; summing lanes first loses the small values.
+    assert_eq!(f32::from_bits(output[9]), 6.0);
+    // SAFETY: same input and output lengths as above, with exactly representable float reductions.
+    unsafe { reduce(integers.as_ptr(), [2.0, 3.0, 4.0, 5.0].as_ptr(), output.as_mut_ptr(), 1.0) };
+    assert_eq!(output[9..], [15.0f32.to_bits(), 15.0f32.to_bits(), 120.0f32.to_bits()]);
 }
 
 fn object_fixture(ir: &str) -> super::LlvmModule<'static> {
