@@ -36,6 +36,11 @@ pub enum ReadError {
     UnknownSymbol { name: FixedString<80> },
     /// A relocation of a kind this reader does not map.
     Relocation { at: u64, kind: u32 },
+    /// A direct `bl`/`b` to a callee. The record form's `Call` site is the 12-byte
+    /// `adrp`+`ldr`+`blr` sequence the loader rewrites (`blaze_code::image`), which a direct
+    /// branch is not: written as a `Call` it would run past the function and the loader would
+    /// refuse it. Refused by name until the lowering emits the form's sequence.
+    DirectCall { at: u64 },
     /// A relocation against a section the code does not lay out.
     Section { at: u64 },
     /// A `ldr` whose `adrp` is not the instruction before it naming the same target: the
@@ -60,6 +65,7 @@ impl fmt::Display for ReadError {
             ReadError::CodeOutside => write!(f, "the function's code is not where its section says"),
             ReadError::UnknownSymbol { name } => write!(f, "a relocation names {name}, which the module does not"),
             ReadError::Relocation { at, kind } => write!(f, "a relocation of kind {kind} at {at}"),
+            ReadError::DirectCall { at } => write!(f, "a direct call at {at}: the record form's call is the 12-byte `adrp`+`ldr`+`blr` the loader rewrites, which a direct branch is not"),
             ReadError::Section { at } => write!(f, "a relocation at {at} against a section the code does not lay out"),
             ReadError::UnpairedLoad { at, target } => write!(f, "a load at {at} of {target:?} whose `adrp` is not the instruction before it"),
             ReadError::TrapSource { at } => write!(f, "a `brk` at {at} for an `unreachable` whose source the module does not carry"),
@@ -73,9 +79,12 @@ impl fmt::Display for ReadError {
 impl core::error::Error for ReadError {}
 
 /// The symbol's name as the lowering lane spells it: `blaze_fn_<64 hex>`, without the `@`.
+/// `definition_name` is the range of `@blaze_fn_<hex>` in the IR, `@` included, so the `@`
+/// is taken off here: an object's symbols carry no `@`.
 fn function_name<'a>(module: &LlvmModule<'_>, alloc: Alloc<'a>) -> String<Alloc<'a>> {
     let range = module.definition_name.clone();
-    String::from_str_in(core::str::from_utf8(&module.ir[range]).unwrap_or(""), alloc)
+    let spelled = core::str::from_utf8(&module.ir[range]).unwrap_or("");
+    String::from_str_in(spelled.strip_prefix('@').unwrap_or(spelled), alloc)
 }
 
 /// Where a relocation leads: a named symbol (an import, or the function's own) or a section.
@@ -105,7 +114,10 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
 
     let mut record = CodeRecord::new_in(alloc);
     record.code.extend_from_slice(code);
-    record.code_align = align_of(section.align());
+    // The code's alignment, at least the record form's least: Mach-O's `__text` reports a
+    // 4-byte alignment, and the form asks 16. LLVM aligns every AArch64 function to 16, so
+    // the record's claim is true of the code it holds.
+    record.code_align = align_of(section.align()).max(blaze_code::record::LEAST_CODE_ALIGN);
     record.relro_align = blaze_code::record::LEAST_RELRO_ALIGN;
     // The frame word: LLVM's own prologue sizes it, which the record's form does not read
     // (the SOTA tier's `frame` is its pass's); a release record keeps the convention of the
@@ -173,9 +185,11 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
         }
         let at = offset - range.start;
         let flags = relocation.flags();
-        let kind = match flags {
+        match flags {
             RelocationFlags::MachO { r_type: macho::ARM64_RELOC_BRANCH26, .. }
-            | RelocationFlags::Elf { r_type: elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 } => SiteKind::Call,
+            | RelocationFlags::Elf { r_type: elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 } => {
+                return Err(ReadError::DirectCall { at });
+            }
             RelocationFlags::MachO { r_type: macho::ARM64_RELOC_PAGE21 | macho::ARM64_RELOC_GOT_LOAD_PAGE21, .. }
             | RelocationFlags::Elf { r_type: elf::R_AARCH64_ADR_PREL_PG_HI21 | elf::R_AARCH64_ADR_GOT_PAGE } => {
                 // The `adrp`: its `ldr` is found when the `PAGEOFF12` is read.
@@ -194,10 +208,7 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
             RelocationFlags::MachO { r_type, .. } => return Err(ReadError::Relocation { at, kind: u32::from(r_type.0) }),
             RelocationFlags::Elf { r_type } => return Err(ReadError::Relocation { at, kind: r_type.0 }),
             _ => return Err(ReadError::Relocation { at, kind: 0 }),
-        };
-        let target = named_target(&file, &relocation, at, module, alloc)?;
-        let index = record.target(target);
-        record.sites.push(Site { at: at as u32, kind, target: index, addend: 0 });
+        }
     }
 
     // The traps: each `brk` in LLVM's code is one the lowerer wrote for a LIR `trap` or
