@@ -1,5 +1,11 @@
 name: PR 81 finished coroutine panic verification
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        type: choice
+        default: linux
+        options: [linux, macos]
 permissions:
   contents: read
 defaults:
@@ -10,6 +16,7 @@ env:
   RUST_BACKTRACE: "0"
 jobs:
   native:
+    if: inputs.host == 'linux'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 65
     steps:
@@ -34,6 +41,7 @@ jobs:
       - name: run the unchanged completed async migration fixture
         run: |
           scratch="$RUNNER_TEMP/blaze-fs/async-forkfixes"
+          # shellcheck disable=SC2016
           input=$(timeout 10 jq -nc --arg blaze "$CARGO_TARGET_DIR/release/blaze" --arg scratch "$scratch" --arg source "$GITHUB_WORKSPACE" \
             '{blaze:$blaze,scratch:$scratch,source:$source,only:["an-async-fn-and-polling-it-again"],timeout:180,workers:2}')
           timeout -k 20 600 python3 harness/forkfixes.py "$input" 2>&1 | tee "$RUNNER_TEMP/async-evidence/forkfixes.log"
@@ -47,4 +55,98 @@ jobs:
             ${{ runner.temp }}/toolchain-cut
             ${{ runner.temp }}/blaze-fs/async-forkfixes/*.json
             ${{ runner.temp }}/blaze-fs/async-forkfixes/evidence
+          if-no-files-found: warn
+  macos:
+    if: inputs.host == 'macos'
+    runs-on: macos-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 8910ba065b383657cd297b581430c1e78c08a0f5
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: confirm the ARM64 Mac and establish bounded commands
+        run: |
+          test "$(uname -s -m)" = "Darwin arm64"
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/blaze-target" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/mac-evidence"
+          git rev-parse HEAD 'HEAD^{tree}' > "$RUNNER_TEMP/mac-evidence/source.txt"
+          df -h "$RUNNER_TEMP"
+      - uses: ./.github/actions/toolchain
+        with:
+          components: rust-src
+          targets: wasm32-wasip1
+      - name: build pinned tools and source CLI
+        run: |
+          tc="$(cat pins/toolchain)"
+          timeout -k 30 3600 nice -n 10 cargo +"$tc" build -j 6 --release --locked \
+            -p blaze-cli -p blaze-launcher -p scripts --bin blaze --bin blaze-fact-shim \
+            --bin blaze-launcher --bin toolchain_cut --bin proc_macro_modules \
+            2>&1 | tee "$RUNNER_TEMP/mac-evidence/build.log"
+          install_dir="$RUNNER_TEMP/source-binaries"
+          mkdir -p "$install_dir"
+          for name in blaze blaze-launcher blaze-fact-shim toolchain_cut proc_macro_modules; do
+            install -m 0755 "$CARGO_TARGET_DIR/release/$name" "$install_dir/$name"
+          done
+          sha256sum "$install_dir"/* > "$RUNNER_TEMP/mac-evidence/binaries.txt"
+          echo "BLAZE_SCRIPTS=$install_dir" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/toolchain-shelf
+      - name: unpack the authenticated pinned native C shelf
+        id: clang
+        run: |
+          pin=pins/clang.json
+          target=aarch64-apple-darwin
+          archive=$(jq -er --arg t "$target" '.targets[$t].name' "$pin")
+          digest=$(jq -er --arg t "$target" '.targets[$t].sha256' "$pin")
+          size=$(jq -er --arg t "$target" '.targets[$t].size' "$pin")
+          url="$(jq -er '.release' "$pin")/$archive"
+          bytes="$RUNNER_TEMP/$archive"
+          timeout -k 10 900 curl --fail --silent --show-error --location --proto '=https' \
+            --proto-redir '=https' --max-time 870 --max-filesize "$size" --output "$bytes" "$url"
+          test "$(stat -c %s "$bytes")" = "$size"
+          printf '%s  %s\n' "$digest" "$bytes" | sha256sum --check
+          shelf="$HOME/.blaze/v2/toolchain/clang/$digest"
+          mkdir -p "$shelf"
+          top=${archive%.tar.xz}
+          timeout -k 10 360 tar -xJf "$bytes" -C "$shelf" --strip-components 1 \
+            "$top"/bin/{clang,clang++,clang-23,ld64.lld,lld,llvm-ar,llvm-nm} \
+            "$top"/lib/{clang,libclang.dylib}
+          rows="$RUNNER_TEMP/mac-evidence/clang-members.jsonl"
+          jq -cer --arg t "$target" '.shelf_programs[$t][] | objects' "$pin" > "$rows"
+          while IFS= read -r row; do
+            member=$(jq -er '.member' <<< "$row")
+            expected=$(jq -er '.sha256' <<< "$row")
+            printf '%s  %s\n' "$expected" "$shelf/${member#*/}" | sha256sum --check
+          done < "$rows"
+      - name: run all unchanged fork migration fixtures
+        run: |
+          scratch="$RUNNER_TEMP/mac-forkfixes"
+          # shellcheck disable=SC2016
+          input=$(timeout 10 jq -nc --arg blaze "$BLAZE_SCRIPTS/blaze" --arg scratch "$scratch" \
+            --arg source "$GITHUB_WORKSPACE" --arg builder "$BLAZE_SCRIPTS/proc_macro_modules" \
+            '{blaze:$blaze,scratch:$scratch,source:$source,module_builder:$builder,timeout:700,workers:2}')
+          timeout -k 20 2100 python3 harness/forkfixes.py "$input" 2>&1 | tee "$RUNNER_TEMP/mac-evidence/forkfixes.log"
+      - name: run the sandboxed real-project smoke
+        if: ${{ !cancelled() && steps.clang.outcome == 'success' }}
+        run: |
+          work="$RUNNER_TEMP/mac-real-smoke"
+          # shellcheck disable=SC2016
+          input=$(timeout 10 jq -nc --arg bin "$BLAZE_SCRIPTS" --arg work "$work" --arg home "$HOME" \
+            '{blaze:$bin,work:$work,tmpfs:"",modules:($bin+"/proc_macro_modules"),toolchain_home:$home,workers:2}')
+          timeout -k 20 1200 python3 -I harness/v2/real_smoke.py "$input" 2>&1 | tee "$RUNNER_TEMP/mac-evidence/real-smoke.log"
+      - name: keep the exact source and fixture evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-source-acceptance-evidence
+          path: |
+            ${{ runner.temp }}/mac-evidence
+            ${{ runner.temp }}/toolchain-cut
+            ${{ runner.temp }}/mac-forkfixes/*.json
+            ${{ runner.temp }}/mac-forkfixes/evidence
+            ${{ runner.temp }}/mac-real-smoke/**/logs/*
           if-no-files-found: warn
