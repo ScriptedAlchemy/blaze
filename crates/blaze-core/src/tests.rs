@@ -1989,38 +1989,57 @@ fn connected(
     (server.expect("accepted"), client.expect("connected"))
 }
 
-/// `rounds` of "ping" sent on `client` and received on `server`, the send's buffer and the
-/// receive's (`buffers`) handed back by each round and given to the next: what they allocated
-/// on the polling thread.
+#[cfg(unix)]
+enum SendRounds {
+    Warm(u64),
+    Measure,
+}
+
+/// Send "ping" on `client` and receive it on `server`, keeping both buffers for the next round.
+/// In measured rounds the polling thread must allocate nothing.
 #[cfg(unix)]
 fn send_rounds(
     driver: &mut impl Driver,
     (server, client): (crate::Conn, crate::Conn),
-    rounds: u64,
+    rounds: SendRounds,
     buffers: &mut [Vec<u8>; 2],
-) -> u64 {
+) {
     let (mut effects, mut out) = (Vec::with_capacity(2), Vec::with_capacity(16));
-    let mut used = 0;
-    for round in 0..rounds {
+    let count = match rounds {
+        SendRounds::Warm(count) => count,
+        SendRounds::Measure => ROUNDS,
+    };
+    for round in 0..count {
         let [sending, receiving] = buffers;
         sending.extend_from_slice(b"ping");
         receiving.clear();
-        let ((), cycle) = blaze_alloc_count::measure(|| {
-            effects.push(Effect::Send {
+        let mut drive = || {
+            let send = Effect::Send {
                 conn: client,
                 bytes: std::mem::take(sending),
                 tag: Tag(10),
-            });
-            effects.push(Effect::Recv {
+            };
+            let recv = Effect::Recv {
                 conn: server,
                 most: 64,
                 into: std::mem::take(receiving),
                 tag: Tag(11),
+            };
+            effects.extend(match rounds {
+                // The socket is empty and the receive stays pending until the send.
+                // Threads must warm enough errand workers for both operations.
+                SendRounds::Warm(_) => [recv, send],
+                SendRounds::Measure => [send, recv],
             });
             driver.submit(&mut effects);
             poll_for(driver, &mut out, 2);
-        });
-        used += cycle.allocations;
+        };
+        match rounds {
+            SendRounds::Warm(_) => drive(),
+            SendRounds::Measure => {
+                blaze_alloc_count::assert_at_most(0, "a warm send and receive on the polling thread", drive)
+            }
+        }
         out.sort_by_key(|it| it.tag);
         match &mut out[..] {
             [
@@ -2033,7 +2052,6 @@ fn send_rounds(
         }
         out.clear();
     }
-    used
 }
 
 /// Both ends of a connection hung up, and a new connection made in their slots: the old
@@ -2076,7 +2094,7 @@ fn hung_up_conns_name_nothing(
         "stale: {out:?}"
     );
     out.clear();
-    send_rounds(driver, again, 1, &mut Default::default());
+    send_rounds(driver, again, SendRounds::Warm(1), &mut Default::default());
     effects.extend([
         Effect::Hangup { conn: again.0, tag: Tag(40) },
         Effect::Hangup { conn: again.1, tag: Tag(41) },
@@ -2101,19 +2119,17 @@ fn a_warm_send_and_receive_allocates_nothing() {
     let mut sim = Sim::new(14, Faults::default());
     let conns = connected(&mut sim, &at, Tag(2), true);
     let mut buffers = Default::default();
-    send_rounds(&mut sim, conns, WARM, &mut buffers);
-    let used = send_rounds(&mut sim, conns, ROUNDS, &mut buffers);
-    assert_eq!(used, 0, "the simulation: {ROUNDS} warm sends and receives, their buffers reused");
+    send_rounds(&mut sim, conns, SendRounds::Warm(WARM), &mut buffers);
+    send_rounds(&mut sim, conns, SendRounds::Measure, &mut buffers);
     hung_up_conns_name_nothing(&mut sim, &at, conns);
     let root = dir("budget-conn");
     let root = root.path();
     let mut threads = Threads::new(&root, 1);
     let conns = connected(&mut threads, &at, Tag(2), true);
     let mut buffers = Default::default();
-    send_rounds(&mut threads, conns, WARM, &mut buffers);
+    send_rounds(&mut threads, conns, SendRounds::Warm(WARM), &mut buffers);
     threads.off_thread();
-    let used = send_rounds(&mut threads, conns, ROUNDS, &mut buffers);
-    assert_eq!(used, 0, "threads: {ROUNDS} warm sends and receives, on the polling thread");
+    send_rounds(&mut threads, conns, SendRounds::Measure, &mut buffers);
     let (off, payload) = threads.off_thread();
     assert_eq!(
         (off, payload),
