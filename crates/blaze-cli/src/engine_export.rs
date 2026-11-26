@@ -603,6 +603,7 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
     maker: &mut Maker<'n, Runnable, T>,
     codes: &mut dyn CodeStore,
     roots: &ProductRoots<'_>,
+    tier: Tier,
     alloc: Alloc<'a>,
     frame: &Frame,
     heap: &'static blaze_own::Heap,
@@ -670,21 +671,21 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
         }
     }
 
-    // Whole-program demand-driven cross-function LIR inlining + host-ISA SOTA emission over
-    // workspace functions and their non-cold reachable callees, held in the export allocator.
-    let mut lto_seeds: AVec<'_, usize> = Vec::new_in(alloc);
-    for (row, outcome) in outcomes.iter().enumerate() {
-        if walk.kind(row) == RowKind::Instance
-            && !matches!(outcome, RowOutcome::UnbuiltStub(_))
-            && ids.grain(walk.tabled(row)) == Some(crate::run_ids::Grain::Workspace)
-        {
-            lto_seeds.push(row);
+    // A dev image places its fast-tier records. The serial release route of a CLI without
+    // the LLVM feature performs workspace LIR inlining here.
+    let (lto_bodies, lto_inlined) = if matches!(tier, Tier::Optimized) {
+        let mut lto_seeds: AVec<'_, usize> = Vec::new_in(alloc);
+        for (row, outcome) in outcomes.iter().enumerate() {
+            if walk.kind(row) == RowKind::Instance
+                && !matches!(outcome, RowOutcome::UnbuiltStub(_))
+                && ids.grain(walk.tabled(row)) == Some(crate::run_ids::Grain::Workspace)
+            {
+                lto_seeds.push(row);
+            }
         }
-    }
-    let lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(builder.isa);
-    let lto_out = {
+        let lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(builder.isa);
         let _lto_span = cx.span("export: workspace LTO");
-        blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
+        let lto_out = blaze_ladder::run::make_one::export_lto::optimize_export_workspace(
             &walk,
             lto_seeds.as_slice(),
             |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
@@ -699,30 +700,25 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
                 ExportCliError::Lto { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
                 heap,
             )
-        })?
-    };
-    let lto_bodies = lto_out.bodies.len();
-    let lto_inlined = lto_out.total_inlined;
-    let mut extra_roots: AVec<'_, (ItemKey, AVec<'_, u8>)> = Vec::new_in(alloc);
-    for body in lto_out.bodies {
-        if let Some(slot) = outcomes.get_mut(body.row) {
-            *slot = RowOutcome::Lto {
-                record: body.record,
-                vtable_data: body.vtable_data,
-            };
-        }
-        for decl in body.extra_declared {
-            extra_roots.push(decl);
-        }
-    }
-    for (tabled, name_bytes) in extra_roots {
-        walk.root::<RunError>((tabled, name_bytes.as_slice()), MOST_WALKED).map_err(|why| {
-            box_err(
-                ExportCliError::Walk { symbol: blaze_ladder::symbols::fn_symbol_of_name(name_bytes.as_slice()).0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
-                heap,
-            )
         })?;
-    }
+        let lto_bodies = lto_out.bodies.len();
+        for body in lto_out.bodies {
+            if let Some(slot) = outcomes.get_mut(body.row) {
+                *slot = RowOutcome::Lto { record: body.record, vtable_data: body.vtable_data };
+            }
+            for (tabled, name) in body.extra_declared {
+                walk.root::<RunError>((tabled, name.as_slice()), MOST_WALKED).map_err(|why| {
+                    box_err(
+                        ExportCliError::Walk { symbol: blaze_ladder::symbols::fn_symbol_of_name(name.as_slice()).0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                        heap,
+                    )
+                })?;
+            }
+        }
+        (lto_bodies, lto_out.total_inlined)
+    } else {
+        (0, 0)
+    };
     while next_row < walk.len() {
         let row = next_row;
         next_row += 1;
@@ -1009,8 +1005,9 @@ fn export_program<'f>(
         }
     }
 
+    let tier = if release { Tier::Optimized } else { Tier::Fast };
     let PreparedExport { walk, outcomes, tls, compiled, cached, unkeyed, stubs, lto_bodies, lto_inlined } =
-        prepare_export(cx, list, &ids, &builder, &mut maker, &mut codes, &roots, alloc, frame, heap, || {
+        prepare_export(cx, list, &ids, &builder, &mut maker, &mut codes, &roots, tier, alloc, frame, heap, || {
             end_procs(cx, &maker_procs, standing.err, "export")?;
 
             let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
