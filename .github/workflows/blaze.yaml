@@ -280,6 +280,10 @@ jobs:
           job: cargo
       - uses: ./.github/actions/toolchain-shelf
         id: shelf
+      - uses: ./.github/actions/apt
+        if: ${{ !cancelled() && matrix.partition == 0 }}
+        with:
+          packages: gdb
       # Keep the canonical shelf's profile unchanged. The later workspace test build retains
       # every executable before running any: CI does not need their debug metadata, while
       # optimization, debug assertions and the complete target set stay as declared.
@@ -415,9 +419,11 @@ jobs:
             '{exclude:["blaze-std"],evidence:$evidence,partition:$partition,partitions:9,build_timeout_s:2400}')
           # A runner shutdown can prevent artifact upload. Stream one small sample every 15s.
           # The workload and its existing watchdog run in the foreground.
-          timeout -k 1 5435 bash -s -- "$$" <<'MEMORY_SAMPLES' &
+          timeout -k 1 5435 bash -s -- "$$" '${{ matrix.partition }}' <<'MEMORY_SAMPLES' &
           step_pid=$1
+          partition=$2
           cgroup=$(awk -F: '$1 == "0" && $2 == "" {print "/sys/fs/cgroup" $3; exit}' /proc/self/cgroup)
+          sampled_build=''
           printf 'ci_test resources: cadence=15s max_samples=362 host/process=kB cgroup=bytes psi_total=us\n'
           for ((sample=1; sample<=362; sample++)); do
             host=$(awk '$1 ~ /^(MemAvailable|SwapTotal|SwapFree):$/ && $2 ~ /^[0-9]+$/ {sub(/:$/, "", $1); printf " %s=%s", $1, $2}' /proc/meminfo)
@@ -432,6 +438,7 @@ jobs:
               done
             fi
             process=''
+            ci_pid=''
             for watchdog in $(ps -o pid=,comm= --ppid "$step_pid" | awk '$2 == "timeout" && $1 ~ /^[0-9]+$/ {print $1}'); do
               ci_pid=$(ps -o pid=,comm= --ppid "$watchdog" | awk '$2 == "ci_test" && $1 ~ /^[0-9]+$/ {print $1; exit}')
               [[ -n $ci_pid ]] || continue
@@ -442,6 +449,21 @@ jobs:
               break
             done
             printf 'ci_test resources: sample=%d%s%s%s%s\n' "$sample" "$host" "$psi" "$scope" "$process"
+            # The blaze-build arithmetic test reached the 600s deadline. Capture its parent
+            # and one live child while the test process still exists.
+            if [[ $partition == 0 && -n $ci_pid && -z $sampled_build ]]; then
+              long_build=$(ps -o pid=,comm=,etimes= --ppid "$ci_pid" | awk '$2 ~ /^blaze_build-/ && $3 >= 540 {print $1; exit}')
+              if [[ -n $long_build ]]; then
+                sampled_build=$long_build
+                build_child=$(ps -o pid= --ppid "$long_build" | awk 'NR == 1 {print $1}')
+                for pid in "$long_build" ${build_child:+"$build_child"}; do
+                  printf 'ci_test stack: pid=%s\n' "$pid"
+                  timeout -k 2 10 sudo -n gdb -batch -nx -iex 'set auto-load off' -iex 'set debuginfod enabled off' \
+                    -iex 'set print frame-arguments none' -p "$pid" -ex 'thread apply all bt 24'
+                  printf 'ci_test stack: pid=%s exit=%s\n' "$pid" "$?"
+                done
+              fi
+            fi
             sleep 15
           done
           MEMORY_SAMPLES
