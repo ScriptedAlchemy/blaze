@@ -1,5 +1,5 @@
 use super::*;
-use blaze_lir::ty::Form;
+use blaze_lir::{Scalar, ty::Form};
 
 pub(super) fn bits(words: &[u32]) -> u128 {
     words.iter().rev().fold(0u128, |value, &word| (value << 32) | u128::from(word))
@@ -13,7 +13,7 @@ fn suffix(ty: Ty) -> impl fmt::Display {
             _ => {}
         }
         f.write_str(match ty.elem() {
-            blaze_lir::Scalar::Ptr => "p0",
+            Scalar::Ptr => "p0",
             elem => elem.name(),
         })
     })
@@ -351,6 +351,16 @@ impl<'a> Lower<'a, '_> {
             }
             Op::Project => {
                 format_into!(out, "  %v{i} = extractvalue {}, {}", typed(o.value()), o.imm())
+            }
+            Op::Splat => {
+                // Verified LIR supplies a scalar of the vector's lane type. LLVM's
+                // zero mask selects the initialized lane for both vector forms.
+                let mask = LlType(view, ty.with_elem(Scalar::I32));
+                format_into!(
+                    out,
+                    "  %lane{i} = insertelement {t} poison, {}, i32 0\n  %v{i} = shufflevector {t} %lane{i}, {t} poison, {mask} zeroinitializer",
+                    typed(o.value())
+                );
             }
             Op::Extract => {
                 format_into!(out, "  %v{i} = extractelement {}, i32 {}", typed(o.value()), o.imm())

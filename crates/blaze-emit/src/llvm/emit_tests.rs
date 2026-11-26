@@ -361,6 +361,39 @@ fn release_record_preserves_a_wide_constant() {
     assert_eq!(unsafe { f() }, 0x0123_4567_89ab_cdef);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn release_record_stores_a_splat_to_every_lane() {
+    use blaze_inproc::exec::Executable;
+    use blaze_lir::{Op, Scalar, builder::MemAttrs};
+
+    let mut b = Builder::<_, Full>::new_in(64, blaze_own::testing::heap().alloc());
+    let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::I32)], &[]);
+    b.set_signature(sig);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    let output = b.param(Ty::PTR);
+    let value = b.param(Ty::I32);
+    let vector = b.convert(Op::Splat, Flags::NONE, Ty::vector(Scalar::I32, 4).unwrap(), value);
+    b.store(Flags::NONE, vector, output, 0, MemAttrs::aligned(2));
+    b.ret(&[]);
+    let func = b.finish_verified().unwrap();
+    let module = prepare(Symbol([15; 32]), func.verified(), &ByPlace, Alloc::global()).unwrap();
+    let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, Alloc::global()).unwrap();
+    let view = CodeView::read(&emission.record).unwrap();
+    assert_eq!(view.targets(), 0);
+    assert_eq!(view.sites(), 0);
+    let code = Executable::written(view.code().len(), 0, |code, _| code.copy_from_slice(view.code())).expect("the code maps");
+    // SAFETY: the leaf has the declared C ABI and no relocations.
+    let splat: unsafe extern "C" fn(*mut u32, u32) = unsafe { code.as_fn() };
+    let mut lanes = [0; 6];
+    for value in [0x1234_5678, 0xfedc_ba98] {
+        // SAFETY: lanes[1..5] provides four writable u32 lanes with the declared alignment.
+        unsafe { splat(lanes[1..5].as_mut_ptr(), value) };
+        assert_eq!(lanes, [0, value, value, value, value, 0]);
+    }
+}
+
 fn object_fixture(ir: &str) -> super::LlvmModule<'static> {
     let func = control();
     let mut module = prepare(Symbol([3; 32]), func.verified(), &ByPlace, Alloc::global()).unwrap();
