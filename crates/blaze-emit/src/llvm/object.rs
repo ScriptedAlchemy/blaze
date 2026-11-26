@@ -78,7 +78,8 @@ impl core::error::Error for ReadError {}
 /// The symbol's name as the lowering lane spells it: `blaze_fn_<64 hex>`, without the `@`.
 fn function_name<'a>(module: &LlvmModule<'_>, alloc: Alloc<'a>) -> String<Alloc<'a>> {
     let range = module.definition_name.clone();
-    String::from_str_in(core::str::from_utf8(&module.ir[range]).unwrap_or(""), alloc)
+    let name = core::str::from_utf8(&module.ir[range]).unwrap_or("");
+    String::from_str_in(name.strip_prefix('@').unwrap_or(name), alloc)
 }
 
 /// Where a relocation leads: a named symbol (an import, or the function's own) or a section.
@@ -117,6 +118,12 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
     // (the SOTA tier's `frame` is its pass's); a release record keeps the convention of the
     // tier it stands in for, so the launcher's trap reporting finds the frame.
     record.frame = 0;
+    for symbol in file.symbols().filter(|symbol| symbol.is_undefined()) {
+        let symbol_name = plain(macho, symbol.name().map_err(|_| ReadError::Object)?);
+        if module.references.iter().flatten().chain(module.implicit_references.iter()).any(|target| target.space == Space::Outside && target.symbol == blaze_code::record::Symbol::of_name(symbol_name)) {
+            record.outside(symbol_name);
+        }
+    }
 
     // Reach every local data section through both instruction and data relocations. Data
     // stays in relro: absolute words and source positions are filled only at placement.
@@ -204,9 +211,17 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
 /// `address` is: up to the next symbol there, or the end of the section.
 fn atom(file: &object::File<'_>, text: SectionIndex, address: u64) -> Result<core::ops::Range<u64>, ReadError> {
     let section = file.section_by_index(text).map_err(|_| ReadError::NoSection)?;
+    if file.format() == BinaryFormat::Elf {
+        if let Some(size) = file.symbols().find(|symbol| symbol.section() == SymbolSection::Section(text) && symbol.address() == address && symbol.kind() == object::SymbolKind::Text && symbol.size() != 0).map(|symbol| symbol.size()) {
+            let start = address.checked_sub(section.address()).ok_or(ReadError::CodeOutside)?;
+            let end = start.checked_add(size).filter(|end| *end <= section.size()).ok_or(ReadError::CodeOutside)?;
+            return Ok(start..end);
+        }
+    }
     let next = file
         .symbols()
         .filter(|it| it.section() == SymbolSection::Section(text) && it.address() > address)
+        .filter(|it| it.kind() == object::SymbolKind::Text)
         .filter(|it| it.name().is_ok_and(|name| !name.starts_with(['l', 'L'])))
         .map(|it| it.address())
         .min();
@@ -222,12 +237,15 @@ fn destination(file: &object::File<'_>, relocation: &object::Relocation, at: u64
         RelocationTarget::Section(index) => Ok(Destination::Section { index, offset: 0 }),
         RelocationTarget::Symbol(index) => {
             let symbol = file.symbol_by_index(index).map_err(|_| ReadError::Object)?;
+            let name = plain(file.format() == BinaryFormat::MachO, symbol.name().map_err(|_| ReadError::Object)?);
+            if symbol.kind() == object::SymbolKind::Text && symbol.is_global() && name != function_name(module, alloc) {
+                return Ok(Destination::Named(target_of(module, name, alloc)?));
+            }
             if let SymbolSection::Section(index) = symbol.section() {
                 let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
                 let offset = symbol.address().checked_sub(section.address()).and_then(|n| i64::try_from(n).ok()).ok_or(ReadError::CodeOutside)?;
                 Ok(Destination::Section { index, offset })
             } else {
-                let name = plain(file.format() == BinaryFormat::MachO, symbol.name().map_err(|_| ReadError::Object)?);
                 Ok(Destination::Named(target_of(module, name, alloc)?))
             }
         }
@@ -261,7 +279,7 @@ fn low_kind(word: u32, at: u64) -> Result<SiteKind, ReadError> {
     if word & 0x3b00_0000 != 0x3900_0000 {
         return Err(ReadError::Semantics { at, what: "PAGEOFF12 is neither ADD64 nor an unsigned-offset load/store" });
     }
-    let scale = if word & 0x0480_0000 == 0x0480_0000 { 4 } else { word >> 30 };
+    let scale = if word >> 30 == 0 && word & 0x0480_0000 == 0x0480_0000 { 4 } else { word >> 30 };
     Ok(match scale { 0 => SiteKind::LdstLo12_1, 1 => SiteKind::LdstLo12_2, 2 => SiteKind::LdstLo12_4, 3 => SiteKind::LdstLo12_8, _ => SiteKind::LdstLo12_16 })
 }
 
@@ -433,7 +451,7 @@ impl LinkName {
             Space::Static => "blaze_static_",
             Space::Vtable => "blaze_vtable_",
             Space::Tls => "blaze_tls_",
-            Space::Outside => return false,
+            Space::Outside => return self.0.symbol == blaze_code::record::Symbol::of_name(name),
         };
         let mut spelled = String::new_in(alloc);
         spelled.push_str(prefix);

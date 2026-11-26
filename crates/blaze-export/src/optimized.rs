@@ -583,15 +583,6 @@ fn call_triple(r: &RecordView<'_>, k: usize) -> bool {
     ldr & LDR64.0 == LDR64.1 && (ldr >> 5) & 0x1F == rd && ldr & 0x1F == rd && calls(code, off.at)
 }
 
-/// `inst`, a `b` or `bl` at `pc`, made to reach `to`.
-fn branch(inst: u32, pc: u64, to: u64, symbol: Symbol) -> Result<u32, ExportError> {
-    let delta = to as i64 - pc as i64;
-    if delta % 4 != 0 || !(-(1i64 << 27)..(1i64 << 27)).contains(&delta) {
-        return Err(ExportError::Patch(ImageError::OutOfReach { symbol, at: pc, what: "b/bl (128 MiB)" }));
-    }
-    Ok((inst & 0xFC00_0000) | (((delta >> 2) as u32) & 0x03FF_FFFF))
-}
-
 /// Lays the program out from `bzcode02` records. `members` holds every function (the program's
 /// and the start's), in any order; `entry` is the one the loader enters; `tail` bytes are kept
 /// after the code (the stubs included) for the unwind tables (eh_out.rs `eh_room_rows`), as
@@ -886,7 +877,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                             Space::Static | Space::Vtable | Space::Tls => return Err(ExportError::CallOfData { from: symbol, at: reloc.at }),
                         },
                     };
-                    write32(&mut text, x, branch(inst, pc, to, symbol)?);
+                    write32(&mut text, x, blaze_code::a64::branch26(inst, pc, to, symbol)?);
                 }
                 RelocKind::Page21 => {
                     let inst = expect(&text, x, ADRP, symbol, "adrp")?;

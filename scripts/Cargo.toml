@@ -39,7 +39,7 @@ blaze-pins.workspace = true
 # Seatbelt profile renderer (`blaze-roots::seatbelt`, zero extra third-party deps).
 blaze-build-script.workspace = true
 blaze-roots.workspace = true
-blaze-manifest = { workspace = true, default-features = false }
+blaze-manifest = { workspace = true, default-features = false, features = ["wasm-registration"] }
 edition.workspace = true
 
 [dev-dependencies]

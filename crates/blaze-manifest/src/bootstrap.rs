@@ -5,47 +5,42 @@ use blaze_int::Int;
 
 pub const TOOLCHAIN: &str = blaze_pins::TOOLCHAIN;
 
-/// The D52 registration global exported by a core Wasm module. Only section headers
-/// and the export table are read, so this also works on a read-only mapping.
-pub fn proc_macro_decls(wasm: &[u8]) -> Option<&str> {
-    fn byte(bytes: &mut &[u8]) -> Option<u8> {
-        let (&first, rest) = bytes.split_first()?;
-        *bytes = rest;
-        Some(first)
-    }
-    fn uleb32(bytes: &mut &[u8]) -> Option<u32> {
-        let mut value = 0;
-        for shift in [0, 7, 14, 21, 28] {
-            let b = byte(bytes)?;
-            if shift == 28 && b > 0x0f { return None; }
-            value |= u32::from(b & 0x7f) << shift;
-            if b < 0x80 { return Some(value); }
+#[cfg(feature = "wasm-registration")]
+#[derive(Debug)]
+pub enum WasmRegistrationError {
+    Invalid(wasmparser::BinaryReaderError),
+    NotCore,
+    Missing,
+    Ambiguous,
+    WrongType,
+}
+
+#[cfg(feature = "wasm-registration")]
+impl fmt::Display for WasmRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(error) => write!(f, "invalid WebAssembly: {error}"),
+            Self::NotCore => f.write_str("D52 requires a core WebAssembly module"),
+            Self::Missing => f.write_str("no exported __rustc_proc_macro_decls_* registration global"),
+            Self::Ambiguous => f.write_str("multiple __rustc_proc_macro_decls_* registration exports"),
+            Self::WrongType => f.write_str("the __rustc_proc_macro_decls_* registration export must be an i32 global"),
         }
-        None
     }
-    fn counted<'a>(bytes: &mut &'a [u8]) -> Option<&'a [u8]> {
-        let len = usize::try_from(uleb32(bytes)?).ok()?;
-        let (field, rest) = bytes.split_at_checked(len)?;
-        *bytes = rest;
-        Some(field)
+}
+
+/// The address passed to D52's shim comes from the validator's export type table.
+#[cfg(feature = "wasm-registration")]
+pub fn proc_macro_decls<T>(wasm: &[u8], use_name: impl FnOnce(&str) -> T) -> Result<T, WasmRegistrationError> {
+    let types = wasmparser::Validator::new().validate_all(wasm).map_err(WasmRegistrationError::Invalid)?;
+    let exports = types.as_ref().core_exports().ok_or(WasmRegistrationError::NotCore)?;
+    let mut declarations = exports.filter(|(name, _)|
+        name.strip_prefix("__rustc_proc_macro_decls_").is_some_and(|suffix| !suffix.is_empty()));
+    let (name, ty) = declarations.next().ok_or(WasmRegistrationError::Missing)?;
+    if declarations.next().is_some() { return Err(WasmRegistrationError::Ambiguous); }
+    if !matches!(ty, wasmparser::types::EntityType::Global(global) if global.content_type == wasmparser::ValType::I32) {
+        return Err(WasmRegistrationError::WrongType);
     }
-    let mut sections = wasm.strip_prefix(b"\0asm\x01\0\0\0")?;
-    while !sections.is_empty() {
-        let id = byte(&mut sections)?;
-        let mut section = counted(&mut sections)?;
-        if id != 7 { continue; }
-        let mut registration = None;
-        for _ in 0..uleb32(&mut section)? {
-            let name = core::str::from_utf8(counted(&mut section)?).ok()?;
-            let kind = byte(&mut section)?;
-            uleb32(&mut section)?;
-            if kind == 3 && name.strip_prefix("__rustc_proc_macro_decls_").is_some_and(|suffix| !suffix.is_empty()) {
-                if registration.replace(name).is_some() { return None; }
-            }
-        }
-        return section.is_empty().then_some(registration).flatten();
-    }
-    None
+    Ok(use_name(name))
 }
 
 /// Whether a package's raw manifest has no input inherited from its enclosing workspace.

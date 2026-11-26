@@ -283,7 +283,9 @@ impl ModuleRecord {
             if found != self.wasm_sha256 {
                 return Err(ModuleError::Digest { key: self.key.clone(), held: self.wasm_sha256.clone(), found });
             }
-            if blaze_manifest::bootstrap::proc_macro_decls(wasm.bytes()) != Some(self.decls.as_str()) {
+            let matches = blaze_manifest::bootstrap::proc_macro_decls(wasm.bytes(), |name| name == self.decls)
+                .map_err(|error| ModuleError::Validation { path: self.dir.join("module.wasm"), error })?;
+            if !matches {
                 return Err(ModuleError::Registration { path: self.dir.join("decls"), why: "the D52 module does not export the recorded proc-macro registration global" });
             }
         }
@@ -319,6 +321,7 @@ pub enum ModuleError {
     Digest { key: String, held: String, found: String },
     /// A D52 registration record does not belong to this crate or does not name its ABI.
     Registration { path: PathBuf, why: &'static str },
+    Validation { path: PathBuf, error: blaze_manifest::bootstrap::WasmRegistrationError },
     /// A line of `macros` that is not one.
     Macros { key: String, line: String },
 }
@@ -331,6 +334,7 @@ impl std::fmt::Display for ModuleError {
                 "{name} {version}: no compiled module in the store or the cache (module key {key}); build it with scripts/src/bin/proc_macro_modules.rs (D52)"
             ),
             ModuleError::Io { path, error } => write!(f, "{}: {error}", path.display()),
+            ModuleError::Validation { path, error } => write!(f, "{}: {error}", path.display()),
             ModuleError::Digest { key, held, found } => {
                 write!(f, "module {key}: its wasm-sha256 says {held}, its module.wasm is {found}")
             }

@@ -103,6 +103,18 @@ pub fn no_address_word(view: &CodeView<'_>, insts: u32) -> Result<usize, Address
     while at < end {
         let word = inst(code, at);
         let here = at as u32;
+        if site < view.sites() && view.site(site).at == here && view.site(site).kind.len() == 4 {
+            let row = view.site(site);
+            let mut instruction = word.to_le_bytes();
+            blaze_code::a64::single_site(&mut instruction, 0, 0, 0, row.kind, blaze_code::record::Symbol([0; 32]))
+                .map_err(|_| AddressWord::SiteForm { at: here, what: "the declared single-instruction relocation" })?;
+            if instruction != word.to_le_bytes() {
+                return Err(AddressWord::SiteForm { at: here, what: "a zero relocation immediate before placement" });
+            }
+            site += 1;
+            at += 4;
+            continue;
+        }
         if word & 0x3b00_0000 == 0x1800_0000 {
             return Err(AddressWord::LiteralLoad { at: here });
         }

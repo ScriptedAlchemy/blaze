@@ -87,6 +87,8 @@ fn alignments_round_trip_and_older_forms_are_refused() {
     assert_eq!(CodeView::read(&older).err(), Some(DecodeError::Older { form: *b"bzcode04" }));
     older[..8].copy_from_slice(b"bzcode06");
     assert_eq!(CodeView::read(&older[..56]).err(), Some(DecodeError::Older { form: *b"bzcode06" }), "even an empty v6 record is identified");
+    older[..8].copy_from_slice(b"bzcode07");
+    assert_eq!(CodeView::read(&older).err(), Some(DecodeError::Older { form: *b"bzcode07" }), "the previous native record is reported for rebuild, never reinterpreted");
     older[..8].copy_from_slice(b"notacode");
     assert_eq!(CodeView::read(&older).err(), Some(DecodeError::Magic), "bytes of no form of this record");
 

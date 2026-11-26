@@ -15,6 +15,7 @@ doctest = false
 
 [features]
 default = ["cargo"]
+wasm-registration = ["dep:wasmparser"]
 # The cargo-compatible reader (`Config`, `Workspace`, `metadata`, the profiles, the schema),
 # which still rests on serde, serde_json and url. Without it the crate is `layout` alone, the
 # sans-IO workspace reader the new `blaze` takes, on blaze's own crates only
@@ -36,6 +37,7 @@ cargo = [
 [dependencies]
 blaze-int.workspace = true
 blaze-sha256.workspace = true
+wasmparser = { workspace = true, optional = true }
 blaze-own.workspace = true
 # The pinned cargo's version, as its messages name it (`features`; pins/rust.txt).
 blaze-pins.workspace = true

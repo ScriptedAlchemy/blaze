@@ -507,6 +507,25 @@ fn d52_registration_distinguishes_absent_invalid_and_empty_export_tables() {
     assert_ne!(read().unwrap().verify_registration().unwrap(), verified, "a changed export moves the registration input");
     put("wasm-sha256", &sha256_hex(b"other module"));
     assert!(matches!(read().unwrap().verify_registration(), Err(ModuleError::Digest { .. })));
+    let mut wrong = b"\0asm\x01\0\0\0".to_vec();
+    section(6, &[1, 0x7e, 0, 0x42, 0, op::END], &mut wrong);
+    let mut exports = vec![1];
+    name(DECLS, &mut exports);
+    exports.extend_from_slice(&[3, 0]);
+    section(7, &exports, &mut wrong);
+    let replace_module = |bytes: &[u8]| {
+        std::fs::write(dir.join("module.wasm"), bytes).expect("the control module");
+        put("wasm-sha256", &sha256_hex(bytes));
+    };
+    replace_module(&wrong);
+    assert!(matches!(read().unwrap().verify_registration(), Err(ModuleError::Validation {
+        error: blaze_manifest::bootstrap::WasmRegistrationError::WrongType, ..
+    })), "a valid module's i64 global cannot serve the wasm32 dispatch ABI");
+    wrong.push(0xff);
+    replace_module(&wrong);
+    assert!(matches!(read().unwrap().verify_registration(), Err(ModuleError::Validation {
+        error: blaze_manifest::bootstrap::WasmRegistrationError::Invalid(_), ..
+    })), "the matching digest and real export name cannot certify malformed Wasm");
     std::fs::remove_dir_all(store).expect("remove the registration");
 }
 

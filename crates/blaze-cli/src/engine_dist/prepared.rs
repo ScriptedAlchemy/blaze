@@ -89,7 +89,7 @@ fn crates<'s, 'n: 's, M>(
         let key = rec.key();
         let name = rec
             .name()
-            .map_err(|why| refused(request.heap, format_args!("source crate {key:?}: {why}")))?;
+            .map_err(|why| refused(request.heap, format_args!("source crate {key:?}: {why:?}")))?;
         let slot = crates.len();
         if slots.insert(key.prefix(), slot).is_some() {
             return Err(refused(

@@ -188,7 +188,7 @@ fn env_get<'a>(env: Option<&'a Env>, name: &str) -> Option<&'a str> {
 /// Parsed distributed settings for one `blaze export` invocation.
 pub(crate) struct DistConfig {
     pub(crate) config: Config,
-    pub(crate) report: Option<AString<'static>>,
+    pub(crate) report: Option<WireString>,
     pub(crate) wire_alloc: WireAlloc,
 }
 
@@ -269,7 +269,7 @@ impl DistConfig {
             holder: HolderConfig { heartbeat_ms: 1_000, retry_ms: 5_000, idle_ms: 10 },
             poll: Duration::from_millis(10),
         };
-        let report = env_get(env, REPORT_VAR).map(|p| own_str(p, alloc));
+        let report = env_get(env, REPORT_VAR).map(|p| wire_str(p, wire_alloc));
         Ok(Some(DistConfig { config, report, wire_alloc }))
     }
 }

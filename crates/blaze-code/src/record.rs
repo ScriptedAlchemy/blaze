@@ -452,6 +452,8 @@ pub enum RecordError {
     SitesOverlap { at: u32 },
     /// A relro site at `at` addresses relro byte `addend`, past the relro part's `relro` bytes.
     RelroOutside { at: u32, addend: u32, relro: u32 },
+    /// Import slots name one exact pointer; their instructions cannot encode an addend.
+    ImportAddend { at: u32, addend: u32 },
     /// A word at `at` is not inside the relro part (`relro` bytes).
     WordOutside { at: u32, relro: u32 },
     /// A word at `at` is not 8-aligned.
@@ -492,6 +494,7 @@ impl fmt::Display for RecordError {
             RecordError::SiteMisaligned { at } => write!(f, "a code record's site at {at} is not on an instruction (4-aligned)"),
             RecordError::SitesOverlap { at } => write!(f, "a code record's site at {at} overlaps the site before it"),
             RecordError::RelroOutside { at, addend, relro } => write!(f, "a code record's site at {at} addresses relro byte {addend}, past its {relro} relro bytes"),
+            RecordError::ImportAddend { at, addend } => write!(f, "a code record's import site at {at} has unsupported addend {addend}"),
             RecordError::WordOutside { at, relro } => write!(f, "a code record's relro word at {at} is past its {relro} relro bytes"),
             RecordError::WordMisaligned { at } => write!(f, "a code record's relro word at {at} is not 8-aligned"),
             RecordError::WordsOverlap { at } => write!(f, "a code record has two relro words at {at}"),
@@ -613,6 +616,9 @@ impl<'a> CodeRecord<'a> {
         let code_len = code.len() as u32;
         let relro_len = relro.len() as u32;
         for site in sites.iter_mut() {
+            if site.kind != SiteKind::Relro && !site.kind.own() && site.addend != 0 {
+                return Err(RecordError::ImportAddend { at: site.at, addend: site.addend });
+            }
             match site.kind {
                 SiteKind::Relro => {
                     if site.target != NO_TARGET {
@@ -1148,6 +1154,12 @@ impl<'b> CodeView<'b> {
         let mut end = 0u64;
         for i in 0..view.sites() {
             let site = view.site(i);
+            if site.kind == SiteKind::Relro && site.target != NO_TARGET {
+                return Err(DecodeError::Site(RecordError::NoSuchTarget { at: site.at, target: site.target }));
+            }
+            if site.kind != SiteKind::Relro && !site.kind.own() && site.addend != 0 {
+                return Err(DecodeError::Site(RecordError::ImportAddend { at: site.at, addend: site.addend }));
+            }
             if site.at % 4 != 0 { return Err(DecodeError::Site(RecordError::SiteMisaligned { at: site.at })); }
             if u64::from(site.at) < end { return Err(DecodeError::Site(RecordError::SitesOverlap { at: site.at })); }
             end = u64::from(site.at) + u64::from(site.kind.len());

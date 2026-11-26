@@ -113,11 +113,16 @@ pub fn add_lo12(inst: u32, to: u64) -> u32 {
 
 /// `bl to` at `pc`.
 pub fn bl(pc: u64, to: u64, symbol: Symbol) -> Result<u32, ImageError> {
+    branch26(BL.1, pc, to, symbol)
+}
+
+/// Displace a checked B or BL to `to`, preserving its link bit.
+pub fn branch26(inst: u32, pc: u64, to: u64, symbol: Symbol) -> Result<u32, ImageError> {
     let delta = i128::from(to) - i128::from(pc);
     if delta % 4 != 0 || !(-(1i128 << 27)..(1i128 << 27)).contains(&delta) {
-        return Err(ImageError::OutOfReach { symbol, at: pc, what: "bl (128 MiB)" });
+        return Err(ImageError::OutOfReach { symbol, at: pc, what: "b/bl (128 MiB)" });
     }
-    Ok(0x9400_0000 | (((delta >> 2) as u32) & 0x03FF_FFFF))
+    Ok((inst & 0xfc00_0000) | (((delta >> 2) as u32) & 0x03ff_ffff))
 }
 
 /// Size of one unsigned-immediate load/store, including SIMD Q loads and stores.
@@ -141,7 +146,7 @@ pub fn single_site(code: &mut [u8], off: u64, pc: u64, to: u64, kind: SiteKind, 
         GotLo12 => aligned(expect(code, off, LDR64, symbol, "ldr Xt, [Xn, #imm12 * 8]")?, 3)?,
         Branch26 => {
             let original = expect(code, off, (0x7c00_0000, 0x1400_0000), symbol, "b or bl")?;
-            (original & 0xfc00_0000) | (bl(pc, to, symbol)? & 0x03ff_ffff)
+            branch26(original, pc, to, symbol)?
         }
         LdstLo12_1 | LdstLo12_2 | LdstLo12_4 | LdstLo12_8 | LdstLo12_16 => {
             let inst = read32(code, off);

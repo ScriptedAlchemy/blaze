@@ -1849,10 +1849,10 @@ impl Plan<'_> {
         };
         let wasm = std::fs::read(wasm_path).map_err(io(Path::new(wasm_path)))?;
         let macros = macros_of(&read(Path::new(expanded_path))?, &wanted.name)?;
-        let decls = blaze_manifest::bootstrap::proc_macro_decls(&wasm).ok_or_else(|| Failure::NoModule {
+        let decls = blaze_manifest::bootstrap::proc_macro_decls(&wasm, str::to_owned).map_err(|error| Failure::NoModule {
             name: wanted.name.clone(),
             version: wanted.version.clone(),
-            why: "the module exports no `__rustc_proc_macro_decls_*` global".to_owned(),
+            why: error.to_string(),
         })?;
         let wasm_sha256 = sha256(&wasm);
 
