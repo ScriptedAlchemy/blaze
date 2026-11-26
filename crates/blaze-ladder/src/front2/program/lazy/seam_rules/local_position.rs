@@ -406,7 +406,7 @@ mod tests {
                 .expect("macro call in rendered block module");
             let chain = blaze_file_items::item_chain(&outline, macro_item, &rendered);
             let range = written_range(&body, chain, Edition::E2024, alloc)
-                .unwrap_or_else(|e| panic!("attributed `{call}` must resolve: {e:?}"));
+                .unwrap_or_else(|e| panic!("attributed {call:?} must resolve: {e:?}"));
             assert_eq!(&body[range.start as usize..range.end as usize], call);
         }
     }
