@@ -76,7 +76,12 @@ impl Lower<'_, '_> {
         )?;
         format_into!(&mut self.ir, "  call void {name}(");
         if !params.is_empty() {
-            format_into!(&mut self.ir, "i32 {code}");
+            self.ir.push_str("i32 ");
+            let start = self.ir.len();
+            format_into!(&mut self.ir, "{code}");
+            if code == blaze_code::trap::UNREACHABLE {
+                self.unreachable_operands.push(traps::Operand(start..self.ir.len()));
+            }
         }
         format_into!(&mut self.ir, "), !blaze.trap !{{i32 {code}}}\n  unreachable\n");
         Ok(())

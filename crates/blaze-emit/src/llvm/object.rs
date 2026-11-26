@@ -19,7 +19,7 @@ use object::{
     BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionIndex, SectionKind, SymbolSection, elf, macho,
 };
 
-use super::LlvmModule;
+use super::{LlvmModule, traps::{Tag, Tags}};
 
 /// Why an object file could not be read back as a record.
 #[derive(Debug, PartialEq, Eq)]
@@ -41,8 +41,8 @@ pub enum ReadError {
     /// A `ldr` whose `adrp` is not the instruction before it naming the same target: the
     /// record form's `Load` site is the adjacent pair, which LLVM did not emit.
     UnpairedLoad { at: u64, target: Target },
-    /// A `brk` for an `unreachable` whose `TrapSource` the module does not carry.
-    TrapSource { at: u32 },
+    /// A temporary `brk` immediate whose source is absent from this emission.
+    TrapTag { at: u32, immediate: u32 },
     /// A constant section holds an address of the code, which a record cannot name.
     AddressOfCode { at: u64 },
     /// A section the code refers to is writable.
@@ -64,7 +64,7 @@ impl fmt::Display for ReadError {
             ReadError::Relocation { at, kind } => write!(f, "a relocation of kind {kind} at {at}"),
             ReadError::Section { at } => write!(f, "a relocation at {at} against a section the code does not lay out"),
             ReadError::UnpairedLoad { at, target } => write!(f, "a load at {at} of {target:?} whose `adrp` is not the instruction before it"),
-            ReadError::TrapSource { at } => write!(f, "a `brk` at {at} for an `unreachable` whose source the module does not carry"),
+            ReadError::TrapTag { at, immediate } => write!(f, "a `brk` at {at} uses temporary trap ID {immediate:#x} without a source in this emission"),
             ReadError::AddressOfCode { at } => write!(f, "a constant at {at} holds an address of the code"),
             ReadError::Writable { section } => write!(f, "the code refers to the writable section {section}"),
             ReadError::Semantics { at, what } => write!(f, "native object relocation at {at}: {what}"),
@@ -89,7 +89,7 @@ enum Destination {
 }
 
 /// Reads `object` (what LLVM wrote for `module`) as a sealed code record in `alloc`.
-pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ReadError> {
+pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, tags: &Tags<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ReadError> {
     let file = object::File::parse(object).map_err(|_| ReadError::Object)?;
     if file.architecture() != object::Architecture::Aarch64 || !file.is_little_endian() {
         return Err(ReadError::Semantics { at: 0, what: "only little-endian AArch64 object code is supported" });
@@ -195,27 +195,19 @@ pub fn read<'a>(object: &[u8], module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Res
     }
     positions(&file, module, &placed, &mut record, alloc)?;
 
-    // The traps: each `brk` in LLVM's code is one the lowerer wrote for a LIR `trap` or
-    // `unreachable`. An `unreachable`'s `brk #0xff02` takes the next `TrapSource` by ordinal
-    // (the build's rows, in LIR order); a `trap`'s `brk #code` names its own code and has no
-    // source row. LLVM may drop an `unreachable` it proves dead, so a source left over is not
-    // an error; one missing when a `brk` needs it is.
-    let mut next_source = 0usize;
-    for at in (0..code.len()).step_by(4) {
-        let Some(word) = code.get(at..at + 4).and_then(|w| w.try_into().ok()) else { break };
-        let word = u32::from_le_bytes(word);
-        if word & 0xffe0_001f != 0xd420_0000 {
+    // Visit the function's original instructions, excluding appended import veneers.
+    // An ID may survive zero or several times, and may come from any linked import.
+    const BRK: u32 = 0xd420_0000;
+    for (index, slot) in record.code[..code.len()].as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let word = u32::from_le_bytes(*slot);
+        if word & 0xffe0_001f != BRK {
             continue;
         }
         let immediate = (word >> 5) & 0xffff;
-        if immediate != blaze_code::trap::UNREACHABLE {
-            continue;
-        }
-        let at = u32::try_from(at).map_err(|_| ReadError::CodeOutside)?;
-        let Some(source) = module.traps.get(next_source) else {
-            return Err(ReadError::TrapSource { at });
-        };
-        next_source += 1;
+        let Some(tag) = Tag::of_immediate(immediate) else { continue };
+        let at = u32::try_from(index * 4).map_err(|_| ReadError::CodeOutside)?;
+        let source = tags.source(tag).ok_or(ReadError::TrapTag { at, immediate })?;
+        *slot = (BRK | blaze_code::trap::UNREACHABLE << 5).to_le_bytes();
         record.traps.push(TrapRow { at, kind: source.kind, site: source.site, held: Held::Unknown, subject: source.subject });
     }
 

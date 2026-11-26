@@ -178,6 +178,7 @@ pub fn module<'a>(
         literals: Vec::new_in(alloc),
         positions: Vec::new_in(alloc),
         traps: Vec::new_in(alloc),
+        unreachable_operands: Vec::new_in(alloc),
         instructions: original.instructions,
     })
 }

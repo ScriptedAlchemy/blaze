@@ -38,7 +38,8 @@ use blaze_llvm_abi::{
     LLVMSetTarget, LLVMTargetMachineEmitToMemoryBuffer, LLVMTargetMachineRef,
 };
 
-use super::LlvmModule;
+use super::{LlvmModule, traps::Tags};
+pub use super::traps::TrapError;
 
 /// Which backend made a record. `Some(..)` is minted only by [`emit_release`] and
 /// [`emit_fold`]: a record is release or folded work only when LLVM made it here.
@@ -132,6 +133,8 @@ pub struct FoldOutput<'a> {
 /// Why LLVM could not make a record.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EmitError {
+    /// Trap provenance could not be bound before linking the module.
+    Trap(TrapError),
     /// The IR did not parse; LLVM's message.
     Parse { message: FixedString<256> },
     /// LLVM has no target for the machine's triple; LLVM's message.
@@ -151,6 +154,7 @@ pub enum EmitError {
 impl core::fmt::Display for EmitError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            EmitError::Trap(why) => why.fmt(f),
             EmitError::Parse { message } => write!(f, "LLVM did not parse the module's IR: {}", message.as_str()),
             EmitError::NoTarget { message } => write!(f, "LLVM has no target for the machine: {}", message.as_str()),
             EmitError::Link => write!(f, "an import did not link into the module"),
@@ -395,11 +399,29 @@ impl Drop for Session {
 
 /// Emits one release blob: the module optimized at `task.opt` and emitted for `task.machine`.
 pub fn emit_release<'a>(task: ReleaseTask<'_>, alloc: Alloc<'a>) -> Result<Emission<'a>, EmitError> {
-    let imports: AVec<'_, &[u8]> = task.imports.iter().map(|m| m.ir.as_slice()).collect_in(alloc);
-    let session = Session::new(task.module.ir.as_slice(), &imports, task.machine)?;
-    let object = session.emit(task.opt, alloc)?;
-    let record = super::object::read(&object, task.module, alloc).map_err(EmitError::Read)?;
+    let record = record(task.module, task.imports, task.machine, task.opt, alloc)?;
     Ok(Emission { record, backend: Backend::ReleaseBlob, symbol: task.module.symbol })
+}
+
+fn record<'a>(
+    module: &LlvmModule<'_>,
+    imports: &[&LlvmModule<'_>],
+    machine: Machine,
+    opt: u8,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u8>, EmitError> {
+    let mut tags = Tags::new(alloc);
+    let root = tags.prepare(module).map_err(EmitError::Trap)?;
+    let mut marked = AVec::with_capacity_in(imports.len(), alloc);
+    for module in imports {
+        marked.push(tags.prepare(module).map_err(EmitError::Trap)?);
+    }
+    let imported: AVec<'_, &[u8]> = imports.iter().zip(&marked)
+        .map(|(module, marked)| marked.as_deref().unwrap_or(module.ir.as_slice()))
+        .collect_in(alloc);
+    let session = Session::new(root.as_deref().unwrap_or(module.ir.as_slice()), &imported, machine)?;
+    let object = session.emit(opt, alloc)?;
+    super::object::read(&object, module, &tags, alloc).map_err(EmitError::Read)
 }
 
 /// Emits a folded group: its body and one thunk per other member.
@@ -407,9 +429,7 @@ pub fn emit_fold<'a>(task: FoldTask<'_>, alloc: Alloc<'a>) -> Result<FoldOutput<
     let mut body: Option<Emission<'a>> = None;
     let mut thunks: AVec<'a, Emission<'a>> = AVec::new_in(alloc);
     for member in task.members {
-        let session = Session::new(member.module.ir.as_slice(), &[], task.machine)?;
-        let object = session.emit(2, alloc)?;
-        let record = super::object::read(&object, member.module, alloc).map_err(EmitError::Read)?;
+        let record = record(member.module, &[], task.machine, 2, alloc)?;
         let emission = Emission { record, backend: Backend::FoldedOutput, symbol: member.module.symbol };
         if member.is_body {
             body = Some(emission);

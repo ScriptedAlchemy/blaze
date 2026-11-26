@@ -2,11 +2,14 @@
 //! sealed code record, and the record runs and computes what the LIR says. The negative
 //! control: a record the Reference tier made is never named release or folded work.
 
-use blaze_code::record::{CodeView, SiteKind, Space, Symbol, Target};
+use blaze_code::{
+    record::{CodeView, SiteKind, Space, Symbol, Target, TrapKind, TrapSource},
+    trap::UNREACHABLE,
+};
 use blaze_lir::{
     BlockKind, Builder, Flags, Full, Ty,
     builder::{Param, Variadic},
-    func::Conv,
+    func::{Conv, FnAttrs, Inline},
 };
 use blaze_own::Alloc;
 
@@ -229,7 +232,103 @@ fn object_fixture(ir: &str) -> super::LlvmModule<'static> {
     module.implicit_references.clear();
     module.positions.clear();
     module.traps.clear();
+    module.unreachable_operands.clear();
     module
+}
+
+#[test]
+fn optimized_import_keeps_its_trap_source_when_the_roots_trap_is_deleted() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let make = |is_root: bool| {
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let p = Param::of(Ty::I32);
+        let sig = b.sig(Conv::C, Variadic::No, &[p], &[p]);
+        b.set_signature(sig);
+        if !is_root {
+            b.set_attrs(FnAttrs::default().with_inline(Inline::Always));
+        }
+        let entry = b.create_block(BlockKind::Normal);
+        let die = b.create_block(BlockKind::Normal);
+        let good = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let x = b.param(Ty::I32);
+        let condition = if is_root {
+            b.iconst(Ty::I1, 0)
+        } else {
+            let zero = b.iconst(Ty::I32, 0);
+            b.icmp(blaze_lir::IntCond::Eq, x, zero)
+        };
+        b.br(Flags::NONE, condition, (die, &[]), (good, &[]));
+        b.begin(die);
+        b.unreachable();
+        b.begin(good);
+        let value = if is_root {
+            let reference = b.reference(blaze_lir::func::RefKind::Func, 0);
+            b.call(Flags::NONE, reference, sig, &[x])
+        } else {
+            x
+        };
+        b.ret(&[value]);
+        b.finish_verified().unwrap()
+    };
+    let before_opt = make(true);
+    let imported = make(false);
+    let mut root = prepare(Symbol([2; 32]), before_opt.verified(), &ByPlace, alloc).unwrap();
+    let mut callee = prepare(Symbol([7; 32]), imported.verified(), &ByPlace, alloc).unwrap();
+    root.traps.push(TrapSource { ordinal: 0, kind: TrapKind::BodyEnd, site: Some((2, 10)), subject: None });
+    callee.traps.push(TrapSource { ordinal: 0, kind: TrapKind::Intrinsic, site: Some((7, 20)), subject: None });
+    let record = emit_release(ReleaseTask { module: &root, imports: &[&callee], opt: 2, machine: machine() }, alloc).unwrap();
+    let view = CodeView::read(&record.record).unwrap();
+    assert_eq!(view.targets(), 0, "the trap must survive in the root after inlining");
+    assert_eq!(view.traps(), 1, "only the imported trap survives optimization");
+    let trap = view.trap(0);
+    assert_eq!((trap.kind, trap.site), (TrapKind::Intrinsic, Some((7, 20))));
+    let at = usize::try_from(trap.at).unwrap();
+    let brk = u32::from_le_bytes(view.code()[at..at + 4].try_into().unwrap());
+    assert_eq!(brk, 0xd420_0000 | UNREACHABLE << 5, "only the semantic BRK reaches the record");
+}
+
+#[test]
+fn explicit_lir_traps_cannot_consume_the_llvm_provenance_range() {
+    let alloc = blaze_own::testing::heap().alloc();
+    for reserved in [UNREACHABLE + 1, u32::from(u16::MAX)] {
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[], &[]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        b.trap(reserved);
+        let body = b.finish_verified().unwrap();
+        let error = prepare(Symbol([5; 32]), body.verified(), &ByPlace, alloc).err().unwrap();
+        assert_eq!(error.reason, "a LIR trap in the emitter's reserved BRK range");
+    }
+}
+
+#[test]
+fn a_c_link_name_cannot_call_the_break_intrinsic() {
+    struct NamedBreak;
+    impl Names for NamedBreak {
+        fn name(&self, _: Outside) -> Option<Named<'_>> {
+            Some(Named::C("llvm.aarch64.break"))
+        }
+
+        fn routines(&self) -> RoutinePlaces {
+            RoutinePlaces::NONE
+        }
+    }
+    let body = caller();
+    let error = prepare(Symbol([5; 32]), body.verified(), &NamedBreak, Alloc::global()).err().unwrap();
+    assert_eq!(error.reason, "a C link name in LLVM's intrinsic namespace");
+}
+
+#[test]
+fn object_reader_refuses_an_unassigned_trap_id() {
+    use super::{emit::EmitError, object::ReadError};
+    let ir = "declare void @llvm.aarch64.break(i32)\ndefine void @entry() {\n\
+              call void @llvm.aarch64.break(i32 65535)\n  unreachable\n}\n";
+    let module = object_fixture(ir);
+    let error = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, Alloc::global()).err().unwrap();
+    assert!(matches!(error, EmitError::Read(ReadError::TrapTag { immediate: 65535, .. })));
 }
 
 #[cfg(target_arch = "aarch64")]

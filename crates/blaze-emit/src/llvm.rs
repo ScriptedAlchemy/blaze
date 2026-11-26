@@ -18,6 +18,7 @@ mod memory;
 #[cfg(test)]
 mod tests;
 mod tls;
+mod traps;
 pub mod emit;
 pub mod object;
 #[cfg(test)]
@@ -51,6 +52,7 @@ pub struct LlvmModule<'a> {
     pub positions: AVec<'a, (u32, blaze_lir::func::DataPositionRec)>,
     /// The source build's item-relative trap metadata, by its original LIR trap ordinal.
     pub traps: AVec<'a, blaze_code::record::TrapSource>,
+    unreachable_operands: AVec<'a, traps::Operand>,
     pub instructions: usize,
 }
 
@@ -102,6 +104,7 @@ struct Lower<'a, 'v> {
     names: AVec<'a, AString<'a>>,
     calls: AVec<'a, Symbol>,
     literals: AVec<'a, Literal>,
+    unreachable_operands: AVec<'a, traps::Operand>,
     declarations: blaze_own::ABTreeMap<'a, AString<'a>, AString<'a>>,
     edges: control::Edges<'a, 'v>,
     at: Option<usize>,
@@ -123,6 +126,9 @@ impl<'a> Lower<'a, '_> {
             Some(Named::C(name)) => {
                 if name.is_empty() || name.as_bytes().contains(&0) {
                     return Err(self.error("empty or NUL-containing C link name"));
+                }
+                if name.starts_with("llvm.") {
+                    return Err(self.error("a C link name in LLVM's intrinsic namespace"));
                 }
                 if !matches!(space, Space::Func | Space::Static) {
                     return Err(self.error("a C name for a vtable or thread-local"));
@@ -186,6 +192,7 @@ pub fn prepare<'a>(
         resolver: names,
         calls: AVec::new_in(alloc),
         literals: AVec::new_in(alloc),
+        unreachable_operands: AVec::new_in(alloc),
         declarations: BTreeMap::new_in(alloc),
         edges: control::Edges::new(view, alloc),
         at: None,
@@ -282,6 +289,7 @@ pub fn prepare<'a>(
         implicit_references: lower.implicit_references,
         positions,
         traps: AVec::new_in(alloc),
+        unreachable_operands: lower.unreachable_operands,
         calls: lower.calls,
         literals: lower.literals,
         instructions: view.len(),
