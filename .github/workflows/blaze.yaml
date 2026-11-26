@@ -8,7 +8,7 @@ on:
       suite:
         required: true
         type: choice
-        options: [items, front-equal, ladder-lib, test-cache]
+        options: [items, front-equal, ladder-lib, test-cache, closure-sigs, closure-fn-pointer]
 permissions:
   contents: read
 defaults:
@@ -37,9 +37,8 @@ jobs:
           mkdir "$RUNNER_TEMP/blaze-fs/workspace-home"
           test_home=$(timeout 10 mktemp -d /tmp/bc.XXXXXX)
           timeout 10 sudo mount --bind "$RUNNER_TEMP/blaze-fs/workspace-home" "$test_home"
-          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
-          echo "HOME=$test_home" >> "$GITHUB_ENV"
+          printf '%s\n' "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "HOME=$test_home" >> "$GITHUB_ENV"
       - uses: ./.github/actions/script
         with:
           job: cargo
@@ -56,6 +55,8 @@ jobs:
             items) crate=blaze-ladder; target=front2_items; cargo_target=(--test "$target"); selection=(--test-threads=4) ;;
             front-equal) crate=blaze-ladder; target=front_equal; cargo_target=(--test "$target"); selection=(--test-threads=4) ;;
             ladder-lib) crate=blaze-ladder; target=blaze_ladder; cargo_target=(--lib); selection=(--test-threads=4) ;;
+            closure-sigs) crate=blaze-ladder; target=front2_closure_sigs; cargo_target=(--test "$target"); selection=(closure_and_projection_signatures_are_laid_and_checked --exact) ;;
+            closure-fn-pointer) crate=blaze-flow-lower; target=blaze_flow_lower; cargo_target=(--lib); selection=(callee_value_tests::explicit_closure_to_fn_pointer_cast_uses_the_checked_coercion_once --exact) ;;
             test-cache)
               crate=blaze-cli; target=test_command_runs; cargo_target=(--test "$target")
               selection=(pooled_workers_match_serial_bztr_and_purity --exact)
@@ -65,9 +66,13 @@ jobs:
           esac
           timeout -k 20 1760 cargo +"$tc" test --locked -p "$crate" "${cargo_target[@]}" \
             --no-run --message-format=json-render-diagnostics > "$evidence/build.jsonl"
+          # shellcheck disable=SC2016
           binary=$(timeout 20 jq -er --arg target "$target" \
             'select(.target.name==$target and .executable!=null).executable' "$evidence/build.jsonl")
           timeout -k 20 480 /usr/bin/time -v "$binary" --nocapture "${selection[@]}" 2>&1 | tee "$evidence/test.log"
+          if [[ "$SUITE" == closure-* ]]; then
+            timeout 10 grep -Fq '1 passed; 0 failed' "$evidence/test.log"
+          fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:
