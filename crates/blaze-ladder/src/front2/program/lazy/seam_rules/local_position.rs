@@ -7,6 +7,7 @@
 use super::{Anchor, LibKey, NamesSource, PositionGap, PositionSource, Start, checker_of, position_at};
 use blaze_file_items::nested::{NestedEnd, NestedKind};
 use blaze_id::{ContentId, CrateItemKey};
+use blaze_int::idx;
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{Edition, ItemKind, Range};
 use blaze_typeck::ItemKey;
@@ -338,7 +339,7 @@ pub(super) fn written_range(body: &str, chain: ContentId, edition: Edition, allo
         }
     }
     let range = current.ok_or(PositionGap::NoItem)?;
-    for (idx, copy) in copies.iter().copied().enumerate() {
+    for (at, copy) in copies.iter().copied().enumerate() {
         let end = copy.to.checked_add(copy.len).ok_or(PositionGap::PastText)?;
         if !(copy.to <= range.start && range.start < end) {
             continue;
@@ -349,11 +350,11 @@ pub(super) fn written_range(body: &str, chain: ContentId, edition: Edition, allo
         // `\n`: the statement's attributes, then the call itself (plus optional synthetic `;`).
         // Rust places a function-like call at the call's own path (past outer attributes), so
         // return the call copy's written range in `body`.
-        if let Some(next) = copies.get(idx + 1).copied()
-            && rendered.get(end as usize..next.to as usize) == Some("\n")
+        if let Some(next) = copies.get(at + 1).copied()
+            && rendered.get(idx(end)..idx(next.to)) == Some("\n")
         {
             let next_end = next.to.checked_add(next.len).ok_or(PositionGap::PastText)?;
-            let tail_ok = range.end <= next_end || rendered.get(next_end as usize..range.end as usize) == Some(";");
+            let tail_ok = range.end <= next_end || rendered.get(idx(next_end)..idx(range.end)) == Some(";");
             if range.end > next.to && tail_ok {
                 let last = next_end.min(range.end);
                 let start = next.from;
