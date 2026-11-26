@@ -2660,7 +2660,7 @@ fn open_stretch_records<'n>(
     let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.into_bump_slice();
     let texts: &'n crate::job_texts::JobTexts<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
         crate::job_texts::JobTexts {
-            caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
+            caller_reads: RefCell::new(blaze_own::Vec::new_in(Global)),
             cx,
             root,
             frame,
@@ -7187,7 +7187,7 @@ fn run_stretch<'a, 'f, R: ?Sized + CellDigests>(
         };
         {
             let reads = opened.sources.0.caller_reads.borrow();
-            result.done.reads.extend_from_slice(&reads[caller_at..]);
+            result.done.reads.extend(reads.iter().skip(caller_at).copied());
             result.done.reads.sort_unstable_by_key(|read| read.0);
             result.done.reads.dedup_by_key(|read| read.0);
         }
