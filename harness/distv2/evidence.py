@@ -245,6 +245,16 @@ def cached(rows: list[dict]) -> None:
         require(row["grants"] == 0 and row["stored_for_work"] == 0 and not compiled(row), f"{row['unit']}: cold build did work")
 
 
+def no_local_emission(phase: str, output: str) -> None:
+    """The worker reports do not cover emission in the final artifact assembly walk."""
+    prefix = "export stats: "
+    rows = [line.removeprefix(prefix).split() for line in output.splitlines() if line.startswith(prefix)]
+    require(len(rows) == 1, f"{phase} export did not report exactly one final stats line")
+    for name in ("compiled", "unkeyed", "lto"):
+        values = [field.removeprefix(name + "=") for field in rows[0] if field.startswith(name + "=")]
+        require(len(values) == 1 and values[0] == "0", f"{phase} export requires {name}=0 in final stats, saw {values}")
+
+
 def held_result(gate: Path, events: list[dict], pid: int) -> dict | None:
     """Bind a product-written capture to its issued grant; readiness alone is insufficient.
 

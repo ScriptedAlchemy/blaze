@@ -151,25 +151,27 @@ class ResultGateOracles(unittest.TestCase):
             with self.assertRaises(e.Failed):
                 e.gate_answer(gate, grant(), refused=True)
 
-    def test_gate_configuration_is_daemon_only_and_cleanup_releases_before_resume(self):
+    def test_gate_is_passed_to_its_export_process_and_cleanup_releases_before_resume(self):
         with tempfile.TemporaryDirectory() as directory:
-            run = object.__new__(h.Run)
-            run.root, run.project = Path(directory), Path(directory)
-            (run.root / "logs").mkdir()
-            run.given = h.Input("/unused", "/unused", "/unused", directory)
-            run.daemons, run.result_gates = {}, []
-            run.socket, run.port = run.root / "coordinator.sock", 12345
-            run.until = unittest.mock.Mock()
+            with patch.object(h, "free_port", return_value=12345), patch.dict(os.environ, {"HOME": directory}):
+                run = h.Run(h.Input("/unused", "/unused", "/unused", directory))
+            run.project = run.root / "project"
+            run.socket = run.root / "coordinator.sock"
             child = unittest.mock.Mock(pid=123)
-            child.poll.return_value = None
             gate = run.root / "gate"
             with patch.object(h.subprocess, "Popen", return_value=child) as start:
-                run.daemon("a", result_gate=gate)
+                process, _ = run.build("a", wait=False, result_gate=gate)
+            self.assertIs(process, child)
+            self.assertEqual(start.call_args.args[0][:2], ["/unused", "export"])
+            self.assertTrue(start.call_args.kwargs["start_new_session"])
             self.assertEqual(start.call_args.kwargs["env"]["BLAZE_DIST_TEST_RESULT_GATE"], str(gate.resolve()))
             self.assertNotIn("BLAZE_DIST_TEST_RESULT_GATE", run.env("a", True))
-            with self.assertRaises(e.Failed):
-                run.daemon("a", result_gate=run.root / "another")
-            run.clients, run.services, run.suspended = [], [], {123}
+            with patch.object(h.evidence, "held_result", return_value={"pid": 123}) as held, \
+                 patch.object(h.evidence, "accepted", return_value=False), \
+                 patch.object(run, "events", return_value=[]):
+                self.assertEqual(run.held_result("a", child, gate, 0, suspend=False), {"pid": 123})
+            held.assert_called_once_with(gate, [], child.pid)
+            run.suspended.add(child.pid)
             def resumed(pid, signal):
                 self.assertTrue((gate / "release").is_file(), "cleanup resumed before releasing the gate")
             with patch.object(h.os, "kill", side_effect=resumed), patch.object(h.Run, "terminate"):
@@ -179,9 +181,9 @@ class ResultGateOracles(unittest.TestCase):
     def test_a_failed_release_write_still_resumes_and_terminates_owned_children(self):
         run = object.__new__(h.Run)
         run.result_gates, run.suspended = [Path("/unused/gate")], {123}
-        run.clients, run.services = [], []
         child = unittest.mock.Mock(pid=123)
-        run.daemons, run.socket = {"a": child}, Path("/unused/socket")
+        run.clients, run.services = [(child, 0, "/unused/log")], []
+        run.socket = Path("/unused/socket")
         with patch.object(Path, "touch", side_effect=OSError("no space")), patch.object(Path, "unlink"), patch.object(h.os, "kill") as resume, patch.object(h.Run, "terminate") as terminate:
             with self.assertRaises(e.Failed):
                 run.stop()
@@ -190,6 +192,16 @@ class ResultGateOracles(unittest.TestCase):
 
 
 class Oracles(unittest.TestCase):
+    def test_final_export_cannot_hide_emission_outside_the_worker_reports(self):
+        clean = "export stats: compiled=0 cached=20 unkeyed=0 lto=0 inlined=0"
+        e.no_local_emission("cold", clean)
+        for name in ("compiled", "unkeyed", "lto"):
+            with self.subTest(name=name), self.assertRaisesRegex(e.Failed, f"requires {name}=0"):
+                e.no_local_emission("cold", clean.replace(f"{name}=0", f"{name}=1"))
+        for invalid in ("", clean + "\n" + clean, clean + " lto=0"):
+            with self.assertRaises(e.Failed):
+                e.no_local_emission("cold", invalid)
+
     def test_duplicate_tail_and_cross_daemon_compiles_are_caught(self):
         e.no_duplicate_compile([row(), row(work_compiled_keys=[OTHER])])
         with self.assertRaises(e.Failed):
@@ -415,12 +427,12 @@ class Oracles(unittest.TestCase):
             with patch.dict(os.environ, {"BLAZE_CORES": "24", "BLAZE_DAEMON_MEMORY_GB": "48", "BLAZE_DIST_LOCAL": "fallback"}):
                 env = run.env("a", True)
                 self.assertEqual(env["BLAZE_CORES"], "24")
-                self.assertEqual(env["BLAZE_DAEMON_MEMORY_GB"], "48")
+                self.assertNotIn("BLAZE_DAEMON_MEMORY_GB", env)
                 self.assertNotIn("BLAZE_DIST_LOCAL", env)
                 run.given = h.Input(**base, cores=12, daemon_memory_gb=32, env={"BLAZE_CORES": "10"})
                 env = run.env("b", True)
                 self.assertEqual(env["BLAZE_CORES"], "12")
-                self.assertEqual(env["BLAZE_DAEMON_MEMORY_GB"], "32")
+                self.assertNotIn("BLAZE_DAEMON_MEMORY_GB", env)
             with self.assertRaises(TypeError):
                 h.load(json.dumps({**base, "unrecognized": True}))
             with self.assertRaises(e.Failed):

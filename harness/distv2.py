@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""distv2.py: a real V2 build of a workspace across two real daemons, and its cache.
+"""distv2.py: export a workspace across two real worker processes and prove cache reuse.
 
 Input, one JSON value (`python3 harness/distv2.py '{...}'`):
     blaze        the blaze binary under test
@@ -14,29 +14,27 @@ Input, one JSON value (`python3 harness/distv2.py '{...}'`):
     faults       (optional) run the fault cases; default true
     release_fold (optional) require two real holders for both LLVM and folded work; default false
     profile      (optional) the directory under the target directory programs are in; default "debug"
-    stall_bound  (optional) seconds a daemon's loop may make no progress (`blaze serve --stall-bound`):
-                 an unoptimized blaze under test needs more than the default
     timeout      (optional) bound in seconds for each build/fault stage; default 3600
-    command_timeout (optional) seconds for status, stop and running the program; default 60
+    command_timeout (optional) seconds for probes, stop and running the program; default 60
     env          (optional) explicit toolchain/runtime environment for every child
     module_builder (optional) explicit D52 bootstrap proc_macro_modules executable for fixture modules;
                  runs sandboxed before export, never invoked by blaze
-    cores, daemon_memory_gb (optional) per-daemon resource hints; otherwise preserve the caller's
-                 explicit BLAZE_CORES / BLAZE_DAEMON_MEMORY_GB; no harness resource cap
+    cores        (optional) per-process core budget; otherwise preserve the caller's BLAZE_CORES
+    stall_bound, daemon_memory_gb (optional) legacy inputs retained in provenance only
 
 Checks, each on what the build itself reports (BLAZE_DIST_REPORT) and on running the program:
-    solo         one daemon, no coordinator: the program the others are held to
-    two workers  two daemons build at once: every unit done once by agreement, both compile, both
+    solo         one export without a coordinator: the program the others are held to
+    two workers  two processes export at once: every unit done once by agreement, both compile, both
                  programs behave as solo's; granted templates are not recompiled in the tail
-                 or by another daemon, and raw emitted keys are all published
-    cold cache   a third daemon with an empty store takes published units and compiles none
+                 or by another worker, and raw emitted keys are all published
+    cold cache   a third process with an empty store takes published units and compiles none
     warm         a build with nothing changed reports no execution
     edit         one edited function: only what it reaches is worked again
     other PR     another checkout, in a pull request's namespace, with one crate edited: the
                  units it shares with what was published come from the cache, and the edited
                  ones compile; a newer revision of that pull request supersedes an older one
-    worker lost  a daemon killed in the middle: the other finishes alone, same program
-    fenced       a daemon stopped past its lease and resumed: its work is taken back, it cannot
+    worker lost  a worker killed in the middle: the other finishes alone, same program
+    fenced       a worker stopped past its lease and resumed: its work is taken back, it cannot
                  commit after that, and both end with the program of a build alone
     no carrier   with no coordinator the build stops naming it; `fallback` compiles here
     bad cache    a committed pack damaged: both `never` and `fallback` refuse it, without recompilation
@@ -156,13 +154,7 @@ def free_port() -> int:
 
 
 def host_triple(blaze: str, env: dict, timeout: int, evidence_dir: Path) -> str:
-    """Probe the selected CLI's retained worker protocol before giving it acceptance credit.
-
-    The current source CLI has `run`, `check` and `export`, but has not yet connected those
-    commands to the retained coordinator/cache protocol. A successful version or hello is
-    not evidence of that connection. Keep the real protocol oracle below, and retain the
-    exact capability reply when this bridge is absent.
-    """
+    """Record the selected compiler's target before starting the coordinator."""
     argv = [blaze, "toolchain", "--json"]
     out = subprocess.run(argv, env=env, capture_output=True, text=True,
                          check=False, timeout=timeout, stdin=subprocess.DEVNULL)
@@ -176,10 +168,7 @@ def host_triple(blaze: str, env: dict, timeout: int, evidence_dir: Path) -> str:
         host = None
     if out.returncode != 0 or not isinstance(host, str) or not host or any(c.isspace() for c in host):
         raise Failed(
-            "source CLI lacks the distributed worker protocol bridge: `blaze toolchain --json` "
-            "must return a host before the serve/build/status protocol can run. The current "
-            "run/check/export compiler must connect to blaze-dist-local and blaze-serve; "
-            "no two-worker, cross-PR, fencing, recovery or final-artifact acceptance was run. "
+            "`blaze toolchain --json` must return a host before distributed exports can run. "
             f"Probe exit {out.returncode}; see {evidence_dir / 'worker-protocol-probe.json'}")
     return host
 
@@ -209,10 +198,8 @@ class Run:
         (self.root / "logs").mkdir(parents=True, exist_ok=True)
         self.socket = Path("/tmp") / f"blzd-{os.getpid()}.sock"
         self.port = free_port()
-        self.daemons: dict[str, subprocess.Popen] = {}
         self.services: list[subprocess.Popen] = []
         self.clients: list[tuple[subprocess.Popen, float, str]] = []
-        self.client_homes: dict[int, str] = {}
         self.prepared_modules: set[str] = set()
         self.builder_hash = file_hash(Path(given.module_builder)) if given.module_builder else None
         self.suspended: set[int] = set()
@@ -248,8 +235,7 @@ class Run:
         record = {"input": dataclasses.asdict(self.given), "commit": commit,
                   "tree": tree, "patch_sha256": hashlib.sha256(diff).hexdigest(),
                   "binaries": identities, "fixture_sha256": fixture.hexdigest(),
-                  "resources": {k: v for k, v in self.env("solo", False).items()
-                                if k in ("BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB")}}
+                  "resources": {"BLAZE_CORES": self.env("solo", False).get("BLAZE_CORES")}}
         (self.root / "provenance.json").write_text(json.dumps(record, indent=2) + "\n")
         self.identities = identities
 
@@ -273,10 +259,7 @@ class Run:
     def wait(self, process: subprocess.Popen) -> int:
         _, deadline, log = next(it for it in self.clients if it[0] is process)
         try:
-            code = process.wait(timeout=max(0, deadline - time.monotonic()))
-            # Keep stores and targets, but release idle front ends before the next stage.
-            self.terminate(self.daemons[self.client_homes[process.pid]], timeout=self.given.command_timeout)
-            return code
+            return process.wait(timeout=max(0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired as why:
             raise Failed(f"build pid {process.pid} exceeded {self.given.timeout}s; log {log}") from why
 
@@ -310,13 +293,12 @@ class Run:
     def env(self, home: str, dist: bool, **extra) -> dict:
         env = {k: v for k, v in os.environ.items() if not k.startswith(("CARGO", "RUST", "BLAZE_"))}
         env.update(self.given.env)
-        for name, value in (("BLAZE_CORES", self.given.cores), ("BLAZE_DAEMON_MEMORY_GB", self.given.daemon_memory_gb)):
-            if value is not None:
-                env[name] = str(value)
-            elif name not in env and name in os.environ:
-                env[name] = os.environ[name]
+        if self.given.cores is not None:
+            env["BLAZE_CORES"] = str(self.given.cores)
+        elif "BLAZE_CORES" not in env and "BLAZE_CORES" in os.environ:
+            env["BLAZE_CORES"] = os.environ["BLAZE_CORES"]
         home_dir = self._prepare_home(home)
-        env.update(HOME=str(home_dir), BLAZE_HOME=str(home_dir), TMPDIR=str(self.root / "tmp"), RUST_BACKTRACE="0", BLAZE_DIST_EVENTS=str(self.root / "logs" / "events.jsonl"))
+        env.update(HOME=str(home_dir), TMPDIR=str(self.root / "tmp"), RUST_BACKTRACE="0", BLAZE_DIST_EVENTS=str(self.root / "logs" / "events.jsonl"))
         (self.root / "tmp").mkdir(exist_ok=True)
         if dist:
             env.update(
@@ -372,28 +354,6 @@ class Run:
         self.coordinator = coordinator
         self.services.append(coordinator)
         self.until("coordinator binds its socket", self.socket.exists, [coordinator], timeout=30)
-
-    def daemon(self, home: str, result_gate: Path | None = None, project: Path | None = None) -> None:
-        """Own every daemon explicitly, including ones whose startup fails."""
-        if home in self.daemons and self.daemons[home].poll() is None:
-            if result_gate is not None:
-                raise Failed(f"{home}: cannot install a result gate on an already running daemon")
-            return
-        gate_env = {}
-        if result_gate is not None:
-            result_gate.mkdir(parents=True, exist_ok=False)
-            self.result_gates.append(result_gate)
-            gate_env["BLAZE_DIST_TEST_RESULT_GATE"] = str(result_gate.resolve())
-        # Status is only for this run's private home, never a shared daemon.
-        log = open(self.root / "logs" / f"{home}.daemon.log", "a")
-        args = [self.given.blaze, "daemon"]
-        if self.given.stall_bound is not None:
-            args += ["--stall-bound", str(self.given.stall_bound)]
-        with log:
-            daemon = subprocess.Popen(args, cwd=project or self.project, env=self.env(home, False, **gate_env),
-                                      stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        self.daemons[home] = daemon
-        self.until(f"{home} daemon becomes ready", lambda: daemon_pid(self, home, project) == daemon.pid, [daemon], timeout=300)
 
     def prepare_modules(self, home: str, project: Path) -> None:
         """Explicit D52 fixture setup, keyed per package revision, outside the compiler."""
@@ -459,31 +419,34 @@ class Run:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(path, target)
 
-    def build(self, home: str, dist: bool = True, wait: bool = True, project: Path | None = None, **extra):
+    def build(self, home: str, dist: bool = True, wait: bool = True, project: Path | None = None,
+              *, result_gate: Path | None = None, **extra):
         self.prepare_modules(home, project or self.project)
-        self.daemon(home, project=project)
+        if result_gate is not None:
+            check(dist, "a result gate belongs to a distributed export")
+            result_gate.mkdir(parents=True, exist_ok=False)
+            self.result_gates.append(result_gate)
+            extra["BLAZE_DIST_TEST_RESULT_GATE"] = str(result_gate.resolve())
         self.sequence += 1
-        log = open(self.root / "logs" / f"{home}.{self.sequence}.log", "w")
         out = self.program(home, project)
         out.parent.mkdir(parents=True, exist_ok=True)
-        process = subprocess.Popen(
-            [self.given.blaze, "export", "-p", self.given.program, "-o", str(out), *self.given.args],
-            cwd=project or self.project,
-            env={**self.env(home, dist, **extra), "CARGO_TARGET_DIR": str(self.target(home, project))},
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-        log.close()
+        with (self.root / "logs" / f"{home}.{self.sequence}.log").open("x") as log:
+            process = subprocess.Popen(
+                [self.given.blaze, "export", "-p", self.given.program, "-o", str(out), "--stats", *self.given.args],
+                cwd=project or self.project,
+                env={**self.env(home, dist, **extra), "CARGO_TARGET_DIR": str(self.target(home, project))},
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
         self.clients.append((process, time.monotonic() + self.given.timeout, log.name))
-        self.client_homes[process.pid] = home
         if not wait:
             return process, log.name
         code = self.wait(process)
         return code, Path(log.name).read_text()
 
     def target(self, home: str, project: Path | None = None) -> Path:
-        """Each daemon's target directory of a checkout, as a person on that machine would have."""
+        """The per-worker output directory for this checkout."""
         return self.root / "targets" / home / (project or self.project).name
 
     def program(self, home: str, project: Path | None = None) -> Path:
@@ -512,13 +475,13 @@ class Run:
                 (gate / "release").touch()
             except OSError as why:
                 failures.append(f"result gate {gate}: {why}")
-        # A failure while a daemon is SIGSTOPped must not strand it or its client.
+        # A failure while a worker is SIGSTOPped must not strand it.
         for pid in self.suspended:
             try:
                 os.kill(pid, signal.SIGCONT)
             except ProcessLookupError:
                 pass
-        for process in [*(p for p, _, _ in self.clients), *self.daemons.values(), *self.services]:
+        for process in [*(p for p, _, _ in self.clients), *self.services]:
             try:
                 self.terminate(process)
             except (OSError, subprocess.TimeoutExpired) as why:
@@ -528,7 +491,7 @@ class Run:
             raise Failed("owned-process cleanup failed: " + "; ".join(failures))
 
     def held_result(self, home: str, process: subprocess.Popen, gate: Path, after: int, *, suspend: bool) -> dict:
-        pid = self.daemons[home].pid
+        pid = process.pid
         grant = self.until(f"{home} captures an actual uncommitted Result carrier",
                            lambda: evidence.held_result(gate, self.events()[after:], pid), [process])
         if suspend:
@@ -540,7 +503,7 @@ class Run:
         return grant
 
     def suspend_grant(self, home: str, process: subprocess.Popen, after: int) -> dict:
-        pid = self.daemons[home].pid
+        pid = process.pid
         def suspend():
             events = self.events()[after:]
             for grant in reversed(events):
@@ -561,16 +524,6 @@ class Run:
                 return grant
             return None
         return self.until(f"{home} holds uncommitted compile work (requires BLAZE_DIST_EVENTS)", suspend, [process])
-
-
-def daemon_pid(run: Run, home: str, project: Path | None = None) -> int | None:
-    out = subprocess.run(
-        [run.given.blaze, "daemon", "--status"], cwd=project or run.project, env=run.env(home, False), capture_output=True, text=True, timeout=run.given.command_timeout
-    )
-    try:
-        return (json.loads(out.stdout).get("daemon") or {}).get("pid")
-    except json.JSONDecodeError:
-        return None
 
 
 def file_hash(path: Path) -> str:
@@ -616,9 +569,8 @@ def faults(run: Run, edited: Path) -> None:
     edit(edited, 'format!("9:{sum}', 'format!("9 gated valid:{sum}')
     wanted = control(run)
     valid_gate = run.root / "gates" / "valid-result"
-    run.daemon("a", result_gate=valid_gate)
     mark = len(run.events())
-    valid, valid_log = run.build("a", wait=False)
+    valid, valid_log = run.build("a", wait=False, result_gate=valid_gate)
     grant = run.held_result("a", valid, valid_gate, mark, suspend=False)
     (valid_gate / "release").touch()
     run.until("the released valid Result is accepted by the real coordinator and Client",
@@ -634,8 +586,6 @@ def faults(run: Run, edited: Path) -> None:
     # that the victim had outstanding work. Give the survivor the exact same edited input.
     edit(edited, 'format!("7:{sum}', 'format!("7 lost:{sum}')
     wanted = control(run)
-    run.daemon("a")
-    run.daemon("b")
     mark = len(run.events())
     lost, lost_log = run.build("a", wait=False)
     survivor, survivor_log = run.build("b", wait=False)
@@ -643,7 +593,7 @@ def faults(run: Run, edited: Path) -> None:
     os.kill(grant["pid"], signal.SIGKILL)
     killed_at = len(run.events()) - mark
     run.suspended.discard(grant["pid"])
-    check(run.wait(lost) != 0, f"the client of killed daemon {grant['pid']} fails (log {lost_log})")
+    check(run.wait(lost) == -signal.SIGKILL, f"worker {grant['pid']} exits from SIGKILL (log {lost_log})")
     run.until("survivor commits every name held by the killed worker",
               lambda: evidence.recovered(run.events()[mark:], grant, accepted_after=killed_at), [survivor])
     code = run.wait(survivor)
@@ -660,10 +610,8 @@ def faults(run: Run, edited: Path) -> None:
     edit(edited, 'format!("8:{sum}', 'format!("8 fence:{sum}')
     wanted = control(run)
     stale_gate = run.root / "gates" / "stale-result"
-    run.daemon("a", result_gate=stale_gate)
-    run.daemon("b")
     mark = len(run.events())
-    stalled, stalled_log = run.build("a", wait=False)
+    stalled, stalled_log = run.build("a", wait=False, result_gate=stale_gate)
     # The victim reaches its real result before the survivor submits, so the selected
     # holder is this execution's lead. Its silence advances the attempt even if the
     # survivor publishes Done before SIGCONT and the stale submission.
@@ -756,8 +704,8 @@ def main(given: Input) -> None:
     try:
         run.provenance()
         resource_env = run.env("solo", False)
-        check(all(resource_env.get(name, "").strip() for name in ("BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB")),
-              "root supplied explicit per-daemon core and memory hints before starting children")
+        check(bool(resource_env.get("BLAZE_CORES", "").strip()),
+              "root supplied an explicit per-process core budget before starting children")
         run.host = host_triple(given.blaze, resource_env, given.command_timeout, run.root / "logs")
         run.start_services()
         code, text = run.build("solo", dist=False)
@@ -770,8 +718,6 @@ def main(given: Input) -> None:
         check(solo[0].startswith("40 functions, ") and solo[0].endswith(expected),
               "solo executes 40 functions, the expected unwind/drop, script, included file and proc macro")
 
-        run.daemon("a")
-        run.daemon("b")
         a, a_log = run.build("a", wait=False)
         b, b_log = run.build("b", wait=False)
         code_a, code_b = run.wait(a), run.wait(b)
@@ -797,22 +743,23 @@ def main(given: Input) -> None:
             and row["compiled_for_work"] > 0 and by_a[row["unit_digest"]]["compiled_for_work"] > 0
         ]
         print(f"     one execution of both: {sorted(row['unit'] for row in shared)}", flush=True)
-        check(bool(shared), "both daemons actually compile the same unit in the same execution and attempt")
+        check(bool(shared), "both workers actually compile the same unit in the same execution and attempt")
         evidence.publication(run.root / "blobs", rows_a + rows_b, run.events())
         if given.release_fold:
             evidence.release_fold(rows_a + rows_b, run.events())
             check(True, "two holders actually emitted LLVM work and two holders emitted folded bundles in shared executions")
-        check(True, "no granted template was recompiled in the tail or by another daemon; every raw emitted key was committed in the full manifest")
+        check(True, "no granted template was recompiled in the tail or by another worker; every raw emitted key was committed in the full manifest")
         for name, behaviour in (("a", run.behaviour("a")), ("b", run.behaviour("b"))):
             check(behaviour[0] == solo[0], f"worker {name}'s program behaves as solo's")
             check(behaviour[1] == solo[1], f"worker {name}'s program is solo's, byte for byte")
 
         code, text = run.build("cold")
-        check(code == 0, f"a third daemon builds from the cache: {text[-400:] if code else ''}")
+        check(code == 0, f"a fresh process builds from the cache: {text[-400:] if code else ''}")
+        cold_export = text
         rows = run.report("cold")
         published = [row for row in rows if row["source"] == "published"]
         print(f"     cold: {len(published)}/{len(rows)} published; compiled {sums(rows, 'tail_compiled')} of {sums(rows, 'instances')}", flush=True)
-        check(len(published) == len(rows) and rows, f"every unit of the cold daemon was published: {len(published)}/{len(rows)}")
+        check(len(published) == len(rows) and rows, f"every unit of the cold export was published: {len(published)}/{len(rows)}")
         evidence.cached(rows)
         evidence.publication(run.root / "blobs", rows, run.events())
         check(True, "cold units schedule no execution or grants and compile no work or tail keys")
@@ -820,7 +767,7 @@ def main(given: Input) -> None:
         check(behaviour[0] == solo[0] and behaviour[1] == solo[1], "its program is solo's, byte for byte")
 
         before = len(run.report("cold"))
-        code, _ = run.build("cold")
+        code, warm_export = run.build("cold")
         check(code == 0 and len(run.report("cold")) == before, "a build with nothing changed runs no unit")
 
         # One function edited: what it reaches is worked again, by the same keys.
@@ -898,6 +845,8 @@ def main(given: Input) -> None:
 
         if given.faults:
             faults(run, edited)
+        for phase, output in (("cold", cold_export), ("warm", warm_export)):
+            evidence.no_local_emission(phase, output)
         for name, identity in run.identities.items():
             check(file_hash(Path(identity["path"])) == identity["sha256"], f"{name} binary did not change during acceptance")
         provenance = json.loads((run.root / "provenance.json").read_text())

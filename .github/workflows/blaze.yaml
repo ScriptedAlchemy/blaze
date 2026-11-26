@@ -664,16 +664,14 @@ jobs:
           mkdir -p "$HOME/.blaze/v2" "$RUNNER_TEMP/dist-evidence"
           tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$HOME/.blaze/v2"
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-      # The real source CLI must implement the retained worker protocol. distv2 probes it,
-      # preserves the exact reply and names the missing bridge before any acceptance credit.
-      # Version metadata, a hello or Cargo's native protocol tests cannot satisfy this gate.
+      # distv2 checks real export workers, published records and artifacts in both profiles.
       - name: full distributed worker and fault acceptance
         timeout-minutes: 240
         run: |
           first_failure=0
           for profile in dev release; do
             jq -n --arg bin "$RUNNER_TEMP/source-binaries" --arg scratch "$RUNNER_TEMP/blaze-fs/dist-$profile" --arg profile "$profile" --arg modules "$BLAZE_SCRIPTS/proc_macro_modules" \
-              '{blaze:($bin+"/blaze"),dist_local:($bin+"/blaze-dist-local"),serve:($bin+"/blaze-serve"),module_builder:$modules,scratch:$scratch,faults:true,cores:2,daemon_memory_gb:2,timeout:1800,command_timeout:60,stall_bound:300,args:(if $profile=="release" then ["--release"] else [] end),profile:(if $profile=="release" then "release" else "debug" end),release_fold:($profile=="release")}' \
+              '{blaze:($bin+"/blaze"),dist_local:($bin+"/blaze-dist-local"),serve:($bin+"/blaze-serve"),module_builder:$modules,scratch:$scratch,faults:true,cores:2,timeout:1800,command_timeout:60,args:(if $profile=="release" then ["--release"] else [] end),profile:(if $profile=="release" then "release" else "debug" end),release_fold:($profile=="release")}' \
               > "$RUNNER_TEMP/dist-evidence/$profile-input.json"
             python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
             status=0

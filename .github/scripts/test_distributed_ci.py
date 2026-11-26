@@ -488,7 +488,7 @@ class WorkerBridgeTests(unittest.TestCase):
                     if works:
                         self.assertEqual(worker.host_triple("/source/blaze",{},5,out),"aarch64-unknown-linux-gnu")
                     else:
-                        with self.assertRaisesRegex(worker.Failed,"distributed worker protocol bridge"):
+                        with self.assertRaisesRegex(worker.Failed, "must return a host before distributed exports"):
                             worker.host_triple("/source/blaze",{},5,out)
                 self.assertEqual(invoke.call_args.args[0],["/source/blaze","toolchain","--json"])
                 self.assertEqual(json.loads((out/"worker-protocol-probe.json").read_text())["stdout"],stdout)

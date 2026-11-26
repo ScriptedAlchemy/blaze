@@ -4,11 +4,11 @@ One typed JSON object (inline, a file, or `-`):
     blaze                  the source-built client, beside blaze-launcher, blaze-fact-shim,
                            blaze-dist-local, blaze-serve and their services=true seal
     out                    a new ledger report path on a reflink filesystem
-    cores, daemon_memory_gb required positive integer per-daemon resource hints; the D11
-                           check supplies 2 cores and 6 GiB, as the existing CI lane does
+    cores                  required positive per-process core budget
+    daemon_memory_gb       legacy input recorded in provenance
     timeout                seconds per build/fault stage (3600)
-    command_timeout        seconds for status, stop and running an artifact (60)
-    stall_bound            optional daemon loop-stall bound, in seconds
+    command_timeout        seconds for probes, stop and running an artifact (60)
+    stall_bound            optional legacy input recorded in provenance
 
 The existing build-identity verifier binds all five programs to the current clean source.
 This adapter never builds or seals them. Evidence stays beside out in <out>.distv2, with a
@@ -20,8 +20,6 @@ every cold-cache, publication and fault oracle; release also requires real LLVM 
 work from two holders. There is no profile filter, fault opt-out, or second receipt policy.
 These checks cover native distributed-cache reuse. D11's signed global-cache integration
 and off-critical-path latency/overlap evidence remain missing in the objective ledger.
-The current source CLI must also supply the distributed compiler bridge: the retained
-acceptance harness refuses its missing capabilities before starting either profile.
 """
 
 import contextlib
@@ -112,7 +110,7 @@ def profile_input(given: Input, blaze: Path, evidence: Path, name: str) -> Any:
         "command_timeout": given.command_timeout,
         "stall_bound": given.stall_bound,
         # Fixture locks are disposable. Shared std outputs stay on the same new volume;
-        # every daemon still has distv2's separate BLAZE_HOME, store and target directory.
+        # every worker still has distv2's separate HOME, store and target directory.
         "env": {"BLAZE_LOCK": "write", "XDG_CACHE_HOME": str(scratch / "machine-cache")},
     }))
 

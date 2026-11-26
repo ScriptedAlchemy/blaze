@@ -130,7 +130,8 @@ class DistributedLedgerTests(unittest.TestCase):
             run.root.mkdir()
             run.socket, run.port = self.root / "unused.sock", 1
             child: dict[str, str] = run.env("a", True)
-        self.assertEqual((child["BLAZE_CORES"], child["BLAZE_DAEMON_MEMORY_GB"]), ("2", "6"))
+            self.assertEqual(child["BLAZE_CORES"], "2")
+            self.assertNotIn("BLAZE_DAEMON_MEMORY_GB", child)
 
     def test_each_sealed_program_and_the_services_manifest_are_required_before_acceptance(self) -> None:
         for name in ("blaze", "blaze-launcher", "blaze-fact-shim", "blaze-dist-local", "blaze-serve"):
