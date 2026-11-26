@@ -252,7 +252,7 @@ pub(crate) fn names_records_envs<'n>(
     let callers: &'n [(usize, usize, blaze_expand::Edition)] = callers.into_bump_slice();
     let texts: &'n JobTexts<'n> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
         JobTexts {
-            caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
+            caller_reads: RefCell::new(blaze_own::Vec::new_in(frame)),
             cx,
             root,
             frame,

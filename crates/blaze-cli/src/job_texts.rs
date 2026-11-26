@@ -163,7 +163,7 @@ impl<'a: 'n, 'f: 'a, 'n> From<(&'a SyncLazyTrees<'f>, &'a bstd::fs::Fs)> for Pac
 }
 
 pub(crate) struct JobTexts<'n> {
-    pub(crate) caller_reads: RefCell<std::vec::Vec<(blaze_engine::CellId, blaze_ids::ContentId), Global>>,
+    pub(crate) caller_reads: RefCell<blaze_own::Vec<(blaze_engine::CellId, blaze_ids::ContentId), &'n Frame>>,
     pub(crate) cx: &'n Cx,
     pub(crate) root: &'n Dir<ReadWrite>,
     pub(crate) frame: &'n Frame,
@@ -634,14 +634,14 @@ mod tests {
             assert_eq!(job.read_env(0, "APP_USED").unwrap(), Some("read"));
             assert_eq!(job.read_env(0, "APP_MISSING").unwrap(), None);
             assert_eq!(job.read_env(0, "CARGO_PKG_NAME").unwrap(), Some("app"));
-            assert_eq!(&*job.caller_reads.borrow(), &[(used, ContentId([2; 32])), (missing, blaze_drive::key::ABSENT)]);
+            assert_eq!(job.caller_reads.borrow().as_slice(), &[(used, ContentId([2; 32])), (missing, blaze_drive::key::ABSENT)]);
         }
     }
 
     /// A names job of the crate 0 (so its runner key is asked) with no files and `procs`.
     fn texts<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, procs: Procs<'n>) -> JobTexts<'n> {
         JobTexts {
-            caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
+            caller_reads: RefCell::new(blaze_own::Vec::new_in(cx.frame())),
             cx,
             root,
             frame: cx.frame(),

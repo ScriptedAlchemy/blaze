@@ -219,8 +219,8 @@ fn sdk_bytes(ran_as: RanAs, sdk: Option<blaze_apple_sdk::SdkId>) -> ([u8; 1 + bl
 /// run's subject and its reading crate's world key, named with the crates' `CrateScope` parts),
 /// for a command whose macOS SDK is `sdk` ([`sdk_identity`]): one a subject, sorted and without
 /// repeats (two crates of one subject read one run, and have one crate key: ruling D115 (3)).
-pub(crate) fn parts(keys: impl Iterator<Item = (ContentId, ContentId, RanAs)>, sdk: Option<blaze_apple_sdk::SdkId>) -> std::vec::Vec<(Name, ContentId), Global> {
-    let mut parts = std::vec::Vec::new_in(Global);
+pub(crate) fn parts<A: core::alloc::Allocator>(keys: impl Iterator<Item = (ContentId, ContentId, RanAs)>, sdk: Option<blaze_apple_sdk::SdkId>, alloc: A) -> blaze_own::Vec<(Name, ContentId), A> {
+    let mut parts = blaze_own::Vec::new_in(alloc);
     // Piece 2c (ruling D115 (5), (c)): no module listing in a run's source. Its module is a
     // read (script_modules.rs); its crate's world key holds the package's identity and its
     // dependencies' (which `links` inputs it has). Its placement is in it too (ruling D115
@@ -239,8 +239,8 @@ pub(crate) fn parts(keys: impl Iterator<Item = (ContentId, ContentId, RanAs)>, s
 }
 
 /// Plan script sources for this command, including the environment of member scripts.
-pub(crate) fn parts_for(names: &crate::names::Names<'_>, env: &FetchEnv<'_>) -> std::vec::Vec<(Name, ContentId), Global> {
-    let mut parts = parts(names.script_keys(), sdk_identity(env));
+pub(crate) fn parts_for<A: core::alloc::Allocator>(names: &crate::names::Names<'_>, env: &FetchEnv<'_>, alloc: A) -> blaze_own::Vec<(Name, ContentId), A> {
+    let mut parts = parts(names.script_keys(), sdk_identity(env), alloc);
     if env.caller_env.identity().is_some() {
         for (name, source) in &mut parts {
             if names.script_readers(*name).any(|at| names.list().member(at)) {

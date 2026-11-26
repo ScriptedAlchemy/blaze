@@ -862,7 +862,7 @@ impl<'f> ScriptsStage<'f> {
         // reads, from the crate list's runs table (names.rs `NamesWorld::script_runs` and its
         // `ListFacts` wrote it from the graph): the runs the world's crates read, never every
         // unit of the graph on both sides, and no graph decoded to plan them.
-        for (name, source) in crate::scripts::parts_for(names, env) {
+        for (name, source) in crate::scripts::parts_for(names, env, frame) {
             if let Some((allowed_scripts, _, _)) = &scoped_sets
                 && !allowed_scripts.contains(&name)
             {

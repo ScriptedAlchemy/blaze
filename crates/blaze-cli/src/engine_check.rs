@@ -1630,7 +1630,7 @@ fn preserve_standing_sibling_names<'a, 'f, 's, 'r>(
         crate_sources.insert(name, source);
     }
     let mut script_sources: SMap<'_, Name, blaze_ids::ContentId> = SMap::new_in(alloc);
-    for (name, source) in crate::scripts::parts_for(world, env) {
+    for (name, source) in crate::scripts::parts_for(world, env, alloc) {
         script_sources.insert(name, source);
     }
     let mut module_sources: SMap<'_, Name, blaze_ids::ContentId> = SMap::new_in(alloc);
