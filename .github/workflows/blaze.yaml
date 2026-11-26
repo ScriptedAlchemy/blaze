@@ -100,6 +100,14 @@ jobs:
           timeout -k 30 1200 cargo +"$tc" test --locked --release -p blaze-emit --features llvm --lib \
             release_record 2>&1 | tee "$evidence/llvm-records.log"
           grep -Fq 'release_record_stores_a_splat_to_every_lane ... ok' "$evidence/llvm-records.log"
+      - name: Free build space for the release-only fault run
+        if: ${{ !cancelled() && steps.binaries.outcome == 'success' && inputs.profile == 'release' }}
+        run: |
+          evidence="$RUNNER_TEMP/plan-evidence/disk.log"
+          timeout 10 df -h "$RUNNER_TEMP" "$RUNNER_TEMP/blaze-fs" | tee "$evidence"
+          timeout -k 15 170 cargo +"$(cat pins/toolchain)" clean --target-dir "$CARGO_TARGET_DIR" \
+            2>&1 | tee -a "$evidence"
+          timeout 10 df -h "$RUNNER_TEMP" "$RUNNER_TEMP/blaze-fs" | tee -a "$evidence"
       - name: Exercise the unchanged distributed fault harness
         if: ${{ !cancelled() && steps.binaries.outcome == 'success' }}
         env:
