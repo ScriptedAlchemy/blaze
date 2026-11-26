@@ -66,10 +66,12 @@ jobs:
           mkdir -p "$evidence"
           git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
           tc="$(cat pins/toolchain)"
-          timeout -k 30 1400 cargo +"$tc" check --locked --release -p blaze-cli --bin blaze \
-            2>&1 | tee "$evidence/check-default.log"
-          timeout -k 30 1400 cargo +"$tc" check --locked --release -p blaze-cli --bin blaze --features llvm \
-            2>&1 | tee "$evidence/check-llvm.log"
+          status=0
+          timeout -k 30 1400 cargo +"$tc" check --locked --release --keep-going -p blaze-cli --bin blaze \
+            2>&1 | tee "$evidence/check-default.log" || status=$?
+          timeout -k 30 1400 cargo +"$tc" check --locked --release --keep-going -p blaze-cli --bin blaze --features llvm \
+            2>&1 | tee "$evidence/check-llvm.log" || status=$?
+          exit "$status"
       - name: Build and seal the exact source binaries
         run: |
           evidence="$RUNNER_TEMP/plan-evidence"
