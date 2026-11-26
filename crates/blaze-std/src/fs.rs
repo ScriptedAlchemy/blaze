@@ -1505,9 +1505,9 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         let submit_one = |io: &Io, base: &DirName, opt_path: Option<&Path>| {
             let (dir_name, path_owned) = match opt_path {
                 Some(p) => (DirName::Named(self.beneath(p)), Some(p.clone())),
-                None => (base.clone(), None),
+                None => (base.share(), None),
             };
-            let asked = dir_name.clone();
+            let asked = dir_name.share();
             let tag = io.submit(|tag| Effect::Entries { dir: asked, tag });
             (tag, dir_name, path_owned)
         };
@@ -1644,7 +1644,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     /// Target bytes of the symbolic link at `path` (not followed) added to `into`; how many bytes.
     pub fn read_link(&self, cx: &Cx, path: &Path, into: &mut Bytes<'_>) -> Result<usize, FsError> {
         let name = self.beneath(path);
-        let file = name.clone();
+        let file = name.share();
         match call(&self.io, cx, FsOp::Read, &name, |tag| Effect::ReadLink { file, tag })? {
             Done::Read(bytes) => {
                 into.try_extend(&bytes)
