@@ -124,6 +124,7 @@ impl World for FmtWorld {
         if item == DISPLAY {
             return Ok(Some(blaze_typeck::TraitDef {
                 generics: 1,
+                lifetimes: None,
                 flags: blaze_typeck::TraitFlags(0),
                 lang: Some(LangItem::FmtDisplay),
                 supertraits: &[],

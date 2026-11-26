@@ -56,6 +56,9 @@ struct AdtRow {
 struct TraitRow {
     key: ItemKey,
     generics: u32,
+    /// How many lifetime parameters it declares: none unless [`Fx::trait_lifetimes`] says
+    /// otherwise (a fixture's trait is known whole).
+    lifetimes: Option<u32>,
     lang: Option<LangItem>,
     /// `auto trait`: implemented structurally where no impl could apply.
     auto: bool,
@@ -509,9 +512,18 @@ impl Fx {
             .collect();
         let assoc = assoc.iter().map(|&n| AssocTyDef { name: Name::of(n), item: ItemKey(crate::infer::assoc_def(key, Name::of(n))), default: None }).collect();
         let defaults = std::vec![None; generics.saturating_sub(1) as usize];
-        self.traits.push(TraitRow { key, generics, lang: None, auto: false, supers, assoc, dyn_members, defaults });
+        self.traits.push(TraitRow { key, generics, lifetimes: Some(0), lang: None, auto: false, supers, assoc, dyn_members, defaults });
         self.paths.push((std::vec![Name::of(name)], Def::Trait(key)));
         key
+    }
+
+    /// Sets how many lifetime parameters `trait_` declares (`Deserialize<'de>`: one), as a
+    /// head counts them; a fixture's trait declares none until this says otherwise, and `None`
+    /// is a world that did not read the count.
+    pub fn trait_lifetimes(&mut self, trait_: ItemKey, lifetimes: Option<u32>) {
+        if let Some(t) = self.traits.iter_mut().find(|t| t.key == trait_) {
+            t.lifetimes = lifetimes;
+        }
     }
 
     /// Sets `trait_`'s supertraits: for a trait whose supertrait names its own projection
@@ -1050,6 +1062,7 @@ impl World for Fx {
     fn trait_def(&self, _: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>> {
         Ok(self.trait_row(trait_).map(|t| TraitDef {
             generics: t.generics,
+            lifetimes: t.lifetimes,
             flags: TraitFlags(if t.auto { TraitFlags::AUTO } else { 0 }),
             lang: t.lang,
             supertraits: &t.supers,

@@ -1199,6 +1199,9 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         };
         Ok(Some(TraitDef {
             generics: t.generics,
+            // The trait's declared lifetimes, as its head counted them (heads.rs
+            // `Maps::trait_lifetimes`); a head that filed none: not known, never none.
+            lifetimes: self.store.maps.trait_lifetimes.get(&trait_).copied(),
             flags: t.flags,
             lang: self.index.lang_name_of(lib).and_then(trait_lang).or_else(|| {
                 if t.generics != 2 {

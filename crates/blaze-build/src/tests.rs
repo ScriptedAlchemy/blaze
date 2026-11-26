@@ -730,6 +730,7 @@ impl World for TestWorld {
             // `trait Index<Idx>`: `Self` and `Idx`.
             return Ok(Some(blaze_typeck::TraitDef {
                 generics: 2,
+                lifetimes: None,
                 flags: blaze_typeck::TraitFlags(0),
                 lang: Some(LangItem::Index),
                 supertraits: &[],
@@ -744,6 +745,7 @@ impl World for TestWorld {
             // supertrait, so it is not listed.
             return Ok(Some(blaze_typeck::TraitDef {
                 generics: 2,
+                lifetimes: None,
                 flags: blaze_typeck::TraitFlags(0),
                 lang: Some(LangItem::IndexMut),
                 supertraits: &[],
@@ -755,6 +757,7 @@ impl World for TestWorld {
         }
         Ok((item == DEREF && self.deref.is_some()).then(|| blaze_typeck::TraitDef {
             generics: 1,
+            lifetimes: None,
             flags: blaze_typeck::TraitFlags(0),
             lang: Some(LangItem::Deref),
             supertraits: &[],

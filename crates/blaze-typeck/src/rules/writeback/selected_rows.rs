@@ -112,6 +112,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         let inert = self.inert()?;
         let env = self.call_env(inert)?;
+        let mut lifetimes: HashMap<ItemKey, Option<u32>, Alloc<'a>> = HashMap::new_in(alloc);
         // In a world that stops at holes (`World::stops_at_holes`), a stop met here (each
         // `Err(Stop::Need)` arm below that would go on) ends the rows: nothing runs past a
         // missing fact, and the caller (writeback.rs) returns the run's need, as it does for any
@@ -139,7 +140,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.diags.truncate(n);
                 continue;
             }
-            if name.is_none() && !may_relate(ex.out.view(), &ps, alloc)? {
+            if name.is_none() && !may_relate(ex.out.view(), &ps, self.trait_lifetimes(trait_, &mut lifetimes)?, alloc)? {
                 continue;
             }
             let list = ex.out.intern_list(&ps)?;
@@ -152,7 +153,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             out.push(Projected { expr: e, at: 0, trait_, name, args: list, global_env: rows.env.global, selected });
         }
-        self.impl_where_rows(ex, &mut rows, inert, &mut seen, &mut out)?;
+        self.impl_where_rows(ex, &mut rows, inert, &mut seen, &mut lifetimes, &mut out)?;
         // Stable: each call's rows keep their lowering order, an impl's where-clause rows
         // (pushed last) after the call's own.
         out.sort_by_key(|r| (r.expr, r.name.is_none()));
@@ -178,6 +179,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         rows: &mut Rows<'_, 'a>,
         inert: Inert,
         seen: &mut HashMap<(ExprId, ItemKey, Option<Name>, List), (), Alloc<'a>>,
+        mut lifetimes: &mut HashMap<ItemKey, Option<u32>, Alloc<'a>>,
         out: &mut Vec<Projected, Alloc<'a>>,
     ) -> Result<(), CheckError> {
         let alloc = self.alloc;
@@ -291,7 +293,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                     ps.push(norm);
                 }
-                if cname.is_none() && !may_relate(ex.out.view(), &ps, alloc)? {
+                if cname.is_none() && !may_relate(ex.out.view(), &ps, self.trait_lifetimes(trait_, &mut lifetimes)?, alloc)? {
                     continue;
                 }
                 let list = ex.out.intern_list(&ps)?;
@@ -497,6 +499,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         rows.memo.insert(key, selected);
         Ok(selected)
+    }
+
+    /// How many lifetime parameters `trait_` declares (`None`: its definition was not read at
+    /// writeback, never a wait here: the row is then kept, which decides nothing it would
+    /// not), asked once per trait per writeback.
+    fn trait_lifetimes(&mut self, trait_: ItemKey, memo: &mut HashMap<ItemKey, Option<u32>, Alloc<'_>>) -> Result<Option<u32>, CheckError> {
+        if let Some(&n) = memo.get(&trait_) {
+            return Ok(n);
+        }
+        let n = match self.reads.trait_def(trait_) {
+            Ok(Some(def)) => def.lifetimes,
+            Ok(None) | Err(Stop::Need(_)) => None,
+            Err(Stop::Error(err)) => return Err(err),
+        };
+        memo.insert(trait_, n);
+        Ok(n)
     }
 
     /// The four relates-nothing traits of this world ([`Inert`]).

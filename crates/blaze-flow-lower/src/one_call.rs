@@ -407,14 +407,29 @@ impl<F: Facts> Variances for FactsArity<'_, F> {
 /// does not tell apart must give one answer (the same `Selected`, impl arguments included):
 /// two are [`NotSelected::TwoSources`], never a pick.
 struct CallSel<'s, F: Facts> {
+    /// The rows the type checker noted at THIS call (`Checked::call_selections`).
     rows: &'s [Projected],
+    /// The rows of the body's own signature (`Checked::selected_at(body.root)`, filed by the
+    /// type check while it lowered the signature: machine.rs `sig_rows`): a projection on one
+    /// of the body's type parameters (`__A::Error` of `visit_map<__A: MapAccess<'de>>`) is
+    /// decided by the body's environment, not by any one call, so a call whose own signature
+    /// names it only through a normalized alias (`FromResidual::from_residual`'s
+    /// `<Result<T, F> as Try>::Residual`, whose value holds `__A::Error`) asks it here.
+    root_rows: &'s [Projected],
     facts: &'s F,
     /// The checked record's table: a row's arguments and impl arguments are its types, and the
     /// caller's values' types are its types too (the walk's `Cx::types`).
     tys: PTys<'s>,
 }
 
-impl<F: Facts> CallSel<'_, F> {
+impl<'s, F: Facts> CallSel<'s, F> {
+    /// Every row that may answer an ask of this call: the call's own, then the body's own
+    /// signature's ([`Self::root_rows`]).
+    fn all_rows(&self) -> impl Iterator<Item = &'s Projected> {
+        let (rows, root_rows) = (self.rows, self.root_rows);
+        rows.iter().chain(root_rows)
+    }
+
     /// How row `r`'s arguments compare against the ask's: `Differ` if any differs, `Same` if
     /// every argument matches structurally, `Unknown` otherwise.
     fn match_row(&self, r: &Projected, args: &dyn AskArgs) -> Keyed {
@@ -544,7 +559,7 @@ impl<F: Facts> Selected for CallSel<'_, F> {
         let mut exact: Option<&Projected> = None;
         let mut loose: Option<&Projected> = None;
         let mut loose_conflict = false;
-        for r in self.rows.iter().filter(answers) {
+        for r in self.all_rows().filter(answers) {
             let keyed = match self.tys.list(r.args) {
                 Ok(list) if usize::try_from(info.trait_types).is_ok_and(|tt| list.len() >= tt) => {
                     let mut all_exact = true;
@@ -618,7 +633,7 @@ impl<F: Facts> Selected for CallSel<'_, F> {
         let mut exact_conflict = false;
         let mut loose: Option<&Projected> = None;
         let mut loose_conflict = false;
-        for r in self.rows.iter().filter(answers) {
+        for r in self.all_rows().filter(answers) {
             match self.match_row(r, args) {
                 Keyed::Differ => continue,
                 Keyed::Same => match exact {
@@ -1131,7 +1146,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             Ok(b) => b,
             Err(unread) => return self.refuse(Form::RegionsUnread { item: unread.item, why: unread.why }, e),
         };
-        let sel = CallSel { rows: self.ck.call_selections(e), facts, tys: self.tys };
+        let sel = CallSel { rows: self.ck.call_selections(e), root_rows: self.ck.selected_at(self.body.root), facts, tys: self.tys };
         let res = {
             let who = CallOwner {
                 item: owner,
@@ -1259,7 +1274,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             self.param_origin(p);
         }
         let Ok(bounds) = regions.clauses(owner) else { return Ok(false) };
-        let sel = CallSel { rows: self.ck.call_selections(e), facts, tys: self.tys };
+        let sel = CallSel { rows: self.ck.call_selections(e), root_rows: self.ck.selected_at(self.body.root), facts, tys: self.tys };
         let output = match out_match {
             Some((ty, col)) => Typed { ty, col },
             // When the callable has no `Output = ..` clause (so returns `()`, 0 slots), pass
@@ -1729,7 +1744,7 @@ mod keyed {
     }
 
     fn ask(r: &Rows, args: &dyn AskArgs) -> Selection<'static> {
-        let sel = CallSel { rows: &r.rows, facts: &World, tys: r.fx.t.view() };
+        let sel = CallSel { rows: &r.rows, root_rows: &[], facts: &World, tys: r.fx.t.view() };
         match sel.select_keyed(Ask { trait_: r.trait_, name: None, written: r.u8_ }, args) {
             Selection::Not(why) => Selection::Not(why),
             Selection::Impl { .. } => panic!("no row here selects an impl"),
@@ -1773,5 +1788,20 @@ mod keyed {
         assert!(matches!(none, Selection::Not(NotSelected::Unanswered)), "three asked: {none:?}");
         let twin = ask(&r, &Want { n: 2, self_: r.s });
         assert!(matches!(twin, Selection::Not(NotSelected::NotImpl)), "two asked: {twin:?}");
+    }
+
+    /// THE BODY'S OWN ROWS ANSWER TOO: a call whose own rows name nothing of the asked
+    /// projection (`from_residual`'s signature holds `__A::Error` only inside a normalized
+    /// alias) asks a projection on the body's type parameter, which the body's own signature
+    /// filed at its root (`sig_rows`). TWIN: the same ask with no root row is `Unanswered`.
+    #[test]
+    fn the_body_signature_rows_answer_a_call_that_names_none() {
+        let r = rows(blaze_typeck::Selected::NotImpl, false, blaze_typeck::Selected::Generic);
+        let root = [Projected { expr: blaze_typeck::ExprId(99), at: 0, trait_: r.trait_, name: None, args: r.rows[0].args, global_env: false, selected: blaze_typeck::Selected::ParamEnv { clause: 1 } }];
+        let sel = CallSel { rows: &[], root_rows: &root, facts: &World, tys: r.fx.t.view() };
+        let asked = sel.select_keyed(Ask { trait_: r.trait_, name: None, written: r.u8_ }, &Want { n: 2, self_: r.p0 });
+        assert!(matches!(asked, Selection::Not(NotSelected::GenericSelf(SelfHead::Param))), "the root row answers: {asked:?}");
+        let none = ask(&r, &Want { n: 2, self_: r.s });
+        assert!(matches!(none, Selection::Not(NotSelected::NotImpl)), "no root row: {none:?}");
     }
 }

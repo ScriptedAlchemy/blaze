@@ -2,20 +2,24 @@
 
 The controls hold the harness to what it promises: the D52 request it makes for the proc-macro
 and the build-script modules (the lock's own checkout, the sandbox required, the exact feature
-sets), the records it copies into a fresh home, the blaze-edition member's manifest contract,
-and the input it refuses. A planted bug (an unsandboxed request, a missing module, a manifest
+sets), the records it copies into a fresh home, the pinned C toolchain's shelf it copies there
+beside the Rust one and refuses when a member is missing or differs, the blaze-edition member's
+manifest contract, and the input it refuses. A planted bug (an unsandboxed request, a missing module, a manifest
 that still names bstd) fails its control.
 """
 
 import contextlib
 import io
 import json
+import shutil
 import subprocess
 import tempfile
+import typing
 import unittest
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -41,6 +45,17 @@ class RealSmokeTests(unittest.TestCase):
         (self.shelf / "manifest-record").write_text("synthetic shelf\n")
         self.toolchain_home = self.root / "toolchain-home"
         (self.toolchain_home / ".rustup" / "toolchains").mkdir(parents=True)
+        self.clang = self.root / "clang"
+        self.pin = typing.cast(dict[str, Any], json.loads((rs.TREE / "pins/clang.json").read_text()))
+        self.clang_digest = typing.cast(
+            rs.ClangPin, typing.cast(dict[str, Any], self.pin["targets"])[rs.HOST]
+        )["sha256"]
+        self.programs = {
+            name: typing.cast(rs.Program, value)
+            for name, value in typing.cast(dict[str, Any], self.pin["shelf_programs"])[rs.HOST].items()
+            if isinstance(value, dict)
+        }
+        self.make_clang_shelf()
         self.given = rs.Input(
             str(self.bin),
             str(self.root / "work"),
@@ -48,11 +63,43 @@ class RealSmokeTests(unittest.TestCase):
             modules=str(self.builder),
             toolchain_home=str(self.toolchain_home),
             shelf=str(self.shelf),
+            clang_shelf=str(self.clang),
         )
 
-    def invoke(self, given: rs.Input | None = None, code: int = 1) -> None:
+    def make_clang_shelf(self) -> Path:
+        """A synthetic C toolchain's shelf under `self.clang`, named by the pin's archive digest and
+        holding every member the native runs start or load (none is executed)."""
+        shelf = self.clang / self.clang_digest
+        for member in rs.CLANG_MEMBERS:
+            (shelf / member).parent.mkdir(parents=True, exist_ok=True)
+            (shelf / member).write_text(f"synthetic {member}; never executed\n")
+        return shelf
+
+    def digests(self, differ: dict[str, str] | None = None) -> Any:
+        """`hashlib.file_digest` as the harness reads it: a program's file hashes to its row's
+        SHA-256, so the shelf is what the pin table rows, except for a path in `differ`."""
+        rows = {
+            str(self.clang / self.clang_digest / program["member"].split("/", 1)[1]): program["sha256"]
+            for program in self.programs.values()
+        }
+        rows.update(differ or {})
+
+        def file_digest(held: Any, algorithm: str) -> Any:
+            self.assertEqual(algorithm, "sha256")
+            digest = rows[held.name]
+            return SimpleNamespace(hexdigest=lambda: digest)
+
+        return patch.object(rs.hashlib, "file_digest", side_effect=file_digest)
+
+    def invoke(
+        self, given: rs.Input | None = None, code: int = 1, differ: dict[str, str] | None = None
+    ) -> None:
         given = given or self.given
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as ended:
+        with (
+            self.digests(differ),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaises(SystemExit) as ended,
+        ):
             rs.main(
                 [
                     "real_smoke.py",
@@ -64,6 +111,7 @@ class RealSmokeTests(unittest.TestCase):
                             "modules": given.modules,
                             "toolchain_home": given.toolchain_home,
                             "shelf": given.shelf,
+                            "clang_shelf": given.clang_shelf,
                         }
                     ),
                 ]
@@ -162,6 +210,66 @@ class RealSmokeTests(unittest.TestCase):
                 )
 
     def test_without_a_builder_no_module_is_asked_for(self) -> None:
+        requests, _, builder = self.fake_builder({})
+        with (
+            builder,
+            patch.object(
+                rs.ran, "run", return_value=rs.ran.Ran(1.0, 125, "", "refused", "exit 125, not 0")
+            ) as run,
+        ):
+            self.invoke(replace(self.given, modules=""), code=1)
+        self.assertEqual(requests, [])
+        self.assertEqual(run.call_count, 4)
+
+    def test_the_c_toolchain_shelf_is_copied_into_the_home_beside_the_rust_one(self) -> None:
+        requests, _, builder = self.fake_builder(
+            {"proc-macro": len(rs.MACROS), "build-script": len(rs.SCRIPTS)}
+        )
+
+        def ran(command: rs.Command, proof: rs.Proof) -> rs.ran.Ran:
+            return rs.ran.Ran(1.0, 0, proof.stdout, "")
+
+        with builder, patch.object(rs.ran, "run", side_effect=ran):
+            self.invoke(code=0)
+        self.assertEqual(len(requests), 2)
+        home = self.root / "work" / "home" / ".blaze" / "v2" / "toolchain"
+        self.assertEqual((home / "manifest-record").read_text(), "synthetic shelf\n")
+        for member in rs.CLANG_MEMBERS:
+            self.assertTrue((home / "clang" / self.clang_digest / member).is_file(), member)
+
+    def refuse(self, said: str, differ: dict[str, str] | None = None) -> None:
+        """`main` with `self.given` stops before any row runs, saying `said`."""
+        with self.digests(differ), self.assertRaisesRegex(SystemExit, said):
+            rs.main(
+                [
+                    "real_smoke.py",
+                    json.dumps(
+                        {
+                            "blaze": self.given.blaze,
+                            "work": self.given.work,
+                            "tmpfs": "",
+                            "modules": self.given.modules,
+                            "toolchain_home": self.given.toolchain_home,
+                            "shelf": self.given.shelf,
+                            "clang_shelf": self.given.clang_shelf,
+                        }
+                    ),
+                ]
+            )
+        self.assertFalse((self.root / "work").exists())
+
+    def test_a_c_toolchain_shelf_that_lacks_a_member_or_differs_is_refused_by_name(self) -> None:
+        shelf = self.clang / self.clang_digest
+        (shelf / "bin/llvm-nm").unlink()
+        self.refuse("holds no `bin/llvm-nm`")
+        self.make_clang_shelf()
+        name, program = next(iter(self.programs.items()))
+        path = shelf / program["member"].split("/", 1)[1]
+        self.refuse(f"is not `{name}`", differ={str(path): "0" * 64})
+        shutil.rmtree(self.clang / self.clang_digest)
+        self.refuse("is not unpacked there")
+        self.make_clang_shelf()
+        # Whole again: the check passes and the rows run (and refuse: no Blaze process is real).
         requests, _, builder = self.fake_builder({})
         with (
             builder,

@@ -215,3 +215,72 @@ fn a_callers_ground_clause_on_other_types_leaves_the_impl_selected() {
     assert_eq!(diags, 0);
     assert!(matches!(rows[0].2, Selected::Impl { imp, .. } if imp == w.marker_ref), "CONTROL: no clause: {rows:?}");
 }
+
+/// A BOUND WHOSE TRAIT REFERENCE CARRIES A LIFETIME OF ITS OWN (reduced from the real-project
+/// smoke's `Point`: serde's derived `visit_map` calls `map.next_value::<i32>()?`, whose
+/// clause `i32: Deserialize<'de>` was refused by the borrow check as `Unanswered`).
+/// `trait Deserialize<'de>` declares a lifetime, so the clause's trait reference has one slot
+/// of its own: the call's `'de`, though its erased arguments `[i32]` hold none. The borrow
+/// check ties it through `impl<'de> Deserialize<'de> for i32` (blaze-borrow relate.rs
+/// `tie_of`: not inert), so the row must be filed: `may_relate` keeps a bound row whose trait
+/// declares a lifetime whatever its arguments hold.
+///
+/// ```text
+/// trait Deserialize<'de> {}
+/// impl<'de> Deserialize<'de> for u8 {}
+/// fn load<'de, T: Deserialize<'de>>(t: T) -> u8 { 0 }
+/// fn caller() -> u8 { load(1u8) }                 // a row `u8: Deserialize`, Impl
+/// ```
+/// TWIN: the same call at a trait declaring no lifetime is no row (the test above). CONTROL
+/// (rule 23): the trait's count not known (`None`) keeps the row too: never guessed none.
+#[test]
+fn a_bound_whose_trait_declares_a_lifetime_is_a_row_at_an_inert_instance() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let p0 = fx.param(0);
+    let (u8_, unit) = (fx.u8(), fx.unit());
+    let de = fx.tr("Deserialize", 1, Vec::new(), &[]);
+    fx.trait_lifetimes(de, Some(1));
+    let de_u8 = fx.imp("impl<'de> Deserialize<'de> for u8", 0, u8_, Some((de, &[])), &[], Vec::new());
+    let t_de = fx.bound(de, &[p0]);
+    let load = fx.func("load", 1, &[p0], u8_, std::vec![t_de]);
+    let caller = fx.func("caller", 0, &[], u8_, Vec::new());
+    fx.finish();
+
+    let mut b = Bb::new();
+    let f = b.path(&["load"]);
+    let one = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let call = b.call(f, &[one]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, caller, root, Plant::None, InferPlant::None);
+    assert_eq!(c.diags.len(), 0);
+    let rows = c.call_selections(call);
+    assert_eq!(rows.len(), 1, "`u8: Deserialize<'de>` names the call's `'de`: a row: {rows:?}");
+    assert_eq!(rows[0].trait_, de);
+    assert!(matches!(rows[0].selected, Selected::Impl { imp, .. } if imp == de_u8), "{:?}", rows[0].selected);
+
+    // CONTROL: the trait's lifetime count not known: the row is kept, never guessed away.
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let p0 = fx.param(0);
+    let (u8_, unit) = (fx.u8(), fx.unit());
+    let de = fx.tr("Deserialize", 1, Vec::new(), &[]);
+    fx.trait_lifetimes(de, None);
+    let de_u8 = fx.imp("impl<'de> Deserialize<'de> for u8", 0, u8_, Some((de, &[])), &[], Vec::new());
+    let t_de = fx.bound(de, &[p0]);
+    let load = fx.func("load", 1, &[p0], u8_, std::vec![t_de]);
+    let caller = fx.func("caller", 0, &[], u8_, Vec::new());
+    fx.finish();
+    let mut b = Bb::new();
+    let f = b.path(&["load"]);
+    let one = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let call = b.call(f, &[one]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, caller, root, Plant::None, InferPlant::None);
+    assert_eq!(c.diags.len(), 0);
+    let rows = c.call_selections(call);
+    assert_eq!(rows.len(), 1, "CONTROL: not known is kept: {rows:?}");
+    assert!(matches!(rows[0].selected, Selected::Impl { imp, .. } if imp == de_u8), "{:?}", rows[0].selected);
+}

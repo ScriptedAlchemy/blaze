@@ -172,6 +172,14 @@ impl Question {
 pub struct TraitDef<'w> {
     /// Generic parameters, `Self` (index 0) included.
     pub generics: u32,
+    /// How many lifetime parameters the trait declares (`Deserialize<'de>`: one; `Clone`:
+    /// none), as its head counted them (blaze-ladder heads.rs `Maps::trait_lifetimes`).
+    /// `None`: not known (a world that reads no lifetimes), which a reader takes as "may
+    /// declare some", never as none. Portable types erase regions (D148), so this is the one
+    /// place the checker learns that a trait reference carries a lifetime of its own: a
+    /// callee's bound `i32: Deserialize<'de>` names the call's `'de` though its erased
+    /// arguments `[i32]` hold none (rules/writeback/selected_rows.rs `may_relate`).
+    pub lifetimes: Option<u32>,
     pub flags: TraitFlags,
     /// The lang item the trait is, if any (`#[lang = ".."]`).
     pub lang: Option<LangItem>,

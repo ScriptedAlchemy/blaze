@@ -2880,6 +2880,8 @@ impl World for FrontWorld<'_, '_> {
     fn trait_def(&self, _: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>> {
         Ok(self.trait_row(trait_).map(|t| TraitDef {
             generics: t.generics,
+            // The old front end reads no lifetimes: not known.
+            lifetimes: None,
             flags: TraitFlags(0),
             lang: t.lang,
             supertraits: &t.supers,

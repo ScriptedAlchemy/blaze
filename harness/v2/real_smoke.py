@@ -38,6 +38,15 @@ The input is one JSON object (`Input`), unknown fields refused:
             needs `cold`
     path    the PATH of the fixed environment: where `cc` is
     shelf   an installed toolchain shelf to copy into each fresh home (default ~/.blaze/v2/toolchain)
+    clang_shelf
+            the pinned C toolchain unpacked (D112: `<home>/.blaze/v2/toolchain/clang`, one folder per
+            archive digest), copied into each fresh home beside the shelf: the build script of the
+            local `-sys` crate compiles C with it. Blaze never fetches it (rule 3: each thing it
+            needs and does not find is a refusal naming the path), so a home without it stops the
+            C rows at `dlsym`. Checked before any row runs against pins/clang.json: the folder named
+            by the host's archive digest, every member the native runs start or load
+            (blaze_build_script toolchain.rs `SHELF_MEMBERS`), and each program's SHA-256 (default
+            ~/.blaze/v2/toolchain/clang)
     workers optional number of Blaze workers per command
 
 Each step is `blaze run` under `env -i`-like conditions (ran.Command: the whole environment is
@@ -61,15 +70,17 @@ firstedit-1112's lock-file feedback, open; its fix belongs in
 writes). To see that cause, delete the two lock files from the copy.
 """
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import typing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 # Run with `python3 -I`, which leaves the script's directory off the path: ran.py is beside it.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -83,6 +94,21 @@ SOURCE = Path(os.path.dirname(os.path.abspath(__file__))) / "smoke"
 # The repository the harness is run from: the module builder's `tree` (the shim, the target
 # JSON, pins/toolchain).
 TREE = SOURCE.parents[2]
+# The host the rows run on (crates/blaze-cli/src/graph.rs `TRIPLE`): the row of pins/clang.json read.
+HOST = "aarch64-apple-darwin"
+# Every member of the C toolchain's shelf a native run starts or loads (blaze-build-script
+# toolchain.rs `SHELF_MEMBERS`); a shelf unpacked without one is refused naming it.
+CLANG_MEMBERS = (
+    "bin/clang",
+    "bin/clang++",
+    "bin/clang-23",
+    "bin/ld64.lld",
+    "bin/lld",
+    "bin/llvm-ar",
+    "bin/llvm-nm",
+    "lib/clang",
+    "lib/libclang.dylib",
+)
 
 
 class Crate(TypedDict):
@@ -91,6 +117,21 @@ class Crate(TypedDict):
     name: str
     version: str
     features: list[str]
+
+
+class ClangPin(TypedDict):
+    """The host's row of pins/clang.json: the archive's name and its SHA-256, which names its folder."""
+
+    name: str
+    sha256: str
+
+
+class Program(TypedDict):
+    """A program the pin table rows for the shelf (`shelf_programs`): its member in the archive and
+    the member's own SHA-256."""
+
+    member: str
+    sha256: str
 
 
 # The proc-macro crates of the workspace's lock blaze cannot compile yet (D52): each with the
@@ -123,6 +164,7 @@ class Input:
     steps: tuple[str, ...] = STEPS
     path: str = "/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin"
     shelf: str | None = None
+    clang_shelf: str | None = None
     workers: int | None = None
 
 
@@ -230,7 +272,43 @@ def provision(asked: Input, project: Path, home: Path, logs: Path) -> bool:
     return good
 
 
-def place(name: str, root: Path, asked: Input) -> bool:
+def clang_shelf(asked: Input) -> Path:
+    """The pinned C toolchain's folder under the given `clang_shelf` (the default: the user's),
+    checked against pins/clang.json before any row runs: the folder is named by the host's
+    archive digest, holds every member of `CLANG_MEMBERS`, and each program the pin table rows
+    (`shelf_programs`) has that row's SHA-256. A refusal names what is missing or differs."""
+    pin = typing.cast(dict[str, Any], json.loads((TREE / "pins/clang.json").read_text()))
+    row = typing.cast(ClangPin, typing.cast(dict[str, Any], pin["targets"])[HOST])
+    root = (
+        Path(asked.clang_shelf)
+        if asked.clang_shelf is not None
+        else Path.home() / ".blaze/v2/toolchain/clang"
+    )
+    shelf = root / row["sha256"]
+    if not shelf.is_dir():
+        raise ValueError(
+            f"clang_shelf {root} holds no `{row['sha256']}`: the pinned C toolchain ({row['name']}) is not unpacked there"
+        )
+    for member in CLANG_MEMBERS:
+        if not (shelf / member).exists():
+            raise ValueError(
+                f"clang_shelf {shelf} holds no `{member}`: the pinned C toolchain was unpacked without it"
+            )
+    for name, value in typing.cast(dict[str, Any], pin["shelf_programs"])[HOST].items():
+        if not isinstance(value, dict):
+            continue  # `names`: the sorted row names, not a program.
+        program = typing.cast(Program, value)
+        path = shelf / program["member"].split("/", 1)[1]
+        with path.open("rb") as held:
+            digest = hashlib.file_digest(held, "sha256").hexdigest()
+        if digest != program["sha256"]:
+            raise ValueError(
+                f"clang_shelf {path} is not `{name}`: sha256 {digest}, the pin rows {program['sha256']}"
+            )
+    return shelf
+
+
+def place(name: str, root: Path, asked: Input, clang: Path) -> bool:
     """The steps in a new copy and a new home under `root`; whether every row counted."""
     blaze = str(Path(asked.blaze) / "blaze")
     shutil.rmtree(root, ignore_errors=True)
@@ -238,6 +316,7 @@ def place(name: str, root: Path, asked: Input) -> bool:
     home.mkdir(parents=True)
     shelf = Path(asked.shelf) if asked.shelf is not None else Path.home() / ".blaze/v2/toolchain"
     shutil.copytree(shelf, home / ".blaze/v2/toolchain")
+    shutil.copytree(clang, home / ".blaze/v2/toolchain/clang" / clang.name, symlinks=True)
     project = root / "p"
     shutil.copytree(SOURCE, project)
     env = {"HOME": str(home), "PATH": asked.path, "TERM": "dumb", "LANG": "C.UTF-8", "RUST_BACKTRACE": "0"}
@@ -325,8 +404,12 @@ def main(argv: list[str]) -> None:
         sys.exit(
             f"work {asked.work} is on a tmpfs: the first run is on a disk (the second, `tmpfs`, is the tmpfs one)"
         )
+    try:
+        clang = clang_shelf(asked)
+    except (OSError, ValueError, KeyError) as e:
+        sys.exit(f"real_smoke.py: {e}")
     print(f"real smoke of {asked.blaze}, load {os.getloadavg()[0]:.0f}", flush=True)
-    good = place(f"disk({disk or '?'})", Path(asked.work), asked)
+    good = place(f"disk({disk or '?'})", Path(asked.work), asked, clang)
     if asked.tmpfs:
         parent = Path(asked.tmpfs) if Path(asked.tmpfs).exists() else Path(asked.tmpfs).parent
         memory = filesystem(parent)
@@ -334,7 +417,7 @@ def main(argv: list[str]) -> None:
             sys.exit(
                 f"tmpfs {asked.tmpfs} is on {memory or 'a file system /proc/mounts does not name'}, not a tmpfs"
             )
-        good = place("tmpfs", Path(asked.tmpfs), asked) and good
+        good = place("tmpfs", Path(asked.tmpfs), asked, clang) and good
         shutil.rmtree(asked.tmpfs, ignore_errors=True)
     else:
         print("tmpfs            NOT RUN: no `tmpfs` directory was given", flush=True)

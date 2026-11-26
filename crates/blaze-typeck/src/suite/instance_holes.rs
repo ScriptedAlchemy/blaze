@@ -118,6 +118,7 @@ fn owner_field_bounds_select_only_the_matching_impl() -> Result<(), crate::world
             }
             Ok(Some(TraitDef {
                 generics: 2,
+                lifetimes: None,
                 flags: TraitFlags(0),
                 lang: None,
                 supertraits: &[],

@@ -113,9 +113,19 @@ pub(crate) const MOST_NODES: u32 = 1 << 16;
 /// check refuses its tie by name (no row is never a decided answer).
 pub(crate) const MOST_ROW_NESTING: u32 = 32;
 
-/// Whether a bound row's instance `roots` (`[Self, trait args..]`, resolved and exported) may
-/// hold a region or a caller's type parameter: the filter that keeps a bound row
-/// (`name: None`). A row that may not relates nothing at the call and is not kept.
+/// Whether a bound row's instance may hold a region or a caller's type parameter: the filter
+/// that keeps a bound row (`name: None`). A row that may not relates nothing at the call and
+/// is not kept.
+///
+/// `trait_lifetimes` is how many lifetime parameters the row's trait declares (`None`: not
+/// known). A trait reference carries its trait's lifetimes as slots of its OWN, before its
+/// arguments': `i32: Deserialize<'de>` names the call's `'de` though its erased arguments
+/// `[i32]` hold none, and the borrow check ties it through `impl<'de> Deserialize<'de> for
+/// i32` (blaze-borrow relate.rs `tie_of`: not inert, `own` slots). So a row whose trait
+/// declares a lifetime, or whose trait's count is not known, is kept whatever its arguments
+/// hold; one whose trait declares none is kept by its arguments alone.
+///
+/// The instance `roots` (`[Self, trait args..]`, resolved and exported):
 ///
 /// - No: `bool`, `char`, the numbers, `str`, `!`, a const (a parameter or a value), an auto
 ///   trait row of an object; and a tuple, array, slice, raw pointer or pattern type of those.
@@ -127,7 +137,10 @@ pub(crate) const MOST_ROW_NESTING: u32 = 32;
 /// Typeck keeps no ADT's lifetime arity (portable types erase regions; D148), so `Vec<u8>`
 /// is kept as `Vec<&u8>` is; the borrow check's `inert` drops a row whose instance holds no
 /// position (blaze-borrow relate.rs).
-pub(crate) fn may_relate(tys: PTys<'_>, roots: &[PTy], alloc: Alloc<'_>) -> Result<bool, CheckError> {
+pub(crate) fn may_relate(tys: PTys<'_>, roots: &[PTy], trait_lifetimes: Option<u32>, alloc: Alloc<'_>) -> Result<bool, CheckError> {
+    if trait_lifetimes != Some(0) {
+        return Ok(true);
+    }
     let mut stack: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
     stack.extend_from_slice(roots);
     let mut steps = 0u32;
