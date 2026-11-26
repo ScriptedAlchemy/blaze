@@ -445,6 +445,66 @@ fn publication_preserves_the_newest_pointer_moved_by_compaction() {
     assert_eq!(reader.root_named("writer.answer"), Some(answer));
 }
 
+/// A successful publication keeps every immutable key it names when a concurrent writer
+/// retargets an old root under the same name and compaction sweeps its old contents.
+#[test]
+fn publication_keeps_a_reused_key_after_the_old_root_is_retargeted() {
+    let root = test_root();
+    let reached = |n| {
+        let mut config = cfg(n, 1, false, &root);
+        config.liveness = super::Liveness::Reached;
+        config
+    };
+    let mut sim = Sim::new(163, Faults::default());
+    let mut owner = Actor::new(reached(1), &root, Plant::None);
+    settle(&mut sim, core::slice::from_mut(&mut owner));
+    let old = key(80);
+    let old_bytes = b"reused record";
+    owner.store.put(old, Namespace::LOCAL, TAG, old_bytes).expect("put old record");
+    let old_root = owner.store.root("base", &[old]).expect("stage base root");
+    owner.store.release_lease();
+    owner.store.commit(&[], sim.wall_ns(), &mut owner.effects).expect("commit base root");
+    settle(&mut sim, core::slice::from_mut(&mut owner));
+    assert!(matches!(owner.store.take_committed(), Some(Ok(_))));
+
+    let mut writer = Actor::new(reached(2), &root, Plant::None);
+    settle(&mut sim, core::slice::from_mut(&mut writer));
+    assert_eq!(writer.store.root_named("base"), Some(old_root));
+    assert_eq!(writer.store.get(&old).expect("read reused record").bytes, old_bytes);
+
+    let replacement = key(81);
+    owner.store.put(replacement, Namespace::LOCAL, TAG, &[1; 1024]).expect("put replacement record");
+    let new_root = owner.store.root("base", &[replacement]).expect("retarget base root");
+    owner.store.commit(&[], sim.wall_ns(), &mut owner.effects).expect("commit retargeted base root");
+    settle(&mut sim, core::slice::from_mut(&mut owner));
+    assert!(matches!(owner.store.take_committed(), Some(Ok(_))));
+
+    let mut gc = Actor::new(reached(3), &root, Plant::None);
+    settle(&mut sim, core::slice::from_mut(&mut gc));
+    assert_eq!(gc.store.root_named("base"), Some(new_root));
+    assert!(gc.store.compact(&mut gc.effects));
+    settle(&mut sim, core::slice::from_mut(&mut gc));
+    assert!(!gc.store.take_sliced().expect("compaction verdict").aborted);
+
+    let fresh = key(82);
+    writer.store.put(fresh, Namespace::LOCAL, TAG, b"fresh record").expect("put fresh record");
+    let answer = writer.store.root("answer", &[old, fresh]).expect("stage answer root");
+    writer.store.release_lease();
+    let published = writer.store.commit(&[], sim.wall_ns(), &mut writer.effects).and_then(|()| {
+        settle(&mut sim, core::slice::from_mut(&mut writer));
+        writer.store.take_committed().expect("publication verdict")
+    });
+
+    let mut reader = Actor::new(reached(4), &root, Plant::None);
+    settle(&mut sim, core::slice::from_mut(&mut reader));
+    if published.is_ok() {
+        assert_eq!(reader.store.root_named("answer"), Some(answer));
+        assert_eq!(reader.store.get(&old).map(|record| record.bytes), Some(old_bytes.as_slice()), "published root lost its reused record after retarget and sweep");
+    } else {
+        assert_eq!(reader.store.root_named("answer"), None, "refused publication installed its root");
+    }
+}
+
 /// One effect of the test's own, run to its completion.
 fn ask(sim: &mut Sim, effect: Effect) -> Done {
     let mut effects = vec![effect];
