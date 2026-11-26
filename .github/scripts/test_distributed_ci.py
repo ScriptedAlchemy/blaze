@@ -378,7 +378,7 @@ class AcceptanceGateTests(unittest.TestCase):
     def test_source_protocol_needs_all_causal_cases_actual_launches_and_termination(self):
         packages=["blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"]
         for plant in (None,"missing-control","reused","filtered","not-built","empty-package",
-                      "failed-test","old-schema","old-scope","missing-command-pid","timed-out",
+                      "failed-test","wrong-package","bad-test-path","old-schema","old-scope","missing-command-pid","timed-out",
                       "bad-command","mismatched-command","missing-mode","lost-trace","changed-binary"):
             with self.subTest(plant=plant), tempfile.TemporaryDirectory() as directory:
                 root=Path(directory);env=self.fixture(root)
@@ -398,7 +398,10 @@ class AcceptanceGateTests(unittest.TestCase):
                     names=CONTROLS[at::len(packages)]
                     if at == 0 and plant == "missing-control": names=names[1:]
                     if at == 0 and plant == "empty-package": names=[]
-                    tests=[{"event":"test","path":"tests::"+name,"outcome":"passed","ran_because":"run_all","failure":None,"basis":None} for name in names]
+                    tests=[{"event":"test",
+                            "path":f"{package}/lib:model/tests::{name}" if index % 2 == 0 else f"{package}/test:protocol/{name}",
+                            "outcome":"passed","ran_because":"run_all","failure":None,"basis":None}
+                           for index,name in enumerate(names)]
                     summary={"event":"summary","result":"ok","ran":len(names),"passed":len(names),"failed":0,
                              "reused":0,"filtered_out":0,"flaky":0}
                     if at == 0:
@@ -406,6 +409,8 @@ class AcceptanceGateTests(unittest.TestCase):
                         elif plant == "filtered": summary["filtered_out"]=1
                         elif plant == "not-built": summary["not_built"]=1
                         elif plant == "failed-test": tests[0]["outcome"]="failed"
+                        elif plant == "wrong-package": tests[0]["path"]=tests[0]["path"].replace(package,"blaze-wire",1)
+                        elif plant == "bad-test-path": tests[0]["path"]=names[0]
                     (out/(package+".log")).write_text("\n".join(json.dumps(row) for row in [*tests,summary])+"\n")
                 done=self.run_shell("complete source protocol receipt with unchanged executables",
                                     {**env,"IDENTITY_EXIT":"9" if plant == "changed-binary" else "0"})

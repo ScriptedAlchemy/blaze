@@ -835,7 +835,12 @@ jobs:
                       or any(row.get("outcome") != "passed" or row.get("ran_because") != "run_all"
                              or row.get("failure") is not None or row.get("basis") is not None for row in tests)):
                   raise SystemExit(f"{package}: source tests did not all execute and pass")
-              passed.extend(row["path"] for row in tests)
+              for row in tests:
+                  path = row.get("path")
+                  parts = path.split("/") if isinstance(path, str) else []
+                  if len(parts) != 3 or parts[0] != package or not parts[1] or not parts[2]:
+                      raise SystemExit(f"{package}: invalid source test path {path!r}")
+                  passed.append(parts[2])
           required = Path(".github/distributed-controls.txt").read_text().splitlines()
           missing = [name for name in required if not any(path == name or path.endswith("::" + name) for path in passed)]
           if not required or missing:
