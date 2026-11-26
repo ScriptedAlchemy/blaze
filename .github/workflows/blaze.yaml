@@ -413,6 +413,44 @@ jobs:
           input=$(timeout 10 jq -cn --arg evidence "$RUNNER_TEMP/workspace-storage-evidence" \
             --argjson partition '${{ matrix.partition }}' \
             '{exclude:["blaze-std"],evidence:$evidence,partition:$partition,partitions:9,build_timeout_s:2400}')
+          # A runner shutdown can prevent artifact upload. Stream one small sample every 15s.
+          # The workload and its existing watchdog run in the foreground.
+          timeout -k 1 5435 bash -s -- "$$" <<'MEMORY_SAMPLES' &
+          step_pid=$1
+          cgroup=$(awk -F: '$1 == "0" && $2 == "" {print "/sys/fs/cgroup" $3; exit}' /proc/self/cgroup)
+          printf 'ci_test resources: cadence=15s max_samples=362 host/process=kB cgroup=bytes psi_total=us\n'
+          for ((sample=1; sample<=362; sample++)); do
+            host=$(awk '$1 ~ /^(MemAvailable|SwapTotal|SwapFree):$/ && $2 ~ /^[0-9]+$/ {sub(/:$/, "", $1); printf " %s=%s", $1, $2}' /proc/meminfo)
+            psi=$(awk '$1 ~ /^(some|full)$/ {for (i=2; i<=NF; i++) if ($i ~ /^total=[0-9]+$/) printf " psi_%s_%s", $1, $i}' /proc/pressure/memory 2>/dev/null)
+            scope=' cgroup=unavailable'
+            if [[ -n $cgroup && -r $cgroup/memory.events ]]; then
+              scope=$(awk '$1 ~ /^(oom|oom_kill|oom_group_kill)$/ && $2 ~ /^[0-9]+$/ {printf " cg_%s=%s", $1, $2}' "$cgroup/memory.events")
+              for field in memory.current memory.peak memory.max memory.swap.current; do
+                if read -r value 2>/dev/null < "$cgroup/$field" && [[ $value =~ ^([0-9]+|max)$ ]]; then
+                  scope+=" cg_$field=$value"
+                fi
+              done
+            fi
+            process=''
+            for watchdog in $(ps -o pid=,comm= --ppid "$step_pid" | awk '$2 == "timeout" && $1 ~ /^[0-9]+$/ {print $1}'); do
+              ci_pid=$(ps -o pid=,comm= --ppid "$watchdog" | awk '$2 == "ci_test" && $1 ~ /^[0-9]+$/ {print $1; exit}')
+              [[ -n $ci_pid ]] || continue
+              workload=$(ps -o pid=,rss= --sort=-rss --ppid "$ci_pid" | awk 'NR == 1 && $1 ~ /^[0-9]+$/ {print $1}')
+              if [[ -n $workload ]]; then
+                process=" workload_pid=$workload$(awk '$1 ~ /^(VmRSS|VmHWM|VmSwap):$/ && $2 ~ /^[0-9]+$/ {sub(/:$/, "", $1); printf " %s=%s", $1, $2}' /proc/"$workload"/status 2>/dev/null)"
+              fi
+              break
+            done
+            printf 'ci_test resources: sample=%d%s%s%s%s\n' "$sample" "$host" "$psi" "$scope" "$process"
+            sleep 15
+          done
+          MEMORY_SAMPLES
+          resource_sampler=$!
+          stop_resource_sampler() {
+            kill "$resource_sampler" 2>/dev/null || true
+            wait "$resource_sampler" 2>/dev/null || true
+          }
+          trap stop_resource_sampler EXIT
           timeout -k 30 5400 "$BLAZE_SCRIPTS/ci_test" "$input"
       - name: recover completed links after an interrupted test build
         if: ${{ always() && env.BLAZE_SCRIPTS != '' }}
