@@ -57,17 +57,19 @@ const MAGIC: &[u8; 4] = b"BZCL";
 /// so a reader of the list knows a tree's kind without mapping its pack; a version-6 list is
 /// refused by name and made again. 8: each row's package binaries ([`BIN_EXES_AT`]: an
 /// integration test's `CARGO_BIN_EXE_<name>`); a version-7 list is refused by name and made
-/// again.
-pub const VERSION: u16 = 8;
+/// again. 9: runs name their own module, source and role, including host build-dependency
+/// producers with no checked crate row.
+pub const VERSION: u16 = 9;
 /// magic 4, version 2, pad 2, `n` 4, `d` 4, heap 4, sysroot 16, `t` 4, `c` 4, `m` 4, `u` 4,
 /// `q` 4, `p` 4.
 pub const HEADER_LEN: usize = 60;
 /// A build-script module: row 4, placement 1 (its maker's byte, never 0), pad 3, subject 32,
 /// the script's root file (package-relative) 8.
 pub const MODULE: usize = 48;
-/// A build-script run: subject 32, its unit 4, side 1, pad 3, the unit's package name 8 and
-/// version 8, its producers' start 4 and count 4.
-pub const RUN: usize = 64;
+/// A build-script run: subject 32, its unit 4, side 1, host-dependency 1, member 1, placement 1,
+/// the unit's package name 8 and version 8, producers' start 4 and count 4, source basis 32,
+/// module subject 32.
+pub const RUN: usize = 128;
 /// A producer (a `Script` run's subject) or a proc-macro crate's module subject.
 pub const SUBJECT: usize = 32;
 /// origin 1 ([`SHELF`] or [`SOURCE`]), the pack's kind 1 ([`pack_kind_byte`]), pad 2, its name
@@ -155,6 +157,21 @@ pub struct Module<'s> {
     pub root: &'s str,
 }
 
+/// Inputs of a build-script run carried by the planner's record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunInputs {
+    /// A run serving a host build dependency uses the resolved host unit's configuration.
+    pub host_dependency: bool,
+    /// Only a workspace member can be given the caller's environment.
+    pub member: bool,
+    /// The maker's placement byte, shared with the build-script module row.
+    pub ran_as: u8,
+    /// The run's semantic source basis, a crate key or a standalone unit's configuration key.
+    pub source: [u8; 32],
+    /// The verified executable lookup this run reads.
+    pub module: [u8; 32],
+}
+
 /// A build-script run as its maker answers it ([`ListFacts::runs`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Run<'s> {
@@ -165,7 +182,8 @@ pub struct Run<'s> {
     /// The unit's package name and version.
     pub name: &'s str,
     pub version: &'s str,
-    /// The `Script` runs its `links` closure reads, by subject.
+    pub inputs: RunInputs,
+    /// The `Script` runs supplying metadata or build-dependency outputs, by subject.
     pub producers: &'s [[u8; 32]],
 }
 
@@ -180,7 +198,7 @@ pub trait ListFacts {
     fn public(&self, at: usize) -> bool;
     /// The module crate `at`'s package's build script is looked up by.
     fn module(&self, at: usize) -> Option<Module<'_>>;
-    /// Each run the crates read, in order of subject, each once.
+    /// Each run the command needs, in order of subject, each once.
     fn runs(&self, each: &mut dyn FnMut(Run<'_>));
     /// Each proc-macro crate's module subject, in order, each once.
     fn macros(&self, each: &mut dyn FnMut([u8; 32]));
@@ -222,11 +240,12 @@ pub struct RunRow<'b> {
     pub side: Side,
     pub name: &'b str,
     pub version: &'b str,
+    pub inputs: RunInputs,
     producers: &'b [u8],
 }
 
 impl<'b> RunRow<'b> {
-    /// The `Script` runs its `links` closure reads, by subject, as written.
+    /// The `Script` runs it reads, by subject, as written.
     pub fn producers(&self) -> impl Iterator<Item = [u8; 32]> + 'b {
         self.producers.chunks_exact(SUBJECT).map(subject_of)
     }
@@ -499,11 +518,13 @@ pub fn encode_with<'a>(world: &World<'_>, facts: &dyn ListFacts, alloc: Alloc<'a
         let one = (|| -> Result<(), ListError> {
             runs.extend_from_slice(&run.subject);
             runs.extend_from_slice(&run.unit.to_le_bytes());
-            runs.extend_from_slice(&[side_byte(run.side), 0, 0, 0]);
+            runs.extend_from_slice(&[side_byte(run.side), u8::from(run.inputs.host_dependency), u8::from(run.inputs.member), run.inputs.ran_as]);
             runs.extend_from_slice(&text(run.name, &mut heap)?);
             runs.extend_from_slice(&text(run.version, &mut heap)?);
             runs.extend_from_slice(&u32_of(producers.len() / SUBJECT, "producer count")?.to_le_bytes());
             runs.extend_from_slice(&u32_of(run.producers.len(), "producer count")?.to_le_bytes());
+            runs.extend_from_slice(&run.inputs.source);
+            runs.extend_from_slice(&run.inputs.module);
             for producer in run.producers.iter() {
                 producers.extend_from_slice(producer);
             }
@@ -743,8 +764,10 @@ impl<'b> CrateList<'b> {
         for e in 0..u {
             let run = &list.runs[e * RUN..(e + 1) * RUN];
             let (start, count) = (le32(run, 56) as usize, le32(run, 60) as usize);
-            if run[36] > 1 || run[37..40] != [0, 0, 0] || !text_ok(run, 40) || !text_ok(run, 48) || start.checked_add(count).is_none_or(|end| end > q) {
-                return Err(form("a run names no side, no string or producers outside the table", modules_end + e * RUN));
+            if run[36] > 1 || run[37] > 1 || run[38] > 1 || !matches!(run[39], 1 | 2) || (run[37] == 1 && run[36] != 0)
+                || !text_ok(run, 40) || !text_ok(run, 48) || start.checked_add(count).is_none_or(|end| end > q)
+            {
+                return Err(form("a run's side, flags, placement, text or producer range is invalid", modules_end + e * RUN));
             }
             if e > 0 && list.runs[(e - 1) * RUN..(e - 1) * RUN + 32] >= run[..32] {
                 return Err(form("the runs are not strictly by subject", modules_end + e * RUN));
@@ -877,10 +900,11 @@ impl<'b> CrateList<'b> {
             side: if run[36] == 1 { Side::Macro } else { Side::Target },
             name: self.text(run, 40),
             version: self.text(run, 48),
+            inputs: RunInputs { host_dependency: run[37] == 1, member: run[38] == 1, ran_as: run[39], source: subject_of(&run[64..96]), module: subject_of(&run[96..128]) },
             producers: &self.producers[start * SUBJECT..(start + count) * SUBJECT],
         }
     }
-    /// Every build-script run the crates read, by subject.
+    /// Every build-script run the command needs, by subject.
     pub fn runs(&self) -> impl Iterator<Item = RunRow<'b>> + '_ {
         (0..self.runs.len() / RUN).map(|e| self.run_at(e))
     }

@@ -816,10 +816,8 @@ impl<'f> ScriptsStage<'f> {
                 }
             }
             while let Some(script) = stack.pop() {
-                if let Some(module) = names.script_readers(script).next().and_then(|at| names.script_module_of(at)) {
-                    allowed_script_modules.insert(module.subject);
-                }
                 if let Some(run) = names.script_run(script.subject) {
+                    allowed_script_modules.insert(ContentId(run.inputs.module));
                     for producer in run.producers() {
                         let producer = Name::new(Kind::Script, ContentId(producer));
                         if allowed_scripts.insert(producer) {
@@ -843,12 +841,7 @@ impl<'f> ScriptsStage<'f> {
                 self.reads.push((part.name, reads_only(&[unit_graph])));
             }
         }
-        let mut last = None;
         for subject in names.script_module_subjects() {
-            if last == Some(subject) {
-                continue;
-            }
-            last = Some(subject);
             if let Some((_, allowed_modules, _)) = &scoped_sets
                 && !allowed_modules.contains(&subject)
             {
@@ -858,10 +851,8 @@ impl<'f> ScriptsStage<'f> {
             planned.push(Planned { name, phase: Phase::new(Stage::Scripts, 0), source: crate::script_modules::part_source(graph.source, subject), file: name });
             self.reads.push((name, reads_only(&[])));
         }
-        // The runs: each one's unit, side, package and the `Script` runs its `links` closure
-        // reads, from the crate list's runs table (names.rs `NamesWorld::script_runs` and its
-        // `ListFacts` wrote it from the graph): the runs the world's crates read, never every
-        // unit of the graph on both sides, and no graph decoded to plan them.
+        // The crate-list rows supply the module and producer reads for both checked scripts
+        // and standalone host producers. A standing graph needs no decoding to plan them.
         for (name, source) in crate::scripts::parts_for(names, env, frame) {
             if let Some((allowed_scripts, _, _)) = &scoped_sets
                 && !allowed_scripts.contains(&name)
@@ -870,10 +861,7 @@ impl<'f> ScriptsStage<'f> {
             }
             let mut reads = reads_only(&[unit_graph]);
             if let Some(run) = names.script_run(name.subject) {
-                // Its module's lookup: the one its reading crate names (scripts.rs `job`).
-                if let Some(module) = names.script_readers(name).next().and_then(|at| names.script_module_of(at)) {
-                    reads.push(crate::script_modules::name(module.subject));
-                }
+                reads.push(crate::script_modules::name(ContentId(run.inputs.module)));
                 for producer in run.producers() {
                     let producer = Name::new(Kind::Script, ContentId(producer));
                     #[cfg(test)]
@@ -1037,7 +1025,7 @@ impl<'f> ScriptsStage<'f> {
             }
             let lane = if run.is_some_and(|run| run.native) {
                 ScriptLane::Native
-            } else if name.kind == Kind::MacroModule && names.names.as_ref().is_some_and(|world| world.script_module(name.subject).is_none()) {
+            } else if name.kind == Kind::MacroModule && names.names.as_ref().is_some_and(|world| !world.has_script_module(name.subject)) {
                 ScriptLane::ProcLookup
             } else {
                 ScriptLane::Other
@@ -1389,7 +1377,7 @@ impl<'f> ScriptsStage<'f> {
         let drive = self.drive(&task, handles.env.heap.alloc())?;
         let name = drive.name;
         let world = names.names.as_ref().ok_or(CliError::Text { what: "the names world, made by the planner, is gone (engine_scripts.rs `prepare_lookup`)" })?;
-        if world.script_module(name.subject).is_some() {
+        if world.has_script_module(name.subject) {
             #[cfg(test)]
             if self.runner.is_some() { return Ok(Dispatch::Run(ScriptWork::Module(ModuleJob::Fixture), drive)); }
             // The lookup's package, version and features are the world's: made now if no task

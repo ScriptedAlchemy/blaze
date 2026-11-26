@@ -1862,10 +1862,8 @@ fn preserve_standing_sibling_names<'a, 'f, 's, 'r>(
                             script_stack.push(script);
                             while let Some(s) = script_stack.pop() {
                                 children.push(Node::Aux(s));
-                                if let Some(module) = self.world.script_readers(s).next().and_then(|r| self.world.script_module_of(r)) {
-                                    children.push(Node::Aux(crate::script_modules::name(module.subject)));
-                                }
                                 if let Some(run) = self.world.script_run(s.subject) {
+                                    children.push(Node::Aux(crate::script_modules::name(blaze_ids::ContentId(run.inputs.module))));
                                     for producer in run.producers() {
                                         let producer = Name::new(Kind::Script, blaze_ids::ContentId(producer));
                                         if script_seen.insert(producer) {
