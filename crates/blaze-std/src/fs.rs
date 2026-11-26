@@ -2875,3 +2875,26 @@ impl fmt::Debug for Buffered<'_, '_> {
         write!(f, "Buffered({} of {} bytes held for {})", self.held.len(), self.capacity, self.file.name)
     }
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn overlapping_publishes_from_two_worlds_keep_their_bytes() {
+    let scratch = blaze_core::temp::TempDir::for_test("bstd-publish-");
+    let a = crate::test::native(&scratch).expect("first publishing world");
+    let b = crate::test::native(&scratch).expect("second publishing world");
+    let budget = core::time::Duration::from_secs(10);
+    let a_cx = a.cx(budget, crate::mem::TASK_FRAME).expect("first publishing context");
+    let b_cx = b.cx(budget, crate::mem::TASK_FRAME).expect("second publishing context");
+    let a_dir = a.need_fs().expect("first filesystem").root();
+    let b_dir = b.need_fs().expect("second filesystem").root();
+    let path = Path::new("start.txt").expect("publish destination");
+    let name = a_dir.beneath(&path);
+
+    // Stage both writes before either rename. Each world must still own its staged bytes.
+    let (first, _) = a_dir.place(&a_cx, &name, Content::bytes(b"first")).expect("stage first publish");
+    let (second, _) = b_dir.place(&b_cx, &name, Content::bytes(b"second")).expect("stage second publish");
+    rename_unsynced(&a, &a_cx, FsOp::Publish, &first, &name, Unsynced::No).expect("publish first write");
+    assert_eq!(std::fs::read(scratch.join("start.txt")).expect("read first publish"), b"first", "the second world overwrote the first stage");
+    rename_unsynced(&b, &b_cx, FsOp::Publish, &second, &name, Unsynced::No).expect("publish second write");
+    assert_eq!(std::fs::read(scratch.join("start.txt")).expect("read second publish"), b"second");
+}
