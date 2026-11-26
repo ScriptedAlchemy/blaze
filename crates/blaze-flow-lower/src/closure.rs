@@ -192,8 +192,8 @@ pub struct Requirement {
 }
 
 /// The requirement an outlives result of the closure's flow (`UnprovenOutlives { from, into }`:
-/// `from: into` needed between two placeholders) puts on its owner. A capture that must
-/// outlive a late-bound region can be required to outlive its unique owner signature bound.
+/// `from: into` needed between two placeholders) puts on its owner. An owner region that
+/// must outlive a late-bound region can be required to outlive its unique owner signature bound.
 /// For `&'scope Scope<'scope, 'env>`, the closure knows `'env: 'scope`. Other relations
 /// that cannot be stated in the owner stay `NestedOutlives`.
 pub fn requirement<A: Allocator>(
@@ -212,13 +212,13 @@ pub fn requirement<A: Allocator>(
         External::DynPlaceholder(ord) => Some(Need::DynPlaceholder(ord)),
         External::Env | External::Sig | External::Late => None,
     };
-    let start = external_of(externals, from)?;
+    let start = need(external_of(externals, from)?)?;
     let end = external_of(externals, into)?;
-    let target = match (start, end) {
-        (External::Capture(_), External::Late) => owner_signature_bound(externals, known, into, alloc),
+    let target = match end {
+        External::Late => owner_signature_bound(externals, known, into, alloc),
         _ => need(end),
     }?;
-    Some(Requirement { from: need(start)?, into: target })
+    Some(Requirement { from: start, into: target })
 }
 
 fn external_of(externals: &[(Origin, External)], origin: Origin) -> Option<External> {
@@ -587,10 +587,14 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
                 SigSlot::Static => externals.push((o, External::Static)),
                 SigSlot::InnerBound(..) => {}
             }
-            if s == SigSlot::Static {
+            if !matches!(s, SigSlot::InnerBound(..)) {
+                // Every rigid signature region, including one bound by this closure, is
+                // shorter than or equal to `'static`.
                 let st = self.universal(Region::Static);
-                self.b.known(o, st);
                 self.b.known(st, o);
+                if s == SigSlot::Static {
+                    self.b.known(o, st);
+                }
             }
             // Two positions of one variable of the clause's or fn pointer's binder are one region.
             if let SigSlot::Late(Some(var)) = s {

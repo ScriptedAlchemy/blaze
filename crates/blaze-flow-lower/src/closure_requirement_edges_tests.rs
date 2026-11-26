@@ -9,6 +9,7 @@ const SCOPE_ARG: Origin = Origin(2);
 const ENV: Origin = Origin(3);
 const OUTER: Origin = Origin(4);
 const STATIC: Origin = Origin(5);
+const PARAM: Origin = Origin(6);
 
 const EXTERNALS: &[(Origin, External)] = &[
     (CAPTURE, External::Capture(0)),
@@ -17,6 +18,7 @@ const EXTERNALS: &[(Origin, External)] = &[
     (ENV, External::SigOwner(0)),
     (OUTER, External::SigOwner(1)),
     (STATIC, External::Static),
+    (PARAM, External::Param(3)),
 ];
 
 #[test]
@@ -26,6 +28,16 @@ fn a_scoped_callback_requires_its_capture_to_outlive_the_environment() {
     let known = [(SCOPE_REF, SCOPE_ARG), (SCOPE_ARG, SCOPE_REF), (ENV, SCOPE_REF), (OUTER, ENV)];
     let got = requirement(EXTERNALS, &known, CAPTURE, SCOPE_ARG, alloc());
     assert_eq!(got, Some(Requirement { from: Need::Capture(0), into: Need::Sig(0) }));
+}
+
+#[test]
+fn a_scoped_callback_requires_the_owner_type_to_outlive_the_environment() {
+    let known = [(ENV, SCOPE_REF), (STATIC, SCOPE_REF)];
+    assert_eq!(
+        requirement(EXTERNALS, &known, PARAM, SCOPE_REF, alloc()),
+        Some(Requirement { from: Need::Param(3), into: Need::Sig(0) }),
+    );
+    assert_eq!(requirement(EXTERNALS, &[(STATIC, SCOPE_REF)], PARAM, SCOPE_REF, alloc()), None);
 }
 
 #[test]
