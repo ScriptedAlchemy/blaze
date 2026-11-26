@@ -30,7 +30,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1065
+blaze-cli	1068
 blaze-code	102
 blaze-columns	193
 blaze-comptime	68
@@ -103,7 +103,7 @@ blaze-pg	10
 blaze-phf	40
 blaze-pins	1
 blaze-preview	28
-blaze-proc-macro	470
+blaze-proc-macro	472
 blaze-producers	24
 blaze-profile	735
 blaze-protocol	134

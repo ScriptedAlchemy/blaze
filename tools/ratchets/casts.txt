@@ -21,7 +21,7 @@ blaze-body-lower	22
 blaze-borrow	20
 blaze-bstd-convert	9
 blaze-build	740
-blaze-build-script	109
+blaze-build-script	110
 blaze-c	4
 blaze-cad	105
 blaze-cad-cloth	666
