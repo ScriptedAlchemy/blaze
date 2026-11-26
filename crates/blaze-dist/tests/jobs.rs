@@ -1040,6 +1040,37 @@ mod claim {
     }
 
     #[test]
+    fn pull_workers_reuse_an_unstarted_reservation_but_acknowledge_claimed_stops() {
+        let alloc = heap();
+        let (jobs, first) = started(3, alloc);
+        let mut jobs = jobs.start_on_claim();
+        let mut out = Vec::new_in(alloc);
+        let (lead, attempt) = jobs.claim(1, first, [1; 32], &mut out).unwrap().unwrap();
+        let lead = WireString::from_str_in(lead, alloc);
+        let token = super::AssignmentToken { execution: first, attempt };
+        jobs.tick(1, &mut out);
+        let direct = jobs.execution(first).unwrap().executors().find(|&e| e != lead.as_str()).unwrap();
+        let direct = WireString::from_str_in(direct, alloc);
+        let heartbeat = super::WorkersEventsRequest { execution: first, attempt, events: Vec::new_in(alloc) };
+        jobs.worker_events(1, direct.as_str(), &heartbeat, &mut out).unwrap();
+        let subscriber = jobs.execution(first).unwrap().subscribers().next().unwrap().id;
+        jobs.unsubscribe(2, first, subscriber, &mut out).unwrap();
+        let need = Reservation { memory: 1, cpus: 1, disk: 1 };
+        let next = jobs.submit(3, &super::request(7), need, &mut out).unwrap().execution;
+        let (other, _) =
+            jobs.claim(3, next, [2; 32], &mut out).unwrap().expect("unstarted helper was released");
+        let other = WireString::from_str_in(other, alloc);
+        assert_ne!(other, lead);
+        assert_ne!(other, direct);
+        assert!(!jobs.killed(3, other.as_str(), token, true));
+        assert!(jobs.claim(3, next, [3; 32], &mut out).unwrap().is_none());
+        assert!(jobs.killed(4, lead.as_str(), token, true));
+        assert_eq!(jobs.claim(4, next, [3; 32], &mut out).unwrap().unwrap().0, lead.as_str());
+        assert!(!jobs.killed(5, lead.as_str(), token, true));
+        assert!(jobs.killed(5, direct.as_str(), token, true));
+    }
+
+    #[test]
     fn work_unfinished_has_no_committed_packs() {
         let alloc = heap();
         let (jobs, id) = started(1, alloc);

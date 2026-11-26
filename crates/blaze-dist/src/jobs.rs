@@ -398,7 +398,6 @@ impl Execution {
             }
         }
         self.lead_heard = now;
-        self.heard.insert(WireString::from_str_in(lead, self.alloc), now);
         let mut log = Vec::new_in(out.allocator().clone());
         match &mut self.work {
             None => {
@@ -994,6 +993,7 @@ pub struct Jobs {
     platforms: BTreeMap<ExecutionId, (Digest, Reservation), WireAlloc>,
     pr_jobs: BTreeMap<u64, PrJobs, WireAlloc>,
     assignments: BTreeMap<WireString, Assignment, WireAlloc>,
+    starts_on_claim: bool,
     next_execution: u64,
     next_subscriber: u64,
 }
@@ -1021,9 +1021,17 @@ impl Jobs {
             platforms: BTreeMap::new_in(alloc),
             pr_jobs: BTreeMap::new_in(alloc),
             assignments: BTreeMap::new_in(alloc),
+            starts_on_claim: false,
             next_execution: 1,
             next_subscriber: 1,
         }
+    }
+
+    /// For a driver that starts workers on claim and only reports assignment effects.
+    /// Unclaimed reservations that received no worker calls have no process to stop.
+    pub fn start_on_claim(mut self) -> Self {
+        self.starts_on_claim = true;
+        self
     }
 
     /// Seed the execution and subscriber counters from a daemon instance identity, so a
@@ -1570,12 +1578,21 @@ impl Jobs {
         }
     }
 
-    fn track_stop(&mut self, effect: &Effect) {
+    fn track_stop(&mut self, now: Millis, effect: &Effect) {
         if let Effect::Kill { executor, assignment } = effect
             && let Some(held) = self.assignments.get_mut(executor.as_str())
             && held.token == *assignment
         {
             held.stopping = true;
+            if self.starts_on_claim
+                && held.claimant.is_none()
+                && self
+                    .executions
+                    .get(&assignment.execution)
+                    .is_some_and(|e| !e.heard.contains_key(executor.as_str()))
+            {
+                self.killed(now, executor.as_str(), *assignment, true);
+            }
         }
     }
 
@@ -1671,12 +1688,12 @@ impl Jobs {
                 }
                 out.push((id, effect));
                 for effect in more {
-                    self.track_stop(&effect);
+                    self.track_stop(now, &effect);
                     out.push((id, effect));
                 }
                 continue;
             }
-            self.track_stop(&effect);
+            self.track_stop(now, &effect);
             out.push((id, effect));
         }
         let Some(e) = self.executions.get(&id) else { return };
