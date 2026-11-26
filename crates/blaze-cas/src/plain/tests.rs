@@ -370,6 +370,81 @@ fn settle(sim: &mut Sim, actors: &mut [Actor<'_>]) {
     assert!(run(sim, actors, &mut None));
 }
 
+/// A writer can root a name whose old segment was replaced. It keeps the newest value when
+/// another writer updated that name before the merge.
+#[test]
+fn publication_preserves_the_newest_pointer_moved_by_compaction() {
+    use blaze_keyed::kind::ReservedTag;
+    use super::{core::{Batch, ROOT_LIFE_NS}, lent::Lent};
+
+    let root = test_root();
+    let reached = |n| {
+        let mut config = cfg(n, 1, false, &root);
+        config.liveness = super::Liveness::Reached;
+        config
+    };
+    let mut sim = Sim::new(162, Faults::default());
+    let mut seed = Actor::new(reached(1), &root, Plant::None);
+    settle(&mut sim, core::slice::from_mut(&mut seed));
+    let targets = [key(70), key(71)];
+    let pointer = key(72);
+    let seeded = [targets[0], targets[1], pointer, key(73), key(74), key(75)];
+    let payload = b"target or filler";
+    for &key in &seeded {
+        if key == pointer {
+            seed.store.put(key, Namespace::LOCAL, ReservedTag::Pointer.tag(), &targets[0].0.0).expect("point to the old target");
+        } else {
+            seed.store.put(key, Namespace::LOCAL, TAG, payload).expect("seed record");
+        }
+        seed.store.commit(&[], sim.wall_ns(), &mut seed.effects).expect("seed commit");
+        settle(&mut sim, core::slice::from_mut(&mut seed));
+        assert!(matches!(seed.store.take_committed(), Some(Ok(_))));
+    }
+    let life = Duration::from_secs(60);
+    seed.store.root_for("seed", &seeded, life.as_nanos() as u64).expect("temporary seed root");
+    seed.store.release_lease();
+    seed.store.commit(&[], sim.wall_ns(), &mut seed.effects).expect("seed root commit");
+    settle(&mut sim, core::slice::from_mut(&mut seed));
+    assert!(matches!(seed.store.take_committed(), Some(Ok(_))));
+    assert_eq!(seed.store.leases_len(), 0);
+
+    let mut writer = Actor::new(reached(2), &root, Plant::None);
+    settle(&mut sim, core::slice::from_mut(&mut writer));
+    let (old_map, old_entry) = writer.store.newest_mapped(Namespace::LOCAL, &pointer).expect("writer's pointer");
+    let old = writer.store.mapped_at(old_map);
+    let old_segment = old.seg().id;
+    assert_eq!(old.payload(&old_entry), &targets[0].0.0);
+
+    let mut update = Batch::new(Namespace::LOCAL);
+    update.put(pointer, ReservedTag::Pointer.tag(), &targets[1].0.0).expect("update the pointer");
+    seed.store.commit(&[&update], sim.wall_ns(), &mut seed.effects).expect("concurrent pointer commit");
+    settle(&mut sim, core::slice::from_mut(&mut seed));
+    assert!(matches!(seed.store.take_committed(), Some(Ok(_))));
+
+    let mut gc = Actor::new(reached(3), &root, Plant::None);
+    settle(&mut sim, core::slice::from_mut(&mut gc));
+    assert!(gc.store.compact(&mut gc.effects));
+    settle(&mut sim, core::slice::from_mut(&mut gc));
+    let slice = gc.store.take_sliced().expect("compaction result");
+    assert!(slice.merged && !slice.aborted && slice.segments > 1, "{slice:?}");
+    assert!(!gc.store.segments().iter().any(|&(id, _)| id == old_segment));
+    let (map, entry) = gc.store.newest_mapped(Namespace::LOCAL, &pointer).expect("compacted pointer");
+    assert_eq!(gc.store.mapped_at(map).payload(&entry), &targets[1].0.0);
+
+    sim.advance(life);
+    let answer = writer.store.root_for("writer.answer", &[pointer, targets[0]], ROOT_LIFE_NS).expect("closing root");
+    writer.store.commit(&[], sim.wall_ns(), &mut writer.effects).expect("closing commit");
+    settle(&mut sim, core::slice::from_mut(&mut writer));
+    let published = writer.store.take_committed().expect("closing verdict");
+    assert!(published.is_ok(), "closing commit must keep the relocated pointer: {published:?}");
+
+    let store = Driven::with(sim, Path::new("/sim"), reached(4), &root).expect("reader open");
+    let reader = Lent::new(store, &root);
+    assert_eq!(reader.pointed(TAG, &pointer).expect("reader's pointer"), Some(targets[1]));
+    assert_eq!(reader.get(&targets[0]).expect("old target").expect("rooted record").bytes, payload);
+    assert_eq!(reader.root_named("writer.answer"), Some(answer));
+}
+
 /// One effect of the test's own, run to its completion.
 fn ask(sim: &mut Sim, effect: Effect) -> Done {
     let mut effects = vec![effect];

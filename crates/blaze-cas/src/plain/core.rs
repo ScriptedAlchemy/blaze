@@ -6926,7 +6926,7 @@ impl<A: Allocator + Clone> Plain<A> {
         if flip.carry {
             let has_pointer = self.carrying.iter().any(|&(segment, key)| self.swept_entry(segment, key).is_some_and(|(_, entry)| ReservedTag::Pointer.is(entry.tag)));
             if has_pointer && let Some((_, manifest)) = flip.refreshed {
-                let previous = std::mem::replace(&mut self.manifest, manifest);
+                let previous = core::mem::replace(&mut self.manifest, manifest);
                 self.carry_check = Some(CarryCheck { previous, change: flip.change });
                 self.map_new(Then::CarryCheck, effects);
             } else {
@@ -7051,6 +7051,12 @@ impl<A: Allocator + Clone> Plain<A> {
         self.phase = Phase::Ready;
     }
 
+    /// The entry in the exact segment the commit previously read, including retired mappings.
+    fn swept_entry(&self, segment: u64, key: ContentId) -> Option<(usize, Entry)> {
+        let &at = self.by_id.get(&segment)?;
+        self.probe(at, &Key(key)).map(|(_, entry)| (at, entry))
+    }
+
     /// One round of a commit carrying forward the records its roots name whose segment a
     /// slice replaced since this process read it (`carrying`, listed by the flip that found
     /// them, which unlocked without flipping): each copied from this process's own mapping of
@@ -7060,13 +7066,10 @@ impl<A: Allocator + Clone> Plain<A> {
     /// then asked again, naming the commit's segments and it. The records are the commit's
     /// own from then on: no longer reused, so nothing more is checked of them. Counted in
     /// [`Plain::carried`].
-    fn swept_entry(&self, segment: u64, key: ContentId) -> Option<(usize, Entry)> {
-        let &at = self.by_id.get(&segment)?;
-        self.probe(at, &Key(key)).map(|(_, entry)| (at, entry))
-    }
-
     fn carry(&mut self, change: Change<A>, effects: &mut Vec<Effect>) {
-        let Change::Commit { segs, started_ns, roots } = change else { unreachable!("only a commit carries") };
+        let Change::Commit { segs, started_ns, roots } = change else {
+            return self.stop(StoreError::Busy { phase: "carrying entries without a commit" });
+        };
         self.carry_rounds += 1;
         let carrying = std::mem::replace(&mut self.carrying, Vec::new_in(self.alloc.clone()));
         let mut out = Batch::new(Namespace::LOCAL);
@@ -7114,28 +7117,26 @@ impl<A: Allocator + Clone> Plain<A> {
     /// Check a mutable name against the manifest read at the failed flip. Keep any newly
     /// verified maps, but restore the commit's original manifest: its reach and any parked
     /// compaction were planned against that generation. The next flip checks the new row ID.
-    fn recheck_carried_pointers(&mut self, effects: &mut Vec<Effect>) {
-        let CarryCheck { previous, change } = self.carry_check.take().expect("a carry waiting for its view");
+    fn recheck_carried_pointers(&mut self, previous: Manifest) -> Result<(), StoreError> {
         let mut moved = self.alloc_vec();
         let mut missing = None;
         for &(segment, key) in self.carrying.iter() {
             if !self.swept_entry(segment, key).is_some_and(|(_, entry)| ReservedTag::Pointer.is(entry.tag)) {
                 continue;
             }
-            match self.newest_mapped(Namespace::LOCAL, &Key(key)) {
-                Some((at, entry)) if ReservedTag::Pointer.is(entry.tag) => moved.push(((segment, key), (self.maps[at].seg().id, key))),
-                _ => {
-                    missing = Some(StoreError::SweptUnder { key, segment });
-                    break;
-                }
-            }
+            let found = self.newest_mapped(Namespace::LOCAL, &Key(key))
+                .filter(|(_, entry)| ReservedTag::Pointer.is(entry.tag))
+                .and_then(|(at, _)| self.maps.get(at));
+            let Some(found) = found else {
+                missing = Some(StoreError::SweptUnder { key, segment });
+                break;
+            };
+            moved.push(((segment, key), (found.seg().id, key)));
         }
         self.manifest = previous;
         self.order_view();
         if let Some(why) = missing {
-            let Change::Commit { roots, .. } = change else { unreachable!("only a commit carries") };
-            self.commit_refused(why, roots);
-            return;
+            return Err(why);
         }
         let was_moved = |touch: &(u64, ContentId)| moved.binary_search_by_key(touch, |&(old, _)| old).is_ok();
         self.carrying.retain(|touch| !was_moved(touch));
@@ -7144,7 +7145,7 @@ impl<A: Allocator + Clone> Plain<A> {
         self.touches.sort_unstable();
         self.touches.dedup();
         self.note_carried(moved.iter().map(|&(_, (_, key))| key));
-        self.carry(change, effects);
+        Ok(())
     }
 
     /// Records this process's commits carried forward, ever ([`CARRY_ROUNDS`]): the store's
@@ -7512,7 +7513,18 @@ impl<A: Allocator + Clone> Plain<A> {
         self.pending_map_files.clear();
         self.order_view();
         match then {
-            Then::CarryCheck => return self.recheck_carried_pointers(effects),
+            Then::CarryCheck => {
+                let Some(CarryCheck { previous, change }) = self.carry_check.take() else {
+                    return self.stop(StoreError::Busy { phase: "rechecking a relocated pointer without its commit" });
+                };
+                if let Err(why) = self.recheck_carried_pointers(previous) {
+                    let Change::Commit { roots, .. } = change else { return self.stop(why) };
+                    self.commit_refused(why, roots);
+                } else {
+                    self.carry(change, effects);
+                }
+                return;
+            }
             Then::Commit => {
                 let segments = std::mem::replace(&mut self.committing, Vec::new_in(self.alloc.clone()));
                 for id in segments.iter() {
