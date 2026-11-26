@@ -79,7 +79,9 @@ blaze-screen	8
 blaze-script	45
 blaze-semver	12
 blaze-serve	126
+blaze-sh	21
 blaze-sha256	1
+blaze-shell	139
 blaze-sim	24
 blaze-solve	24
 blaze-sort	3
