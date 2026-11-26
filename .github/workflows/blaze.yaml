@@ -1,5 +1,11 @@
 name: PR 81 nested WASI build dependency migration
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Exact migration source commit
+        type: string
+        required: true
 permissions:
   contents: read
 defaults:
@@ -15,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: fee396b2363f7eeb7a3877f1c21d11a0ab41c9f4
+          ref: ${{ inputs.source }}
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
@@ -64,6 +70,14 @@ jobs:
             a_wasi_producer_receipt_serves_the_compiled_path_and_search_list \
             2>&1 | tee "$evidence/producer-grant.log"
           grep -Fq 'a_wasi_producer_receipt_serves_the_compiled_path_and_search_list ... ok' "$evidence/producer-grant.log"
+      - name: Verify GAT bounds and associated const arguments
+        if: ${{ !cancelled() && steps.shelf.outcome == 'success' }}
+        run: |
+          evidence="$RUNNER_TEMP/selection-evidence"
+          tc="$(cat pins/toolchain)"
+          timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-ladder --test front2_bounds \
+            bounds_through_front2 -- --exact --nocapture 2>&1 | tee "$evidence/gat-bounds.log"
+          grep -Fq 'bounds_through_front2 ... ok' "$evidence/gat-bounds.log"
       - name: Preserve source, binary and runtime evidence
         if: always()
         uses: actions/upload-artifact@v7
