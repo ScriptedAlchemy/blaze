@@ -392,7 +392,8 @@ mod tests {
     /// span in the body (past the attribute and `let events = `), matching both paren and brace calls.
     #[test]
     fn attributed_expr_macro_call_in_body_resolves_to_call_span() {
-        let alloc = blaze_own::Alloc::global();
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
         for call in ["stream_select!(a, b)", "stream_select! { a, b }"] {
             let body = format!("fn f() {{\n    #[expect(clippy::needless_continue)]\n    let events = {call};\n}}\n");
             let nested = blaze_file_items::nested::scan(&body, alloc);

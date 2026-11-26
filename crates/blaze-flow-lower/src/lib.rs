@@ -6335,9 +6335,15 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             let object = PInfo { start: d.start + ref_skip, len: d.len - ref_skip, ..d };
             if self.relate_projected_object(from_inner, source, obj, object, e)? {
                 if ref_skip == 1 {
-                    let dest_ref = self.origs[d.start as usize];
-                    self.b.subset(self.origs[s.start as usize], dest_ref);
-                    self.b.subset(self.origs[object.start as usize], dest_ref);
+                    let (Some(&source_ref), Some(&dest_ref), Some(&object_lifetime)) = (
+                        self.origs.get(to_usize(s.start)),
+                        self.origs.get(to_usize(d.start)),
+                        self.origs.get(to_usize(object.start)),
+                    ) else {
+                        return self.refuse(Form::Bound, e);
+                    };
+                    self.b.subset(source_ref, dest_ref);
+                    self.b.subset(object_lifetime, dest_ref);
                 }
                 return Ok(UnsizeDone::ClosureSigTied);
             }

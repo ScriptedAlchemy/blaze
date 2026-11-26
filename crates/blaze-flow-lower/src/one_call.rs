@@ -41,6 +41,7 @@ use blaze_borrow::{
 };
 use blaze_borrow::inst::{AskArgs, ImplWhere, Keyed, SelfHead, Unkeyed};
 use blaze_flow::{Origin, Place};
+use blaze_int::idx;
 use blaze_own::Vec;
 use blaze_typeck::region_facts::{ClauseView, Outlives};
 use blaze_typeck::regions::{Arity, Count, Region};
@@ -955,7 +956,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             at += 1;
             if let PNode::Closure { owner, ordinal, .. } = self.node(ty, e)?
                 && owner == self.body.owner
-                && let Some(&sig) = self.ck.closures.column::<2>().get(ordinal as usize)
+                && let Some(&sig) = self.ck.closures.column::<2>().get(idx(ordinal))
             {
                 self.body_slots(sig, bodies, e)?;
             }
@@ -989,9 +990,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 && let PNode::Closure { owner, ordinal, .. } = self.node(ty, e)?
                 && owner == self.body.owner
                 && !body.closures.iter().any(|r| r.0 == ordinal)
-                && let Some(&sig) = self.ck.closures.column::<2>().get(ordinal as usize)
-                && self.sig_slots(ordinal as usize, e, &mut slots).is_ok()
-                && caller.count(sig) == Ok(SlotCount::new(slots.len() as u32))
+                && let Some(&sig) = self.ck.closures.column::<2>().get(idx(ordinal))
+                && self.sig_slots(idx(ordinal), e, &mut slots).is_ok()
+                && let Ok(count) = u32::try_from(slots.len())
+                && caller.count(sig) == Ok(SlotCount::new(count))
             {
                 let mut nsig = 0u32;
                 let mut max_late = 0u32;
@@ -1003,7 +1005,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                     }
                 }
                 if let Some(ncap) = total_slots.get().checked_sub(nsig) {
-                    let start = u32::try_from(body.regs.len()).unwrap_or(u32::MAX);
+                    let Ok(start) = u32::try_from(body.regs.len()) else { return self.refuse(Form::Bound, e) };
                     let mut next_late = max_late;
                     for &slot in slots.iter() {
                         body.regs.push(match slot {
@@ -1017,7 +1019,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                             }
                         });
                     }
-                    body.closures.push((ordinal, sig, ncap, nsig, start, slots.len() as u32));
+                    body.closures.push((ordinal, sig, ncap, nsig, start, count));
                 }
             }
         }

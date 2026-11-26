@@ -52,7 +52,7 @@ blaze-export	193
 blaze-fetch	170
 blaze-file-items	280
 blaze-flow	275
-blaze-flow-lower	230
+blaze-flow-lower	229
 blaze-fmt	352
 blaze-format	24
 blaze-format-core	103

@@ -88,16 +88,18 @@ fn the_real_context_refuses_an_unmet_bound() {
 /// and its source location, then closes with what this build runs today.
 #[test]
 fn a_slice_pattern_over_a_slice_in_a_let_is_a_named_refusal() {
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
     let text = "fn main() {\n    let array = [1u8];\n    let slice: &[u8] = &array;\n    let [..] = slice;\n}";
     let files = [SourceFile { path: "src/main.rs", text }];
     assert_eq!(diagnostics(&files), 0, "the slice pattern type-checks");
-    let all = refusals(&files, "src/main.rs", OverflowChecks::On, Alloc::global());
+    let all = refusals(&files, "src/main.rs", OverflowChecks::On, alloc);
     assert_eq!(all.len(), 1, "{all:?}");
     let r = &all[0];
     let construct = "a slice pattern over a slice `[T]` in a `let` or parameter pattern";
     assert_eq!(r.rule, RefusalRule::Unsupported, "{r:?}");
     assert_eq!(r.construct, Some(construct), "{r:?}");
-    let message = blaze_own::format_in!(Alloc::global(), "{construct} {NOT_YET}");
+    let message = blaze_own::format_in!(alloc, "{construct} {NOT_YET}");
     assert_eq!(&*r.message, message.as_str());
     let at = (r.place + r.start) as usize;
     let end = (r.place + r.end) as usize;
@@ -111,9 +113,10 @@ fn a_slice_pattern_over_a_slice_in_a_let_is_a_named_refusal() {
 
 #[test]
 fn an_irrefutable_or_pattern_in_a_let_builds() {
+    let heap = blaze_own::testing::heap();
     let text = "enum E { A(u8), B(u8) }\nfn main() { let (E::A(x) | E::B(x)) = E::A(1); }";
     let files = [SourceFile { path: "src/main.rs", text }];
-    let all = refusals(&files, "src/main.rs", OverflowChecks::On, Alloc::global());
+    let all = refusals(&files, "src/main.rs", OverflowChecks::On, heap.alloc());
     assert!(all.is_empty(), "{all:?}");
 }
 
