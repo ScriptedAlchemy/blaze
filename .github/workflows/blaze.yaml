@@ -248,11 +248,15 @@ jobs:
   # blaze builds blaze again (AGENTS.md rule blaze-builds-blaze). No LLVM: no buildable crate
   # links it. Each hosted job starts from its checked-out source and the pinned toolchain.
   cargo:
-    name: cargo check and test, linux arm64
+    name: cargo check and test, linux arm64 (${{ matrix.partition }}/9)
     needs: changes
     if: needs.changes.outputs.tier != 'none'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/locked-memory
@@ -303,7 +307,7 @@ jobs:
       # build. Constructors, TLS and refusal cleanup need execution receipts, not only an
       # all-target type check. The full workspace checks below remain required.
       - name: native launcher, constructors, TLS and cleanup
-        if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && env.BLAZE_SCRIPTS != '' }}
         run: |
           evidence="$RUNNER_TEMP/native-launcher-evidence"
           mkdir -p "$evidence"
@@ -319,7 +323,7 @@ jobs:
           printf '%s\n' "$result" > "$evidence/exit-code.txt"
           exit "$result"
       - name: keep native launcher execution evidence
-        if: always()
+        if: ${{ always() && matrix.partition == 0 }}
         uses: actions/upload-artifact@v7
         with:
           name: native-launcher-evidence
@@ -328,7 +332,7 @@ jobs:
       # This instance-selection regression must execute even when the complete workspace's
       # later test-binary build finds another blocker. A filter matching no test is a failure.
       - name: owner field-bound instance selection
-        if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && env.BLAZE_SCRIPTS != '' }}
         run: |
           evidence="$RUNNER_TEMP/owner-field-bound-evidence"
           mkdir -p "$evidence"
@@ -349,14 +353,14 @@ jobs:
           printf '%s\n' "$result" > "$evidence/exit-code.txt"
           exit "$result"
       - name: keep owner field-bound execution evidence
-        if: always()
+        if: ${{ always() && matrix.partition == 0 }}
         uses: actions/upload-artifact@v7
         with:
           name: owner-field-bound-evidence
           path: ${{ runner.temp }}/owner-field-bound-evidence
           if-no-files-found: warn
       - name: source C ABI integer pairs through both emitters
-        if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && env.BLAZE_SCRIPTS != '' }}
         run: |
           evidence="$RUNNER_TEMP/cabi-integer-evidence"
           mkdir -p "$evidence"
@@ -396,21 +400,28 @@ jobs:
           printf '%s\n' "$result" > "$evidence/exit-code.txt"
           exit "$result"
       - name: keep source C ABI execution evidence
-        if: always()
+        if: ${{ always() && matrix.partition == 0 }}
         uses: actions/upload-artifact@v7
         with:
           name: cabi-integer-evidence
           path: ${{ runner.temp }}/cabi-integer-evidence
           if-no-files-found: warn
       - name: cargo check --workspace --exclude blaze-std --all-targets
-        if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
+        if: ${{ !cancelled() && matrix.partition == 0 && env.BLAZE_SCRIPTS != '' }}
         run: timeout -k 30 3600 cargo +"$(cat pins/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short
       - name: cargo test --workspace --exclude blaze-std
         if: ${{ !cancelled() && env.BLAZE_SCRIPTS != '' }}
         run: |
           input=$(timeout 10 jq -cn --arg evidence "$RUNNER_TEMP/workspace-storage-evidence" \
-            '{exclude:["blaze-std"],evidence:$evidence}')
+            --argjson partition '${{ matrix.partition }}' \
+            '{exclude:["blaze-std"],evidence:$evidence,partition:$partition,partitions:9,build_timeout_s:2400}')
           timeout -k 30 5400 "$BLAZE_SCRIPTS/ci_test" "$input"
+      - name: recover completed links after an interrupted test build
+        if: ${{ always() && env.BLAZE_SCRIPTS != '' }}
+        run: |
+          input=$(timeout 10 jq -cn --arg evidence "$RUNNER_TEMP/workspace-storage-evidence" \
+            '{inventory_only:true,evidence:$evidence}')
+          timeout -k 10 60 "$BLAZE_SCRIPTS/ci_test" "$input"
       - name: storage after workspace compiler tests
         if: ${{ always() && env.BLAZE_SCRIPTS != '' }}
         run: |
@@ -424,7 +435,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: workspace-storage-evidence
+          name: workspace-storage-evidence-${{ matrix.partition }}
           path: ${{ runner.temp }}/workspace-storage-evidence
           if-no-files-found: warn
       # D180: blaze-sys's compiled objects reference no C-library symbol on Linux (both
@@ -432,6 +443,7 @@ jobs:
       # tools/ratchets/blaze-sys-libsystem.txt (scripts/src/bin/sys_imports.rs). Its lib alone,
       # no_std: an rlib per target (nothing links, so the Mac target builds here too).
       - name: blaze-sys imports, per target
+        if: ${{ success() && matrix.partition == 0 }}
         run: |
           tc="$(cat pins/toolchain)"
           sysroot="$(rustc +"$tc" --print sysroot)"
@@ -449,7 +461,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: workspace-toolchain-evidence
+          name: workspace-toolchain-evidence-${{ matrix.partition }}
           path: ${{ runner.temp }}/toolchain-cut
           if-no-files-found: warn
 
