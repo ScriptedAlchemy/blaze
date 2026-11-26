@@ -432,10 +432,8 @@ fn compare_binding(provider: &'static str, plant: bool) {
             name: Name::new(Kind::BodyCheck, main.0), phase: Phase::new(Stage::Bodies, 0),
             source: ABSENT, file: Name::new(Kind::FileItems, ABSENT),
         };
-        let body = BodyFrame {
-            frame, alloc: a, plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All,
-            heads: None, sources: None, goals: None, prepared: None,
-        };
+        let body = BodyFrame { frame, alloc: a, plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All,
+        heads: None, sources: None, goals: None, prepared: None, front: None };
         let filed = check_body(view, &Task { planned, key: Key(ABSENT) }, &body, kept, blaze_own::testing::heap().shared())
             .expect("the caller's BodyCheck read list");
         let reads = recorder.finish().expect("binding reads");
@@ -469,8 +467,9 @@ fn compare_binding(provider: &'static str, plant: bool) {
         if plant {
             assert_ne!(w, l, "the comparison must catch the other module's definition");
             let syms = NameCell::InternalSymbols { krate: crates[1].key.prefix() };
-            let orig_names = blaze_scope::names_record::encode(names.krate(1), a).expect("original provider names");
-            let orig_items = items_record::encode_with(names.krate(1), &names, a).expect("original provider items");
+            let bump = blaze_own::testing::bump();
+            let orig_names = blaze_scope::resolve::aligned(&blaze_scope::names_record::encode(names.krate(1), a).expect("original provider names"), bump);
+            let orig_items = blaze_scope::resolve::aligned(&items_record::encode_with(names.krate(1), &names, a).expect("original provider items"), bump);
             let digest_of = |n_bytes: &[u8], i_bytes: &[u8], text: &'static str| {
                 let record = blaze_scope::names_record::NamesRecord::open(blaze_scope::names_record::Verified::check(n_bytes).expect("names record"));
                 let items_rec = blaze_scope::items_record::ItemsRecord::open_with_files(i_bytes, blaze_own::testing::heap().alloc(), move |index, _, _, edition| {

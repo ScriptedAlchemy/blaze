@@ -741,6 +741,13 @@ pub enum Lang {
     CallRefFuture,
     /// The trait `From` (`from` / `core::convert::From`), for error-union conversions.
     From,
+    /// Compiler-builtin marker trait satisfied by every `enum` ADT (`#[lang = "blaze_enum"]`).
+    Enum,
+    /// Compiler-builtin marker trait satisfied by every fieldless `enum` ADT (`#[lang = "blaze_unit_enum"]`).
+    UnitEnum,
+    /// `core::any::TryAsDynCompatible` (`#[lang = "try_as_dyn"]`): implemented for `dyn Trait + 'a`
+    /// without associated type bounds.
+    TryAsDyn,
 }
 
 /// The shape of a self type impls are bucketed by (rustc's `SimplifiedType`, blaze-impls'

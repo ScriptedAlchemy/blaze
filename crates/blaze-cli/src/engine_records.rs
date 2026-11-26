@@ -93,6 +93,12 @@ pub(crate) trait Route {
     /// read it before, copied twice (the record out of the store into the wave's frame, then the
     /// section 16-aligned again), each copy counted.
     fn exports<'r>(name: Name, bytes: &'r [u8], counts: &mut ReadCounts, alloc: Alloc<'r>) -> Result<&'r [u8], ReadError>;
+
+    /// Whether records opened on this route use O(1) lazy header validation (verifying accessed
+    /// module scopes, enum variants, and strings on demand) instead of eager full-section scans.
+    fn check_lazy() -> bool {
+        false
+    }
 }
 
 /// The section borrowed where it lies in the mapping, refused when it is not aligned.
@@ -105,6 +111,10 @@ impl Route for InPlace {
 
     fn exports<'r>(name: Name, bytes: &'r [u8], _counts: &mut ReadCounts, _alloc: Alloc<'r>) -> Result<&'r [u8], ReadError> {
         Aligned16::new(bytes).map(Aligned16::bytes).map_err(|why| ReadError::Misaligned { name, which: "exports section", why })
+    }
+
+    fn check_lazy() -> bool {
+        true
     }
 }
 
@@ -170,7 +180,11 @@ pub(crate) fn open_record<'r, R: Route>(
     let names = R::section(name, "names section", parts.names, counts, alloc)?;
     let items = R::section(name, "items section", parts.items, counts, alloc)?;
     let expansions = R::section(name, "expansions directory", parts.expansions, counts, alloc)?;
-    Ok(crate::front_load::checked_records(name, key, names, items, expansions, alloc)?)
+    if R::check_lazy() {
+        Ok(crate::front_load::checked_records_lazy(name, key, names, items, expansions)?)
+    } else {
+        Ok(crate::front_load::checked_records(name, key, names, items, expansions, alloc)?)
+    }
 }
 
 /// A dependency's exports section as a names task is handed it ([`EngineRecords::exports`]),
@@ -257,6 +271,62 @@ impl<'r> EngineRecords<'r> {
         let records = open_record::<InPlace>(input.name, record, key, &mut self.counts, alloc)?;
         self.read.insert((input.name, input.at), records);
         Ok(records)
+    }
+
+    /// Committed-only in-place lookup of a dependency's exports section: borrows a committed
+    /// segment for `'r` without pinning any uncommitted arena, returning `Ok(None)` when the
+    /// record lives in this command's uncommitted arena (caller reads through a snapshot).
+    pub(crate) fn exports_committed<'j, R: Route>(&mut self, cx: &Cx, store: &mut dyn Store<'r>, input: &Input, alloc: Alloc<'j>) -> Result<Option<Exports<'j>>, ReadError>
+    where
+        'r: 'j,
+    {
+        if let Some(cached) = self.exports_cache.get(&(input.name, input.at)) {
+            self.counts.hits += 1;
+            return Ok(Some(*cached));
+        }
+        let cx = cx.span("engine: a dependency's exports read in place");
+        let held = match store.get_committed(&cx, input.at).map_err(LoadError::Store)? {
+            crate::store::Committed::Found(held) => held,
+            crate::store::Committed::InArena => return Ok(None),
+            crate::store::Committed::Absent => return Err(LoadError::NotInStore { name: input.name, at: input.at }.into()),
+        };
+        let record = held.place.map_err(|why| ReadError::NotInPlace { name: input.name, why })?;
+        let (payload, parts) = payload_of(input.name, record)?;
+        self.counts.records += 1;
+        self.counts.bytes += u64::try_from(record.len()).unwrap_or(u64::MAX);
+        store_read(record.len());
+        self.counts.sections += u64::try_from(parts.exports.len()).unwrap_or(u64::MAX);
+        let exports = R::exports(input.name, parts.exports, &mut self.counts, alloc)?;
+        if let Ok(aligned) = Aligned16::new(parts.exports) {
+            self.exports_cache.insert((input.name, input.at), Exports { payload: payload.bytes(), exports: aligned.bytes() });
+        }
+        Ok(Some(Exports { payload: payload.bytes(), exports }))
+    }
+
+    /// Reads an uncommitted dependency's exports section in place from `snap` (a short-lived
+    /// `StoreSnapshot` holding the shared arena), returning the exports slice and its byte
+    /// `(offset, len)` inside the record bytes so workers can re-slice from `snap` without
+    /// setting `shared_lent = true` on `Lent`.
+    pub(crate) fn exports_from_snapshot<'j, R: Route>(
+        &mut self,
+        snap: &'j crate::store::StoreSnapshot,
+        input: &Input,
+        alloc: Alloc<'j>,
+    ) -> Result<(Exports<'j>, usize, usize), ReadError> {
+        let bytes = snap
+            .get(input.at)
+            .map_err(|why| LoadError::Store(crate::CliError::Store(crate::store::StoreFailure::Place(crate::store::plain_place::PlaceError::Snapshot(why)))))?
+            .ok_or(LoadError::NotInStore { name: input.name, at: input.at })?;
+        let record = Aligned16::new(bytes).map_err(|why| ReadError::NotInPlace { name: input.name, why: blaze_cas::plain::NotInPlace::Misaligned(why) })?;
+        let (payload, parts) = payload_of(input.name, record)?;
+        let offset = parts.exports.as_ptr().addr().saturating_sub(bytes.as_ptr().addr());
+        let len = parts.exports.len();
+        self.counts.records += 1;
+        self.counts.bytes += u64::try_from(record.len()).unwrap_or(u64::MAX);
+        store_read(record.len());
+        self.counts.sections += u64::try_from(len).unwrap_or(u64::MAX);
+        let exports = R::exports(input.name, parts.exports, &mut self.counts, alloc)?;
+        Ok((Exports { payload: payload.bytes(), exports }, offset, len))
     }
 
     /// The exports section of the dependency record `input` names, for a names task (names/

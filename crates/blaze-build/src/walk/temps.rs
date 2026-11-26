@@ -41,12 +41,12 @@ use core::alloc::Allocator;
 
 use blaze_lir::builder::MemAttrs;
 use blaze_lir::func::{SlotId, SlotKind};
-use blaze_lir::{Flags, IntCond, Ty, Value};
+use blaze_lir::{Block, Flags, IntCond, Op, Ty, Value};
 use blaze_own::Vec;
-use blaze_typeck::{BinOp, CtorKind, Def, Edition, Expr, ExprId, Stmt, UnOp};
+use blaze_typeck::{BinOp, CtorKind, Def, Edition, Expr, ExprId, Pat, PatId, Stmt, StmtId, StructBase, UnOp};
 
 use super::lets::scope::LetAnchor;
-use super::{Held, NO_EXPR, Repr, Task, Walk, malformed, unsupported};
+use super::{Held, Home, LocalOwn, NO_EXPR, Repr, Task, V, Walk, malformed, unsupported};
 use crate::BuildError;
 
 /// `Walk::temp_here` per expression: not a temporary scope of its own.
@@ -449,6 +449,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// reverse order of creation; the bindings its `let` made, and extended temporaries
     /// (`Held::Temp`, its block's), stay.
     pub(super) fn temp_end(&mut self) -> Result<(), BuildError> {
+        let depth = self.temp_scopes.len().saturating_sub(1);
         let mark = self.temp_marks.pop().ok_or(malformed("a statement's temporaries out of order"))? as usize;
         self.temp_scopes.pop().ok_or(malformed("a statement's temporaries out of order"))?;
         let mut i = self.scope_pats.len();
@@ -456,14 +457,787 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             i -= 1;
             let h = self.scope_pats[i];
             // `Held::Moved`: a temporary scrutinee a match by tests moves out of (walk/moves.rs).
-            if let Held::Rest { .. } | Held::Moved { .. } = h {
+            if let Held::Rest { at, .. } = h {
                 self.drop_held(h, true)?;
                 self.scope_pats.remove(i);
+                if let Some(slot) = self.whole_slot(at) {
+                    self.end_temp_slot(slot);
+                }
+            } else if let Held::Moved { at, mask, .. } = h {
+                self.drop_held(h, true)?;
+                self.scope_pats.remove(i);
+                if self.live {
+                    self.b.slot_dead(mask);
+                    self.release_dead_slot(mask);
+                }
+                if let Some(slot) = self.whole_slot(at) {
+                    self.end_temp_slot(slot);
+                }
             } else if self.super_let_ends_here(h)? {
                 // A `super let` binding of a block in this scope (walk/super_let.rs).
                 self.scope_pats.remove(i);
             }
         }
+        // End non-dropping temporary slots (and non-dropping `super let` binding slots)
+        // registered in this temporary scope.
+        let mut j = self.temp_slots.len();
+        while j > 0 {
+            j -= 1;
+            if self.temp_slots.get(j).is_some_and(|&(d, _, _)| d >= depth) {
+                let (_, slot, _) = self.temp_slots.remove_swap(j);
+                if self.is_temp_slot(slot) {
+                    self.end_temp_slot(slot);
+                } else if self.live && !self.vals_use_slot(slot) && !self.slot_held(slot) {
+                    self.b.slot_dead(slot);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Whether `slot` is a `SlotKind::Temp` in the current LIR function.
+    pub(super) fn is_temp_slot(&self, slot: SlotId) -> bool {
+        self.b
+            .func()
+            .view()
+            .slots
+            .get(slot.index())
+            .is_some_and(|s| SlotKind::from_byte(s.kind) == Some(SlotKind::Temp))
+    }
+
+    /// Registers a non-dropping temporary slot (`SlotKind::Temp`) created for expression `e`
+    /// (a borrowed copy temporary or `format_args!` argument array) so its storage ends when
+    /// its temporary (or extended `let` block) scope closes, and names it if the flow saves `e`.
+    pub(super) fn hold_copy_temp(&mut self, e: ExprId, at: (Value, i32)) -> Result<(), BuildError> {
+        let Some(slot) = self.whole_slot(at) else { return Ok(()) };
+        if !self.is_temp_slot(slot) {
+            return Ok(());
+        }
+        self.name_slot(slot, blaze_flow_lower::identity::Identity::Temp(e, blaze_flow_lower::identity::Role::Value));
+        if self.co.is_none() {
+            return Ok(());
+        }
+        if let Some((_, init, _)) = self.extended_by(e)? {
+            if let Some(t) = self.temp_scope_index(init)
+                && let Some(&(_, depth)) = self.temp_scopes.get(t)
+                && let Ok(d) = usize::try_from(depth)
+            {
+                self.scope_slots.push((d, slot, Some(e)));
+            }
+            return Ok(());
+        }
+        if let Ok(anchor) = self.temp_anchor(e)
+            && let Some(t) = self.temp_scope_index(anchor)
+        {
+            self.temp_slots.push((t, slot, Some(e)));
+        }
+        Ok(())
+    }
+
+    /// The slot `p` addresses (at any byte offset), if `p` is a `slot_addr`.
+    pub(super) fn value_slot(&self, p: Value) -> Option<SlotId> {
+        let view = self.b.func().view();
+        let ix = p.index();
+        (ix < view.len() && view.op(ix) == Op::SlotAddr).then(|| view.data.get(ix).copied().map(SlotId)).flatten()
+    }
+
+    /// Whether any value currently on the walk's value stack addresses `slot`.
+    fn vals_use_slot(&self, slot: SlotId) -> bool {
+        self.vals_slot_count(slot) > 0
+    }
+
+    /// How many entries currently on the walk's value stack address `slot`.
+    pub(super) fn vals_slot_count(&self, slot: SlotId) -> usize {
+        self.vals
+            .iter()
+            .filter(|&&v| match v {
+                V::Place(p, _) | V::Unsized(p, _) | V::Scalar(p) => self.value_slot(p) == Some(slot),
+                V::None => false,
+            })
+            .count()
+    }
+
+    /// Whether `slot` is owned by an entry currently in `scope_pats`.
+    pub(super) fn slot_held(&self, slot: SlotId) -> bool {
+        self.scope_pats.iter().any(|&h| match h {
+            Held::Rest { at, .. } => self.value_slot(at.0) == Some(slot),
+            Held::Moved { at, mask, .. } => mask == slot || self.value_slot(at.0) == Some(slot),
+            Held::Temp { at, flag, .. } => {
+                self.value_slot(at.0) == Some(slot)
+                    || flag.is_some_and(|(f, home)| f == slot || home == slot)
+            }
+            Held::Pat(p) => {
+                let home_hit = match self.slots.get(p.ix()).copied().flatten() {
+                    Some((Home::Slot(s), _)) => s == slot,
+                    Some((Home::At(v, _), _)) => self.value_slot(v) == Some(slot),
+                    Some((Home::Indirect(..), _)) | None => false,
+                };
+                let own_hit = match self.owned.get(p.ix()).copied() {
+                    Some(LocalOwn::Drop(o)) => o.flag == Some(slot) || o.rest == Some(slot),
+                    Some(LocalOwn::KeptFlags(s)) => s == slot,
+                    _ => false,
+                };
+                home_hit || own_hit
+            }
+            Held::EnvPlace(_) => false,
+        })
+    }
+
+    /// Whether `slot` is bound as any local's home (even a non-dropping local not in `scope_pats`).
+    pub(super) fn slot_is_local(&self, slot: SlotId) -> bool {
+        self.slots.iter().any(|s| match *s {
+            Some((Home::Slot(s), _)) => s == slot,
+            Some((Home::At(v, _), _)) => self.value_slot(v) == Some(slot),
+            Some((Home::Indirect(..), _)) | None => false,
+        })
+    }
+
+    /// Ends `slot` (`slot_dead`) when it is a `SlotKind::Temp` in live code that nothing on the
+    /// value stack, in an open drop scope, or in a local binding still holds.
+    pub(super) fn end_temp_slot(&mut self, slot: SlotId) {
+        if !self.live {
+            return;
+        }
+        if !self.is_temp_slot(slot) {
+            return;
+        }
+        if self.vals_use_slot(slot) || self.slot_held(slot) || self.slot_is_local(slot) {
+            return;
+        }
+        self.b.slot_dead(slot);
+        self.release_dead_slot(slot);
+    }
+
+    /// Marks every `Pat::Bind` declared inside `root` into `decls`.
+    fn mark_pat_binds(&self, root: PatId, decls: &mut [bool]) {
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
+        todo.push(root);
+        while let Some(p) = todo.pop() {
+            let Some(pat) = self.body.pats.get(p.ix()).copied() else { continue };
+            match pat {
+                Pat::Bind { sub, .. } => {
+                    if let Some(b) = decls.get_mut(p.ix()) {
+                        *b = true;
+                    }
+                    if let Some(s) = sub {
+                        todo.push(s);
+                    }
+                }
+                Pat::Ref { inner, .. } => todo.push(inner),
+                Pat::Tuple { elems, .. }
+                | Pat::TupleStruct { elems, .. }
+                | Pat::Slice { elems, .. }
+                | Pat::Or { alts: elems } => {
+                    if let Some(list) = self.body.pat_lists.get(elems.range()) {
+                        todo.extend_from_slice(list);
+                    }
+                }
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                    if let Some(fps) = self.body.field_pats.get(fields.range()) {
+                        for fp in fps {
+                            todo.push(fp.pat);
+                        }
+                    }
+                }
+                Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } | Pat::Missing => {}
+            }
+        }
+    }
+
+    /// Scans `todo_expr` and `todo_stmt` iteratively, marking every local `PatId` read (or
+    /// captured by a nested closure / async block) in `reads`. When `decls` is `Some`, also marks
+    /// every local `PatId` declared inside the scanned subtree.
+    fn scan_reachable_locals(
+        &self,
+        todo_expr: &mut Vec<ExprId, A>,
+        todo_stmt: &mut Vec<StmtId, A>,
+        reads: &mut [bool],
+        mut decls: Option<&mut [bool]>,
+    ) {
+        let body = self.body;
+        while !todo_expr.is_empty() || !todo_stmt.is_empty() {
+            while let Some(s) = todo_stmt.pop() {
+                let Some(stmt) = body.stmts.get(s.ix()).copied() else { continue };
+                match stmt {
+                    Stmt::Let { pat, init, else_, .. } => {
+                        if let Some(d) = decls.as_deref_mut() {
+                            self.mark_pat_binds(pat, d);
+                        }
+                        if let Some(i) = init {
+                            let wild_place = else_.is_none()
+                                && matches!(body.pats.get(pat.ix()), Some(Pat::Wild))
+                                && matches!(body.exprs.get(i.ix()), Some(Expr::Local(p)) if !self.local_drops(*p));
+                            if !wild_place {
+                                todo_expr.push(i);
+                            }
+                        }
+                        if let Some(e) = else_ {
+                            todo_expr.push(e);
+                        }
+                    }
+                    Stmt::Expr { expr, .. } => todo_expr.push(expr),
+                    Stmt::Item => {}
+                }
+            }
+            if let Some(e) = todo_expr.pop() {
+                let Some(expr) = body.exprs.get(e.ix()).copied() else { continue };
+                match expr {
+                    Expr::Local(p) => {
+                        if let Some(b) = reads.get_mut(p.ix()) {
+                            *b = true;
+                        }
+                    }
+                    Expr::Closure { .. } | Expr::AsyncBlock { .. } => {
+                        for f in self.checked.env_fields_by::<crate::layout::BuildEnv>(e) {
+                            if let Some(b) = reads.get_mut(f.base.ix()) {
+                                *b = true;
+                            }
+                        }
+                    }
+                    Expr::Missing | Expr::Lit(_) | Expr::Path(_) | Expr::Continue { .. } | Expr::Underscore | Expr::OffsetOf { .. } | Expr::ConstBlock { .. } => {}
+                    Expr::Paren(x)
+                    | Expr::Loop { body: x }
+                    | Expr::Become { value: x }
+                    | Expr::Field { base: x, .. }
+                    | Expr::TupleField { base: x, .. }
+                    | Expr::Unary { operand: x, .. }
+                    | Expr::Ref { operand: x, .. }
+                    | Expr::RawRef { operand: x, .. }
+                    | Expr::Cast { operand: x, .. }
+                    | Expr::Await(x) => todo_expr.push(x),
+                    Expr::Break { value, .. } | Expr::Return { value } => {
+                        if let Some(x) = value {
+                            todo_expr.push(x);
+                        }
+                    }
+                    Expr::Block { stmts, tail, .. } => {
+                        if let Some(ss) = body.stmt_lists.get(stmts.range()) {
+                            todo_stmt.extend_from_slice(ss);
+                        }
+                        if let Some(t) = tail {
+                            todo_expr.push(t);
+                        }
+                    }
+                    Expr::If { cond, then, else_ } => {
+                        todo_expr.push(cond);
+                        todo_expr.push(then);
+                        if let Some(x) = else_ {
+                            todo_expr.push(x);
+                        }
+                    }
+                    Expr::Let { pat, init } => {
+                        if let Some(d) = decls.as_deref_mut() {
+                            self.mark_pat_binds(pat, d);
+                        }
+                        todo_expr.push(init);
+                    }
+                    Expr::Match { scrutinee, arms } => {
+                        todo_expr.push(scrutinee);
+                        if let Some(list) = body.arms.get(arms.range()) {
+                            for arm in list {
+                                if let Some(d) = decls.as_deref_mut() {
+                                    self.mark_pat_binds(arm.pat, d);
+                                }
+                                if let Some(g) = arm.guard {
+                                    todo_expr.push(g);
+                                }
+                                todo_expr.push(arm.body);
+                            }
+                        }
+                    }
+                    Expr::Call { callee, args } => {
+                        todo_expr.push(callee);
+                        if let Some(list) = body.expr_lists.get(args.range()) {
+                            todo_expr.extend_from_slice(list);
+                        }
+                    }
+                    Expr::MethodCall { receiver, args, .. } => {
+                        todo_expr.push(receiver);
+                        if let Some(list) = body.expr_lists.get(args.range()) {
+                            todo_expr.extend_from_slice(list);
+                        }
+                    }
+                    Expr::Binary { lhs, rhs, .. }
+                    | Expr::Assign { lhs, rhs }
+                    | Expr::AssignOp { lhs, rhs, .. }
+                    | Expr::Index { base: lhs, index: rhs } => {
+                        todo_expr.push(lhs);
+                        todo_expr.push(rhs);
+                    }
+                    Expr::Tuple { elems } | Expr::Array { elems } | Expr::FormatArgs { args: elems, .. } => {
+                        if let Some(list) = body.expr_lists.get(elems.range()) {
+                            todo_expr.extend_from_slice(list);
+                        }
+                    }
+                    Expr::Repeat { elem, .. } => todo_expr.push(elem),
+                    Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
+                        if let Some(inits) = body.field_inits.get(fields.range()) {
+                            for f in inits {
+                                todo_expr.push(f.expr);
+                            }
+                        }
+                        if let StructBase::Expr(b) = base {
+                            todo_expr.push(b);
+                        }
+                    }
+                    Expr::Asm { operands, .. } => {
+                        if let Some(ops) = body.asm_operands.get(operands.range()) {
+                            for o in ops {
+                                todo_expr.push(o.expr);
+                                if let Some(out) = o.out_expr {
+                                    todo_expr.push(out);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per pattern: whether any code reachable in the continuation after the current `.await`
+    /// resumes (pending `self.work` tasks minus unreachable sibling branches/arms, plus enclosing
+    /// loop back-edges for bindings declared outside the loop) may read binding `p`.
+    fn locals_reachable_after_await(&self) -> Vec<bool, A> {
+        let pats = self.body.pats.len();
+        let mut used: Vec<bool, A> = Vec::with_capacity_in(pats, self.alloc);
+        used.resize(pats, false);
+        let mut fail_blocks: Vec<Block, A> = Vec::new_in(self.alloc);
+        let mut has_guard = false;
+        for task in self.work.iter() {
+            match *task {
+                Task::LetLink { fail, .. } | Task::CondLink(fail) => fail_blocks.push(fail),
+                Task::Guard { .. } | Task::GuardAlts { .. } => has_guard = true,
+                _ => {}
+            }
+        }
+        let mut todo_expr: Vec<ExprId, A> = Vec::new_in(self.alloc);
+        let mut todo_stmt: Vec<StmtId, A> = Vec::new_in(self.alloc);
+        for task in self.work.iter() {
+            match *task {
+                Task::Eval(e) | Task::Raw(e) | Task::Place(e) | Task::PlaceDerefs(e, _) => todo_expr.push(e),
+                Task::Stmt(s) => todo_stmt.push(s),
+                Task::If { then, else_, .. } => {
+                    todo_expr.push(then);
+                    if let Some(e) = else_ {
+                        todo_expr.push(e);
+                    }
+                }
+                Task::IfThen { else_: Some(e), else_block, .. } => {
+                    if fail_blocks.iter().any(|&b| b == else_block) {
+                        todo_expr.push(e);
+                    }
+                }
+                Task::LetLink { expr, .. } => todo_expr.push(expr),
+                Task::LetElse(s) => {
+                    if let Some(Stmt::Let { else_: Some(els), .. }) = self.body.stmts.get(s.ix()).copied() {
+                        todo_expr.push(els);
+                    }
+                }
+                Task::Match(e) => {
+                    if let Some(Expr::Match { arms, .. }) = self.body.exprs.get(e.ix()).copied()
+                        && let Some(list) = self.body.arms.get(arms.range())
+                    {
+                        for arm in list {
+                            if let Some(g) = arm.guard {
+                                todo_expr.push(g);
+                            }
+                            todo_expr.push(arm.body);
+                        }
+                    }
+                }
+                Task::Arm { m, i } if has_guard => {
+                    if let Some(st) = usize::try_from(m).ok().and_then(|mx| self.matches.get(mx))
+                        && let Some(Expr::Match { arms, .. }) = self.body.exprs.get(st.expr.ix()).copied()
+                        && let Some(arm) = self
+                            .body
+                            .arms
+                            .get(arms.range())
+                            .and_then(|l| usize::try_from(i).ok().and_then(|ix| l.get(ix)))
+                    {
+                        if let Some(g) = arm.guard {
+                            todo_expr.push(g);
+                        }
+                        todo_expr.push(arm.body);
+                    }
+                }
+                Task::Short { rhs, .. } => todo_expr.push(rhs),
+                Task::AsmLabel { body, .. } => todo_expr.push(body),
+                _ => {}
+            }
+        }
+        self.scan_reachable_locals(&mut todo_expr, &mut todo_stmt, &mut used, None);
+        for t in self.targets.iter() {
+            if t.header.is_none() {
+                continue;
+            }
+            let Some(Expr::Loop { body }) = self.body.exprs.get(t.expr.ix()).copied() else {
+                continue;
+            };
+            let mut loop_reads: Vec<bool, A> = Vec::with_capacity_in(pats, self.alloc);
+            loop_reads.resize(pats, false);
+            let mut loop_decls: Vec<bool, A> = Vec::with_capacity_in(pats, self.alloc);
+            loop_decls.resize(pats, false);
+            todo_expr.push(body);
+            self.scan_reachable_locals(&mut todo_expr, &mut todo_stmt, &mut loop_reads, Some(&mut loop_decls));
+            for i in 0..pats {
+                if loop_reads.get(i).copied().unwrap_or(false) && !loop_decls.get(i).copied().unwrap_or(false)
+                    && let Some(u) = used.get_mut(i)
+                {
+                    *u = true;
+                }
+            }
+        }
+        used
+    }
+
+    /// Before an `.await`'s suspension loop: ends the storage of:
+    /// 1. any statically moved-out dropping local binding (either unflagged with `!self.init[p]`,
+    ///    or flagged with path-sensitive `self.definitely_uninit[p]`), plus its drop flag and
+    ///    partial-move `rest` slots when the flow does not save `p` (so `drop_local` skips it on
+    ///    the cancel path too),
+    /// 2. in a laid coroutine state (`self.names.is_some()`), any non-dropping (`LocalOwn::None`,
+    ///    `LocalOwn::Kept`, or `LocalOwn::KeptFlags`) local binding whose `Identity::Binding(p)` is
+    ///    NOT saved by `blaze-flow::saved()` and has no reachable reads after this `.await`, and
+    /// 3. in a laid coroutine state, any unnamed `SlotKind::Temp` slot unreachable from every
+    ///    live root of `Walk` (completed pre-await temporaries, plus unsaved non-dropping
+    ///    `hold_copy_temp` temporaries such as `format_args!` argument arrays consumed before the
+    ///    suspension).
+    pub(super) fn end_dead_slots_before_await(&mut self, fut_slot: Option<SlotId>) {
+        if !self.live {
+            return;
+        }
+        for i in 0..self.scope_pats.len() {
+            let Some(&Held::Pat(p)) = self.scope_pats.get(i) else { continue };
+            if self.captured_whole(p) {
+                continue;
+            }
+            let Some(LocalOwn::Drop(o)) = self.owned.get(p.ix()).copied() else { continue };
+            let moved_out = match o.flag {
+                None => !self.init.get(p.ix()).copied().unwrap_or(false),
+                Some(_) => self.definitely_uninit.get(p.ix()).copied().unwrap_or(false),
+            };
+            if !moved_out {
+                continue;
+            }
+            if let Some((Home::Slot(slot), _)) = self.slots.get(p.ix()).copied().flatten()
+                && !self.vals_use_slot(slot)
+                && !self.slot_is_named(slot)
+            {
+                self.b.slot_dead(slot);
+            }
+            if let Some(flag_slot) = o.flag
+                && self.names.is_some()
+                && !self.binding_is_saved(p)
+                && !self.slot_is_named(flag_slot)
+            {
+                self.b.slot_dead(flag_slot);
+            }
+            if let Some(rest_slot) = o.rest
+                && self.names.is_some()
+                && !self.binding_is_saved(p)
+                && !self.slot_is_named(rest_slot)
+            {
+                self.b.slot_dead(rest_slot);
+            }
+        }
+        if self.names.is_some() {
+            let live_after = self.locals_reachable_after_await();
+            for ix in 0..self.slots.len() {
+                let Some((Home::Slot(slot), _)) = self.slots.get(ix).copied().flatten() else {
+                    continue;
+                };
+                let rest_slot = match self.owned.get(ix).copied() {
+                    Some(LocalOwn::None | LocalOwn::Kept) => None,
+                    Some(LocalOwn::KeptFlags(r)) => Some(r),
+                    _ => continue,
+                };
+                if live_after.get(ix).copied().unwrap_or(true) {
+                    continue;
+                }
+                let Ok(ix_u32) = u32::try_from(ix) else {
+                    continue;
+                };
+                let p = blaze_typeck::PatId(ix_u32);
+                if self.captured_whole(p)
+                    || self.binding_is_saved(p)
+                    || self.slot_is_named(slot)
+                    || self.vals_use_slot(slot)
+                    || self.slot_held(slot)
+                {
+                    continue;
+                }
+                self.b.slot_dead(slot);
+                if let Some(r) = rest_slot
+                    && !self.slot_is_named(r)
+                {
+                    self.b.slot_dead(r);
+                }
+            }
+            // Live-root sweep over unnamed `SlotKind::Temp` slots: any temp slot not referenced
+            // by any live walk state or named in `StateNames` cannot be read after this suspend.
+            let num_slots = self.b.func().view().slots.len();
+            let mut keep: Vec<bool, A> = Vec::with_capacity_in(num_slots, self.alloc);
+            keep.resize(num_slots, false);
+            let mut mark = |slot: SlotId| {
+                if let Some(b) = keep.get_mut(slot.index()) {
+                    *b = true;
+                }
+            };
+            if let Some(s) = fut_slot {
+                mark(s);
+            }
+            if let Some(s) = self.co.and_then(|c| c.pin) {
+                mark(s);
+            }
+            for &v in self.vals.iter() {
+                if let V::Place(p, _) | V::Unsized(p, _) | V::Scalar(p) = v
+                    && let Some(s) = self.value_slot(p)
+                {
+                    mark(s);
+                }
+            }
+            for held_list in [&self.scope_pats, &self.let_else_held] {
+                for &h in held_list.iter() {
+                    match h {
+                        Held::Rest { at, .. } => {
+                            if let Some(s) = self.value_slot(at.0) {
+                                mark(s);
+                            }
+                        }
+                        Held::Moved { at, mask, .. } => {
+                            mark(mask);
+                            if let Some(s) = self.value_slot(at.0) {
+                                mark(s);
+                            }
+                        }
+                        Held::Temp { at, flag, .. } => {
+                            if let Some(s) = self.value_slot(at.0) {
+                                mark(s);
+                            }
+                            if let Some((f, home)) = flag {
+                                mark(f);
+                                mark(home);
+                            }
+                        }
+                        Held::Pat(_) | Held::EnvPlace(_) => {}
+                    }
+                }
+            }
+            for s in self.slots.iter().flatten() {
+                match s.0 {
+                    Home::Slot(slot) => mark(slot),
+                    Home::At(v, _) => {
+                        if let Some(slot) = self.value_slot(v) {
+                            mark(slot);
+                        }
+                    }
+                    Home::Indirect(..) => {}
+                }
+            }
+            for &own in self.owned.iter() {
+                match own {
+                    LocalOwn::Drop(o) => {
+                        if let Some(f) = o.flag {
+                            mark(f);
+                        }
+                        if let Some(r) = o.rest {
+                            mark(r);
+                        }
+                    }
+                    LocalOwn::KeptFlags(r) => mark(r),
+                    _ => {}
+                }
+            }
+            for &(_, s, expr) in self.temp_slots.iter() {
+                if expr.is_none_or(|e| self.temp_is_saved(e)) {
+                    mark(s);
+                }
+            }
+            for &(_, s, expr) in self.scope_slots.iter() {
+                if expr.is_none_or(|e| self.temp_is_saved(e)) {
+                    mark(s);
+                }
+            }
+            for &(_, s) in self.ext_flags.iter() {
+                mark(s);
+            }
+            for t in self.targets.iter() {
+                if let Some(s) = t.res {
+                    mark(s);
+                }
+            }
+            for m in self.matches.iter() {
+                if let Some(s) = m.res {
+                    mark(s);
+                }
+                if let Some((at, ..)) = m.of_enum
+                    && let Some(s) = self.value_slot(at.0)
+                {
+                    mark(s);
+                }
+                if let Some(at) = m.tested
+                    && let Some(s) = self.value_slot(at.at.0)
+                {
+                    mark(s);
+                }
+            }
+            for task in self.work.iter() {
+                match *task {
+                    Task::IfThen { res: Some(s), .. } | Task::IfElse { res: Some(s), .. } => mark(s),
+                    Task::GuardAlts { word, .. } => mark(word),
+                    _ => {}
+                }
+            }
+            self.moves.for_each_live_slot(&mut mark, |v| self.value_slot(v));
+            for (i, &kept) in keep.iter().enumerate() {
+                if kept {
+                    continue;
+                }
+                let Ok(id) = u32::try_from(i) else { continue };
+                let slot = SlotId(id);
+                if self.is_temp_slot(slot) && !self.slot_is_named(slot) {
+                    self.b.slot_dead(slot);
+                }
+            }
+        }
+    }
+
+    /// Ends the `SlotKind::Temp` slot underlying `v`, if `v` is a whole-slot place and unused.
+    pub(super) fn end_temp_val(&mut self, v: V) {
+        if let V::Place(p, off) = v
+            && let Some(slot) = self.whole_slot((p, off))
+        {
+            self.end_temp_slot(slot);
+        }
+    }
+
+    /// Collects the slots owned by `self.scope_pats[mark..]` into `dead`.
+    fn collect_held_slots(&self, mark: usize, dead: &mut Vec<SlotId, A>) {
+        let Some(held) = self.scope_pats.get(mark..) else { return };
+        for &h in held {
+            match h {
+                Held::Pat(p) => {
+                    match self.slots.get(p.ix()).copied().flatten() {
+                        Some((Home::Slot(s), _)) => dead.push(s),
+                        Some((Home::At(val, off), _)) => {
+                            if let Some(s) = self.whole_slot((val, off)) {
+                                dead.push(s);
+                            }
+                        }
+                        Some((Home::Indirect(..), _)) | None => {}
+                    }
+                    match self.owned.get(p.ix()).copied() {
+                        Some(LocalOwn::Drop(o)) => {
+                            if let Some(f) = o.flag {
+                                dead.push(f);
+                            }
+                            if let Some(r) = o.rest {
+                                dead.push(r);
+                            }
+                        }
+                        Some(LocalOwn::KeptFlags(r)) => dead.push(r),
+                        _ => {}
+                    }
+                }
+                Held::Rest { at, .. } => {
+                    if let Some(s) = self.whole_slot(at)
+                        && self.is_temp_slot(s)
+                    {
+                        dead.push(s);
+                    }
+                }
+                Held::Moved { at, mask, .. } => {
+                    dead.push(mask);
+                    if let Some(s) = self.whole_slot(at)
+                        && self.is_temp_slot(s)
+                    {
+                        dead.push(s);
+                    }
+                }
+                Held::Temp { at, flag, .. } => {
+                    if let Some(s) = self.whole_slot(at)
+                        && self.is_temp_slot(s)
+                    {
+                        dead.push(s);
+                    }
+                    if let Some((f, home)) = flag {
+                        dead.push(f);
+                        dead.push(home);
+                    }
+                }
+                Held::EnvPlace(_) => {}
+            }
+        }
+    }
+
+    /// Emits `slot_dead` on slots owned by `self.scope_pats[mark..]`, `self.scope_slots` at
+    /// depth `>= depth`, and `self.temp_slots` inside `temp_depth` (or whose enclosing drop
+    /// depth is `>= depth` when `temp_depth` is `None`), WITHOUT modifying `scope_pats`,
+    /// `scope_slots`, or `temp_slots` (for a failed `if let` link, `let`-`else` miss path,
+    /// `break`, or `continue`).
+    pub(super) fn end_scope_slots_peek(&mut self, mark: usize, depth: usize) {
+        self.end_scope_slots_peek_except(mark, depth, None, None);
+    }
+
+    pub(super) fn end_scope_slots_peek_except(
+        &mut self,
+        mark: usize,
+        depth: usize,
+        temp_depth: Option<usize>,
+        except: Option<SlotId>,
+    ) {
+        if !self.live {
+            return;
+        }
+        let mut dead: Vec<SlotId, A> = Vec::new_in(self.alloc);
+        self.collect_held_slots(mark, &mut dead);
+        for &(d, slot, _) in self.scope_slots.iter() {
+            if d >= depth {
+                dead.push(slot);
+            }
+        }
+        for &(td, slot, _) in self.temp_slots.iter() {
+            let inside = match temp_depth {
+                Some(t) => td >= t,
+                None => self.temp_scopes.get(td).is_some_and(|&(_, sd)| usize::try_from(sd).is_ok_and(|d| d >= depth)),
+            };
+            if inside {
+                dead.push(slot);
+            }
+        }
+        for slot in dead {
+            if Some(slot) != except && !self.vals_use_slot(slot) {
+                self.b.slot_dead(slot);
+            }
+        }
+    }
+
+    /// Ends the storage of slots owned by the drop scope closing at `(mark, depth)`, sparing any
+    /// slot backing the scope's settled tail value `v` or still live on the value stack.
+    pub(super) fn end_scope_slots(&mut self, mark: usize, depth: usize, v: V) {
+        let kept = match v {
+            V::Place(p, _) | V::Unsized(p, _) | V::Scalar(p) => self.value_slot(p),
+            V::None => None,
+        };
+        let mut dead: Vec<SlotId, A> = Vec::new_in(self.alloc);
+        if self.live {
+            self.collect_held_slots(mark, &mut dead);
+        }
+        let mut j = self.scope_slots.len();
+        while j > 0 {
+            j -= 1;
+            if self.scope_slots.get(j).is_some_and(|&(d, _, _)| d >= depth) {
+                let (_, slot, _) = self.scope_slots.remove_swap(j);
+                if self.live {
+                    dead.push(slot);
+                }
+            }
+        }
+        for slot in dead {
+            if Some(slot) != kept && !self.vals_use_slot(slot) {
+                self.b.slot_dead(slot);
+            }
+        }
     }
 }

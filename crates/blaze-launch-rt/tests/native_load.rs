@@ -468,6 +468,14 @@ fn a_rust_pointer_in_the_tls_template_is_refused_before_execution() {
     println!("native_load: Rust-pointer TLS refused before constructors; a late template patch demonstrably misses the OS's copy");
 }
 
+#[test]
+fn a_preopened_library_reuses_its_handle() {
+    let folder = filed("preopen", Fixture::Bound);
+    let mut natives = DlNatives::open_record(folder.as_os_str().as_encoded_bytes(), LIBRARY).expect("preopen the native image");
+    assert_eq!(load(&mut natives).record, LIBRARY);
+    remove_fixture(&folder);
+}
+
 /// The control: no library loaded (no `Native` sent), the same name is refused by type, naming
 /// the code record's symbol. Prints "native_load: control: no library, `c_seven` is NoNativeLibrary".
 #[test]

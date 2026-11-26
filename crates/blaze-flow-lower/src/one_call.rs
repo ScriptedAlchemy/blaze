@@ -111,7 +111,7 @@ impl CallRule for OneRule {
     const RELATES: bool = true;
     type Grain = RegionSlots;
     fn call<F: Facts, A: Allocator + Copy>(l: &mut Lower<'_, '_, F, A, Self>, site: &CallSite<'_>) -> Result<(), Refusal> {
-        l.call_one(site, false, true)?;
+        l.call_one(site, None, false, true)?;
         l.stats.calls_by_signature += 1;
         Ok(())
     }
@@ -408,6 +408,11 @@ impl<F: Facts> Variances for FactsArity<'_, F> {
 /// two are [`NotSelected::TwoSources`], never a pick.
 struct CallSel<'s, F: Facts> {
     rows: &'s [Projected],
+    /// All selections recorded across the body (`Checked::selected`): consulted only on exact
+    /// structural `Keyed::Same` match when `rows` (the call's own expression) has no entry
+    /// (e.g. `Expr::Await`, where `blaze-typeck::rules::await_impl` selects `IntoFuture` without
+    /// duplicating its operand call's `projected` rows at the `.await` expression).
+    body_rows: &'s [Projected],
     facts: &'s F,
     /// The checked record's table: a row's arguments and impl arguments are its types, and the
     /// caller's values' types are its types too (the walk's `Cx::types`).
@@ -494,11 +499,20 @@ impl<F: Facts> Selected for CallSel<'_, F> {
     fn relates_nothing(&self, trait_: ItemKey) -> bool {
         self.facts.trait_relates_nothing(trait_)
     }
+    fn is_auto_trait(&self, trait_: ItemKey) -> bool {
+        self.facts.is_auto_trait(trait_)
+    }
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
         self.facts.is_zero_slot_builtin_assoc(trait_, name)
     }
     fn is_fn_trait(&self, trait_: ItemKey) -> bool {
         self.facts.is_fn_trait(trait_)
+    }
+    fn is_future_trait(&self, trait_: ItemKey) -> bool {
+        self.facts.is_future_trait(trait_)
+    }
+    fn is_into_future_trait(&self, trait_: ItemKey) -> bool {
+        self.facts.is_into_future_trait(trait_)
     }
     fn fn_def_sig(&self, item: ItemKey) -> Result<(blaze_typeck::region_facts::ParamsView<'_>, blaze_typeck::region_facts::ColView<'_>, ImplWhere<'_>), NotSelected> {
         let regions = self.facts.regions();
@@ -527,6 +541,85 @@ impl<F: Facts> Selected for CallSel<'_, F> {
         let views = regions.clauses(opaque).ok()?;
         let lts = regions.lifetime_params(opaque).ok()?.count();
         Some((lts, views))
+    }
+    fn rpitit_target(&self, opaque: ItemKey, args: &dyn AskArgs) -> Option<blaze_borrow::RpititTarget<'_>> {
+        let info = self.facts.rpitit_opaque(opaque)?;
+        let answers = |r: &&Projected| {
+            r.trait_ == info.trait_
+                && (r.name == Some(info.name) || (r.name.is_none() && matches!(r.selected, blaze_typeck::Selected::Impl { .. })))
+        };
+        let mut exact: Option<&Projected> = None;
+        let mut loose: Option<&Projected> = None;
+        for r in self.rows.iter().filter(answers) {
+            let keyed = match self.tys.list(r.args) {
+                Ok(list) if usize::try_from(info.trait_types).is_ok_and(|tt| list.len() >= tt) => {
+                    let mut all_exact = true;
+                    let mut differ = false;
+                    for (k, &t) in (0..info.trait_types).zip(list.iter()) {
+                        match args.compare(k, t) {
+                            Keyed::Differ => {
+                                differ = true;
+                                break;
+                            }
+                            Keyed::Unknown => all_exact = false,
+                            Keyed::Same => {}
+                        }
+                    }
+                    if differ {
+                        Keyed::Differ
+                    } else if all_exact {
+                        Keyed::Same
+                    } else {
+                        Keyed::Unknown
+                    }
+                }
+                _ if r.name.is_some() => self.match_row(r, args),
+                Ok(_) => Keyed::Differ,
+                Err(_) => Keyed::Unknown,
+            };
+            match keyed {
+                Keyed::Differ => continue,
+                Keyed::Same => match exact {
+                    None => exact = Some(r),
+                    Some(f) if f.selected == r.selected => {}
+                    Some(_) => return None,
+                },
+                Keyed::Unknown => match loose {
+                    None => loose = Some(r),
+                    Some(f) if f.selected == r.selected => {}
+                    Some(_) => return None,
+                },
+            }
+        }
+        let r = exact.or(loose)?;
+        let blaze_typeck::Selected::Impl { imp, args: imp_args } = r.selected else {
+            return None;
+        };
+        let Some(impl_fn) = self.facts.impl_fn(imp, info.fn_name) else {
+            return info.default_twin.map(|twin| blaze_borrow::RpititTarget::Twin { twin });
+        };
+        let types = self.tys.list(imp_args).ok()?;
+        let ntypes = u32::try_from(types.len()).ok()?;
+        let regions = self.facts.regions();
+        let (_, Some(trait_col)) = regions.impl_header(imp).ok()? else { return None };
+        let params = regions.lifetime_params(imp).ok()?;
+        let impl_sig = regions.sig(impl_fn).ok()?;
+        let trait_sig = regions.sig(info.trait_fn).ok()?;
+        let head = ImplHead {
+            imp,
+            lifetimes: params.count(),
+            types: ntypes,
+            trait_ref: Typed { ty: trait_col.ty(), col: trait_col.as_slice() },
+        };
+        Some(blaze_borrow::RpititTarget::ImplFn {
+            trait_: info.trait_,
+            head,
+            trait_types: info.trait_types,
+            impl_fn,
+            impl_params: impl_sig.params,
+            impl_col: impl_sig.col,
+            trait_col: trait_sig.col,
+        })
     }
 
     fn select_keyed(&self, ask: Ask, args: &dyn AskArgs) -> Selection<'_> {
@@ -561,15 +654,37 @@ impl<F: Facts> Selected for CallSel<'_, F> {
             exact
         } else if loose_conflict {
             return Selection::Not(NotSelected::TwoSources);
-        } else {
+        } else if loose.is_some() {
             loose
+        } else if args.count().is_some() {
+            // Fall back to exact `Keyed::Same` rows recorded elsewhere in the same body
+            // (sound by Rust trait coherence: `(trait_, erased_args)` has one unique impl).
+            let mut body_exact: Option<&Projected> = None;
+            let mut body_conflict = false;
+            for r in self.body_rows.iter().filter(answers) {
+                if matches!(r.selected, blaze_typeck::Selected::Unanswered) {
+                    continue;
+                }
+                if self.match_row(r, args) == Keyed::Same {
+                    match body_exact {
+                        None => body_exact = Some(r),
+                        Some(f) if f.selected == r.selected => {}
+                        Some(_) => body_conflict = true,
+                    }
+                }
+            }
+            if body_conflict {
+                return Selection::Not(NotSelected::TwoSources);
+            }
+            body_exact
+        } else {
+            None
         };
         let Some(r) = found else {
-            // If no call row answers, check the body owner's own enclosing trait impl (for
-            // projections on `Self` inside the caller's own `where`-clauses, e.g. `Cycle<I>::Item`,
-            // `Zip<A, B>::Item`, `(&T0, &T1)::Item`).
-            if let Some(oti) = self.facts.owner_trait_impl()
-                && oti.trait_ == ask.trait_
+            // If no call row answers, check the body owner's own enclosing trait impl (and its
+            // supertrait impls for the same `SelfTy`, e.g. `Cloned<I>: Iterator` inside
+            // `impl DoubleEndedIterator for Cloned<I>`).
+            if let Some(oti) = self.facts.owner_trait_impl(ask.trait_)
                 && args.self_shape() == Some(oti.self_shape)
             {
                 return self.impl_at_count(ask, oti.imp, oti.generics);
@@ -625,6 +740,7 @@ struct CallOwner<'s> {
     uni: &'s [(Region, Origin)],
     params: &'s [ParamOrigin],
     bounds: &'s [ClauseView<'s>],
+    sig: Option<Typed<'s>>,
     heads: &'s dyn RegionTypes,
     bodies: BodyParams<'s>,
     closures: ClosureSigs<'s>,
@@ -648,6 +764,9 @@ impl Owner for CallOwner<'_> {
     }
     fn clauses(&self) -> &[ClauseView<'_>] {
         self.bounds
+    }
+    fn sig(&self) -> Option<Typed<'_>> {
+        self.sig
     }
     fn closure_sig(&self, ordinal: u32) -> Option<blaze_borrow::ClosureSig<'_>> {
         self.closures.of(ordinal)
@@ -685,6 +804,7 @@ fn proj_clause_of<'v>(heads: &dyn RegionTypes, views: &'v [ClauseView<'v>], p: u
 struct Sink<'s, A: Allocator + Copy> {
     b: &'s mut Builder<A>,
     static_: Origin,
+    dyn_ph: &'s mut Vec<Origin, A>,
     /// The planted control: drop the next subset.
     drop_next: bool,
 }
@@ -707,6 +827,20 @@ impl<A: Allocator + Copy> Constraints for Sink<'_, A> {
             self.b.known(self.static_, o);
         }
         o
+    }
+    fn dyn_placeholder(&mut self, ordinal: u32) -> Origin {
+        let Ok(idx) = usize::try_from(ordinal) else { return self.fresh(Kind::Placeholder) };
+        if let Some(&o) = self.dyn_ph.get(idx) {
+            return o;
+        }
+        let mut last = self.static_;
+        while self.dyn_ph.len() <= idx {
+            let o = self.b.origin(true);
+            self.b.known(self.static_, o);
+            self.dyn_ph.push(o);
+            last = o;
+        }
+        last
     }
 }
 
@@ -802,9 +936,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
     /// the call's generic arguments' and values' slots in one origin column, the selected
     /// impls), `blaze_borrow::call` run, its constraints into the same flow.
     ///
+    /// `output_override`: when `Some`, relates `site.tp` against this declared return type and
+    /// slots instead of the fn signature's own output (used by `await_call::relate_awaited` for
+    /// an `async fn`'s written output or an opaque `impl Future<Output = T>`'s `Output` term).
+    ///
     /// `closures_related`: `false` only under the census's control ([`OneRuleUntied`]): no
     /// closure-argument tie, and every body type taken to hold no type parameter.
-    fn call_one(&mut self, site: &CallSite<'_>, drop_first: bool, closures_related: bool) -> Result<(), Refusal> {
+    pub(crate) fn call_one(&mut self, site: &CallSite<'_>, output_override: Option<Typed<'_>>, drop_first: bool, closures_related: bool) -> Result<(), Refusal> {
         let e = site.e;
         let facts: &'b F = self.facts;
         let Some((item, g)) = site.callee else {
@@ -934,7 +1072,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                         closure_regs.push(match s {
                             crate::closure::SigSlot::Owner(j) => Region::Param(j),
                             crate::closure::SigSlot::Static => Region::Static,
-                            crate::closure::SigSlot::Late(Some((binder, var))) => Region::Late { binder, var },
+                            crate::closure::SigSlot::Late(Some((binder, var))) | crate::closure::SigSlot::InnerBound(binder, var) => Region::Late { binder, var },
                             crate::closure::SigSlot::Late(None) => {
                                 let var = next_late;
                                 next_late += 1;
@@ -949,10 +1087,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
         }
 
         // The callee's signature and clauses, in the heads' table.
-        let (inputs, output) = match blaze_borrow::split_fn_col(&heads, item, life.regions().col, self.alloc) {
+        let (inputs, sig_output) = match blaze_borrow::split_fn_col(&heads, item, life.regions().col, self.alloc) {
             Ok(io) => io,
             Err(r) => return self.one_refuse(item, OneRuleWhy::of(r), e),
         };
+        let output = output_override.unwrap_or(sig_output);
         let views: &[ClauseView<'_>] = match regions.clauses(item) {
             Ok(v) => v,
             Err(unread) => return self.refuse(Form::RegionsUnread { item: unread.item, why: unread.why }, e),
@@ -1017,8 +1156,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             }
             let clause = Typed { ty: cv.col.ty(), col: cv.col.as_slice() };
             match heads.node(cv.col.ty()) {
-                Ok(PNode::ExTrait(..)) => clauses.push(ClauseIn::TraitOf { trait_ref: clause }),
-                Ok(PNode::ExProj { .. }) => clauses.push(ClauseIn::ProjOf { proj: clause }),
+                Ok(PNode::ExTrait(..)) => clauses.push(ClauseIn::TraitOf { trait_ref: clause, binders: cv.binders }),
+                Ok(PNode::ExProj { .. }) => clauses.push(ClauseIn::ProjOf { proj: clause, binders: cv.binders }),
                 Ok(_) => {}
                 Err(u) => return self.one_refuse(item, OneRuleWhy::counted(u, CountAt::HeadClause), e),
             }
@@ -1053,20 +1192,29 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             Ok(b) => b,
             Err(unread) => return self.refuse(Form::RegionsUnread { item: unread.item, why: unread.why }, e),
         };
-        let sel = CallSel { rows: self.ck.call_selections(e), facts, tys: self.tys };
+        let sel = CallSel { rows: self.ck.call_selections(e), body_rows: &self.ck.selected, facts, tys: self.tys };
         let res = {
             let who = CallOwner {
                 item: owner,
                 uni: &self.uni,
                 params: &self.param_origs,
                 bounds,
+                sig: (!self.in_nested).then(|| {
+                    let c = own.regions().col;
+                    Typed { ty: c.ty(), col: c.as_slice() }
+                }),
                 heads: &heads,
                 bodies: BodyParams { rows: &body_rows, held: &held },
                 closures: ClosureSigs { rows: &closure_rows, regs: &closure_regs },
             };
-            let mut sink = Sink { b: &mut self.b, static_, drop_next: drop_first };
+            let mut sink = Sink { b: &mut self.b, static_, dyn_ph: &mut self.dyn_bound_placeholders, drop_next: drop_first };
             let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &col, out: &mut sink };
-            blaze_borrow::call(&mut cx, Callee::Fn(sig), GenericArgs { lifetimes, types: &types }, &args, dest, self.alloc)
+            let c_variadic = facts.callee(item).is_some_and(|c| c.c_variadic);
+            let call_args = match args.split_at_checked(inputs.len()) {
+                Some((fixed, rest)) if c_variadic && !rest.is_empty() && rest.iter().all(|a| a.at.count().get() == 0) => fixed,
+                _ => &args[..],
+            };
+            blaze_borrow::call(&mut cx, Callee::Fn(sig), GenericArgs { lifetimes, types: &types }, call_args, dest, self.alloc)
         };
         if let Err(r) = res {
             return self.one_refuse(item, OneRuleWhy::of(r), e);
@@ -1181,7 +1329,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             self.param_origin(p);
         }
         let Ok(bounds) = regions.clauses(owner) else { return Ok(false) };
-        let sel = CallSel { rows: self.ck.call_selections(e), facts, tys: self.tys };
+        let sel = CallSel { rows: self.ck.call_selections(e), body_rows: &self.ck.selected, facts, tys: self.tys };
         let output = match out_match {
             Some((ty, col)) => Typed { ty, col },
             // When the callable has no `Output = ..` clause (so returns `()`, 0 slots), pass
@@ -1194,11 +1342,15 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
             uni: &self.uni,
             params: &self.param_origs,
             bounds,
+            sig: (!self.in_nested).then(|| {
+                let c = own.regions().col;
+                Typed { ty: c.ty(), col: c.as_slice() }
+            }),
             heads: &heads,
             bodies: BodyParams { rows: &body_rows, held: &held },
             closures: ClosureSigs { rows: &[], regs: &[] },
         };
-        let mut sink = Sink { b: &mut self.b, static_, drop_next: false };
+        let mut sink = Sink { b: &mut self.b, static_, dyn_ph: &mut self.dyn_bound_placeholders, drop_next: false };
         let mut cx = Cx { types: &caller, sig_types: &heads, selected: &sel, owner: &who, origins: &col, out: &mut sink };
         let generics = GenericArgs { lifetimes, types: &[] };
         let res = if out_match.is_some() {
@@ -1451,10 +1603,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 return self.refuse(Form::Bound, e);
             }
             if let Some(expr) = self.body_expr(t, e)? {
-                for &row in self.captures_of(expr) {
-                    let i = row as usize;
-                    let Some(&pat) = ck.captures.column::<1>().get(i) else { return self.refuse(Form::Malformed, e) };
-                    let Some(&c) = ck.local_ty.get(pat.ix()) else { return self.refuse(Form::Malformed, e) };
+                for f in ck.env_fields_by::<blaze_typeck::Places>(expr) {
+                    let Some(c) = f.place_ty(ck) else { return self.refuse(Form::Malformed, e) };
                     stack.push(c);
                 }
                 continue;
@@ -1651,7 +1801,7 @@ mod keyed {
     }
 
     fn ask(r: &Rows, args: &dyn AskArgs) -> Selection<'static> {
-        let sel = CallSel { rows: &r.rows, facts: &World, tys: r.fx.t.view() };
+        let sel = CallSel { rows: &r.rows, body_rows: &[], facts: &World, tys: r.fx.t.view() };
         match sel.select_keyed(Ask { trait_: r.trait_, name: None, written: r.u8_ }, args) {
             Selection::Not(why) => Selection::Not(why),
             Selection::Impl { .. } => panic!("no row here selects an impl"),

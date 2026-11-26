@@ -54,7 +54,7 @@ pub use error::{At, ConstError, Op, PanicPart, Refusal};
 pub use layout::{IntRepr, Layout, LayoutCx, LayoutFacts, Layouts, Missing, ReprAttrs, TagWrite, ValidRange};
 pub use lit::LitError;
 pub use machine::{Answer, Codes, Need, NeedKind, Outcome, Settle, eval_discriminant, eval_len, value_of};
-pub use record::{ConstFn, ConstRecord, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
+pub use record::{ConstFn, ConstRecord, ConstVtable, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
 
 /// The written text of every literal of a body, read where the literal was written: the item's
 /// own text or a macro expansion's (blaze-lower's `View::text_at` of the literal's range). A
@@ -293,6 +293,15 @@ pub trait ConstWorld: LayoutFacts {
     /// `[closure, (args..)]`, the instance blaze-build's `closure_fn_addr` builds.
     /// An absent method refuses the coercion. A pending lookup names the trait to load.
     fn fn_trait_method(&self, _which: blaze_build::FnTrait) -> FnTraitMethod {
+        FnTraitMethod::Absent
+    }
+
+    /// The `Deref::deref` (`Mutbl::Not`) or `DerefMut::deref_mut` (`Mutbl::Mut`) trait method, as
+    /// `blaze_build::Adts::deref_fn` answers the builder (rule 30: the same item). An overloaded
+    /// dereference adjustment in a constant resolves this trait method at `[Self]` via
+    /// [`ConstWorld::resolve`] and dereferences the reference it returns.
+    /// An absent method refuses the dereference. A pending lookup names the trait to load.
+    fn deref_method(&self, _mutbl: blaze_typeck::Mutbl) -> FnTraitMethod {
         FnTraitMethod::Absent
     }
 

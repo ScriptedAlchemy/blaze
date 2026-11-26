@@ -35,6 +35,7 @@
 //! reader over the record names a foreign fn's symbol without expanding anything again.
 
 pub mod buckets;
+mod cols;
 pub mod grain;
 pub mod owners;
 pub mod values;
@@ -81,7 +82,14 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// 13: an impl row per REFUSED derive ([`each_refused_impl_row`], mark [`REFUSED_CALL`]: D193
 /// point 5): the gap its impls would have filled is a row a question finds, never an absence;
 /// a version-12 record is refused the same way.
-const VERSION: u32 = 13;
+/// 14: columnar encoding (`blaze_columns::enc`) for item, member, impl, bucket and variant
+/// tables (O(1) in-place reads, zero-byte elision for all-default sparse columns, deduplicated
+/// 32-byte ID dictionaries); a version-13 record is refused the same way.
+/// 15: 24-byte crate-prefix-stripped keys in `T_ITEMS`/`T_MEMBERS`/`T_IMPLS`, 8-byte `owners`
+/// index rows (`(owner_row, member_row)`), and optional `grain` section (`F_GRAIN_AT == 0` when
+/// omitted for non-Surface dependency crates); a version-14 record is refused the same way.
+const VERSION: u32 = 15;
+const KEY_TAIL: usize = 24;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
 const KEYS_AT: usize = 160;
@@ -91,28 +99,10 @@ const EXPANSION: u32 = 1 << 31;
 
 const FILE_ROW: usize = 48;
 const EXPANSION_ROW: usize = 72;
-/// An item row, the one statement of its layout (u32 and u16 little-endian): +0 the item's key
-/// (32 bytes); +32 its module's row, +36 its text's code (a file's row, or [`EXPANSION`] and an
-/// expansion's row), +40 the text's start, +44 its length, +48 its index in the text's
-/// outline, +52 its name's place in the strings (u32), +56 the name's length (u16); +58 its
-/// kind's byte, +59 its flags ([`NAMED`], [`BODY_HOLDS_ITEMS`], [`CTOR_OR_WRITTEN_BY`],
-/// [`FOREIGN`]); +60 its impl header's start in the same text ([`NONE`]: no impl), +64 the
-/// header's length, +68 its impl row ([`NONE`]: none), +72 its block ABI's place in the strings,
-/// +76 the ABI's length; +80 its declared lifetimes ([`lifetimes_field`]: the count plus one,
-/// 0 for a kind that declares none here), u16; +82 zeros to 96.
-const ITEM_ROW: usize = 96;
 const OWNER_ROW: usize = 40;
-/// A member row, the one statement of its layout: +0 the member's key (32 bytes); +32 its
-/// text's code, +36 the text's start, +40 its length, +44 its index in the text's outline, +48
-/// its name's place in the strings (u32), +52 the name's length (u16); +54 its kind's byte, +55
-/// its flags ([`NAMED`], [`BODY_HOLDS_ITEMS`], [`CTOR_OR_WRITTEN_BY`]: an expansion wrote it);
-/// +56 its declared lifetimes (an associated type's own, a GAT's; [`lifetimes_field`], as in
-/// [`ITEM_ROW`]), u16; +58 zeros to 64.
-const MEMBER_ROW: usize = 64;
-const IMPL_ROW: usize = 128;
-/// An impl row's roots word (+60): the trait path's root key is held (+64).
+/// An impl row's roots word: the trait path's root key is held.
 const ROOT_TRAIT: u32 = 1;
-/// The self path's root key is held (+96).
+/// The self path's root key is held.
 const ROOT_SELF: u32 = 2;
 const LANG_ROW: usize = 40;
 const MACRO_ROW: usize = 72;
@@ -131,7 +121,8 @@ const F_NAME_LEN: usize = 25;
 /// `std` notes (blaze-ladder front2/std_is_bstd.rs).
 const F_STD: usize = 26;
 const TABLES: usize = 10;
-const WIDTHS: [usize; TABLES] = [FILE_ROW, EXPANSION_ROW, ITEM_ROW, OWNER_ROW, MEMBER_ROW, IMPL_ROW, LANG_ROW, MACRO_ROW, MODULE_ROW, ATOM_ROW];
+/// Row width of fixed-width tables; `0` for columnar tables (`T_ITEMS`, `T_MEMBERS`, `T_IMPLS`).
+const WIDTHS: [usize; TABLES] = [FILE_ROW, EXPANSION_ROW, 0, OWNER_ROW, 0, 0, LANG_ROW, MACRO_ROW, MODULE_ROW, ATOM_ROW];
 const WHAT: [&str; TABLES] = ["file rows", "expansion rows", "item rows", "owner rows", "member rows", "impl rows", "lang rows", "macro rows", "module rows", "cfg atom rows"];
 const T_FILES: usize = 0;
 const T_EXPANSIONS: usize = 1;
@@ -287,10 +278,6 @@ fn pad(out: &mut RecordBytes<'_>) {
 }
 
 fn put32(out: &mut RecordBytes<'_>, n: u32) {
-    out.extend_from_slice(&n.to_le_bytes());
-}
-
-fn put16(out: &mut RecordBytes<'_>, n: u16) {
     out.extend_from_slice(&n.to_le_bytes());
 }
 
@@ -636,7 +623,14 @@ struct ImplOut<'s> {
 /// names is in the unfiled list (`TraitNotRead`, `SelfNotRead`), which a reader files itself.
 /// A caller that holds the names of the crate's dependencies calls [`encode_with`].
 pub fn encode<'n, 'b>(names: &'n CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
-    encode_with(names, &buckets::OwnNames(names), alloc)
+    encode_with_opts(names, &buckets::OwnNames(names), true, alloc)
+}
+
+/// [`encode`], optionally omitting the `grain` section (`include_grain = false` for non-Surface
+/// toolchain/registry crates that never have `SignatureFile` subjects, saving ~6 MB and ~130k
+/// item-chain BLAKE3 hashes on `core`/`alloc`/`std`).
+pub fn encode_for<'n, 'b>(names: &'n CrateNames<'_>, include_grain: bool, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
+    encode_with_opts(names, &buckets::OwnNames(names), include_grain, alloc)
 }
 
 /// [`encode`], its bucket index resolved by `heads`: the names every impl header's trait path
@@ -645,6 +639,10 @@ pub fn encode<'n, 'b>(names: &'n CrateNames<'_>, alloc: Alloc<'b>) -> Result<Rec
 /// solve's answers AND of what `heads` answers for the crate's impl headers: a key or read
 /// list the record is kept under must cover the names `heads` reads (rule 21).
 pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, heads: &H, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
+    encode_with_opts(names, heads, true, alloc)
+}
+
+pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, heads: &H, include_grain: bool, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
     let mut strings: Strings<'b, 'n> = Strings::new(alloc);
     let tables = &names.tables;
 
@@ -758,87 +756,139 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
         }
     }
 
-    // The impl rows, and each impl's row by its key (an item row names it).
+    // The impl rows (columnar, single-allocation SoA buffer), and each impl's row by its key.
+    let mut col_scratch: AVec<'b, u8> = AVec::new_in(alloc);
     let mut impl_rows = RecordBytes::new_in(alloc);
     let mut impl_row_of: HashMap<ItemKey, u32, Alloc<'b>> = HashMap::new_in(alloc);
-    for (at, i) in impls.iter().enumerate() {
-        impl_row_of.insert(i.key, u32_of(at, "a crate's impls")?);
-        let (trait_path, self_path) = (strings.put(i.trait_path)?, strings.put(i.self_path)?);
-        let (head, arity) = i.head.byte();
-        impl_rows.extend_from_slice(&i.key.0.0);
-        for n in [module_at(i.module)?, trait_path.0, trait_path.1, self_path.0, self_path.1, i.flags] {
-            put32(&mut impl_rows, n);
+    if !impls.is_empty() {
+        let dir_at = impl_rows.len();
+        for _ in 0..9 {
+            put32(&mut impl_rows, 0);
         }
-        impl_rows.extend_from_slice(&[head, i.marks]);
-        put16(&mut impl_rows, arity);
-        let roots = (if i.trait_root.is_some() { ROOT_TRAIT } else { 0 }) | (if i.self_root.is_some() { ROOT_SELF } else { 0 });
-        put32(&mut impl_rows, roots);
-        impl_rows.extend_from_slice(&i.trait_root.map_or([0; 32], |k| k.0.0));
-        impl_rows.extend_from_slice(&i.self_root.map_or([0; 32], |k| k.0.0));
+        let mut buf = cols::ImplColsBuf::with_capacity_in(impls.len(), alloc);
+        for (at, i) in impls.iter().enumerate() {
+            impl_row_of.insert(i.key, u32_of(at, "a crate's impls")?);
+            let (trait_path, self_path) = (strings.put(i.trait_path)?, strings.put(i.self_path)?);
+            let (head, arity) = i.head.byte();
+            let roots = (if i.trait_root.is_some() { ROOT_TRAIT } else { 0 }) | (if i.self_root.is_some() { ROOT_SELF } else { 0 });
+            debug_assert_eq!(i.key.0.0[..8], names.key.prefix());
+            impl_rows.extend_from_slice(&i.key.0.0[8..]);
+            buf.push(cols::ImplCol {
+                module: u64::from(module_at(i.module)?),
+                trait_at: u64::from(trait_path.0),
+                trait_len: u64::from(trait_path.1),
+                self_at: u64::from(self_path.0),
+                self_len: u64::from(self_path.1),
+                meta: u64::from(i.flags) | (u64::from(head) << 32) | (u64::from(i.marks) << 40) | (u64::from(arity) << 48),
+                roots: u64::from(roots),
+                trait_root: i.trait_root.map_or([0; 32], |k| k.0.0),
+                self_root: i.self_root.map_or([0; 32], |k| k.0.0),
+            });
+        }
+        let l0 = cols::encode_opt_u64(buf.modules(), 0, "impl modules", alloc, &mut col_scratch, &mut impl_rows)?;
+        let l1 = cols::encode_opt_u64(buf.trait_ats(), 0, "impl trait paths", alloc, &mut col_scratch, &mut impl_rows)?;
+        let l2 = cols::encode_opt_u64(buf.trait_lens(), 0, "impl trait lengths", alloc, &mut col_scratch, &mut impl_rows)?;
+        let l3 = cols::encode_opt_u64(buf.self_ats(), 0, "impl self paths", alloc, &mut col_scratch, &mut impl_rows)?;
+        let l4 = cols::encode_opt_u64(buf.self_lens(), 0, "impl self lengths", alloc, &mut col_scratch, &mut impl_rows)?;
+        let l5 = cols::encode_opt_u64(buf.metas(), 0, "impl meta", alloc, &mut col_scratch, &mut impl_rows)?;
+        let l6 = cols::encode_opt_u64(buf.roots(), 0, "impl roots", alloc, &mut col_scratch, &mut impl_rows)?;
+        let l7 = cols::encode_opt_id(buf.trait_roots(), "impl trait roots", alloc, &mut col_scratch, &mut impl_rows)?;
+        let l8 = cols::encode_opt_id(buf.self_roots(), "impl self roots", alloc, &mut col_scratch, &mut impl_rows)?;
+        cols::patch_dir(&mut impl_rows, dir_at, [l0, l1, l2, l3, l4, l5, l6, l7, l8]);
     }
 
-    // The items, by key.
+    // The items, by key (columnar, single-allocation SoA buffer).
     let mut items: AVec<'b, ItemKey> = AVec::from_iter_in(tables.texts.keys().copied(), alloc);
     items.sort_unstable();
     let mut item_rows = RecordBytes::new_in(alloc);
-    for key in items.iter() {
-        let (it, at) = &tables.texts[key];
-        let (whole, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
-        let entry = outline.items().get(it.item.0 as usize).ok_or(ItemsRecordError::NoOutline { item: *key })?;
-        let detail = entry.detail;
-        // The block's ABI, a fact of the item, from the outline the solve made of its text
-        // (a file's, or an expansion's: the names task outlines each expansion once).
-        let foreign = foreign_abi(whole, outline, entry, *key, names.key)?;
-        let (code, start, len) = place(Some(*at), it.text);
-        let (name, mut flags) = match it.name {
-            Some(n) => (strings.put(n)?, NAMED),
-            None => ((0, 0), 0),
-        };
-        if body_holds_items(detail) {
-            flags |= BODY_HOLDS_ITEMS;
+    if !items.is_empty() {
+        let dir_at = item_rows.len();
+        for _ in 0..12 {
+            put32(&mut item_rows, 0);
         }
-        if tables.ctors.contains_key(key) {
-            flags |= CTOR_OR_WRITTEN_BY;
-        }
-        let abi = match foreign {
-            Some(abi) => {
-                flags |= FOREIGN;
-                strings.put(abi)?
+        let mut buf = cols::ItemColsBuf::with_capacity_in(items.len(), alloc);
+        for key in items.iter() {
+            let (it, at) = &tables.texts[key];
+            let (whole, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
+            let entry = outline.items().get(it.item.0 as usize).ok_or(ItemsRecordError::NoOutline { item: *key })?;
+            let detail = entry.detail;
+            // The block's ABI, a fact of the item, from the outline the solve made of its text
+            // (a file's, or an expansion's: the names task outlines each expansion once).
+            let foreign = foreign_abi(whole, outline, entry, *key, names.key)?;
+            let (code, start, len) = place(Some(*at), it.text);
+            let (name, mut flags) = match it.name {
+                Some(n) => (strings.put(n)?, NAMED),
+                None => ((0, 0), 0),
+            };
+            if body_holds_items(detail) {
+                flags |= BODY_HOLDS_ITEMS;
             }
-            None => (0, 0),
-        };
-        // The header's place in the same text; `NONE` for no impl (or a header out of it).
-        let header = match (it.impl_header, at) {
-            (Some(_), At::File(_)) => (0, 0),
-            (Some(h), _) if code != NONE => text_of(*at).and_then(|(_, base)| span_in(base, h)).unwrap_or((NONE, 0)),
-            _ => (NONE, 0),
-        };
-        item_rows.extend_from_slice(&key.0.0);
-        for n in [module_at(it.module)?, code, start, len, it.item.0, name.0] {
-            put32(&mut item_rows, n);
+            if tables.ctors.contains_key(key) {
+                flags |= CTOR_OR_WRITTEN_BY;
+            }
+            let abi = match foreign {
+                Some(abi) => {
+                    flags |= FOREIGN;
+                    strings.put(abi)?
+                }
+                None => (0, 0),
+            };
+            // The header's place in the same text; `NONE` for no impl (or a header out of it).
+            let header = match (it.impl_header, at) {
+                (Some(_), At::File(_)) => (0, 0),
+                (Some(h), _) if code != NONE => text_of(*at).and_then(|(_, base)| span_in(base, h)).unwrap_or((NONE, 0)),
+                _ => (NONE, 0),
+            };
+            let name_len = u16::try_from(name.1).map_err(|_| ItemsRecordError::TooBig { what: "an item's name" })?;
+            let lifetimes = lifetimes_field(*key, detail, it.text, names.edition)?;
+            debug_assert_eq!(key.0.0[..8], names.key.prefix());
+            item_rows.extend_from_slice(&key.0.0[8..]);
+            buf.push(cols::ItemCol {
+                module: u64::from(module_at(it.module)?),
+                code: u64::from(code),
+                outline: u64::from(it.item.0),
+                name_at: u64::from(name.0),
+                meta: u64::from(name_len)
+                    | (u64::from(detail.kind().byte()) << 16)
+                    | (u64::from(flags) << 24)
+                    | (u64::from(lifetimes) << 32),
+                start: u64::from(start),
+                len: u64::from(len),
+                header_start: u64::from(header.0),
+                header_len: u64::from(header.1),
+                impl_row: u64::from(impl_row_of.get(key).copied().unwrap_or(NONE)),
+                abi_at: u64::from(abi.0),
+                abi_len: u64::from(abi.1),
+            });
         }
-        put16(&mut item_rows, u16::try_from(name.1).map_err(|_| ItemsRecordError::TooBig { what: "an item's name" })?);
-        item_rows.extend_from_slice(&[detail.kind().byte(), flags]);
-        for n in [header.0, header.1, impl_row_of.get(key).copied().unwrap_or(NONE), abi.0, abi.1] {
-            put32(&mut item_rows, n);
-        }
-        // +80: the lifetimes its generics declare, plus one (D155; [`ITEM_ROW`]), then zeros.
-        put16(&mut item_rows, lifetimes_field(*key, detail, it.text, names.edition)?);
-        item_rows.extend_from_slice(&[0; ITEM_ROW - 82]);
+        let l0 = cols::encode_opt_u64(buf.modules(), 0, "item modules", alloc, &mut col_scratch, &mut item_rows)?;
+        let l1 = cols::encode_opt_u64(buf.codes(), 0, "item text codes", alloc, &mut col_scratch, &mut item_rows)?;
+        let l2 = cols::encode_opt_u64(buf.outlines(), 0, "item outlines", alloc, &mut col_scratch, &mut item_rows)?;
+        let l3 = cols::encode_opt_u64(buf.name_ats(), 0, "item name offsets", alloc, &mut col_scratch, &mut item_rows)?;
+        let l4 = cols::encode_opt_u64(buf.metas(), 0, "item meta", alloc, &mut col_scratch, &mut item_rows)?;
+        let l5 = cols::encode_opt_u64(buf.starts(), 0, "item text starts", alloc, &mut col_scratch, &mut item_rows)?;
+        let l6 = cols::encode_opt_u64(buf.lens(), 0, "item text lengths", alloc, &mut col_scratch, &mut item_rows)?;
+        let l7 = cols::encode_opt_u64(buf.header_starts(), u64::from(NONE), "item header starts", alloc, &mut col_scratch, &mut item_rows)?;
+        let l8 = cols::encode_opt_u64(buf.header_lens(), 0, "item header lengths", alloc, &mut col_scratch, &mut item_rows)?;
+        let l9 = cols::encode_opt_u64(buf.impl_rows(), u64::from(NONE), "item impl rows", alloc, &mut col_scratch, &mut item_rows)?;
+        let l10 = cols::encode_opt_u64(buf.abi_ats(), 0, "item ABI offsets", alloc, &mut col_scratch, &mut item_rows)?;
+        let l11 = cols::encode_opt_u64(buf.abi_lens(), 0, "item ABI lengths", alloc, &mut col_scratch, &mut item_rows)?;
+        cols::patch_dir(&mut item_rows, dir_at, [l0, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11]);
     }
 
-    // Each trait's and impl's members, in the solve's (declaration) order.
+    // Each trait's and impl's members, in declaration order (columnar, single-allocation SoA buffer).
     let mut owners: AVec<'b, ItemKey> = AVec::from_iter_in(tables.members.keys().copied(), alloc);
     owners.sort_unstable();
     let mut owner_rows = RecordBytes::new_in(alloc);
-    let mut member_rows = RecordBytes::new_in(alloc);
+    let mut member_keys = RecordBytes::new_in(alloc);
+    let mut member_buf = cols::MemberColsBuf::new_in(alloc);
     let mut members = 0usize;
     // Each named member's key, its owner's row and its own row: the member owners section
     // ([`owners`]), written after everything else.
     let mut owned: AVec<'b, (ItemKey, u32, u32)> = AVec::new_in(alloc);
     #[cfg(test)]
     let mut cut = plant::is(plant::Plant::ShortMembers);
-    for owner in owners.iter() {
+    for (owner_idx, owner) in owners.iter().enumerate() {
         let list = tables.members[owner].as_slice();
         #[cfg(test)]
         let list = if cut && !list.is_empty() {
@@ -851,6 +901,7 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
         owner_rows.extend_from_slice(&owner.0.0);
         put32(&mut owner_rows, u32_of(members, "a crate's members")?);
         put32(&mut owner_rows, u32_of(list.len(), "an owner's members")?);
+        let owner_row = u32_of(owner_idx, "a crate's owners")?;
         for m in list.iter() {
             let at = match m.written_by {
                 Some(call) => Some(At::Expansion(call)),
@@ -867,23 +918,41 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
             if m.written_by.is_some() {
                 flags |= CTOR_OR_WRITTEN_BY;
             }
-            member_rows.extend_from_slice(&m.key.0.0);
-            for n in [code, start, len, m.item.0, name.0] {
-                put32(&mut member_rows, n);
-            }
-            put16(&mut member_rows, u16::try_from(name.1).map_err(|_| ItemsRecordError::TooBig { what: "a member's name" })?);
-            member_rows.extend_from_slice(&[m.detail.kind().byte(), flags]);
-            // +56: an associated type's own (GAT) lifetimes, plus one (D155; [`MEMBER_ROW`]),
-            // then zeros.
-            put16(&mut member_rows, lifetimes_field(m.key, m.detail, m.text, names.edition)?);
-            member_rows.extend_from_slice(&[0; MEMBER_ROW - 58]);
+            let name_len = u16::try_from(name.1).map_err(|_| ItemsRecordError::TooBig { what: "a member's name" })?;
+            let lifetimes = lifetimes_field(m.key, m.detail, m.text, names.edition)?;
+            debug_assert_eq!(m.key.0.0[..8], names.key.prefix());
+            member_keys.extend_from_slice(&m.key.0.0[8..]);
+            member_buf.push(cols::MemberCol {
+                code: u64::from(code),
+                outline: u64::from(m.item.0),
+                name_at: u64::from(name.0),
+                meta: u64::from(name_len)
+                    | (u64::from(m.detail.kind().byte()) << 16)
+                    | (u64::from(flags) << 24)
+                    | (u64::from(lifetimes) << 32),
+                start: u64::from(start),
+                len: u64::from(len),
+            });
             if m.name.is_some() {
-                // Both rows are whole here: the owner's was pushed before its members, this
-                // member's just above.
-                owned.push((m.key, u32_of(owner_rows.len() / OWNER_ROW - 1, "a crate's owners")?, u32_of(member_rows.len() / MEMBER_ROW - 1, "a crate's members")?));
+                owned.push((m.key, owner_row, u32_of(members, "a crate's members")?));
             }
+            members += 1;
         }
-        members += list.len();
+    }
+    let mut member_rows = RecordBytes::new_in(alloc);
+    if members > 0 {
+        let dir_at = member_rows.len();
+        for _ in 0..6 {
+            put32(&mut member_rows, 0);
+        }
+        member_rows.extend_from_slice(&member_keys);
+        let l0 = cols::encode_opt_u64(member_buf.codes(), 0, "member text codes", alloc, &mut col_scratch, &mut member_rows)?;
+        let l1 = cols::encode_opt_u64(member_buf.outlines(), 0, "member outlines", alloc, &mut col_scratch, &mut member_rows)?;
+        let l2 = cols::encode_opt_u64(member_buf.name_ats(), 0, "member name offsets", alloc, &mut col_scratch, &mut member_rows)?;
+        let l3 = cols::encode_opt_u64(member_buf.metas(), 0, "member meta", alloc, &mut col_scratch, &mut member_rows)?;
+        let l4 = cols::encode_opt_u64(member_buf.starts(), 0, "member text starts", alloc, &mut col_scratch, &mut member_rows)?;
+        let l5 = cols::encode_opt_u64(member_buf.lens(), 0, "member text lengths", alloc, &mut col_scratch, &mut member_rows)?;
+        cols::patch_dir(&mut member_rows, dir_at, [l0, l1, l2, l3, l4, l5]);
     }
 
     // Lang items by (name, key).
@@ -1003,7 +1072,9 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
         out.extend_from_slice(s);
     }
     out.extend_from_slice(&strings.bytes);
-    grain::append(&mut out, names, &items)?;
+    if include_grain {
+        grain::append(&mut out, names, &items)?;
+    }
     owners::append(&mut out, &mut owned)?;
     variants::append(&mut out, &tables.enums, alloc)?;
     // In the impl table's order: row `i`'s filing at index `i`.
@@ -1079,7 +1150,7 @@ fn impl_out<'n, 'x: 'n, H: buckets::HeadNames>(heads: &H, krate: CrateItemKey, e
 /// [`crate::resolve::Expansion::refused`]).
 pub fn each_refused_impl_row<'n, 'x: 'n>(names: &'n CrateNames<'x>, each: &mut dyn FnMut(ImplRow<'n>)) {
     for (call, expansion) in names.expansions.iter() {
-        if expansion.refused.is_none() {
+        if expansion.refused().is_none() {
             continue;
         }
         // A refused call the lowering does not know has no shape to read: not a derive.
@@ -1134,10 +1205,6 @@ fn le32(bytes: &[u8], at: usize) -> u32 {
     let mut b = [0u8; 4];
     b.copy_from_slice(&bytes[at..at + 4]);
     u32::from_le_bytes(b)
-}
-
-fn le16(bytes: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([bytes[at], bytes[at + 1]])
 }
 
 fn id_at(bytes: &[u8], at: usize) -> ContentId {
@@ -1456,6 +1523,294 @@ enum Seen<'a> {
 
 type FileSource<'a> = dyn Fn(u32, PackagePath<'a>, ContentId, Edition) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> + 'a;
 
+#[derive(Clone, Copy, Debug)]
+struct ItemsCols<'a> {
+    keys: &'a [u8],
+    module: cols::OptInt<'a>,
+    code: cols::OptInt<'a>,
+    outline: cols::OptInt<'a>,
+    name_at: cols::OptInt<'a>,
+    meta: cols::OptInt<'a>,
+    start: cols::OptInt<'a>,
+    len: cols::OptInt<'a>,
+    header_start: cols::OptInt<'a>,
+    header_len: cols::OptInt<'a>,
+    impl_row: cols::OptInt<'a>,
+    abi_at: cols::OptInt<'a>,
+    abi_len: cols::OptInt<'a>,
+}
+
+impl<'a> ItemsCols<'a> {
+    const fn empty() -> Self {
+        ItemsCols {
+            keys: &[],
+            module: cols::OptInt::empty(0),
+            code: cols::OptInt::empty(0),
+            outline: cols::OptInt::empty(0),
+            name_at: cols::OptInt::empty(0),
+            meta: cols::OptInt::empty(0),
+            start: cols::OptInt::empty(0),
+            len: cols::OptInt::empty(0),
+            header_start: cols::OptInt::empty(0xffff_ffff),
+            header_len: cols::OptInt::empty(0),
+            impl_row: cols::OptInt::empty(0xffff_ffff),
+            abi_at: cols::OptInt::empty(0),
+            abi_len: cols::OptInt::empty(0),
+        }
+    }
+
+    fn open(bytes: &'a [u8], base: usize, count: usize) -> Result<Self, ItemsRecordError> {
+        if count == 0 {
+            return Ok(Self::empty());
+        }
+        let Some(keys_bytes) = count.checked_mul(KEY_TAIL) else {
+            return Err(ItemsRecordError::Short { what: "item rows", at: base });
+        };
+        let (keys, [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11]) = cols::read_dir::<12>(bytes, base, keys_bytes, "item rows")?;
+        Ok(ItemsCols {
+            keys,
+            module: cols::OptInt::open(c0, count, 0, "item modules", base)?,
+            code: cols::OptInt::open(c1, count, 0, "item text codes", base)?,
+            outline: cols::OptInt::open(c2, count, 0, "item outlines", base)?,
+            name_at: cols::OptInt::open(c3, count, 0, "item name offsets", base)?,
+            meta: cols::OptInt::open(c4, count, 0, "item meta", base)?,
+            start: cols::OptInt::open(c5, count, 0, "item text starts", base)?,
+            len: cols::OptInt::open(c6, count, 0, "item text lengths", base)?,
+            header_start: cols::OptInt::open(c7, count, u64::from(NONE), "item header starts", base)?,
+            header_len: cols::OptInt::open(c8, count, 0, "item header lengths", base)?,
+            impl_row: cols::OptInt::open(c9, count, u64::from(NONE), "item impl rows", base)?,
+            abi_at: cols::OptInt::open(c10, count, 0, "item ABI offsets", base)?,
+            abi_len: cols::OptInt::open(c11, count, 0, "item ABI lengths", base)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MembersCols<'a> {
+    keys: &'a [u8],
+    pub(super) code: cols::OptInt<'a>,
+    pub(super) outline: cols::OptInt<'a>,
+    pub(super) name_at: cols::OptInt<'a>,
+    pub(super) meta: cols::OptInt<'a>,
+    pub(super) start: cols::OptInt<'a>,
+    pub(super) len: cols::OptInt<'a>,
+}
+
+impl<'a> MembersCols<'a> {
+    const fn empty() -> Self {
+        MembersCols {
+            keys: &[],
+            code: cols::OptInt::empty(0),
+            outline: cols::OptInt::empty(0),
+            name_at: cols::OptInt::empty(0),
+            meta: cols::OptInt::empty(0),
+            start: cols::OptInt::empty(0),
+            len: cols::OptInt::empty(0),
+        }
+    }
+
+    fn open(bytes: &'a [u8], base: usize, count: usize) -> Result<Self, ItemsRecordError> {
+        if count == 0 {
+            return Ok(Self::empty());
+        }
+        let Some(keys_bytes) = count.checked_mul(KEY_TAIL) else {
+            return Err(ItemsRecordError::Short { what: "member rows", at: base });
+        };
+        let (keys, [c0, c1, c2, c3, c4, c5]) = cols::read_dir::<6>(bytes, base, keys_bytes, "member rows")?;
+        Ok(MembersCols {
+            keys,
+            code: cols::OptInt::open(c0, count, 0, "member text codes", base)?,
+            outline: cols::OptInt::open(c1, count, 0, "member outlines", base)?,
+            name_at: cols::OptInt::open(c2, count, 0, "member name offsets", base)?,
+            meta: cols::OptInt::open(c3, count, 0, "member meta", base)?,
+            start: cols::OptInt::open(c4, count, 0, "member text starts", base)?,
+            len: cols::OptInt::open(c5, count, 0, "member text lengths", base)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ImplsCols<'a> {
+    keys: &'a [u8],
+    module: cols::OptInt<'a>,
+    trait_at: cols::OptInt<'a>,
+    trait_len: cols::OptInt<'a>,
+    self_at: cols::OptInt<'a>,
+    self_len: cols::OptInt<'a>,
+    meta: cols::OptInt<'a>,
+    roots: cols::OptInt<'a>,
+    trait_root: cols::OptId<'a>,
+    self_root: cols::OptId<'a>,
+}
+
+impl<'a> ImplsCols<'a> {
+    const fn empty() -> Self {
+        ImplsCols {
+            keys: &[],
+            module: cols::OptInt::empty(0),
+            trait_at: cols::OptInt::empty(0),
+            trait_len: cols::OptInt::empty(0),
+            self_at: cols::OptInt::empty(0),
+            self_len: cols::OptInt::empty(0),
+            meta: cols::OptInt::empty(0),
+            roots: cols::OptInt::empty(0),
+            trait_root: cols::OptId::empty(),
+            self_root: cols::OptId::empty(),
+        }
+    }
+
+    fn open(bytes: &'a [u8], base: usize, count: usize) -> Result<Self, ItemsRecordError> {
+        if count == 0 {
+            return Ok(Self::empty());
+        }
+        let Some(keys_bytes) = count.checked_mul(KEY_TAIL) else {
+            return Err(ItemsRecordError::Short { what: "impl rows", at: base });
+        };
+        let (keys, [c0, c1, c2, c3, c4, c5, c6, c7, c8]) = cols::read_dir::<9>(bytes, base, keys_bytes, "impl rows")?;
+        Ok(ImplsCols {
+            keys,
+            module: cols::OptInt::open(c0, count, 0, "impl modules", base)?,
+            trait_at: cols::OptInt::open(c1, count, 0, "impl trait paths", base)?,
+            trait_len: cols::OptInt::open(c2, count, 0, "impl trait lengths", base)?,
+            self_at: cols::OptInt::open(c3, count, 0, "impl self paths", base)?,
+            self_len: cols::OptInt::open(c4, count, 0, "impl self lengths", base)?,
+            meta: cols::OptInt::open(c5, count, 0, "impl meta", base)?,
+            roots: cols::OptInt::open(c6, count, 0, "impl roots", base)?,
+            trait_root: cols::OptId::open(c7, count, "impl trait roots", base)?,
+            self_root: cols::OptId::open(c8, count, "impl self roots", base)?,
+        })
+    }
+}
+
+/// How an items record's strings section is verified (rule 74).
+///
+/// - [`StringsMode::Verified`]: the entire strings section passed `core::str::from_utf8` once at
+///   [`VerifiedItems::check`]; individual reads only check range bounds and UTF-8 char boundaries.
+/// - [`StringsMode::Lazy`]: [`VerifiedItems::check_header`] checked all section bounds in O(1)
+///   without touching the strings pages; each accessed slice is validated via `core::str::from_utf8`
+///   at [`ItemsRecord::str_at`]. Zero unverified bytes are ever returned as `&str`.
+#[derive(Clone, Copy, Debug)]
+enum StringsMode<'a> {
+    Verified(&'a str),
+    Lazy(&'a [u8]),
+}
+
+/// An items record whose header and column tables (and optionally its full strings section) have
+/// been verified ONCE (rule 74: verify once). Constructing [`ItemsRecord`] from a [`VerifiedItems`]
+/// proof is O(1) and performs zero re-validation across stretches and jobs.
+#[derive(Clone, Copy, Debug)]
+pub struct VerifiedItems<'a> {
+    bytes: &'a [u8],
+    key: CrateItemKey,
+    root_module: ItemKey,
+    edition: Edition,
+    counts: [usize; TABLES],
+    offsets: [usize; TABLES + 1],
+    item_cols: ItemsCols<'a>,
+    member_cols: MembersCols<'a>,
+    impl_cols: ImplsCols<'a>,
+    buckets: buckets::BucketsCols<'a>,
+    variants: variants::VariantsCols<'a>,
+    strings: StringsMode<'a>,
+}
+
+impl<'a> VerifiedItems<'a> {
+    /// Checks the header, every column table, edition/std bytes, and UTF-8 of the entire strings
+    /// section once, returning a `Copy` proof reusable across jobs and stretches.
+    pub fn check(bytes: &'a [u8]) -> Result<VerifiedItems<'a>, ItemsRecordError> {
+        Self::check_inner(bytes, true)
+    }
+
+    /// Checks the header, alignment, every column table header, section bounds, and edition/std
+    /// bytes in O(1), deferring UTF-8 validation of individual accessed strings to
+    /// [`ItemsRecord::str_at`]. Zero unverified bytes are ever returned as `&str`.
+    pub fn check_header(bytes: &'a [u8]) -> Result<VerifiedItems<'a>, ItemsRecordError> {
+        Self::check_inner(bytes, false)
+    }
+
+    fn check_inner(bytes: &'a [u8], eager_utf8: bool) -> Result<VerifiedItems<'a>, ItemsRecordError> {
+        if !bytes.as_ptr().addr().is_multiple_of(ALIGN) {
+            return Err(ItemsRecordError::Unaligned);
+        }
+        if bytes.len() < HEADER || bytes.get(..4) != Some(MAGIC.as_slice()) || le32(bytes, 4) != VERSION {
+            return Err(ItemsRecordError::NotThisRecord);
+        }
+        let f = |i: usize| usize::try_from(le32(bytes, 8 + 4 * i)).unwrap_or(usize::MAX);
+        let mut counts = [0usize; TABLES];
+        let mut offsets = [0usize; TABLES + 1];
+        for (i, slot) in counts.iter_mut().enumerate() {
+            *slot = f(F_COUNTS + i);
+        }
+        for (i, slot) in offsets.iter_mut().enumerate() {
+            *slot = f(F_OFFSETS + i);
+        }
+        let strings_len = f(F_STRINGS_LEN);
+        let within = |what: &'static str, at: usize, len: Option<usize>| match len.and_then(|len| at.checked_add(len)) {
+            Some(end) if end <= bytes.len() => Ok(()),
+            _ => Err(ItemsRecordError::Short { what, at }),
+        };
+        for i in 0..TABLES {
+            if WIDTHS[i] > 0 {
+                within(WHAT[i], offsets[i], counts[i].checked_mul(WIDTHS[i]))?;
+            }
+        }
+        let item_cols = ItemsCols::open(bytes, offsets[T_ITEMS], counts[T_ITEMS])?;
+        let member_cols = MembersCols::open(bytes, offsets[T_MEMBERS], counts[T_MEMBERS])?;
+        let impl_cols = ImplsCols::open(bytes, offsets[T_IMPLS], counts[T_IMPLS])?;
+        let buckets = buckets::BucketsCols::open(bytes, f(buckets::F_BUCKETS_AT), f(buckets::F_BUCKETS_COUNT))?;
+        let variants = variants::VariantsCols::open(bytes, f(variants::F_VARIANTS_AT), f(variants::F_VARIANTS_COUNT))?;
+        let strings_at = offsets[TABLES];
+        within("strings", strings_at, Some(strings_len))?;
+        let raw_strings = strings_at
+            .checked_add(strings_len)
+            .and_then(|end| bytes.get(strings_at..end))
+            .ok_or(ItemsRecordError::Short { what: "strings", at: strings_at })?;
+        let strings = if eager_utf8 {
+            // The one UTF-8 check of the record's strings (rule 74): every string a row names is a
+            // slice of this section, which the writer made of `&str`s alone ([`Strings::put`]), so
+            // a bad byte anywhere in it is refused here, at check, whichever row's string it is in.
+            StringsMode::Verified(
+                core::str::from_utf8(raw_strings)
+                    .map_err(|e| ItemsRecordError::Utf8 { what: "the record's strings", at: e.valid_up_to() })?,
+            )
+        } else {
+            StringsMode::Lazy(raw_strings)
+        };
+        let edition_byte = bytes.get(8 + 4 * F_EDITION).copied().unwrap_or(u8::MAX);
+        let edition = Edition::from_byte(u8::try_from(f(F_EDITION)).unwrap_or(u8::MAX))
+            .ok_or(ItemsRecordError::Byte { what: "an edition", byte: edition_byte })?;
+        let std_byte = bytes.get(8 + 4 * F_STD).copied().unwrap_or(u8::MAX);
+        std_of(le32(bytes, 8 + 4 * F_STD)).ok_or(ItemsRecordError::Byte { what: "the crate's std", byte: std_byte })?;
+        Ok(VerifiedItems {
+            bytes,
+            key: CrateItemKey(id_at(bytes, KEYS_AT)),
+            root_module: key_at(bytes, KEYS_AT + 32),
+            edition,
+            counts,
+            offsets,
+            item_cols,
+            member_cols,
+            impl_cols,
+            buckets,
+            variants,
+            strings,
+        })
+    }
+
+    pub fn key(&self) -> CrateItemKey {
+        self.key
+    }
+
+    pub fn edition(&self) -> Edition {
+        self.edition
+    }
+
+    /// Number of file rows in this items record, read in O(1) without constructing `ItemsRecord`.
+    pub fn files(&self) -> usize {
+        self.counts.get(T_FILES).copied().unwrap_or(0)
+    }
+}
+
 /// One crate's items record, read in place (D114 rule 1, a record is its own index): a row, a
 /// file's rows, an owner's members ([`Members`]) and an expansion are each found by binary search
 /// and read from the bytes each time asked. Opening allocates nothing. The cfg atoms are made
@@ -1467,10 +1822,14 @@ pub struct ItemsRecord<'a> {
     root_module: ItemKey,
     counts: [usize; TABLES],
     offsets: [usize; TABLES + 1],
-    /// The strings section, checked UTF-8 ONCE by [`ItemsRecord::open`] (the proof every row's
-    /// string is read under: a row's string is a slice of it, so a read checks only that the
-    /// slice lies inside it and on character boundaries, never the bytes again).
-    strings: &'a str,
+    item_cols: ItemsCols<'a>,
+    member_cols: MembersCols<'a>,
+    impl_cols: ImplsCols<'a>,
+    buckets: buckets::BucketsCols<'a>,
+    variants: variants::VariantsCols<'a>,
+    /// The strings section: either checked UTF-8 whole by [`VerifiedItems::check`] or validated
+    /// per accessed slice in [`ItemsRecord::str_at`] when opened via [`VerifiedItems::check_header`].
+    strings: StringsMode<'a>,
     atoms: OnceCell<AVec<'a, (&'a str, Option<&'a str>)>>,
     /// Each text asked, by where it is, as its one check saw it: empty, and unallocated, until
     /// the first text is asked.
@@ -1482,6 +1841,44 @@ pub struct ItemsRecord<'a> {
 }
 
 impl<'a> ItemsRecord<'a> {
+    /// Open a reader over an already-verified proof in O(1) without re-checking columns or UTF-8.
+    pub fn from_verified(proof: VerifiedItems<'a>, alloc: Alloc<'a>) -> ItemsRecord<'a> {
+        Self::from_parts(proof, 0, alloc)
+    }
+
+    /// Open a reader with a file snapshot callback over an already-verified proof in O(1).
+    pub fn from_verified_with_files(
+        proof: VerifiedItems<'a>,
+        alloc: Alloc<'a>,
+        source: impl Fn(u32, PackagePath<'a>, ContentId, Edition) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> + 'a,
+    ) -> ItemsRecord<'a> {
+        let mut record = Self::from_parts(proof, 0, alloc);
+        record.source = Some(Box::new_in(source, alloc));
+        record
+    }
+
+    fn from_parts(proof: VerifiedItems<'a>, string_checks: usize, alloc: Alloc<'a>) -> ItemsRecord<'a> {
+        ItemsRecord {
+            bytes: proof.bytes,
+            key: proof.key,
+            root_module: proof.root_module,
+            counts: proof.counts,
+            offsets: proof.offsets,
+            item_cols: proof.item_cols,
+            member_cols: proof.member_cols,
+            impl_cols: proof.impl_cols,
+            buckets: proof.buckets,
+            variants: proof.variants,
+            strings: proof.strings,
+            atoms: OnceCell::new(),
+            seen: RefCell::new(HashMap::new_in(alloc)),
+            source: None,
+            current: RefCell::new(HashMap::new_in(alloc)),
+            decoded: Cell::new(ItemsDecoded { crates: 1, bytes: proof.bytes.len(), string_checks, ..ItemsDecoded::default() }),
+            alloc,
+        }
+    }
+
     /// Open a reader that can answer file positions and text from the caller's snapshot.
     pub fn open_with_files(bytes: &'a [u8], alloc: Alloc<'a>, source: impl Fn(u32, PackagePath<'a>, ContentId, Edition) -> Result<Option<CurrentFile<'a>>, ItemsRecordError> + 'a) -> Result<Self, ItemsRecordError> {
         let mut record = Self::open(bytes, alloc)?;
@@ -1491,51 +1888,8 @@ impl<'a> ItemsRecord<'a> {
 
     /// Checks the header and that every section lies inside `bytes`; parses nothing else.
     pub fn open(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<ItemsRecord<'a>, ItemsRecordError> {
-        if bytes.as_ptr() as usize % ALIGN != 0 {
-            return Err(ItemsRecordError::Unaligned);
-        }
-        if bytes.len() < HEADER || bytes[..4] != MAGIC || le32(bytes, 4) != VERSION {
-            return Err(ItemsRecordError::NotThisRecord);
-        }
-        let f = |i: usize| le32(bytes, 8 + 4 * i) as usize;
-        let mut counts = [0usize; TABLES];
-        let mut offsets = [0usize; TABLES + 1];
-        for i in 0..TABLES {
-            counts[i] = f(F_COUNTS + i);
-        }
-        for i in 0..=TABLES {
-            offsets[i] = f(F_OFFSETS + i);
-        }
-        let strings_len = f(F_STRINGS_LEN);
-        let within = |what: &'static str, at: usize, len: Option<usize>| match len.and_then(|len| at.checked_add(len)) {
-            Some(end) if end <= bytes.len() => Ok(()),
-            _ => Err(ItemsRecordError::Short { what, at }),
-        };
-        for i in 0..TABLES {
-            within(WHAT[i], offsets[i], counts[i].checked_mul(WIDTHS[i]))?;
-        }
-        within("strings", offsets[TABLES], Some(strings_len))?;
-        // The one UTF-8 check of the record's strings (rule 74): every string a row names is a
-        // slice of this section, which the writer made of `&str`s alone ([`Strings::put`]), so
-        // a bad byte anywhere in it is refused here, at open, whichever row's string it is in.
-        let strings = core::str::from_utf8(&bytes[offsets[TABLES]..offsets[TABLES] + strings_len])
-            .map_err(|e| ItemsRecordError::Utf8 { what: "the record's strings", at: e.valid_up_to() })?;
-        Edition::from_byte(u8::try_from(f(F_EDITION)).unwrap_or(u8::MAX)).ok_or(ItemsRecordError::Byte { what: "an edition", byte: bytes[8 + 4 * F_EDITION] })?;
-        std_of(le32(bytes, 8 + 4 * F_STD)).ok_or(ItemsRecordError::Byte { what: "the crate's std", byte: bytes[8 + 4 * F_STD] })?;
-        Ok(ItemsRecord {
-            bytes,
-            key: CrateItemKey(id_at(bytes, KEYS_AT)),
-            root_module: key_at(bytes, KEYS_AT + 32),
-            counts,
-            offsets,
-            strings,
-            atoms: OnceCell::new(),
-            seen: RefCell::new(HashMap::new_in(alloc)),
-            source: None,
-            current: RefCell::new(HashMap::new_in(alloc)),
-            decoded: Cell::new(ItemsDecoded { crates: 1, bytes: bytes.len(), string_checks: 1, ..ItemsDecoded::default() }),
-            alloc,
-        })
+        let proof = VerifiedItems::check(bytes)?;
+        Ok(Self::from_parts(proof, 1, alloc))
     }
 
     pub fn key(&self) -> CrateItemKey {
@@ -1587,15 +1941,23 @@ impl<'a> ItemsRecord<'a> {
     }
 
     fn str_at(&self, what: &'static str, at: u32, len: u32) -> Result<&'a str, ItemsRecordError> {
-        let (at, len) = (at as usize, len as usize);
-        let Some(end) = at.checked_add(len).filter(|end| *end <= self.strings.len()) else {
-            return Err(ItemsRecordError::Short { what, at });
-        };
-        // No UTF-8 check here: `open` checked the whole section ([`ItemsRecord::strings`]). A
-        // range that cuts a character (a writer's bug: the writer stores whole strings) is
-        // refused by name, as a bad byte was.
-        let strings: &'a str = self.strings;
-        strings.get(at..end).ok_or(ItemsRecordError::Utf8 { what, at })
+        let (at, len) = (usize::try_from(at).unwrap_or(usize::MAX), usize::try_from(len).unwrap_or(usize::MAX));
+        match self.strings {
+            StringsMode::Verified(strings) => {
+                let Some(end) = at.checked_add(len).filter(|end| *end <= strings.len()) else {
+                    return Err(ItemsRecordError::Short { what, at });
+                };
+                // No UTF-8 check here: `check` checked the whole section. A range that cuts a
+                // character (a writer's bug: the writer stores whole strings) is refused by name.
+                strings.get(at..end).ok_or(ItemsRecordError::Utf8 { what, at })
+            }
+            StringsMode::Lazy(bytes) => {
+                let Some(slice) = at.checked_add(len).and_then(|end| bytes.get(at..end)) else {
+                    return Err(ItemsRecordError::Short { what, at });
+                };
+                core::str::from_utf8(slice).map_err(|e| ItemsRecordError::Utf8 { what, at: at.saturating_add(e.valid_up_to()) })
+            }
+        }
     }
 
     /// Row `i` of table `t`: its offset in the bytes. `i` is below the table's count.
@@ -1603,11 +1965,75 @@ impl<'a> ItemsRecord<'a> {
         self.offsets[t] + i * WIDTHS[t]
     }
 
-    /// The row of table `t` keyed `key` (its first 32 bytes): [`find_keyed`] over the table's
-    /// rows, which `open` checked lie inside the bytes (`counts[t]` rows of `WIDTHS[t]`).
+    /// The row of table `t` keyed `key`: [`find_keyed`] over the table's rows, which `open`
+    /// checked lie inside the bytes. `T_ITEMS` stores 24-byte suffixes under `self.key.prefix()`.
     fn find(&self, t: usize, key: ItemKey) -> Option<usize> {
+        if t == T_ITEMS {
+            if key.0.0[..8] != self.key.prefix() {
+                return None;
+            }
+            return blaze_format::rows::find_row(self.item_cols.keys, KEY_TAIL, 0, &key.0.0[8..]).ok();
+        }
         let start = self.offsets[t];
         find_keyed(&self.bytes[start..start + self.counts[t] * WIDTHS[t]], WIDTHS[t], &key.0.0)
+    }
+
+    #[inline]
+    fn tail_at<'b>(keys: &'b [u8], i: usize) -> &'b [u8] {
+        keys.get(i * KEY_TAIL..i * KEY_TAIL + KEY_TAIL).unwrap_or(&[0u8; KEY_TAIL])
+    }
+
+    #[inline]
+    fn key_from_tail(&self, tail: &[u8]) -> ItemKey {
+        let mut out = [0u8; 32];
+        out[..8].copy_from_slice(&self.key.prefix());
+        out[8..].copy_from_slice(tail);
+        ItemKey(ContentId(out))
+    }
+
+    #[inline]
+    pub(super) fn item_key(&self, i: usize) -> ItemKey {
+        self.key_from_tail(Self::tail_at(self.item_cols.keys, i))
+    }
+
+    #[inline]
+    pub(super) fn item_code(&self, i: usize) -> u32 {
+        self.item_cols.code.get_u32(i)
+    }
+
+    #[inline]
+    pub(super) fn item_outline(&self, i: usize) -> ItemIndex {
+        ItemIndex(self.item_cols.outline.get_u32(i))
+    }
+
+    /// The current FileItems body hash of `outline` in `file` without touching the `grain` section.
+    pub fn file_body_hash(&self, file: u32, outline: ItemIndex) -> Result<ContentId, ItemsRecordError> {
+        Ok(self.file_entry(file, outline)?.1.hash)
+    }
+
+    #[inline]
+    pub(super) fn member_key_tail(&self, k: usize) -> &'a [u8] {
+        Self::tail_at(self.member_cols.keys, k)
+    }
+
+    #[inline]
+    pub(super) fn member_key(&self, k: usize) -> ItemKey {
+        self.key_from_tail(self.member_key_tail(k))
+    }
+
+    #[inline]
+    pub(super) fn member_name(&self, k: usize) -> Result<&'a str, ItemsRecordError> {
+        let len = u32::try_from(self.member_cols.meta.get(k) & 0xffff).unwrap_or(0);
+        self.str_at("a member's name", self.member_cols.name_at.get_u32(k), len)
+    }
+
+    #[inline]
+    pub(super) fn impl_bucket_fields(&self, row: usize) -> (ItemKey, u8, u8) {
+        let key = self.key_from_tail(Self::tail_at(self.impl_cols.keys, row));
+        let meta = self.impl_cols.meta.get(row);
+        let head = u8::try_from((meta >> 32) & 0xff).unwrap_or(0);
+        let marks = u8::try_from((meta >> 40) & 0xff).unwrap_or(0);
+        (key, head, marks)
     }
 
     fn module_key(&self, index: u32) -> Result<ItemKey, ItemsRecordError> {
@@ -1731,7 +2157,10 @@ impl<'a> ItemsRecord<'a> {
     }
 
     /// Reuse the solve's surface and file ranges when building cells from its records.
-    pub(super) fn use_solved_texts(&mut self, names: &CrateNames<'a>, bump: Bump<'a>) {
+    pub(super) fn use_solved_texts<'n>(&mut self, names: &CrateNames<'n>, bump: Bump<'a>)
+    where
+        'n: 'a,
+    {
         let checked = |saw, found, text| if saw == found { Seen::Fresh(text) } else { Seen::Stale(found) };
         let files = &names.files[..names.files.len().min(self.files())];
         let mut texts: AVec<'_, &[u8]> = AVec::with_capacity_in(files.len(), self.alloc);
@@ -1814,22 +2243,28 @@ impl<'a> ItemsRecord<'a> {
 
     /// Surface facts of item row `i`, in key order.
     pub fn identity_at(&self, i: usize) -> Result<Option<ItemIdentity<'a>>, ItemsRecordError> {
-        if i >= self.counts[T_ITEMS] { return Ok(None); }
-        let (b, r) = (self.bytes, self.row(T_ITEMS, i));
-        let flags = b[r + 59];
-        let impl_row = le32(b, r + 68);
+        if i >= self.counts[T_ITEMS] {
+            return Ok(None);
+        }
+        let c = self.item_cols;
+        let meta = c.meta.get(i);
+        let name_len = u32::try_from(meta & 0xffff).unwrap_or(0);
+        let kind_byte = u8::try_from((meta >> 16) & 0xff).unwrap_or(0);
+        let flags = u8::try_from((meta >> 24) & 0xff).unwrap_or(0);
+        let lifetimes = u16::try_from((meta >> 32) & 0xffff).unwrap_or(0);
+        let impl_row = c.impl_row.get_u32(i);
         Ok(Some(ItemIdentity {
-            key: key_at(b, r),
-            kind: ItemKind::from_byte(b[r + 58]).ok_or(ItemsRecordError::Byte { what: "an item kind", byte: b[r + 58] })?,
-            module: self.module_key(le32(b, r + 32))?,
-            at: self.at_of(le32(b, r + 36))?,
-            outline: ItemIndex(le32(b, r + 48)),
-            name: if flags & NAMED != 0 { Some(self.str_at("an item's name", le32(b, r + 52), u32::from(le16(b, r + 56)))?) } else { None },
+            key: self.item_key(i),
+            kind: ItemKind::from_byte(kind_byte).ok_or(ItemsRecordError::Byte { what: "an item kind", byte: kind_byte })?,
+            module: self.module_key(c.module.get_u32(i))?,
+            at: self.at_of(c.code.get_u32(i))?,
+            outline: ItemIndex(c.outline.get_u32(i)),
+            name: if flags & NAMED != 0 { Some(self.str_at("an item's name", c.name_at.get_u32(i), name_len)?) } else { None },
             body_holds_items: flags & BODY_HOLDS_ITEMS != 0,
             ctor: flags & CTOR_OR_WRITTEN_BY != 0,
             impl_row: (impl_row != NONE).then_some(impl_row),
-            foreign: if flags & FOREIGN != 0 { Some(self.str_at("an item's block ABI", le32(b, r + 72), le32(b, r + 76))?) } else { None },
-            lifetimes: lifetimes_of(le16(b, r + 80)),
+            foreign: if flags & FOREIGN != 0 { Some(self.str_at("an item's block ABI", c.abi_at.get_u32(i), c.abi_len.get_u32(i))?) } else { None },
+            lifetimes: lifetimes_of(lifetimes),
         }))
     }
 
@@ -1863,8 +2298,8 @@ impl<'a> ItemsRecord<'a> {
 
     pub fn item_at(&self, i: usize) -> Result<Option<ItemRow<'a>>, ItemsRecordError> {
         let Some(identity) = self.identity_at(i)? else { return Ok(None) };
-        let (b, r) = (self.bytes, self.row(T_ITEMS, i));
-        let header_start = le32(b, r + 60);
+        let c = self.item_cols;
+        let header_start = c.header_start.get_u32(i);
         let (text, impl_header) = match identity.at {
             Some(at @ At::File(file)) => {
                 let (current, entry) = self.file_entry(file, identity.outline)?;
@@ -1877,8 +2312,8 @@ impl<'a> ItemsRecord<'a> {
                 (Some(TextSpan { at, start: entry.range.start, len: entry.range.len() }), header)
             }
             Some(at) => (
-                Some(TextSpan { at, start: le32(b, r + 40), len: le32(b, r + 44) }),
-                (header_start != NONE).then(|| TextSpan { at, start: header_start, len: le32(b, r + 64) }),
+                Some(TextSpan { at, start: c.start.get_u32(i), len: c.len.get_u32(i) }),
+                (header_start != NONE).then(|| TextSpan { at, start: header_start, len: c.header_len.get_u32(i) }),
             ),
             None => (None, None),
         };
@@ -1905,31 +2340,33 @@ impl<'a> ItemsRecord<'a> {
         if i >= self.counts[T_IMPLS] {
             return Ok(None);
         }
-        let (b, r) = (self.bytes, self.row(T_IMPLS, i));
-        let key = key_at(b, r);
-        let marks = b[r + 57];
-        let trait_path = self.str_at("an impl's trait path", le32(b, r + 36), le32(b, r + 40))?;
-        let self_path = self.str_at("an impl's self path", le32(b, r + 44), le32(b, r + 48))?;
-        let bits = le32(b, r + 52);
-        let roots = le32(b, r + 60);
+        let c = self.impl_cols;
+        let key = self.key_from_tail(Self::tail_at(c.keys, i));
+        let meta = c.meta.get(i);
+        let bits = u32::try_from(meta & 0xffff_ffff).unwrap_or(0);
+        let head_byte = u8::try_from((meta >> 32) & 0xff).unwrap_or(0);
+        let marks = u8::try_from((meta >> 40) & 0xff).unwrap_or(0);
+        let arity = u16::try_from((meta >> 48) & 0xffff).unwrap_or(0);
+        let trait_path = self.str_at("an impl's trait path", c.trait_at.get_u32(i), c.trait_len.get_u32(i))?;
+        let self_path = self.str_at("an impl's self path", c.self_at.get_u32(i), c.self_len.get_u32(i))?;
+        let roots = c.roots.get_u32(i);
         if roots & !(ROOT_TRAIT | ROOT_SELF) != 0 {
             return Err(ItemsRecordError::Roots { key, bits: roots });
         }
-        let root = |flag: u32, at: usize| (roots & flag != 0).then(|| CrateItemKey(id_at(b, r + at)));
         Ok(Some(ImplRow {
             key,
-            module: self.module_key(le32(b, r + 32))?,
+            module: self.module_key(c.module.get_u32(i))?,
             trait_path: (!trait_path.is_empty()).then_some(trait_path),
             has_trait: marks & HAS_TRAIT != 0,
             bare: marks & BARE != 0,
             flags: ImplFlags::from_bits(bits).map_err(|_| ItemsRecordError::ImplFlags { key, bits })?,
-            head: SelfHead::from_byte(b[r + 56], le16(b, r + 58)).ok_or(ItemsRecordError::Byte { what: "a self type's head", byte: b[r + 56] })?,
+            head: SelfHead::from_byte(head_byte, arity).ok_or(ItemsRecordError::Byte { what: "a self type's head", byte: head_byte })?,
             self_path: (!self_path.is_empty()).then_some(self_path),
             header_unread: marks & HEADER_UNREAD != 0,
             trait_unread: marks & TRAIT_UNREAD != 0,
             refused_call: marks & REFUSED_CALL != 0,
-            trait_root: root(ROOT_TRAIT, 64),
-            self_root: root(ROOT_SELF, 96),
+            trait_root: (roots & ROOT_TRAIT != 0).then(|| CrateItemKey(ContentId(*c.trait_root.get(i)))),
+            self_root: (roots & ROOT_SELF != 0).then(|| CrateItemKey(ContentId(*c.self_root.get(i)))),
         }))
     }
 
@@ -2103,6 +2540,12 @@ pub trait LoadItems<'a>: 'a {
     /// 16-aligned, or `None` when none is kept.
     fn load(&self, krate: usize) -> Option<&'a [u8]>;
 
+    /// An already-verified [`VerifiedItems`] proof for `krate` (rule 74), avoiding redundant
+    /// column validation and UTF-8 checks on every job and stretch.
+    fn load_verified(&self, _krate: usize) -> Option<VerifiedItems<'a>> {
+        None
+    }
+
     /// The text of the crate's file at `path` in its package, as it is now: the loader joins
     /// `path` onto the directory its world placed the crate's package at
     /// ([`PackagePath::in_package`]). The record checks the text against the digest it holds,
@@ -2160,12 +2603,18 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
         self.open
             .get(krate)?
             .get_or_init(|| {
-                let bytes = self.load.load(krate)?;
+                let verified = self.load.load_verified(krate);
+                let bytes = if verified.is_some() { None } else { Some(self.load.load(krate)?) };
                 let load = self.load.clone();
                 let alloc = self.alloc;
                 let bump = self.bump;
                 let source = move |index, path, surface, edition| load.file_items(krate, index, path, surface, edition, bump);
-                Some(ItemsRecord::open_with_files(bytes, alloc, source).unwrap_or_else(|e| panic!("the items record of crate {:?} did not open: {e:?}", self.keys[krate])))
+                if let Some(proof) = verified {
+                    Some(ItemsRecord::from_verified_with_files(proof, alloc, source))
+                } else {
+                    let bytes = bytes?;
+                    Some(ItemsRecord::open_with_files(bytes, alloc, source).unwrap_or_else(|e| panic!("the items record of crate {:?} did not open: {e:?}", self.keys[krate])))
+                }
             })
             .as_ref()
     }

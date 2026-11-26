@@ -8,7 +8,7 @@ use core::ptr::NonNull;
 
 use blaze_code::record::Symbol as CodeSymbol;
 
-use super::{EntryForm, HostTableAt, PreparedEntry, RunModeError, Start, call_entry, finish_control};
+use super::{EntryExit, EntryForm, HostTableAt, PreparedEntry, RunModeError, Start, call_entry, finish_control};
 use crate::native_lib::{ArgumentList, ArgsError, Loaded, NativeError, ProcessArgs, ProcessArgsOpts};
 
 pub(crate) mod process_args_tests;
@@ -76,11 +76,11 @@ fn a_comptime_entry_is_called_with_the_hosts_arguments() {
     let words: [*const core::ffi::c_char; 3] = [c"macro".as_ptr(), c"--derive".as_ptr(), core::ptr::null()];
     // SAFETY: two C-string literals (static) and a null, alive across the call.
     let two = unsafe { ComptimeArgs::new(2, words.as_ptr()) };
-    assert_eq!(call_entry(count as usize as u64, &PreparedEntry::Comptime(two)), 2);
+    assert_eq!(call_entry(count as usize as u64, &PreparedEntry::Comptime(two)), EntryExit::Returned(2));
     let empty: [*const core::ffi::c_char; 1] = [core::ptr::null()];
     // SAFETY: as above.
     let none = unsafe { ComptimeArgs::new(0, empty.as_ptr()) };
-    assert_eq!(call_entry(count as usize as u64, &PreparedEntry::Comptime(none)), 0);
+    assert_eq!(call_entry(count as usize as u64, &PreparedEntry::Comptime(none)), EntryExit::Returned(0));
 }
 
 /// A stand-in for bstd's host table: only its address is compared, never read.
@@ -99,11 +99,11 @@ fn a_hosted_entry_returning_seven_ends_with_seven() {
     // SAFETY: the stand-in is never read (`hosted_seven` compares its address only), and the
     // static outlives the call.
     let table = unsafe { HostTableAt::new(NonNull::from(&TABLE).cast::<c_void>()) };
-    assert_eq!(call_entry(hosted_seven as usize as u64, &PreparedEntry::Hosted { table, args: args(&[], &[]) }), 7);
+    assert_eq!(call_entry(hosted_seven as usize as u64, &PreparedEntry::Hosted { table, args: args(&[], &[]) }), EntryExit::Returned(7));
     static OTHER: [u64; 4] = [0; 4];
     // SAFETY: as above.
     let other = unsafe { HostTableAt::new(NonNull::from(&OTHER).cast::<c_void>()) };
-    assert_eq!(call_entry(hosted_seven as usize as u64, &PreparedEntry::Hosted { table: other, args: args(&[], &[]) }), 1);
+    assert_eq!(call_entry(hosted_seven as usize as u64, &PreparedEntry::Hosted { table: other, args: args(&[], &[]) }), EntryExit::Returned(1));
 }
 
 /// The constructor mutates both a string and the argv array, and puts that array's address
@@ -145,13 +145,13 @@ fn constructors_and_main_share_process_lived_arguments() {
         let args = args(&[b"program", b"abcdefghijklmnop", b"tail"], &[b"PROBE=value"]);
         let (argv, envp) = (args.argv(), args.envp());
         let prepared = PreparedEntry::CMain(args);
-        assert_eq!(call_entry(reads_edited_arguments as usize as u64, &prepared), 2, "no constructor, no identity word");
+        assert_eq!(call_entry(reads_edited_arguments as usize as u64, &prepared), EntryExit::Returned(2), "no constructor, no identity word");
         let inits = [edit_arguments as usize as u64];
         prepared.initialize(Loaded {
             record: blaze_launch::wire::RecordId([0x71; 32]), base: 0,
             inits_at: inits.as_ptr() as u64, inits: 1,
         }).expect("the constructor runs");
-        assert_eq!(call_entry(reads_edited_arguments as usize as u64, &prepared), 37);
+        assert_eq!(call_entry(reads_edited_arguments as usize as u64, &prepared), EntryExit::Returned(37));
         (argv, envp)
     };
     assert_eq!(reads_edited_arguments(3, argv), 37, "escaped argv outlives the entry's metadata");
@@ -272,7 +272,7 @@ pub(crate) fn native_parent_closed() -> i32 {
         launcher.into(),
         &Folder::new(b"."),
         symbol(),
-        Some(record),
+        Some(super::NativeStart::Eager(record)),
         Handed::Unit,
         Dlsym,
         End::Return,
@@ -289,4 +289,77 @@ pub(crate) fn native_parent_closed() -> i32 {
 fn a_parent_that_closes_before_native_does_not_strand_startup() {
     let child = crate::driver_tests::run(crate::driver_tests::Case::NativeParentClosed);
     assert_eq!(child.status.code(), Some(75), "{}", child.stderr);
+}
+
+/// An uncaught guest panic raised by the guest's `panic_unwind` carries `MOZ\0RUST` with the
+/// guest's own `CANARY` address (different from the launcher host's `CANARY`). `call_entry`
+/// catches it at the host/guest boundary via `core::intrinsics::catch_unwind`: guest
+/// destructors run in phase 2, `exception_cleanup` is not invoked, and host
+/// `panic_unwind::__rust_panic_cleanup` is never reached (before this fix, letting the
+/// exception unwind into `std::thread::scope` / `libtest` aborted with
+/// `"fatal runtime error: Rust cannot catch foreign exceptions, aborting"`).
+#[test]
+fn a_guest_unwind_with_foreign_canary_is_caught_at_the_entry_boundary() {
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    const RUST_EXCEPTION_CLASS: u64 = u64::from_ne_bytes(*b"MOZ\0RUST");
+    static GUEST_CANARY: u8 = 0;
+    static DROPPED: AtomicBool = AtomicBool::new(false);
+    static CLEANUP_CALLED: AtomicBool = AtomicBool::new(false);
+
+    #[repr(C, align(16))]
+    struct ForeignRustException {
+        exception_class: u64,
+        exception_cleanup: Option<extern "C" fn(c_int, *mut ForeignRustException)>,
+        private: [*const u8; 2],
+        canary: *const u8,
+    }
+
+    struct SyncExc(UnsafeCell<ForeignRustException>);
+    // SAFETY: accessed only on this single test thread while raising the test exception.
+    unsafe impl Sync for SyncExc {}
+
+    static EXC: SyncExc = SyncExc(UnsafeCell::new(ForeignRustException {
+        exception_class: RUST_EXCEPTION_CLASS,
+        exception_cleanup: Some(on_cleanup),
+        private: [core::ptr::null(); 2],
+        canary: &raw const GUEST_CANARY,
+    }));
+
+    extern "C" fn on_cleanup(_code: c_int, _exc: *mut ForeignRustException) {
+        CLEANUP_CALLED.store(true, Ordering::Relaxed);
+    }
+
+    unsafe extern "C-unwind" {
+        fn _Unwind_RaiseException(exception: *mut ForeignRustException) -> c_int;
+    }
+
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DROPPED.store(true, Ordering::Relaxed);
+        }
+    }
+
+    extern "C-unwind" fn guest_unwinds() {
+        let _guard = Guard;
+        // SAFETY: `EXC` is 16-byte aligned, lives past this frame, and matches the Itanium
+        // `_Unwind_Exception` layout plus `panic_unwind`'s `canary` field.
+        unsafe {
+            let exc = EXC.0.get();
+            (*exc).private = [core::ptr::null(); 2];
+            _Unwind_RaiseException(exc);
+        }
+    }
+
+    extern "C-unwind" fn guest_returns() {}
+
+    DROPPED.store(false, Ordering::Relaxed);
+    CLEANUP_CALLED.store(false, Ordering::Relaxed);
+
+    assert_eq!(call_entry(guest_returns as *const () as usize as u64, &PreparedEntry::Unit(args(&[], &[]))), EntryExit::Returned(0));
+    assert_eq!(call_entry(guest_unwinds as *const () as usize as u64, &PreparedEntry::Unit(args(&[], &[]))), EntryExit::Unwound);
+    assert!(DROPPED.load(Ordering::Relaxed), "phase 2 unwinding must run guest destructors before stopping at call_entry");
+    assert!(!CLEANUP_CALLED.load(Ordering::Relaxed), "call_entry must not invoke _Unwind_DeleteException on a guest panic");
 }

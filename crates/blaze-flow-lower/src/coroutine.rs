@@ -132,8 +132,32 @@ pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call
     log: &mut Option<crate::builder::Log<A>>,
 ) -> Result<LoweredAsync<A>, Refusal> {
     let range = range_of(body, block);
-    let inner = match body.exprs.get(block.ix()) {
-        Some(Expr::AsyncBlock { body: inner, .. }) => *inner,
+    let (inner, closure_params) = match body.exprs.get(block.ix()) {
+        Some(Expr::AsyncBlock { body: inner, .. }) => (*inner, None),
+        // Async closure witness lowering (`!R::RELATES`, RFC 3668): lowers the call future's body
+        // with its captures and parameters so `exact_interior` and `stalled_goals` compute the
+        // exact `Send`/`Sync` interior of `async |..| { .. }` instead of leaving its coroutine row
+        // a superset (unblocks `reth_e2e_test_utils::E2ETestSetupBuilder::build` and callers).
+        Some(Expr::Closure { is_async: true, params, body: inner, .. }) if !R::RELATES => {
+            let Some(params) = body.pat_lists.get(params.range()) else {
+                return Err(Refusal { form: Form::Malformed, range });
+            };
+            let Some(row) = ck.closures.column::<0>().iter().position(|&c| c == block) else {
+                return Err(Refusal { form: Form::Malformed, range });
+            };
+            let Some(&sig) = ck.closures.column::<2>().get(row) else {
+                return Err(Refusal { form: Form::Malformed, range });
+            };
+            let tys = ck.types.view();
+            let (inputs, output): (&[PTy], PTy) = match tys.node(sig) {
+                Ok(PNode::FnPtr(l, _)) => match tys.list(l) {
+                    Ok(all) if all.len() == params.len() + 1 => (&all[..params.len()], all[params.len()]),
+                    _ => return Err(Refusal { form: Form::Malformed, range }),
+                },
+                _ => return Err(Refusal { form: Form::Malformed, range }),
+            };
+            (*inner, Some((params, inputs, output)))
+        }
         _ => return Err(Refusal { form: Form::Malformed, range }),
     };
     // Only expressions evaluated by this block contribute suspension points. Evaluating a
@@ -146,7 +170,7 @@ pub(crate) fn lower_async_with<A: Allocator + Copy, F: Facts, R: crate::one_call
     }
     l.async_root = Some(block);
     let mut externals: Vec<(blaze_flow::Origin, External), A> = Vec::new_in(alloc);
-    let ran = l.run_async(block, inner, &mut externals);
+    let ran = l.run_async(block, inner, closure_params, &mut externals);
     let ran = l.finish_held(ran);
     *log = l.b.take_log();
     ran?;
@@ -423,21 +447,22 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
     /// The walk of an async block's body `inner`: as `run`, with the block's captures as the
     /// arguments and its output as the return place. `externals` receives what each capture's
     /// and the output's placeholder stands for in the block's maker ([`LoweredAsync::externals`]).
-    fn run_async(&mut self, block: ExprId, inner: ExprId, externals: &mut Vec<(blaze_flow::Origin, External), A>) -> Result<(), Refusal> {
+    fn run_async(
+        &mut self,
+        block: ExprId,
+        inner: ExprId,
+        closure_params: Option<(&[PatId], &[PTy], PTy)>,
+        externals: &mut Vec<(blaze_flow::Origin, External), A>,
+    ) -> Result<(), Refusal> {
         let ck = self.ck;
-        // The block's captures, in row order: argument `1 + k` is row `k`.
-        let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc);
-        {
-            let firsts = ck.captures.column::<0>();
-            let pats = ck.captures.column::<1>();
-            let kinds = ck.captures.column::<2>();
-            for i in 0..firsts.len() {
-                if firsts[i] == block {
-                    rows.push((pats[i], kinds[i]));
-                }
-            }
+        // The block's captures, in environment-field order: argument `1 + k` is field `k`.
+        self.env_now.clear();
+        self.field_places.clear();
+        for f in ck.env_fields_by::<blaze_typeck::Places>(block) {
+            self.env_now.push(f);
         }
-        let nu = rows.len() as u32;
+        let mut rows: Vec<(PatId, CaptureKind), A> = Vec::new_in(self.alloc);
+        let Ok(nu) = u32::try_from(self.env_now.len()) else { return self.refuse(Form::Bound, block) };
         self.b.replace(blaze_flow::FlowBuilder::new_in(1 + nu, nu, self.alloc));
         self.nargs = nu;
         let entry = self.b.block();
@@ -446,36 +471,49 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         self.scope_marks.push(0);
         self.scope_temps.push((self.temps.len() as u32, self.temp_marks.len() as u32));
         // The next position of the future value (`External::Capture`): a capture by reference
-        // is its reference then its variable's type's positions, one by value its type's, the
-        // order `Lower::npos` of `PNode::Future` counts and `closure_value` lays them in. An
+        // is its reference then its captured place's type's positions, one by value its type's,
+        // the order `Lower::npos` of `PNode::Future` counts and `closure_value` lays them in. An
         // async block is polled through `Pin<&mut Self>` and owns its captures, so no capture
         // is reached through a per-call environment reference (closure.rs `External::Env`).
         let mut value_at = 0u32;
-        for k in 0..rows.len() {
-            let (p, kind) = rows[k];
-            let t = match ck.local_ty.get(p.ix()) {
-                Some(&t) => t,
-                None => return self.refuse_pat(Form::Malformed, p),
-            };
+        for k in 0..self.env_now.len() {
+            let f = self.env_now[k];
+            let kind = f.how;
             let l = Local(1 + k as u32);
             let first = self.origs.len() as u32;
-            match kind {
-                CaptureKind::ByValue => {
-                    self.new_local_with(TyD::of(t), true, Some(l), block)?;
-                    if let Some(slot) = self.pat_local.get_mut(p.ix()) {
-                        *slot = l.0;
-                    } else {
-                        return self.refuse_pat(Form::Malformed, p);
+            if f.is_whole() {
+                let p = f.base;
+                rows.push((p, kind));
+                let t = match ck.local_ty.get(p.ix()) {
+                    Some(&t) => t,
+                    None => return self.refuse_pat(Form::Malformed, p),
+                };
+                match kind {
+                    CaptureKind::ByValue => {
+                        self.new_local_with(TyD::of(t), true, Some(l), block)?;
+                        if let Some(slot) = self.pat_local.get_mut(p.ix()) {
+                            *slot = l.0;
+                        } else {
+                            return self.refuse_pat(Form::Malformed, p);
+                        }
+                    }
+                    CaptureKind::ByRef | CaptureKind::ByMutRef => {
+                        let m = if kind == CaptureKind::ByRef { Mutbl::Not } else { Mutbl::Mut };
+                        let rt = TyD { wrap: Some(m), ty: t };
+                        self.new_local_with(rt, true, Some(l), block)?;
+                        let at = self.place_of(l);
+                        let place = self.project(at, rt, Proj::Deref, TyD::of(t), false, block)?;
+                        self.upvar_places.push((p, place, TyD::of(t)));
                     }
                 }
-                CaptureKind::ByRef | CaptureKind::ByMutRef => {
-                    let m = if kind == CaptureKind::ByRef { Mutbl::Not } else { Mutbl::Mut };
-                    let rt = TyD { wrap: Some(m), ty: t };
-                    self.new_local_with(rt, true, Some(l), block)?;
-                    let at = self.place_of(l);
-                    let place = self.project(at, rt, Proj::Deref, TyD::of(t), false, block)?;
-                    self.upvar_places.push((p, place, TyD::of(t)));
-                }
+            } else {
+                let through = match kind {
+                    CaptureKind::ByValue => None,
+                    CaptureKind::ByRef => Some(Mutbl::Not),
+                    CaptureKind::ByMutRef => Some(Mutbl::Mut),
+                };
+                let Ok(k32) = u32::try_from(k) else { return self.refuse(Form::Bound, block) };
+                self.place_upvar(block, k32, f, through)?;
             }
             let made = self.origs.len() as u32;
             for o in first..made {
@@ -488,9 +526,15 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
         // placeholder is known to outlive every one of them (the output may hold what a capture
         // by reference points to; a loan of the block's own locals or by-value captures is not
         // known to outlive it and is refused, as a returned reference to a local is).
-        let out = match self.node(self.expr_ty(block)?, block)? {
-            PNode::Future(fe, out, _) if fe == block => out,
-            _ => return self.refuse(Form::TypeNode, block),
+        let out = match closure_params {
+            Some((_, _, output)) => match self.node(output, block)? {
+                PNode::Future(_, out, _) => out,
+                _ => output,
+            },
+            None => match self.node(self.expr_ty(block)?, block)? {
+                PNode::Future(fe, out, _) if fe == block => out,
+                _ => return self.refuse(Form::TypeNode, block),
+            },
         };
         let upvar_origins = self.origs.len();
         self.new_local_with(TyD::of(out), true, Some(Local(0)), block)?;
@@ -512,6 +556,33 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
             for u in 0..upvar_origins {
                 for o in upvar_origins..all {
                     self.b.known(self.origs[u], self.origs[o]);
+                }
+            }
+        }
+        // Async closure parameters: allocated as locals past `flow.args` so `blaze_flow::saved`
+        // tracks whether each parameter crosses a suspension and `parts_with` includes saved
+        // parameters in the call future's exact interior while dropping ones freed before `.await`.
+        if let Some((params, inputs, _)) = closure_params {
+            for (i, &p) in params.iter().enumerate() {
+                let Some(&inp) = inputs.get(i) else {
+                    return self.refuse_pat(Form::Malformed, p);
+                };
+                let ty = TyD::of(inp);
+                let l = self.new_local_with(ty, true, None, block)?;
+                self.b.stmt(StmtKind::StorageLive(l), self.span(block));
+                let pl = self.place_of(l);
+                self.b.assign(pl, blaze_flow::Operand::Const, self.span(block));
+                self.vars.push(l);
+                match self.body.pats.get(p.ix()) {
+                    Some(blaze_typeck::Pat::Bind { ann, sub: None, .. }) if ann.by_ref.is_none() => {
+                        if let Some(slot) = self.pat_local.get_mut(p.ix()) {
+                            *slot = l.0;
+                        } else {
+                            return self.refuse_pat(Form::Malformed, p);
+                        }
+                        self.name_local(l, Identity::Binding(p));
+                    }
+                    _ => self.bind_pattern(p, crate::Val { at: At::Place(pl), ty })?,
                 }
             }
         }

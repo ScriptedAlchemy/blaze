@@ -207,7 +207,7 @@ pub fn needs_of<A: Allocator + Copy>(
         };
         grounded.clear();
         for &t in types.list(list).map_err(|_| malformed("a constant path's arguments past the record's types"))? {
-            grounded.push(blaze_build::ground(types, t, args, ground, scratch, facts)?);
+            grounded.push(blaze_build::ground_own(types, t, args, view, ground, scratch, facts)?);
         }
         out.push(ConstNeed::Item(item), &grounded)?;
     }
@@ -223,7 +223,7 @@ pub fn needs_of<A: Allocator + Copy>(
         };
         grounded.clear();
         for &t in types.list(list).map_err(|_| malformed("a constant pattern's arguments past the record's types"))? {
-            grounded.push(blaze_build::ground(types, t, args, ground, scratch, facts)?);
+            grounded.push(blaze_build::ground_own(types, t, args, view, ground, scratch, facts)?);
         }
         out.push(ConstNeed::Item(item), &grounded)?;
     }
@@ -235,7 +235,7 @@ pub fn needs_of<A: Allocator + Copy>(
     for (&e, &key) in done.default_fields.column::<0>().iter().zip(done.default_fields.column::<2>().iter()) {
         if last != Some(e) {
             let t = *done.expr_ty.get(e.0 as usize).ok_or(malformed("a struct expression with defaults past the record's types"))?;
-            let g = blaze_build::ground(types, t, args, ground, scratch, facts)?;
+            let g = blaze_build::ground_own(types, t, args, view, ground, scratch, facts)?;
             match ground.view().node(g).map_err(|_| malformed("a grounded type past the ground table"))? {
                 PNode::Adt(_, list) => {
                     grounded.clear();
@@ -296,12 +296,13 @@ pub struct ConstTable<A: Allocator + Copy> {
     rows: SortedMap<(u8, u128, u32), Vec<(Vec<PTy, A>, DataRecord<Global>), A>, A>,
     /// Fn relocations of values evaluated directly in the build's own ground type table.
     pub(crate) ground_fns: SortedMap<blaze_build::InstanceKey, blaze_build::Instance, A>,
+    pub(crate) ground_vtables: SortedMap<blaze_build::vtable::VtableKey, blaze_build::vtable::VtableRef, A>,
     alloc: A,
 }
 
 impl<A: Allocator + Copy> ConstTable<A> {
     pub fn new_in(alloc: A) -> ConstTable<A> {
-        ConstTable { rows: SortedMap::new_in(alloc), ground_fns: SortedMap::new_in(alloc), alloc }
+        ConstTable { rows: SortedMap::new_in(alloc), ground_fns: SortedMap::new_in(alloc), ground_vtables: SortedMap::new_in(alloc), alloc }
     }
 
     /// The value of `need` at `args`, if pulled.
@@ -321,14 +322,28 @@ impl<A: Allocator + Copy> ConstTable<A> {
     }
 }
 
+/// Build-side facts for laying out closure and coroutine types met during constant evaluation
+/// (`Box::new` at a closure or async block reads `<T as SizedTypeProperties>::LAYOUT`).
+#[derive(Clone, Copy)]
+pub struct BuildFacts<'a> {
+    pub closures: &'a crate::run::ClosureTable,
+    pub(crate) coroutines: Option<&'a super::coroutines::Coroutines>,
+}
+
+impl<'a> BuildFacts<'a> {
+    pub(crate) fn new(closures: &'a crate::run::ClosureTable, coroutines: &'a super::coroutines::Coroutines) -> BuildFacts<'a> {
+        BuildFacts { closures, coroutines: Some(coroutines) }
+    }
+}
+
 /// Asks the front end for each of `needs` (arguments of `from`, the build's ground table) not
 /// in `table` yet, and files each answer. The first need refused is the instance's refusal.
-/// `closures`: the build's closure facts, which a closure type among the arguments is laid
-/// out from ([`FrontEnd::const_at`]).
-pub fn pull<P: FrontEnd, A: Allocator + Copy>(program: &mut P, needs: &Needs<A>, from: PTys<'_>, table: &mut ConstTable<A>, closures: &crate::run::ClosureTable) -> Result<(), ConstAtRefusal> {
+/// `facts`: the build's closure and coroutine facts, which closure or coroutine types among the
+/// arguments are laid out from ([`FrontEnd::const_at`]).
+pub fn pull<P: FrontEnd, A: Allocator + Copy>(program: &mut P, needs: &Needs<A>, from: PTys<'_>, table: &mut ConstTable<A>, facts: BuildFacts<'_>) -> Result<(), ConstAtRefusal> {
     for (need, args) in needs.iter() {
         let Some(kept) = table.missing_args(need, args) else { continue };
-        let record = program.const_at(need, from, args, closures).map_err(|why| ConstAtRefusal { need, why })?;
+        let record = program.const_at(need, from, args, facts).map_err(|why| ConstAtRefusal { need, why })?;
         table.insert(need, kept, record);
     }
     Ok(())

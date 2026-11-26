@@ -127,6 +127,15 @@ pub trait Par {
         Scratch::Kept
     }
 
+    /// Where the cell core's own working memory (`Cells`, `WriteIndex`, `SolverScratch`) is held
+    /// while a crate is solved (`cells::solve_and_write`): [`Scratch::Reset`] when this `Par`
+    /// runs `work` in a separate frame that is rolled back and trimmed once the solved scopes
+    /// are written into the crate's frame, [`Scratch::Kept`] when it stays in the crate's frame.
+    fn solve_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {
+        let _ = work;
+        Scratch::Kept
+    }
+
     /// D189's strategy seam (rule 78): whether a body's blocks are modules of the crate
     /// ([`crate::surface::BlockScopes::Modules`], the default) or each body's own, solved by
     /// [`crate::body_scope`] after the crate's names are finished
@@ -134,6 +143,12 @@ pub trait Par {
     /// `CrateNames::bodies`).
     fn block_scopes(&self) -> crate::surface::BlockScopes {
         crate::surface::BlockScopes::Modules
+    }
+
+    /// Whether to populate `Tables::by_place` (only in-memory `Names::item_at` / `blaze-ladder`
+    /// link tests read it; record-based `crate_scope` builds skip it to save ~15–20 MB on `core`).
+    fn track_by_place(&self) -> bool {
+        true
     }
 }
 

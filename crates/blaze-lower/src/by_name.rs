@@ -12,8 +12,8 @@
 //! the answers, to [`EAGER_DEPTH`] deep.
 
 use blaze_expand::{
-    BuiltinDerive, BuiltinFn, Call, CallSite, Ctx, DefAt, DefSite, DeriveFacts, Eager, ExpandCx, Expanded, Export, Inside, LocalInner,
-    LexError, MacroDefinition, NestedCall, NestedKind, Prepared, ProcKind, Reads, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
+    BuiltinDerive, BuiltinFn, Call, CallSite, Ctx, DefAt, DefSite, DeriveFacts, Eager, ExpandCx, Expanded, Export, Hole, HoleOf, Inside, LitKind, LocalInner,
+    LexError, MacroDefinition, NestedCall, NestedKind, Place, PlaceOf, Prepared, ProcKind, ReadAnswer, ReadKind, Reads, Spacing, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
 };
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, Vec};
@@ -228,7 +228,11 @@ fn diagnostic_text<'a>(d: &blaze_expand::Diagnostic, notes: &[u8], alloc: Alloc<
     };
     let mut out = AString::new_in(alloc);
     // The expander writes its notes as whole `str`s; a range off them is named as such.
-    match notes.get(t.at as usize..(t.at as usize).saturating_add(t.len as usize)).map(core::str::from_utf8) {
+    let slice = usize::try_from(t.at)
+        .ok()
+        .zip(usize::try_from(t.len).ok())
+        .and_then(|(at, len)| notes.get(at..at.saturating_add(len)));
+    match slice.map(core::str::from_utf8) {
         Some(Ok(text)) => out.push_str(text),
         _ => out.push_str("(a range off the expansion's notes)"),
     }
@@ -489,6 +493,29 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         }
     }
 
+    /// Copies tokens `start..end` (stripping outer delimiters when `strip_delims` is true)
+    /// from an earlier body expansion and seals them with that expansion's key.
+    fn expanded_slice(&self, expansion: u32, start: u32, end: u32, strip_delims: bool) -> Result<TokenStream<'a>, Refused<'a>> {
+        let (key, tokens) =
+            self.expansions.get(expansion as usize).ok_or(Refused::Failed(Failure::NoExpansion { expansion }))?;
+        let (s, e) = (
+            usize::try_from(start).map_err(|_| Refused::Failed(Failure::NoDelimiters))?,
+            usize::try_from(end).map_err(|_| Refused::Failed(Failure::NoDelimiters))?,
+        );
+        let range = match strip_delims {
+            true => {
+                if e < s.saturating_add(2) {
+                    return Err(Refused::Failed(Failure::NoDelimiters));
+                }
+                s + 1..e - 1
+            }
+            false => s..e,
+        };
+        let mut copy = tokens.copy_in(range, self.alloc).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+        copy.seal(*key);
+        Ok(copy)
+    }
+
     /// The `macro_rules!` or `macro` of the body a single-name `path` names (the last written
     /// of the name in scope), as a definition in the body's crate at `edition`.
     fn local(&self, path: &str, locals: &[LocalMacro<'_>], edition: Edition) -> Option<Result<MacroDefinition<'a>, Refused<'a>>> {
@@ -500,11 +527,23 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         };
         let Some(site) = site else { return Some(Err(Refused::Unknown(NoMacro::LocalWithoutCrate))) };
         let at = DefAt { site, edition, export: Export::Local, local_inner: LocalInner::No, transparency: None };
+        let lex_text = |text: &str, marks: InputMarks<'_>| match marks.is_empty() {
+            true => lex(text, edition, self.alloc),
+            false => blaze_expand::lex_marked(text, edition, &|at| marks.mark_at(at), self.alloc),
+        };
         Some(match written.form {
-            LocalForm::Rules(rules) => {
-                lex(rules, edition, self.alloc).map(|body| MacroDefinition::rules(body, at)).map_err(|e| Refused::Failed(Failure::Lex(e)))
+            LocalForm::Rules { text, marks } => {
+                lex_text(text, marks).map(|body| MacroDefinition::rules(body, at)).map_err(|e| Refused::Failed(Failure::Lex(e)))
             }
-            LocalForm::Macro2(trees) => macro2_of(trees, at, self.alloc).map_err(Refused::Failed),
+            LocalForm::RulesExpanded { expansion, start, end } => {
+                self.expanded_slice(expansion, start, end, true).map(|body| MacroDefinition::rules(body, at))
+            }
+            LocalForm::Macro2 { text, marks } => lex_text(text, marks)
+                .map_err(|e| Refused::Failed(Failure::Lex(e)))
+                .and_then(|stream| macro2_of_stream(&stream, at, self.alloc).map_err(Refused::Failed)),
+            LocalForm::Macro2Expanded { expansion, start, end } => self
+                .expanded_slice(expansion, start, end, false)
+                .and_then(|stream| macro2_of_stream(&stream, at, self.alloc).map_err(Refused::Failed)),
         })
     }
 
@@ -541,18 +580,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                 }
                 lexed.copy_in(1..len - 1, self.alloc).map_err(|e| Refused::Failed(Failure::Stream(e)))
             }
-            CallInput::Expanded { expansion, start, end } => {
-                let (key, tokens) =
-                    self.expansions.get(expansion as usize).ok_or(Refused::Failed(Failure::NoExpansion { expansion }))?;
-                if end < start + 2 {
-                    return Err(Refused::Failed(Failure::NoDelimiters));
-                }
-                let mut copy = tokens
-                    .copy_in(start as usize + 1..end as usize - 1, self.alloc)
-                    .map_err(|e| Refused::Failed(Failure::Stream(e)))?;
-                copy.seal(*key);
-                Ok(copy)
-            }
+            CallInput::Expanded { expansion, start, end } => self.expanded_slice(expansion, start, end, true),
         }
     }
 
@@ -670,14 +698,19 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                         let text = diagnostic_text(diagnostic, &exp.notes, self.alloc);
                         return Err(Refused::Failed(Failure::Diagnostic { diagnostic: *diagnostic, text }));
                     }
+                    let tokens = if exp.holes.is_empty() {
+                        exp.tokens
+                    } else {
+                        self.fill_holes(&exp.tokens, &exp.holes, current.written)?
+                    };
                     match parents.pop() {
                         Some(mut parent) => {
-                            let mut tokens = exp.tokens;
+                            let mut tokens = tokens;
                             tokens.seal(key);
                             parent.answers.push(tokens);
                             current = parent;
                         }
-                        None => return Ok((key, exp.tokens)),
+                        None => return Ok((key, tokens)),
                     }
                 }
                 Ok(Expanded::NeedsExpanded(mut nested)) if current.answers.is_empty() && current.depth < EAGER_DEPTH => {
@@ -688,6 +721,76 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                 Err(e) => return Err(Refused::Failed(Failure::Expand(e))),
             }
         }
+    }
+
+    /// Replaces placeholder tokens recorded in `holes` (`line!()`, `column!()`, `file!()`,
+    /// `module_path!()` outside eager input) with the host's answer at `written`, recording each
+    /// answered read. When the host refuses a position (e.g. a stub host with no place), the
+    /// placeholder token stands.
+    fn fill_holes(&mut self, from: &TokenStream<'a>, holes: &[Hole], written: Option<u32>) -> Result<TokenStream<'a>, Refused<'a>> {
+        let mut out = TokenStream::new_in(self.alloc);
+        let mut next_hole = 0usize;
+        for at in 0..from.len() {
+            let hole = holes.get(next_hole).filter(|h| usize::try_from(h.token).ok() == Some(at));
+            let Some(hole) = hole else {
+                out.push_from(from, at).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                continue;
+            };
+            next_hole += 1;
+            let (ask, read_kind, number) = match hole.of {
+                HoleOf::Line => (PlaceOf::Line, ReadKind::Line, true),
+                HoleOf::Column => (PlaceOf::Column, ReadKind::Column, true),
+                HoleOf::File => (PlaceOf::File, ReadKind::File, false),
+                HoleOf::ModulePath => (PlaceOf::ModulePath, ReadKind::ModulePath, false),
+            };
+            let got = match written {
+                Some(call) => self.cx.place_of_call(ask, call),
+                None => self.cx.place(ask),
+            };
+            let Ok(place) = got else {
+                out.push_from(from, at).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                continue;
+            };
+            if usize::try_from(self.read_cap).is_ok_and(|cap| self.reads.list().len() >= cap) {
+                return Err(Refused::ReadList(ReadLimit::Cap(self.read_cap)));
+            }
+            self.reads.push(read_kind, "", ReadAnswer::of_place(place)).map_err(|e| Refused::ReadList(ReadLimit::Table(e)))?;
+            let Some(tok) = from.tokens().get(at) else {
+                continue;
+            };
+            let ctx = out.import_ctx(from, tok.ctx).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+            match (place, number) {
+                (Place::Number(value), true) => {
+                    use core::fmt::Write;
+                    let mut text = AString::new_in(self.alloc);
+                    let _ = write!(text, "{value}u32");
+                    let kind = TokenKind::Literal { kind: LitKind::Integer, suffix_len: 3, spacing: Spacing::Alone };
+                    out.push(kind, text.as_str(), ctx).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                }
+                (Place::Text(value), false) => {
+                    let mut text = AString::new_in(self.alloc);
+                    text.push('"');
+                    for ch in value.chars() {
+                        match ch {
+                            '\\' => text.push_str("\\\\"),
+                            '"' => text.push_str("\\\""),
+                            '\n' => text.push_str("\\n"),
+                            '\r' => text.push_str("\\r"),
+                            '\t' => text.push_str("\\t"),
+                            '\0' => text.push_str("\\0"),
+                            c => text.push(c),
+                        }
+                    }
+                    text.push('"');
+                    let kind = TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone };
+                    out.push(kind, text.as_str(), ctx).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                }
+                _ => {
+                    out.push_from(from, at).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -703,19 +806,18 @@ struct CallFrame<'d, 'a> {
     pending: AVec<'a, NestedCall>,
 }
 
-/// The body's `macro` whose trees after its name are `trees`, defined `at`: `(params) { body }`
+/// The body's `macro` whose trees after its name are `stream`, defined `at`: `(params) { body }`
 /// one function-like rule, `{ arms }` arms as a `macro_rules!` has; the params and the body
 /// are the tokens inside their delimiters, as blaze-scope makes a module's `macro`
 /// (task/lower.rs, `ItemDetail::MacroDef`).
-fn macro2_of<'a>(trees: &str, at: DefAt, alloc: Alloc<'a>) -> Result<MacroDefinition<'a>, Failure<'a>> {
+fn macro2_of_stream<'a>(stream: &TokenStream<'_>, at: DefAt, alloc: Alloc<'a>) -> Result<MacroDefinition<'a>, Failure<'a>> {
     use blaze_expand::Delim;
-    let lexed = lex(trees, at.edition, alloc).map_err(Failure::Lex)?;
-    let tokens = lexed.tokens();
+    let tokens = stream.tokens();
     let group = |open: usize, delim: Delim| match tokens.get(open).map(|t| t.kind) {
-        Some(TokenKind::Open(d)) if d == delim => lexed.close_of(open),
+        Some(TokenKind::Open(d)) if d == delim => stream.close_of(open),
         _ => None,
     };
-    let inside = |open: usize, close: usize| lexed.copy_in(open + 1..close, alloc).map_err(Failure::Stream);
+    let inside = |open: usize, close: usize| stream.copy_in(open + 1..close, alloc).map_err(Failure::Stream);
     let (params, body_open) = match group(0, Delim::Paren) {
         Some(close) => (Some(inside(0, close)?), close + 1),
         None => (None, 0),

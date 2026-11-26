@@ -6,7 +6,7 @@ use std::alloc::Global;
 use blaze_ids::{ContentId, Hasher};
 use blaze_typeck::{Adt, ItemKey, List, Mutbl, PNode, PTy, PTys, PortableTys, UintTy};
 
-use super::{HEADER_WORDS, ObjectMethod, ObjectSuper, ObjectTrait, Shape, TraitArgs, Upcast, Vtable, VtableError, VtableRef, VtableTarget, Word, vtable_key};
+use super::{HEADER_WORDS, MethodDispatch, ObjectMethod, ObjectSuper, ObjectTrait, Shape, TraitArgs, Upcast, Vtable, VtableError, VtableRef, VtableTarget, Word, vtable_key};
 use crate::Instance;
 use crate::layout::{LayoutFacts, Missing, ReprAttrs, ValidRange};
 
@@ -33,7 +33,7 @@ const B: ItemKey = ItemKey(0x30);
 const C: ItemKey = ItemKey(0x40);
 
 fn m(item: u128, dispatch: bool) -> ObjectMethod {
-    ObjectMethod { item: ItemKey(item), dispatch }
+    ObjectMethod { item: ItemKey(item), dispatch: if dispatch { MethodDispatch::Direct } else { MethodDispatch::None } }
 }
 
 fn id(text: &str) -> ContentId {
@@ -77,7 +77,7 @@ fn items(words: &[Word]) -> Vec<Word> {
     words
         .iter()
         .map(|w| match *w {
-            Word::Method { trait_, item, .. } => Word::Method { trait_, item, args: TraitArgs::Principal },
+            Word::Method { trait_, item, by_value, .. } => Word::Method { trait_, item, args: TraitArgs::Principal, by_value },
             Word::Super { trait_, .. } => Word::Super { trait_, args: TraitArgs::Principal },
         })
         .collect()
@@ -85,7 +85,7 @@ fn items(words: &[Word]) -> Vec<Word> {
 
 /// Method words of `item` in trait `trait_`, at the principal's arguments.
 fn method(trait_: ItemKey, item: u128) -> Word {
-    Word::Method { trait_, item: ItemKey(item), args: TraitArgs::Principal }
+    Word::Method { trait_, item: ItemKey(item), args: TraitArgs::Principal, by_value: false }
 }
 
 fn super_word(trait_: ItemKey) -> Word {
@@ -175,10 +175,10 @@ const PAST: ItemKey = ItemKey(0xb0);
 /// (generic supertrait off the first chain), `Twice<P, Q>: Mut<P> + Mut<Q>` (refused), and
 /// `Past`, whose facts name a supertrait argument list past its table.
 fn fn_facts(t: ItemKey) -> Option<ObjectTrait<'static>> {
-    const ONCE_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x51), dispatch: false }];
-    const MUT_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x61), dispatch: true }];
-    const FN_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x71), dispatch: true }];
-    const PLAIN_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x81), dispatch: true }];
+    const ONCE_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x51), dispatch: MethodDispatch::None }];
+    const MUT_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x61), dispatch: MethodDispatch::Direct }];
+    const FN_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x71), dispatch: MethodDispatch::Direct }];
+    const PLAIN_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x81), dispatch: MethodDispatch::Direct }];
     const NODES: [PNode; 2] = [PNode::Param(1), PNode::Param(2)];
     const LISTS: [PTy; 2] = [PTy(0), PTy(1)];
     const TYS: PTys<'static> = PTys::flat(&NODES, &LISTS);
@@ -416,7 +416,7 @@ fn place_table(f: &Fixture, t: ItemKey, concrete: blaze_typeck::PTy, size: u64, 
     let words: &'static mut [u64] = Vec::leak(words);
     for &(offset, to) in table.relocs.iter() {
         words[offset as usize / 8] = match to {
-            VtableTarget::Fn(i) => 0x1000 + i.item.0 as u64,
+            VtableTarget::Fn(i) | VtableTarget::ByValueShim(i) => 0x1000 + i.item.0 as u64,
             VtableTarget::Super(sup) => place_table(f, sup.principal, concrete, size, align, g),
         };
     }
@@ -481,4 +481,67 @@ fn a_vtable_address_in_code_is_a_relocation_to_the_placed_table() {
     // SAFETY: word 6 is the address of `(u64, B)`'s leaked table (header 3 + b1, z1 is shared: 2 words).
     let b_words = unsafe { core::slice::from_raw_parts(words[6] as *const u64, 5) };
     assert_eq!((b_words[1], b_words[2]), (24, 8));
+}
+
+/// `MethodDispatch::ByValueShim` (`FnOnce::call_once`): gets slot 0 on `Once`, `Mut: Once`, and
+/// `Fn: Mut`, reports `by_value == true` from `Shape::slot_info`, and emits
+/// `VtableTarget::ByValueShim` in `Vtable::build` while `call_mut`/`call` emit `VtableTarget::Fn`.
+#[test]
+fn by_value_shim_method_gets_slot_and_by_value_target() {
+    const ONCE_BV: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x51), dispatch: MethodDispatch::ByValueShim }];
+    const MUT_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x61), dispatch: MethodDispatch::Direct }];
+    const FN_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x71), dispatch: MethodDispatch::Direct }];
+    const NODES: [PNode; 1] = [PNode::Param(1)];
+    const LISTS: [PTy; 1] = [PTy(0)];
+    const TYS: PTys<'static> = PTys::flat(&NODES, &LISTS);
+    const ARG1: List = List { start: 0, len: 1 };
+    const S_ONCE: [ObjectSuper; 1] = [ObjectSuper { trait_: ONCE, args: ARG1 }];
+    const S_MUT: [ObjectSuper; 1] = [ObjectSuper { trait_: MUT, args: ARG1 }];
+    let facts = |t: ItemKey| -> Option<ObjectTrait<'static>> {
+        Some(match t {
+            ONCE => ObjectTrait { supers: &[], tys: PTys::EMPTY, methods: &ONCE_BV, shape: id("once_bv") },
+            MUT => ObjectTrait { supers: &S_ONCE, tys: TYS, methods: &MUT_M, shape: id("mut; once_bv") },
+            FN => ObjectTrait { supers: &S_MUT, tys: TYS, methods: &FN_M, shape: id("fn; mut; once_bv") },
+            _ => return None,
+        })
+    };
+    let alloc = blaze_own::testing::heap().alloc();
+    let s_once = Shape::of(ONCE, facts, alloc).expect("Once shape");
+    assert_eq!(s_once.slot_info(ItemKey(0x51)), Some((0, true)));
+    let s_fn = Shape::of(FN, facts, alloc).expect("Fn shape");
+    assert_eq!(s_fn.slot_info(ItemKey(0x51)), Some((0, true)));
+    assert_eq!(s_fn.slot_info(ItemKey(0x61)), Some((1, false)));
+    assert_eq!(s_fn.slot_info(ItemKey(0x71)), Some((2, false)));
+    assert_eq!(s_fn.upcast(ONCE), Some(Upcast::Prefix));
+    let mut g = PortableTys::new_in(alloc);
+    let u32_ = g.intern(PNode::Uint(UintTy::U32)).unwrap();
+    let u64_ = g.intern(PNode::Uint(UintTy::U64)).unwrap();
+    let at_args = g.intern_list(&[u32_, u64_]).unwrap();
+    let vt = Vtable::build(&s_fn, u32_, &[u64_], 4, 4, None, &mut g, &NoFacts, alloc, alloc).expect("Fn vtable");
+    assert_eq!(
+        &vt.relocs[..],
+        &[
+            (24, VtableTarget::ByValueShim(Instance { item: ItemKey(0x51), args: at_args })),
+            (32, VtableTarget::Fn(Instance { item: ItemKey(0x61), args: at_args })),
+            (40, VtableTarget::Fn(Instance { item: ItemKey(0x71), args: at_args })),
+        ]
+    );
+}
+
+/// Auto-trait-only trait objects (`dyn Send + Sync`, `AUTO_ONLY_PRINCIPAL`) have a header-only
+/// 3-word vtable `[drop_in_place, size, align]` with zero methods and zero supertrait slots.
+#[test]
+fn auto_only_principal_builds_header_only_vtable() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let shape = Shape::of(super::AUTO_ONLY_PRINCIPAL, |_| None, alloc).expect("auto-only shape");
+    assert!(shape.words.is_empty());
+    assert!(shape.prefix.is_empty());
+    let mut g = PortableTys::new_in(alloc);
+    let u32_ = g.intern(PNode::Uint(UintTy::U32)).unwrap();
+    let drop_fn = Instance { item: ItemKey(0xdd), args: g.intern_list(&[u32_]).unwrap() };
+    let vt = Vtable::build(&shape, u32_, &[], 16, 8, Some(drop_fn), &mut g, &NoFacts, alloc, alloc).expect("auto-only vtable");
+    assert_eq!(vt.bytes.len(), 24);
+    assert_eq!(u64::from_le_bytes(vt.bytes[8..16].try_into().unwrap()), 16);
+    assert_eq!(u64::from_le_bytes(vt.bytes[16..24].try_into().unwrap()), 8);
+    assert_eq!(&vt.relocs[..], &[(0, VtableTarget::Fn(drop_fn))]);
 }

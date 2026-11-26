@@ -15,7 +15,7 @@ use blaze_lir::{
     func::{BlockKind, Conv, RefKind, SlotKind},
     verify,
 };
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AVec, Alloc};
 use blaze_tier::{
     ARM64, Arch, Emitted, Machine, Names, Os, Outside, RoutinePlaces, Table, Tier, TierName, optimizing_tier,
     record::{encode, place, read, seal},
@@ -65,7 +65,7 @@ fn test_alloc() -> Alloc<'static> {
 /// Places an `Emitted` record into executable memory on this Apple Silicon host.
 fn load_exec(emitted: Emitted<'static>) -> (Executable, usize) {
     let sealed = seal(emitted).expect("emitted record must seal cleanly");
-    let mut bytes: AVec<'static, u8> = Vec::new_in(test_alloc());
+    let mut bytes: AVec<'static, u8> = AVec::new_in(test_alloc());
     encode(&sealed, &mut bytes);
     let view = read(&bytes).expect("encoded record must read back");
     let code_bytes = view.code().len();
@@ -563,7 +563,7 @@ fn sota_high_register_pressure_spilling_over_30_live_values_matches_evaluator_on
     let x = b.param(Ty::I64);
     let y = b.param(Ty::I64);
 
-    let mut live = std::vec::Vec::with_capacity(32);
+    let mut live = AVec::with_capacity_in(32, test_alloc());
     for k in 0..32u64 {
         let c1 = b.iconst(Ty::I64, (k * 7 + 3).into());
         let c2 = b.iconst(Ty::I64, (k * 13 + 5).into());
@@ -625,7 +625,7 @@ fn sota_high_register_pressure_spilling_over_30_live_values_matches_evaluator_on
     let n = b2.param(Ty::I64);
     let seed = b2.param(Ty::I64);
     let zero = b2.iconst(Ty::I64, 0);
-    let mut init_args = std::vec::Vec::with_capacity(31);
+    let mut init_args = AVec::with_capacity_in(31, test_alloc());
     init_args.push(zero);
     for k in 0..30u64 {
         let ck = b2.iconst(Ty::I64, (k + 1).into());
@@ -635,7 +635,7 @@ fn sota_high_register_pressure_spilling_over_30_live_values_matches_evaluator_on
 
     b2.begin(header);
     let iter = b2.param(Ty::I64);
-    let mut ring = std::vec::Vec::with_capacity(30);
+    let mut ring = AVec::with_capacity_in(30, test_alloc());
     for _ in 0..30 {
         ring.push(b2.param(Ty::I64));
     }
@@ -647,7 +647,7 @@ fn sota_high_register_pressure_spilling_over_30_live_values_matches_evaluator_on
     let next_iter = b2.binary(Op::Add, Flags::NONE, iter, one);
     // Rotate all 30 values cyclically (guaranteed spill-to-spill cycle!) while mixing `ring[0] + ring[29]`.
     let mixed = b2.binary(Op::Add, Flags::NONE, ring[0], ring[29]);
-    let mut next_args = std::vec::Vec::with_capacity(31);
+    let mut next_args = AVec::with_capacity_in(31, test_alloc());
     next_args.push(next_iter);
     for k in 1..30 {
         next_args.push(ring[k]);
@@ -945,7 +945,7 @@ fn sota_data_addr_func_addr_call_indirect_and_code_record_seal_on_hardware() {
     let has_call = code_rec.sites.iter().any(|s| s.kind == blaze_code::record::SiteKind::Call);
     assert!(has_load && has_relro && has_call, "expected Load, Relro, and Call sites in CodeRecord");
     let sealed_rec = code_rec.seal().expect("Sota CodeRecord must seal without error");
-    let mut rec_bytes: AVec<'static, u8> = Vec::new_in(Alloc::global());
+    let mut rec_bytes: AVec<'static, u8> = AVec::new_in(test_alloc());
     sealed_rec.encode(&mut rec_bytes);
     let rec_view = blaze_code::record::CodeView::read(&rec_bytes).expect("encoded CodeRecord must read back");
     blaze_code::unwind::read(rec_view).expect("Sota CodeRecord unwind info must validate cleanly");
@@ -1007,7 +1007,7 @@ fn sota_data_addr_func_addr_call_indirect_and_code_record_seal_on_hardware() {
     }
     let emitted_c = Sota::standalone().emit(v, &ExtCNames, MAC_ARM64, Alloc::global()).unwrap();
     let sealed_c = seal(emitted_c).expect("emitted bzcode08 record must seal cleanly");
-    let mut bytes_c: AVec<'static, u8> = Vec::new_in(Alloc::global());
+    let mut bytes_c: AVec<'static, u8> = AVec::new_in(test_alloc());
     encode(&sealed_c, &mut bytes_c);
     let view_c = read(&bytes_c).expect("encoded bzcode08 must read back");
     let mut done_c: Result<(), PlaceError> = Ok(());
@@ -1143,7 +1143,7 @@ mod std_readiness_tests {
         }
         blaze_tier::record::declare(&mut emitted, &BoundDeclares).expect("declare");
         let sealed = seal(emitted).expect("seal");
-        let mut bytes: AVec<'static, u8> = Vec::new_in(test_alloc());
+        let mut bytes: AVec<'static, u8> = AVec::new_in(test_alloc());
         encode(&sealed, &mut bytes);
         let view = read(&bytes).expect("read");
         let code_bytes = view.code().len();
@@ -1256,7 +1256,7 @@ mod std_readiness_tests {
         byval_param.kind = ParamKind::Byval;
         byval_param.facts = Facts { size: 48, align: 3, ..Facts::default() };
 
-        let mut callee_params: AVec<'static, Param> = Vec::new_in(alloc);
+        let mut callee_params: AVec<'static, Param> = AVec::new_in(alloc);
         for _ in 0..10 {
             callee_params.push(Param::of(Ty::I64));
         }
@@ -1271,12 +1271,12 @@ mod std_readiness_tests {
             b.set_signature(sig);
             let e = b.create_block(BlockKind::Normal);
             b.begin(e);
-            let mut gprs = Vec::new_in(alloc);
+            let mut gprs = AVec::new_in(alloc);
             for _ in 0..10 {
                 gprs.push(b.param(Ty::I64));
             }
             let bv_ptr = b.param(Ty::PTR);
-            let mut fps = Vec::new_in(alloc);
+            let mut fps = AVec::new_in(alloc);
             for _ in 0..10 {
                 fps.push(b.param(Ty::F64));
             }
@@ -1327,7 +1327,7 @@ mod std_readiness_tests {
             let e = b.create_block(BlockKind::Normal);
             b.begin(e);
             let src_struct = b.param(Ty::PTR);
-            let mut args = Vec::new_in(alloc);
+            let mut args = AVec::new_in(alloc);
             for k in 1u64..=10 {
                 args.push(b.iconst(Ty::I64, u128::from(k * 10)));
             }
@@ -1435,7 +1435,7 @@ mod std_readiness_tests {
         assert_eq!(rec.positions[0].field, PositionField::Line);
         assert_eq!(rec.positions[0].site, 42);
         let sealed = rec.seal().expect("Sota CodeRecord with words+positions+TLS must seal cleanly");
-        let mut enc_bytes: AVec<'static, u8> = Vec::new_in(alloc);
+        let mut enc_bytes: AVec<'static, u8> = AVec::new_in(alloc);
         sealed.encode(&mut enc_bytes);
         let view = CodeView::read(&enc_bytes).expect("encoded CodeRecord must read back");
         assert_eq!(view.words(), 1);
@@ -1495,7 +1495,7 @@ mod std_readiness_tests {
         )
         .expect("Sota must emit Invoke/Resume/Cleanup cleanly");
         let sealed = rec.seal().expect("Sota unwind CodeRecord must seal cleanly");
-        let mut bytes: AVec<'static, u8> = Vec::new_in(alloc);
+        let mut bytes: AVec<'static, u8> = AVec::new_in(alloc);
         sealed.encode(&mut bytes);
         let view = CodeView::read(&bytes).expect("read back");
         assert_eq!(view.name(Symbol::of_name("_Unwind_Resume")), Some("_Unwind_Resume"));
@@ -1507,5 +1507,1232 @@ mod std_readiness_tests {
         assert!(rows.row(1).landing > 0 && rows.row(1).landing < view.code().len() as u32);
         assert_eq!(rows.row(2).action, Action::Continue);
         assert_eq!(rows.row(2).landing, 0);
+    }
+
+    /// Regression test for the `block_buffer::BlockBuffer::len128_padding_be` SIGSEGV on macOS:
+    /// Apple ARM64 passes a `u128`/`i128` after an odd number of GPR parameters in `x1:x2` (not
+    /// rounded up to even `x2:x3` as generic AAPCS64 C.8 does), leaving the following parameter in
+    /// `x3`. `Sota` and `Reference` must agree with each other and with host `extern "C"` on both
+    /// macOS and Linux, including cross-tier calls and stacked overflow past `x7`.
+    #[test]
+    fn sota_i128_odd_register_abi_matches_host_and_reference() {
+        let alloc = test_alloc();
+
+        // Shape of `BlockBuffer::len128_padding_be(&mut self, data_len: u128, compress: Ptr)`:
+        // loads `*self_ptr` (x0) and `*closure_ptr` (x3 on macOS, x4 on Linux), folds them into
+        // `data_len` (x1:x2 on macOS, x2:x3 on Linux), and returns the `u128`.
+        let callee_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I128), Param::of(Ty::PTR)],
+                &[Param::of(Ty::I128)],
+            );
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let p0 = b.param(Ty::PTR);
+            let wide = b.param(Ty::I128);
+            let p2 = b.param(Ty::PTR);
+            let v0 = b.load(Ty::I64, Flags::NONE, p0, 0, MemAttrs::default());
+            let v2 = b.load(Ty::I64, Flags::NONE, p2, 0, MemAttrs::default());
+            let z0 = b.convert(Op::Zext, Flags::NONE, Ty::I128, v0);
+            let z2 = b.convert(Op::Zext, Flags::NONE, Ty::I128, v2);
+            let s1 = b.binary(Op::Add, Flags::NONE, wide, z0);
+            let s2 = b.binary(Op::Xor, Flags::NONE, s1, z2);
+            b.ret(&[s2]);
+            b.finish_checked().unwrap()
+        };
+
+        let a_word: u64 = 0x1122_3344_5566_7788;
+        let b_word: u64 = 0x99aa_bbcc_ddee_ff01;
+        let wide_val: u128 = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+        let want: u128 = wide_val.wrapping_add(u128::from(a_word)) ^ u128::from(b_word);
+
+        // 1. Host `extern "C"` -> Sota callee directly on macOS arm64.
+        let sota_callee_em = Sota::standalone()
+            .emit(verify(callee_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits (ptr, i128, ptr) -> i128");
+        let (sota_callee_ex, _ks1) = load_exec_with_syms(sota_callee_em, &[]);
+        let sota_callee_addr = unsafe { sota_callee_ex.as_fn::<extern "C" fn()>() as usize as u64 };
+        let f_sota: extern "C" fn(*const u64, u128, *const u64) -> u128 = unsafe { sota_callee_ex.as_fn() };
+        assert_eq!(f_sota(&a_word, wide_val, &b_word), want, "host -> Sota (ptr, u128, ptr) mismatch");
+
+        // 2. Reference callee -> host `extern "C"`.
+        let ref_callee_em = Reference
+            .emit(verify(callee_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Reference emits (ptr, i128, ptr) -> i128");
+        let (ref_callee_ex, _ks2) = load_exec_with_syms(ref_callee_em, &[]);
+        let ref_callee_addr = unsafe { ref_callee_ex.as_fn::<extern "C" fn()>() as usize as u64 };
+
+        // Caller that invokes the target via `(ptr, i128, ptr) -> i128`.
+        let sym = Symbol::of_name("odd_i128_callee");
+        struct OneName(Symbol);
+        impl Names for OneName {
+            fn name(&self, of: Outside) -> Option<blaze_tier::Named<'_>> {
+                match of {
+                    Outside::Func(0) => Some(blaze_tier::Named::Symbol(self.0)),
+                    _ => None,
+                }
+            }
+            fn routines(&self) -> RoutinePlaces {
+                RoutinePlaces::NONE
+            }
+        }
+        let caller_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I128), Param::of(Ty::PTR)],
+                &[Param::of(Ty::I128)],
+            );
+            b.set_signature(sig);
+            let target = b.reference(RefKind::Func, 0);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let p0 = b.param(Ty::PTR);
+            let w = b.param(Ty::I128);
+            let p2 = b.param(Ty::PTR);
+            let res = b.call(Flags::NONE, target, sig, &[p0, w, p2]);
+            b.ret(&[res]);
+            b.finish_checked().unwrap()
+        };
+
+        // 3. Cross-tier: Reference caller -> Sota callee (exact `finalize_variable_core` -> `len128_padding_be` crash).
+        let ref_caller_em = Reference
+            .emit(verify(caller_fn.view()).unwrap(), &OneName(sym), MAC_ARM64, alloc)
+            .expect("Reference emits caller");
+        let (ref_caller_ex, _ks3) = load_exec_with_syms(ref_caller_em, &[(sym, sota_callee_addr)]);
+        let f_ref_to_sota: extern "C" fn(*const u64, u128, *const u64) -> u128 = unsafe { ref_caller_ex.as_fn() };
+        assert_eq!(f_ref_to_sota(&a_word, wide_val, &b_word), want, "Reference -> Sota cross-tier mismatch");
+
+        // 4. Cross-tier: Sota caller -> Reference callee.
+        let sota_caller_em = Sota::standalone()
+            .emit(verify(caller_fn.view()).unwrap(), &OneName(sym), MAC_ARM64, alloc)
+            .expect("Sota emits caller");
+        let (sota_caller_ex, _ks4) = load_exec_with_syms(sota_caller_em, &[(sym, ref_callee_addr)]);
+        let f_sota_to_ref: extern "C" fn(*const u64, u128, *const u64) -> u128 = unsafe { sota_caller_ex.as_fn() };
+        assert_eq!(f_sota_to_ref(&a_word, wide_val, &b_word), want, "Sota -> Reference cross-tier mismatch");
+
+        // 5. Stacked `i128` after 7 GPRs (`x0..x6`), plus trailing `u64` (AAPCS64 C.11: both stacked).
+        let stacked_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let params = [
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I64),
+                Param::of(Ty::I128),
+                Param::of(Ty::I64),
+            ];
+            let sig = b.sig(Conv::C, Variadic::No, &params, &[Param::of(Ty::I128)]);
+            b.set_signature(sig);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let mut gprs = AVec::new_in(alloc);
+            for _ in 0..7 {
+                gprs.push(b.param(Ty::I64));
+            }
+            let w = b.param(Ty::I128);
+            let tail = b.param(Ty::I64);
+            let mut sum = gprs[0];
+            for &p in &gprs[1..] {
+                sum = b.binary(Op::Add, Flags::NONE, sum, p);
+            }
+            let sum = b.binary(Op::Add, Flags::NONE, sum, tail);
+            let z = b.convert(Op::Zext, Flags::NONE, Ty::I128, sum);
+            let out = b.binary(Op::Add, Flags::NONE, w, z);
+            b.ret(&[out]);
+            b.finish_checked().unwrap()
+        };
+        let stacked_em = Sota::standalone()
+            .emit(verify(stacked_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits stacked i128 after 7 GPRs");
+        let (stacked_ex, _ks5) = load_exec_with_syms(stacked_em, &[]);
+        let f_stacked: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u128, u64) -> u128 =
+            unsafe { stacked_ex.as_fn() };
+        assert_eq!(
+            f_stacked(1, 2, 3, 4, 5, 6, 7, wide_val, 100),
+            wide_val.wrapping_add(1 + 2 + 3 + 4 + 5 + 6 + 7 + 100),
+            "host -> Sota stacked i128 after 7 GPRs mismatch"
+        );
+
+        // 6. `Op::Invoke` returning `Ty::I128` must be emitted directly by Sota without refusal.
+        let invoke_i128_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I128), Param::of(Ty::PTR)],
+                &[Param::of(Ty::I128)],
+            );
+            b.set_signature(sig);
+            let target = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            let normal = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let p0 = b.param(Ty::PTR);
+            let w = b.param(Ty::I128);
+            let p2 = b.param(Ty::PTR);
+            let res = b.invoke(Flags::NONE, target, sig, &[p0, w, p2], normal, pad);
+            b.begin(normal);
+            b.ret(&[res]);
+            b.begin(pad);
+            let ex = b.param(Ty::PTR);
+            b.resume(ex);
+            b.finish_checked().unwrap()
+        };
+        let inv_em = Sota::standalone()
+            .emit(verify(invoke_i128_fn.view()).unwrap(), &OneName(sym), MAC_ARM64, alloc)
+            .expect("Sota must emit Op::Invoke returning Ty::I128");
+        let unwind_sym = Symbol::of_name("_Unwind_Resume");
+        let (inv_ex, _ks6) = load_exec_with_syms(inv_em, &[(sym, sota_callee_addr), (unwind_sym, sota_callee_addr)]);
+        let f_inv: extern "C" fn(*const u64, u128, *const u64) -> u128 = unsafe { inv_ex.as_fn() };
+        assert_eq!(f_inv(&a_word, wide_val, &b_word), want, "Sota Invoke returning i128 mismatch");
+
+        // 7. Linux AAPCS64 C.8 still aligns `i128` to an even register pair (`x2:x3`) and places
+        //    the following pointer in `x4`, whereas macOS uses `x1:x2` and `x3`.
+        let linux_arm64 = Machine { arch: Arch::Arm64, os: Os::Linux, features: 0 };
+        let sota_linux = Sota::standalone()
+            .emit(verify(callee_fn.view()).unwrap(), &NoNames, linux_arm64, alloc)
+            .expect("Sota emits Linux (ptr, i128, ptr) -> i128");
+        let sota_mac = Sota::standalone()
+            .emit(verify(callee_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits macOS (ptr, i128, ptr) -> i128");
+        assert_ne!(
+            sota_linux.code.as_slice(),
+            sota_mac.code.as_slice(),
+            "Linux AAPCS64 (even pair x2:x3, ptr in x4) and macOS (unaligned pair x1:x2, ptr in x3) must emit distinct register placements"
+        );
+    }
+
+    #[test]
+    fn sota_mem_uxtw_idx_folding() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        // 1. Unscaled `ptr_add(base, zext(u32 -> u64, idx))` -> `ldr xt, [xn, wm, uxtw]`.
+        let unscaled_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I32)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let base = b.param(Ty::PTR);
+            let idx32 = b.param(Ty::I32);
+            let idx64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, idx32);
+            let p = b.ptr_add(Flags::NONE, base, idx64);
+            let v = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(0));
+            b.ret(&[v]);
+            b.finish_checked().unwrap()
+        };
+        let em_unscaled = Sota::standalone()
+            .emit(verify(unscaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits unscaled MemUxtwIdx load");
+        let mut words_unscaled = blaze_own::AVec::new_in(alloc);
+        for c in em_unscaled.code.as_slice().chunks_exact(4) {
+            words_unscaled.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
+        assert!(
+            words_unscaled.iter().any(|&w| (w & 0x3fe0_fc00) == 0x3860_4800),
+            "expected folded `ldr [rn, wm, uxtw]` instruction, got: {words_unscaled:#x?}"
+        );
+        let (ex_unscaled, _k1) = load_exec_with_syms(em_unscaled, &[]);
+        // Pass a `u64` with dirty upper 32 bits in x1 to prove `UXTW` ignores bits 63..32.
+        let f_unscaled: extern "C" fn(*const u8, u64) -> u64 = unsafe { ex_unscaled.as_fn() };
+        let mut buf = [0u8; 32];
+        buf[5..13].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(
+            f_unscaled(buf.as_ptr(), 0xDEAD_BEEF_0000_0005u64),
+            0x1122_3344_5566_7788u64,
+            "unscaled UXTW load must zero-extend low 32 bits of index"
+        );
+
+        // 2. Scaled `ptr_add(base, shl(zext(u32 -> u64, idx), 2))` -> `ldr wt, [xn, wm, uxtw #2]`.
+        let scaled_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I32)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let base = b.param(Ty::PTR);
+            let idx32 = b.param(Ty::I32);
+            let idx64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, idx32);
+            let c2 = b.iconst(Ty::I64, 2);
+            let byte_off = b.binary(Op::Shl, Flags::NONE, idx64, c2);
+            let p = b.ptr_add(Flags::NONE, base, byte_off);
+            let v = b.load(Ty::I32, Flags::NONE, p, 0, MemAttrs::aligned(2));
+            b.ret(&[v]);
+            b.finish_checked().unwrap()
+        };
+        let em_scaled = Sota::standalone()
+            .emit(verify(scaled_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits scaled MemUxtwIdx load");
+        let mut words_scaled = blaze_own::AVec::new_in(alloc);
+        for c in em_scaled.code.as_slice().chunks_exact(4) {
+            words_scaled.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
+        assert!(
+            words_scaled.iter().any(|&w| (w & 0x3fe0_fc00) == 0x3860_5800),
+            "expected folded `ldr wt, [rn, wm, uxtw #2]` instruction, got: {words_scaled:#x?}"
+        );
+        let (ex_scaled, _k2) = load_exec_with_syms(em_scaled, &[]);
+        let f_scaled: extern "C" fn(*const u32, u64) -> u32 = unsafe { ex_scaled.as_fn() };
+        let table = [10u32, 20, 30, 40, 0xCAFE_BABE, 60, 70, 80];
+        assert_eq!(
+            f_scaled(table.as_ptr(), 0xFFFF_0000_0000_0004u64),
+            0xCAFE_BABE,
+            "scaled UXTW #2 load must zero-extend low 32 bits and scale by 4"
+        );
+    }
+
+    #[test]
+    fn sota_ubfx_and_loop_align() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let decode_words = |bytes: &[u8]| -> AVec<'static, u32> {
+            let mut out = AVec::with_capacity_in(bytes.len() / 4, alloc);
+            for c in bytes.chunks_exact(4) {
+                out.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            }
+            out
+        };
+
+        // 1. `UBFX` fusion: `(x >> 10) & 0x3FF` -> single `ubfx xd, xn, #10, #10` (`0xd34a_4c00`).
+        let ubfx_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let c10 = b.iconst(Ty::I64, 10);
+            let shifted = b.binary(Op::Lshr, Flags::NONE, x, c10);
+            let mask = b.iconst(Ty::I64, 0x3FF);
+            let extracted = b.binary(Op::And, Flags::NONE, shifted, mask);
+            b.ret(&[extracted]);
+            b.finish_checked().unwrap()
+        };
+        let em_ubfx = Sota::standalone()
+            .emit(verify(ubfx_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits UBFX fused bitfield extract");
+        let words_ubfx = decode_words(em_ubfx.code.as_slice());
+        // `ubfx xd, xn, #10, #10` = `ubfm xd, xn, #10, #19` = `0xd340_0000 | (10 << 16) | (19 << 10) = 0xd34a_4c00`.
+        assert!(
+            words_ubfx.iter().any(|&w| (w & 0xffff_fc00) == 0xd34a_4c00),
+            "expected fused `ubfx xd, xn, #10, #10` instruction, got: {words_ubfx:#x?}"
+        );
+        let (ex_ubfx, _k1) = load_exec_with_syms(em_ubfx, &[]);
+        let f_ubfx: extern "C" fn(u64) -> u64 = unsafe { ex_ubfx.as_fn() };
+        for &x in &[0u64, u64::MAX, 0xDEAD_BEEF_CAFE_BABE, 0x3FFu64 << 10, 1u64 << 9, 1u64 << 20] {
+            assert_eq!(f_ubfx(x), (x >> 10) & 0x3FF, "ubfx mismatch for x={x:#x}");
+        }
+
+        // 2. `BFXIL` fusion: `(dst & !0xFF) | (src & 0xFF)` -> `bfxil xd, xn, #0, #8` (`0xb340_1c00`).
+        let bfxil_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::I64);
+            let src = b.param(Ty::I64);
+            let hi_mask = b.iconst(Ty::I64, (!0xFFu64) as u128);
+            let lo_mask = b.iconst(Ty::I64, 0xFF);
+            let dst_hi = b.binary(Op::And, Flags::NONE, dst, hi_mask);
+            let src_lo = b.binary(Op::And, Flags::NONE, src, lo_mask);
+            let inserted = b.binary(Op::Or, Flags::NONE, dst_hi, src_lo);
+            b.ret(&[inserted]);
+            b.finish_checked().unwrap()
+        };
+        let em_bfxil = Sota::standalone()
+            .emit(verify(bfxil_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits BFXIL fused bitfield insert");
+        let words_bfxil = decode_words(em_bfxil.code.as_slice());
+        // `bfxil xd, xn, #0, #8` = `bfm xd, xn, #0, #7` = `0xb340_0000 | (0 << 16) | (7 << 10) = 0xb340_1c00`.
+        assert!(
+            words_bfxil.iter().any(|&w| (w & 0xffff_fc00) == 0xb340_1c00),
+            "expected fused `bfxil xd, xn, #0, #8` instruction, got: {words_bfxil:#x?}"
+        );
+        let (ex_bfxil, _k2) = load_exec_with_syms(em_bfxil, &[]);
+        let f_bfxil: extern "C" fn(u64, u64) -> u64 = unsafe { ex_bfxil.as_fn() };
+        for &(d, s) in &[
+            (0u64, u64::MAX),
+            (u64::MAX, 0u64),
+            (0xDEAD_BEEF_CAFE_BABEu64, 0x1234_5678_9ABC_DEF0u64),
+        ] {
+            assert_eq!(f_bfxil(d, s), (d & !0xFF) | (s & 0xFF), "bfxil mismatch for ({d:#x}, {s:#x})");
+        }
+
+        // 3. Simple loop with 16-byte loop-header alignment: executes cleanly & backward branches land on 16B boundary.
+        let loop_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let n = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let seed = b.iconst(Ty::I64, 0x1234);
+            b.jump((header, &[zero, seed]));
+
+            b.begin(header);
+            let i = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let cont = b.icmp(IntCond::Ult, i, n);
+            b.br(Flags::NONE, cont, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let c3 = b.iconst(Ty::I64, 3);
+            let c1 = b.iconst(Ty::I64, 1);
+            let p = b.binary(Op::Mul, Flags::NONE, acc, c3);
+            let s = b.binary(Op::Add, Flags::NONE, p, i);
+            let r = b.binary(Op::Lshr, Flags::NONE, acc, c1);
+            let next_acc = b.binary(Op::Xor, Flags::NONE, s, r);
+            let next_i = b.binary(Op::Add, Flags::NONE, i, c1);
+            b.jump((header, &[next_i, next_acc]));
+
+            b.begin(exit);
+            b.ret(&[acc]);
+            b.finish_checked().unwrap()
+        };
+        let em_loop = Sota::standalone()
+            .emit(verify(loop_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota emits aligned loop");
+        let words_loop = decode_words(em_loop.code.as_slice());
+        let mut saw_back_branch = false;
+        for (idx, &w) in words_loop.iter().enumerate() {
+            let delta = if (w & 0xfc00_0000) == 0x1400_0000 {
+                // `b <imm26>`
+                Some(((w & 0x03ff_ffff) as i32) << 6 >> 6)
+            } else if (w & 0xff00_0010) == 0x5400_0000 || (w & 0x7e00_0000) == 0x3400_0000 {
+                // `b.cond <imm19>` or `cbz`/`cbnz <imm19>`
+                Some((((w >> 5) & 0x7_ffff) as i32) << 13 >> 13)
+            } else {
+                None
+            };
+            if let Some(d) = delta {
+                if d < 0 {
+                    let target_w = (idx as isize + d as isize) as usize;
+                    if words_loop[target_w] == 0xd65f_03c0 {
+                        // Skip tail jump to shared `ret` epilogue (not a loop header).
+                        continue;
+                    }
+                    assert_eq!(
+                        target_w % 4,
+                        0,
+                        "loop-header target word {target_w} (from branch at {idx}) must be 16-byte aligned: {words_loop:#x?}"
+                    );
+                    saw_back_branch = true;
+                }
+            }
+        }
+        assert!(saw_back_branch, "expected at least one backward loop branch in {words_loop:#x?}");
+        let (ex_loop, _k3) = load_exec_with_syms(em_loop, &[]);
+        let f_loop: extern "C" fn(u64) -> u64 = unsafe { ex_loop.as_fn() };
+        for &n in &[0u64, 1, 5, 32, 200] {
+            let mut want = 0x1234u64;
+            for i in 0..n {
+                want = want.wrapping_mul(3).wrapping_add(i) ^ (want >> 1);
+            }
+            assert_eq!(f_loop(n), want, "aligned loop mismatch for n={n}");
+        }
+    }
+
+    #[test]
+    fn sota_i128_switch_compares_both_words() {
+        let alloc = test_alloc();
+        let high_case: u128 = 0x1234_5678_9abc_def0_0000_0000_0000_0000;
+        let full_case: u128 = 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef;
+        let lo_only: u128 = 42;
+
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I128)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, b_zero, b_lo, b_hi, b_join, b_def] = [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let x = b.param(Ty::I128);
+            let arg_full = b.iconst(Ty::I64, 44);
+            b.switch(
+                x,
+                (b_def, &[]),
+                &[
+                    (0, (b_zero, &[])),
+                    (lo_only, (b_lo, &[])),
+                    (high_case, (b_hi, &[])),
+                    (full_case, (b_join, &[arg_full])),
+                ],
+            );
+
+            b.begin(b_zero);
+            let r0 = b.iconst(Ty::I64, 10);
+            b.ret(&[r0]);
+
+            b.begin(b_lo);
+            let r1 = b.iconst(Ty::I64, 20);
+            b.ret(&[r1]);
+
+            b.begin(b_hi);
+            let r2 = b.iconst(Ty::I64, 30);
+            b.ret(&[r2]);
+
+            b.begin(b_join);
+            let p = b.param(Ty::I64);
+            b.ret(&[p]);
+
+            b.begin(b_def);
+            let rd = b.iconst(Ty::I64, 99);
+            b.ret(&[rd]);
+            b.finish_checked().unwrap()
+        };
+
+        let em = Sota::standalone()
+            .emit(verify(func.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota must emit i128 Op::Switch");
+        let (ex, _k) = load_exec_with_syms(em, &[]);
+        let f: extern "C" fn(u128) -> u64 = unsafe { ex.as_fn() };
+        assert_eq!(f(0), 10);
+        assert_eq!(f(lo_only), 20);
+        assert_eq!(f(high_case), 30);
+        assert_eq!(f(full_case), 44);
+        assert_eq!(f(1u128 << 64), 99);
+        assert_eq!(f((1u128 << 64) | lo_only), 99);
+        assert_eq!(f(full_case ^ (1u128 << 127)), 99);
+        assert_eq!(f(full_case ^ 1), 99);
+        assert_eq!(f(high_case | 1), 99);
+    }
+
+    /// A function whose live stack slots exceed 32 KiB AND simultaneously spills SSA values must
+    /// still emit natively on `Sota` (placing spill slots before local slots so `max_spill_slots`
+    /// never drops to 0) and execute with exact results.
+    #[test]
+    fn sota_large_live_slot_frame_places_spills_first_and_runs() {
+        let alloc = test_alloc();
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            // 40 KiB live stack slot (> 32 KiB scaled-imm12 threshold!).
+            let big = b.slot(40_960, 4, blaze_lir::func::SlotKind::Named);
+            let p = b.slot_addr(big);
+            b.store(Flags::NONE, x, p, 0, blaze_lir::builder::MemAttrs::aligned(3));
+            b.store(Flags::NONE, x, p, 40_952, blaze_lir::builder::MemAttrs::aligned(3));
+            // Create 32 simultaneously live values to force GPR spills alongside the 40 KiB slot.
+            let mut live = [x; 32];
+            for (i, slot_v) in live.iter_mut().enumerate() {
+                let c = b.iconst(Ty::I64, (i as u128) + 3);
+                let v = b.binary(Op::Mul, Flags::NONE, x, c);
+                let w = b.binary(Op::Add, Flags::NONE, v, c);
+                *slot_v = w;
+            }
+            let first = b.load(Ty::I64, Flags::NONE, p, 0, blaze_lir::builder::MemAttrs::aligned(3));
+            let last = b.load(Ty::I64, Flags::NONE, p, 40_952, blaze_lir::builder::MemAttrs::aligned(3));
+            let mut acc = b.binary(Op::Add, Flags::NONE, first, last);
+            for &v in live.iter() {
+                acc = b.binary(Op::Add, Flags::NONE, acc, v);
+            }
+            b.ret(&[acc]);
+            b.finish_checked().unwrap()
+        };
+
+        let em = Sota::standalone()
+            .emit(verify(func.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota must emit >32 KiB slot frame with spills natively");
+        let (ex, _k) = load_exec_with_syms(em, &[]);
+        let f: extern "C" fn(u64) -> u64 = unsafe { ex.as_fn() };
+        let x = 7u64;
+        let expected: u64 = x * 2 + (0..32u64).map(|i| x * (i + 3) + (i + 3)).sum::<u64>();
+        assert_eq!(f(x), expected);
+    }
+
+    /// Linear-scan cell coloring (pass/frame.rs) compacts a 25,000+-instruction function from a
+    /// >400 KiB frame down to <=128 bytes while preserving exact execution semantics on Reference.
+    #[test]
+    fn cell_coloring_compacts_large_function_frame_and_runs() {
+        let alloc = test_alloc();
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let mut acc = b.param(Ty::I64);
+            let slot = b.slot(8, 3, SlotKind::Temp);
+            for i in 0..5_000u128 {
+                let p = b.slot_addr(slot);
+                let k = b.iconst(Ty::I64, (i & 7) + 1);
+                acc = b.binary(Op::Add, Flags::NONE, acc, k);
+                b.store(Flags::NONE, acc, p, 0, MemAttrs::aligned(3));
+                let reloaded = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                acc = b.binary(Op::Xor, Flags::NONE, reloaded, k);
+            }
+            b.slot_dead(slot);
+            b.ret(&[acc]);
+            b.finish_checked().unwrap()
+        };
+
+        let cells = crate::pass::frame::layout_cells(func.view(), alloc).expect("cells");
+        assert!(
+            cells.end <= 128,
+            "25,000+ sequential instructions should compact to <= 128 B of cells, got {} B",
+            cells.end
+        );
+        let code = crate::tests::emitted(func.view(), &[]).expect("emits");
+        // Prologue frame adjustment at bytes 8..16 must be inline `sub sp` (no stack-probe branch!).
+        let w0 = u32::from_le_bytes(code.bytes[8..12].try_into().unwrap());
+        assert_eq!(w0 & 0xff80_0000, 0xd100_0000, "compact frame uses inline `sub sp`, not probe branch: {w0:#010x}");
+        let exec = crate::tests::run::place(&code, |_: crate::Fixup| 0);
+        // SAFETY: `func` has signature `extern "C" fn(u64) -> u64`.
+        let got = unsafe { exec.as_fn::<extern "C" fn(u64) -> u64>() }(42);
+        let mut want = 42u64;
+        for i in 0..5_000u64 {
+            let k = (i & 7) + 1;
+            want = want.wrapping_add(k) ^ k;
+        }
+        assert_eq!(got, want);
+    }
+
+    /// Stack-slot lifetime coloring (pass/frame.rs) overlaps sequential `SlotDead`-bounded temp
+    /// slots AND slots in disjoint `if/else` arms (even without `SlotDead`), while keeping
+    /// simultaneously live slots and hoisted `SlotAddr` pointer comparisons strictly disjoint.
+    #[test]
+    fn slot_coloring_reuses_dead_and_disjoint_slots_and_preserves_live_distinctness() {
+        let alloc = test_alloc();
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, arm_a, arm_b, done] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let sel = b.param(Ty::I64);
+            let mut sum = b.iconst(Ty::I64, 0);
+            for i in 0..32u128 {
+                let s = b.slot(1024, 3, SlotKind::Temp);
+                let p = b.slot_addr(s);
+                let v = b.iconst(Ty::I64, i + 1);
+                b.store(Flags::NONE, v, p, 0, MemAttrs::aligned(3));
+                let got = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                sum = b.binary(Op::Add, Flags::NONE, sum, got);
+                b.slot_dead(s);
+            }
+            let zero = b.iconst(Ty::I64, 0);
+            let is_zero = b.icmp(IntCond::Eq, sel, zero);
+            let sa = b.slot(2048, 3, SlotKind::Temp);
+            let sb = b.slot(2048, 3, SlotKind::Temp);
+            // Hoist both `slot_addr`s into entry (mirroring egraph/LICM) without using them there.
+            let pa = b.slot_addr(sa);
+            let pb = b.slot_addr(sb);
+            b.br(Flags::NONE, is_zero, (arm_a, &[]), (arm_b, &[]));
+
+            b.begin(arm_a);
+            let va = b.iconst(Ty::I64, 100);
+            b.store(Flags::NONE, va, pa, 16, MemAttrs::aligned(3));
+            let la = b.load(Ty::I64, Flags::NONE, pa, 16, MemAttrs::aligned(3));
+            let ra = b.binary(Op::Add, Flags::NONE, sum, la);
+            b.jump((done, &[ra]));
+
+            b.begin(arm_b);
+            let vb = b.iconst(Ty::I64, 200);
+            b.store(Flags::NONE, vb, pb, 16, MemAttrs::aligned(3));
+            let lb = b.load(Ty::I64, Flags::NONE, pb, 16, MemAttrs::aligned(3));
+            let rb = b.binary(Op::Add, Flags::NONE, sum, lb);
+            b.jump((done, &[rb]));
+
+            b.begin(done);
+            let res = b.param(Ty::I64);
+            b.ret(&[res]);
+            b.finish_checked().unwrap()
+        };
+
+        let packed = crate::pass::frame::pack_slots(func.view(), 0, alloc).expect("packs");
+        assert!(
+            packed.end <= 2048,
+            "32x1KiB dead temps + 2x2KiB disjoint arms must pack into <= 2048 B, got {} B",
+            packed.end
+        );
+        let code = crate::tests::emitted(func.view(), &[]).expect("emits");
+        let exec = crate::tests::run::place(&code, |_: crate::Fixup| 0);
+        // SAFETY: `func` has signature `extern "C" fn(u64) -> u64`.
+        let f = unsafe { exec.as_fn::<extern "C" fn(u64) -> u64>() };
+        assert_eq!(f(0), 528 + 100);
+        assert_eq!(f(1), 528 + 200);
+
+        // Simultaneously live slots (including pointer equality comparison) MUST stay distinct.
+        let func2 = {
+            let mut b2 = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig2 = b2.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+            b2.set_signature(sig2);
+            let e2 = b2.create_block(BlockKind::Normal);
+            b2.begin(e2);
+            let s0 = b2.slot(64, 3, SlotKind::Named);
+            let s1 = b2.slot(64, 3, SlotKind::Named);
+            let p0 = b2.slot_addr(s0);
+            let p1 = b2.slot_addr(s1);
+            let c11 = b2.iconst(Ty::I64, 11);
+            let c22 = b2.iconst(Ty::I64, 22);
+            b2.store(Flags::NONE, c11, p0, 0, MemAttrs::aligned(3));
+            b2.store(Flags::NONE, c22, p1, 0, MemAttrs::aligned(3));
+            let l0 = b2.load(Ty::I64, Flags::NONE, p0, 0, MemAttrs::aligned(3));
+            let l1 = b2.load(Ty::I64, Flags::NONE, p1, 0, MemAttrs::aligned(3));
+            let ne = b2.icmp(IntCond::Ne, p0, p1);
+            let ne64 = b2.convert(Op::Zext, Flags::NONE, Ty::I64, ne);
+            let s01 = b2.binary(Op::Add, Flags::NONE, l0, l1);
+            let out = b2.binary(Op::Add, Flags::NONE, s01, ne64);
+            b2.ret(&[out]);
+            b2.finish_checked().unwrap()
+        };
+
+        let packed2 = crate::pass::frame::pack_slots(func2.view(), 0, alloc).expect("packs");
+        assert_ne!(packed2.slot_at[0], packed2.slot_at[1], "live slots must not overlap");
+        let code2 = crate::tests::emitted(func2.view(), &[]).expect("emits");
+        let exec2 = crate::tests::run::place(&code2, |_: crate::Fixup| 0);
+        // SAFETY: `func2` has signature `extern "C" fn() -> u64`.
+        assert_eq!(unsafe { exec2.as_fn::<extern "C" fn() -> u64>() }(), 11 + 22 + 1);
+    }
+
+    /// Cell coloring preserves cross-block values live across a loop back-edge and handles parallel
+    /// parameter swaps `(a, b) -> (b, a)` cleanly.
+    #[test]
+    fn cell_coloring_handles_loops_and_param_swaps() {
+        let alloc = test_alloc();
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let n = b.param(Ty::I64);
+            let a0 = b.iconst(Ty::I64, 1);
+            let b0 = b.iconst(Ty::I64, 2);
+            let bonus = b.iconst(Ty::I64, 1000);
+            b.jump((header, &[n, a0, b0]));
+
+            b.begin(header);
+            let rem = b.param(Ty::I64);
+            let pa = b.param(Ty::I64);
+            let pb = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let cont = b.icmp(IntCond::Ugt, rem, zero);
+            b.br(Flags::NONE, cont, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let one = b.iconst(Ty::I64, 1);
+            let next_rem = b.binary(Op::Sub, Flags::NONE, rem, one);
+            let mut tmp = one;
+            for k in 0..64u128 {
+                let c = b.iconst(Ty::I64, k);
+                tmp = b.binary(Op::Add, Flags::NONE, tmp, c);
+            }
+            let zero_mask = b.binary(Op::Xor, Flags::NONE, tmp, tmp);
+            let next_a = b.binary(Op::Add, Flags::NONE, pb, zero_mask);
+            let next_b = b.binary(Op::Add, Flags::NONE, pa, pb);
+            b.jump((header, &[next_rem, next_a, next_b]));
+
+            b.begin(exit);
+            let ans = b.binary(Op::Add, Flags::NONE, pa, bonus);
+            b.ret(&[ans]);
+            b.finish_checked().unwrap()
+        };
+
+        let code = crate::tests::emitted(func.view(), &[]).expect("emits");
+        let exec = crate::tests::run::place(&code, |_: crate::Fixup| 0);
+        // SAFETY: `func` has signature `extern "C" fn(u64) -> u64`.
+        assert_eq!(unsafe { exec.as_fn::<extern "C" fn(u64) -> u64>() }(5), 1013);
+    }
+
+    /// Regression test: two stack slots BOTH live across a loop back-edge (without `SlotDead`)
+    /// must conflict and receive disjoint offsets even though both are set in `at_start[header]`.
+    #[test]
+    fn slot_coloring_keeps_loop_carried_live_slots_disjoint() {
+        let alloc = test_alloc();
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, header, body, exit] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let n = b.param(Ty::I64);
+            let s0 = b.slot(64, 3, SlotKind::Named);
+            let s1 = b.slot(64, 3, SlotKind::Named);
+            let p0 = b.slot_addr(s0);
+            let p1 = b.slot_addr(s1);
+            let c10 = b.iconst(Ty::I64, 10);
+            let c20 = b.iconst(Ty::I64, 20);
+            b.store(Flags::NONE, c10, p0, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, c20, p1, 0, MemAttrs::aligned(3));
+            b.jump((header, &[n]));
+
+            b.begin(header);
+            let rem = b.param(Ty::I64);
+            let zero = b.iconst(Ty::I64, 0);
+            let cont = b.icmp(IntCond::Ugt, rem, zero);
+            b.br(Flags::NONE, cont, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let v0 = b.load(Ty::I64, Flags::NONE, p0, 0, MemAttrs::aligned(3));
+            let v1 = b.load(Ty::I64, Flags::NONE, p1, 0, MemAttrs::aligned(3));
+            let one = b.iconst(Ty::I64, 1);
+            let two = b.iconst(Ty::I64, 2);
+            let nv0 = b.binary(Op::Add, Flags::NONE, v0, one);
+            let nv1 = b.binary(Op::Add, Flags::NONE, v1, two);
+            b.store(Flags::NONE, nv0, p0, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, nv1, p1, 0, MemAttrs::aligned(3));
+            let next_rem = b.binary(Op::Sub, Flags::NONE, rem, one);
+            b.jump((header, &[next_rem]));
+
+            b.begin(exit);
+            let f0 = b.load(Ty::I64, Flags::NONE, p0, 0, MemAttrs::aligned(3));
+            let f1 = b.load(Ty::I64, Flags::NONE, p1, 0, MemAttrs::aligned(3));
+            let sum = b.binary(Op::Add, Flags::NONE, f0, f1);
+            b.ret(&[sum]);
+            b.finish_checked().unwrap()
+        };
+
+        let packed = crate::pass::frame::pack_slots(func.view(), 0, alloc).expect("packs");
+        assert_ne!(
+            packed.slot_at[0], packed.slot_at[1],
+            "loop-carried live slots must never share an offset"
+        );
+        let code = crate::tests::emitted(func.view(), &[]).expect("emits");
+        let exec = crate::tests::run::place(&code, |_: crate::Fixup| 0);
+        // SAFETY: `func` has signature `extern "C" fn(u64) -> u64`.
+        assert_eq!(unsafe { exec.as_fn::<extern "C" fn(u64) -> u64>() }(5), 45);
+    }
+
+    /// Regression test for the `crypto_bigint::Uint::<4>::from_be_slice` infinite loop:
+    /// when `thread_jumps` folds a loop entry directly into a higher-indexed body block,
+    /// the resulting CFG is valid SSA but non-RPO (`header > latch`). Both the full SOTA
+    /// pipeline and direct `emit_sota_a64` must canonicalize to dominator-first RPO before
+    /// linear-interval register allocation so values defined in `header` and used in `latch`
+    /// never get clobbered.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn sota_non_rpo_uadd_overflow_loop_matches_evaluator_on_hardware() {
+        let alloc = test_alloc();
+        // 1. Original slot-based checked-add loop (`while j < 4 { buf = j; j += 1; }`).
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let [entry, header, body, trap_blk, cont, exit] =
+                [(); 6].map(|_| b.create_block(BlockKind::Normal));
+
+            b.begin(entry);
+            let s_buf = b.slot(8, 3, SlotKind::Named);
+            let s_j = b.slot(8, 3, SlotKind::Named);
+            let p_buf = b.slot_addr(s_buf);
+            let p_j = b.slot_addr(s_j);
+            let zero = b.iconst(Ty::I64, 0);
+            b.store(Flags::NONE, zero, p_buf, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, zero, p_j, 0, MemAttrs::aligned(3));
+            b.jump((header, &[]));
+
+            b.begin(header);
+            let j0 = b.load(Ty::I64, Flags::NONE, p_j, 0, MemAttrs::aligned(3));
+            let four = b.iconst(Ty::I64, 4);
+            let cond = b.icmp(IntCond::Ult, j0, four);
+            b.br(Flags::NONE, cond, (body, &[]), (exit, &[]));
+
+            b.begin(body);
+            let j1 = b.load(Ty::I64, Flags::NONE, p_j, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, j1, p_buf, 0, MemAttrs::aligned(3));
+            let j2 = b.load(Ty::I64, Flags::NONE, p_j, 0, MemAttrs::aligned(3));
+            let one = b.iconst(Ty::I64, 1);
+            let pair = b.overflow(Op::UaddOverflow, j2, one);
+            let nj = b.project(pair, 0);
+            let ovf = b.project(pair, 1);
+            b.br(Flags::NONE, ovf, (trap_blk, &[]), (cont, &[]));
+
+            b.begin(trap_blk);
+            b.trap(1);
+
+            b.begin(cont);
+            b.store(Flags::NONE, nj, p_j, 0, MemAttrs::aligned(3));
+            b.jump((header, &[]));
+
+            b.begin(exit);
+            let res = b.load(Ty::I64, Flags::NONE, p_buf, 0, MemAttrs::aligned(3));
+            b.ret(&[res]);
+            b.finish_checked().unwrap()
+        };
+
+        assert!(matches!(
+            eval::run_in(func.view(), &[], 10_000, alloc).unwrap(),
+            Outcome::Returned(ref v) if v.as_slice() == [Val::Int(3)]
+        ));
+        let pre = crate::sota::run_sroa_thread_cleanup(func.view(), alloc);
+        let mid_in = pre.as_ref().map_or(func.view(), |f| f.view());
+        let opt = blaze_lir::egraph::sota_optimize_fixpoint(
+            mid_in,
+            blaze_lir::egraph::RegBudget::AARCH64,
+            3,
+            |_| 1,
+            alloc,
+        )
+        .unwrap();
+        let late = crate::sota::run_sota_loop_and_late_passes(
+            opt.func.view(),
+            MAC_ARM64,
+            blaze_lir::egraph::RegBudget::AARCH64,
+            true,
+            Some(blaze_lir::superopt::SuperoptOpts::apple_silicon()),
+            alloc,
+        );
+        let emitted = crate::sota::isel::emit_sota_a64(
+            late.view(),
+            &NoNames,
+            crate::sota::CallMode::GotSlot,
+            MAC_ARM64.features,
+            true,
+            alloc,
+        )
+        .unwrap();
+        let (exec, _) = load_exec(emitted);
+        let f_ptr: extern "C" fn() -> u64 = unsafe { exec.as_fn() };
+        assert_eq!(f_ptr(), 3);
+
+        // 2. Direct non-RPO SSA LIR (latch block 1 before dominating header block 2) emitted
+        //    directly via `emit_sota_a64` without mid-end passes.
+        let non_rpo_src = "\
+func ptr64 sig s0 attrs [] features \"\"
+type t0 = {i64, i1}
+sig s0 = c () -> (i64)
+block0 normal:
+  v0 = iconst i64 0
+  v1 = iconst i64 4
+  v2 = iconst i64 1
+  jump block2(v0)
+block1 normal:
+  v4 = icmp i1 ult, v8, v1
+  br v4, block2(v8), block4()
+block2 normal:
+  v6 = param i64
+  v7 = uadd_overflow t0 v6, v2
+  v8 = project i64 v7, 0
+  v9 = project i1 v7, 1
+  br v9, block3(), block1()
+block3 normal:
+  trap 1
+block4 normal:
+  return (v6)
+";
+        let non_rpo = blaze_lir::parse::parse(non_rpo_src).expect("parses non-RPO LIR");
+        assert!(
+            blaze_lir::coldsplit::reorder_blocks_rpo(non_rpo.view(), alloc).unwrap().is_some(),
+            "test input must genuinely be non-RPO"
+        );
+        let emitted2 = crate::sota::isel::emit_sota_a64(
+            non_rpo.view(),
+            &NoNames,
+            crate::sota::CallMode::GotSlot,
+            MAC_ARM64.features,
+            true,
+            alloc,
+        )
+        .unwrap();
+        let (exec2, _) = load_exec(emitted2);
+        let f_ptr2: extern "C" fn() -> u64 = unsafe { exec2.as_fn() };
+        assert_eq!(f_ptr2(), 3);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sota_a64_spilled_i128_and_mul_overflow_preserve_both_halves() {
+        extern "C" fn clobber_caller_saved(x: u64) -> u64 {
+            x.wrapping_mul(3).wrapping_add(7)
+        }
+
+        struct OneSym(Symbol);
+        impl Names for OneSym {
+            fn name(&self, of: Outside) -> Option<blaze_tier::Named<'_>> {
+                match of {
+                    Outside::Func(0) => Some(blaze_tier::Named::Symbol(self.0)),
+                    _ => None,
+                }
+            }
+            fn routines(&self) -> RoutinePlaces {
+                RoutinePlaces::NONE
+            }
+        }
+
+        let alloc = test_alloc();
+        let sym = Symbol::of_name("spilled_pair_helper");
+        let helper_addr = u64::try_from((clobber_caller_saved as *const ()).addr()).unwrap_or(0);
+
+        // 1. 8 simultaneously live `u128` values crossing a call force `GprPairSpill` in exact-CFG
+        //    regalloc; every low half (including values with `hi == 0` like `8u128`) must survive.
+        let i128_spill_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I128), Param::of(Ty::I64)],
+                &[Param::of(Ty::I128)],
+            );
+            b.set_signature(sig);
+            let hsig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            let href = b.reference(RefKind::Func, 0);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let seed = b.param(Ty::I128);
+            let tag = b.param(Ty::I64);
+            let mut live: Vec<blaze_lir::Value, Alloc<'static>> = Vec::with_capacity_in(8, alloc);
+            let mut cur = seed;
+            for k in 1u128..=8 {
+                let delta = b.iconst(Ty::I128, k);
+                cur = b.binary(Op::Add, Flags::NONE, cur, delta);
+                live.push(cur);
+            }
+            let h = b.call(Flags::NONE, href, hsig, &[tag]);
+            let mut acc = b.convert(Op::Zext, Flags::NONE, Ty::I128, h);
+            for (idx, &v) in live.iter().enumerate() {
+                let sh = b.iconst(Ty::I128, u128::try_from(idx).unwrap_or(0));
+                let shifted = b.binary(Op::Shl, Flags::NONE, v, sh);
+                acc = b.binary(Op::Add, Flags::NONE, acc, shifted);
+            }
+            b.ret(&[acc]);
+            b.finish_checked().unwrap()
+        };
+        let emitted1 = Sota::standalone()
+            .emit(verify(i128_spill_fn.view()).unwrap(), &OneSym(sym), MAC_ARM64, alloc)
+            .expect("Sota emits spilled i128 across call");
+        let (ex1, _ks1) = load_exec_with_syms(emitted1, &[(sym, helper_addr)]);
+        let f1: extern "C" fn(u128, u64) -> u128 = unsafe { ex1.as_fn() };
+        for (seed, tag) in [
+            (0u128, 5u64),
+            (8u128, 11u64),
+            ((1u128 << 63) | 0x1234, 42u64),
+            (0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128, 99u64),
+        ] {
+            let mut expected = u128::from(clobber_caller_saved(tag));
+            let mut cur = seed;
+            for k in 1u128..=8 {
+                cur = cur.wrapping_add(k);
+                expected = expected.wrapping_add(cur << (k - 1));
+            }
+            assert_eq!(f1(seed, tag), expected, "spilled i128 mismatch for seed={seed:#x}, tag={tag}");
+        }
+
+        // 2. Spilled `UmulOverflow` and `SmulOverflow` with spilled inputs and spilled pair results.
+        let mul_ov_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let hsig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            let href = b.reference(RefKind::Func, 0);
+            let e = b.create_block(BlockKind::Normal);
+            b.begin(e);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            // Force >= 14 live values across calls so both operands and overflow pairs spill.
+            let mut anchors: Vec<blaze_lir::Value, Alloc<'static>> = Vec::with_capacity_in(14, alloc);
+            let mut cur = a;
+            for k in 1u128..=14 {
+                let ck = b.iconst(Ty::I64, k);
+                cur = b.binary(Op::Add, Flags::NONE, cur, ck);
+                anchors.push(cur);
+            }
+            let h0 = b.call(Flags::NONE, href, hsig, &[a]);
+            let upair = b.overflow(Op::UmulOverflow, a, bv);
+            let spair = b.overflow(Op::SmulOverflow, a, bv);
+            let h1 = b.call(Flags::NONE, href, hsig, &[h0]);
+            let ulo = b.project(upair, 0);
+            let uov_flag = b.project(upair, 1);
+            let uov = b.convert(Op::Zext, Flags::NONE, Ty::I64, uov_flag);
+            let slo = b.project(spair, 0);
+            let sov_flag = b.project(spair, 1);
+            let sov = b.convert(Op::Zext, Flags::NONE, Ty::I64, sov_flag);
+            let mut out = b.binary(Op::Xor, Flags::NONE, ulo, slo);
+            let c1 = b.iconst(Ty::I64, 1);
+            let uov_s = b.binary(Op::Shl, Flags::NONE, uov, c1);
+            out = b.binary(Op::Add, Flags::NONE, out, uov_s);
+            out = b.binary(Op::Add, Flags::NONE, out, sov);
+            out = b.binary(Op::Add, Flags::NONE, out, h1);
+            for &v in &anchors {
+                out = b.binary(Op::Xor, Flags::NONE, out, v);
+            }
+            b.ret(&[out]);
+            b.finish_checked().unwrap()
+        };
+        let emitted2 = Sota::standalone()
+            .emit(verify(mul_ov_fn.view()).unwrap(), &OneSym(sym), MAC_ARM64, alloc)
+            .expect("Sota emits spilled UmulOverflow/SmulOverflow");
+        let (ex2, _ks2) = load_exec_with_syms(emitted2, &[(sym, helper_addr)]);
+        let f2: extern "C" fn(u64, u64) -> u64 = unsafe { ex2.as_fn() };
+        for (a, bv) in [
+            (7u64, 9u64),
+            (1u64 << 40, 1u64 << 30),
+            (i64::MIN.cast_unsigned(), 2u64),
+            (u64::MAX, u64::MAX),
+            ((-5i64).cast_unsigned(), (-7i64).cast_unsigned()),
+        ] {
+            let (ulo, uov) = a.overflowing_mul(bv);
+            let (slo, sov) = a.cast_signed().overflowing_mul(bv.cast_signed());
+            let h1 = clobber_caller_saved(clobber_caller_saved(a));
+            let mut expected = (ulo ^ slo.cast_unsigned())
+                .wrapping_add(u64::from(uov) << 1)
+                .wrapping_add(u64::from(sov))
+                .wrapping_add(h1);
+            let mut cur = a;
+            for k in 1u64..=14 {
+                cur = cur.wrapping_add(k);
+                expected ^= cur;
+            }
+            assert_eq!(f2(a, bv), expected, "spilled mul_overflow mismatch for a={a:#x}, b={bv:#x}");
+        }
+    }
+
+    #[test]
+    fn explicit_tail_call_direct_and_indirect_baseline_sota_and_x64() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        extern "C" fn add_pair(a: u64, b: u64) -> u64 {
+            a.wrapping_add(b).wrapping_add(1)
+        }
+        let target_addr = add_pair as *const () as u64;
+
+        // Direct `Op::TailCall` with a local stack slot (proving explicit tail calls work even
+        // when `view.slots` is non-empty, unlike implicit TCO).
+        let direct_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64), Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let slot = b.slot(16, 3, blaze_lir::func::SlotKind::Named);
+            let callee = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let addr = b.slot_addr(slot);
+            b.store(Flags::NONE, a, addr, 0, MemAttrs::aligned(3));
+            let loaded = b.load(Ty::I64, Flags::NONE, addr, 0, MemAttrs::aligned(3));
+            b.tail_call(Flags::NONE, callee, sig, &[loaded, bv]);
+            b.finish_checked().unwrap()
+        };
+
+        // Indirect `Op::TailCallIndirect` with a local stack slot.
+        let indirect_fn = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            let callee_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64), Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let slot = b.slot(16, 3, blaze_lir::func::SlotKind::Named);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let fp = b.param(Ty::PTR);
+            let a = b.param(Ty::I64);
+            let bv = b.param(Ty::I64);
+            let addr = b.slot_addr(slot);
+            b.store(Flags::NONE, bv, addr, 0, MemAttrs::aligned(3));
+            let loaded = b.load(Ty::I64, Flags::NONE, addr, 0, MemAttrs::aligned(3));
+            b.tail_call_indirect(Flags::NONE, fp, callee_sig, &[a, loaded]);
+            b.finish_checked().unwrap()
+        };
+
+        struct OneSym(Symbol);
+        impl Names for OneSym {
+            fn name(&self, of: Outside) -> Option<blaze_tier::Named<'_>> {
+                match of {
+                    Outside::Func(0) => Some(blaze_tier::Named::Symbol(self.0)),
+                    _ => None,
+                }
+            }
+            fn routines(&self) -> blaze_tier::RoutinePlaces {
+                NoNames.routines()
+            }
+        }
+        let sym = Symbol::of_name("add_pair");
+
+        // 1. Baseline (Reference) tier: record form + native execution.
+        let ref_direct = crate::Reference
+            .emit(verify(direct_fn.view()).unwrap(), &OneSym(sym), MAC_ARM64, alloc)
+            .expect("Reference emits Op::TailCall");
+        let (ex_rd, _k1) = load_exec_with_syms(ref_direct, &[(sym, target_addr)]);
+        let f_rd: extern "C" fn(u64, u64) -> u64 = unsafe { ex_rd.as_fn() };
+        assert_eq!(f_rd(19, 22), 42, "Reference Op::TailCall mismatch");
+
+        let ref_indirect = crate::Reference
+            .emit(verify(indirect_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Reference emits Op::TailCallIndirect");
+        let (ex_ri, _k2) = load_exec_with_syms(ref_indirect, &[]);
+        let f_ri: extern "C" fn(*const (), u64, u64) -> u64 = unsafe { ex_ri.as_fn() };
+        assert_eq!(f_ri(add_pair as *const (), 19, 22), 42, "Reference Op::TailCallIndirect mismatch");
+
+        // 2. SOTA ARM64 (GotSlot JIT mode AND DirectBl export mode): native execution.
+        let sota_direct = Sota::standalone()
+            .emit(verify(direct_fn.view()).unwrap(), &OneSym(sym), MAC_ARM64, alloc)
+            .expect("Sota ARM64 GotSlot emits Op::TailCall");
+        let (ex_sd, _k3) = load_exec_with_syms(sota_direct, &[(sym, target_addr)]);
+        let f_sd: extern "C" fn(u64, u64) -> u64 = unsafe { ex_sd.as_fn() };
+        assert_eq!(f_sd(19, 22), 42, "Sota ARM64 GotSlot Op::TailCall mismatch");
+
+        let sota_indirect = Sota::standalone()
+            .emit(verify(indirect_fn.view()).unwrap(), &NoNames, MAC_ARM64, alloc)
+            .expect("Sota ARM64 emits Op::TailCallIndirect");
+        let (ex_si, _k4) = load_exec_with_syms(sota_indirect, &[]);
+        let f_si: extern "C" fn(*const (), u64, u64) -> u64 = unsafe { ex_si.as_fn() };
+        assert_eq!(f_si(add_pair as *const (), 19, 22), 42, "Sota ARM64 Op::TailCallIndirect mismatch");
+
+        let sota_direct_bl = Sota::for_export()
+            .emit(verify(direct_fn.view()).unwrap(), &OneSym(sym), MAC_ARM64, alloc)
+            .expect("Sota ARM64 DirectBl emits Op::TailCall");
+        assert!(
+            sota_direct_bl.relocs.iter().any(|r| r.kind == blaze_tier::RelocKind::Branch26),
+            "Sota DirectBl Op::TailCall must emit a Branch26 tail branch"
+        );
+
+        // 3. SOTA x86-64 (GotSlot and DirectBl): emit cleanly without refusal.
+        let linux_x64 = Machine { arch: Arch::X86_64, os: Os::Linux, features: 0 };
+        let x64_d_got = Sota::standalone()
+            .emit(verify(direct_fn.view()).unwrap(), &OneSym(sym), linux_x64, alloc)
+            .expect("Sota x86-64 GotSlot emits Op::TailCall");
+        assert!(!x64_d_got.code.is_empty());
+        let x64_d_rel = Sota::for_export()
+            .emit(verify(direct_fn.view()).unwrap(), &OneSym(sym), linux_x64, alloc)
+            .expect("Sota x86-64 DirectBl emits Op::TailCall");
+        assert!(!x64_d_rel.code.is_empty());
+        let x64_ind = Sota::standalone()
+            .emit(verify(indirect_fn.view()).unwrap(), &NoNames, linux_x64, alloc)
+            .expect("Sota x86-64 emits Op::TailCallIndirect");
+        assert!(!x64_ind.code.is_empty());
     }
 }

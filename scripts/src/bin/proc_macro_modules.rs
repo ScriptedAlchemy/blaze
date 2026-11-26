@@ -673,12 +673,14 @@ fn read_members(checkout: &Path, alloc: blaze_own::Alloc<'_>) -> Result<Vec<Path
     use blaze_manifest::layout::{Entry, Layout, Need, Pass};
     let absent = |error: &std::io::Error| matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory);
     let root = checkout.join("Cargo.toml");
-    let mut reader = Layout::new("", alloc).map_err(|why| Failure::Manifest { path: root.clone(), why: why.to_string() })?;
+    let mut reader = Layout::new("", alloc)
+        .map_err(|why| Failure::Manifest { path: root.clone(), why: why.to_string() })?
+        .with_path_packages();
     for _ in 0..LAYOUT_PASSES {
         let needs = match reader.pass().map_err(|why| Failure::Manifest { path: root.clone(), why: why.to_string() })? {
             Pass::Done(units) => {
-                let mut out = Vec::with_capacity(units.members.len());
-                for member in units.members.iter() {
+                let mut out = Vec::with_capacity(units.members.len() + units.path_packages.len());
+                for member in units.members.iter().chain(units.path_packages.iter()) {
                     let dir = member.dir.as_str();
                     out.push(PathPackage {
                         name: member.name.as_str().to_owned(),
@@ -779,33 +781,42 @@ fn git_origin(args: &Args, wanted: &Wanted, source: &str, alloc: blaze_own::Allo
         .map_err(|why| Failure::Manifest { path: record.clone(), why: format!("the record of commit {commit}: {}", blaze_text::Shown(&why)) })?;
     let root = args.work.join("git").join(commit);
     let mut found: Option<String> = None;
-    for file in view.files() {
-        let out = root.join(file.path);
-        if !out.exists() {
-            write(&out, file.bytes)?;
+    for entry in view.entries() {
+        if entry.mode == blaze_fetch::Mode::Submodule {
+            continue;
         }
-        let is_manifest = file.path == "Cargo.toml" || file.path.ends_with("/Cargo.toml");
+        let out = root.join(entry.path);
+        let is_manifest = entry.path == "Cargo.toml" || entry.path.ends_with("/Cargo.toml");
+        if out.exists() && !is_manifest {
+            continue;
+        }
+        let bytes = entry
+            .read_in(alloc)
+            .map_err(|why| Failure::Manifest { path: record.clone(), why: format!("the record of commit {commit}: {}: {}", entry.path, blaze_text::Shown(&why)) })?;
+        if !out.exists() {
+            write(&out, bytes.as_slice())?;
+        }
         if !is_manifest {
             continue;
         }
         // Every manifest of the commit is a candidate, as cargo walks a git source; its name is
         // read as TOML (a comment may open it). One that is no TOML is no package, as cargo
         // skips a malformed package there; it is named, not passed over in silence.
-        let name = match std::str::from_utf8(file.bytes) {
+        let name = match std::str::from_utf8(bytes.as_slice()) {
             Ok(text) => match manifest_package_name(text, alloc) {
                 Ok(name) => name,
                 Err(why) => {
-                    println!("{SCRIPT}: {} {}: commit {commit}: {} is no TOML ({}), so no package", wanted.name, wanted.version, file.path, why.display(text));
+                    println!("{SCRIPT}: {} {}: commit {commit}: {} is no TOML ({}), so no package", wanted.name, wanted.version, entry.path, why.display(text));
                     None
                 }
             },
             Err(_) => {
-                println!("{SCRIPT}: {} {}: commit {commit}: {} is not UTF-8, so no package", wanted.name, wanted.version, file.path);
+                println!("{SCRIPT}: {} {}: commit {commit}: {} is not UTF-8, so no package", wanted.name, wanted.version, entry.path);
                 None
             }
         };
         if name.as_deref() == Some(wanted.name.as_str()) {
-            let folder = file.path.strip_suffix("Cargo.toml").unwrap_or("").trim_end_matches('/');
+            let folder = entry.path.strip_suffix("Cargo.toml").unwrap_or("").trim_end_matches('/');
             // The shortest such folder: a package copied into a test fixture deeper down is not it.
             if found.as_ref().is_none_or(|held| folder.len() < held.len()) {
                 found = Some(folder.to_owned());
@@ -813,6 +824,22 @@ fn git_origin(args: &Args, wanted: &Wanted, source: &str, alloc: blaze_own::Allo
         }
     }
     let path = found.ok_or_else(|| refuse(format!("commit {commit} has no Cargo.toml naming the package")))?;
+    // Sibling submodules outside the selected package were skipped during manifest scanning;
+    // any unpopulated submodule inside the selected package fails closed before building it.
+    for entry in view.entries() {
+        if entry.mode != blaze_fetch::Mode::Submodule {
+            continue;
+        }
+        let inside = path.is_empty()
+            || entry.path == path.as_str()
+            || entry.path.strip_prefix(path.as_str()).is_some_and(|rest| rest.starts_with('/'));
+        if inside {
+            entry.read_in(alloc).map_err(|why| Failure::Manifest {
+                path: record.clone(),
+                why: format!("the record of commit {commit}: {}: {}", entry.path, blaze_text::Shown(&why)),
+            })?;
+        }
+    }
     let dir = if path.is_empty() { root.clone() } else { root.join(&path) };
     let manifest_path = dir.join("Cargo.toml");
     let manifest = inherit(&read(&manifest_path)?, &read(&root.join("Cargo.toml"))?, &root, &manifest_path)?;
@@ -1007,7 +1034,7 @@ fn member_manifest(original: &str, source: &Path, path: &Path, features: &[Strin
                 }
                 continue;
             }
-            ("package", "readme" | "license-file" | "include" | "exclude" | "workspace")
+            ("package", "readme" | "license-file" | "include" | "exclude" | "workspace" | "default-run")
             | ("package", "autobins" | "autoexamples" | "autotests" | "autobenches" | "autolib") => {
                 dropping = opens;
                 continue;
@@ -1064,6 +1091,7 @@ fn table_value<'m>(manifest: &'m str, table: &str, key: &str) -> Option<&'m str>
                 '"' => quoted = !quoted,
                 '[' | '{' if !quoted => depth += 1,
                 ']' | '}' if !quoted => depth -= 1,
+                '#' if !quoted && depth <= 0 => return Some(manifest[start..start + index].trim()),
                 '\n' if depth <= 0 => return Some(manifest[start..start + index].trim()),
                 _ => {}
             }
@@ -1073,10 +1101,31 @@ fn table_value<'m>(manifest: &'m str, table: &str, key: &str) -> Option<&'m str>
     None
 }
 
+/// Strip a trailing `# ...` TOML comment outside double-quoted strings.
+fn strip_toml_comment(value: &str) -> &str {
+    let (mut quoted, mut escaped) = (false, false);
+    for (at, c) in value.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                quoted = false;
+            }
+        } else if c == '"' {
+            quoted = true;
+        } else if c == '#' {
+            return value[..at].trim();
+        }
+    }
+    value.trim()
+}
+
 /// The entries of an inline table's text `{ a = 1, b = [x, y] }`, split at its top-level
 /// commas, each trimmed; `None` for text that is not one inline table on its line.
 fn inline_entries(value: &str) -> Option<Vec<&str>> {
-    let inner = value.trim().strip_prefix('{')?.strip_suffix('}')?;
+    let inner = strip_toml_comment(value).strip_prefix('{')?.strip_suffix('}')?;
     let (mut out, mut depth, mut start, mut quoted) = (Vec::new(), 0_i32, 0, false);
     for (at, c) in inner.char_indices() {
         match c {
@@ -1408,6 +1457,25 @@ fn macros_of(expanded: &str, name: &str) -> Result<Vec<Macro>, Failure> {
     Ok(out)
 }
 
+/// External (registry/git) proc-macro crates are compiled as members of the synthetic workspace,
+/// so Cargo omits the `--cap-lints allow` flag it normally passes to non-workspace dependencies.
+/// Restoring `--cap-lints allow` for external origins matches Cargo's dependency compilation
+/// (e.g. `ts-rs-macros 11.1.0`'s `#![macro_use]` under nightly) while leaving path crates uncapped.
+fn should_cap_lints(origin: &Origin) -> bool {
+    matches!(origin, Origin::Registry { .. } | Origin::Git { .. })
+}
+
+fn push_cap_lints_if_missing(args: &mut Vec<OsString>) {
+    let already = args.iter().any(|arg| {
+        let s = arg.to_string_lossy();
+        s == "--cap-lints" || s.starts_with("--cap-lints=")
+    });
+    if !already {
+        args.push("--cap-lints".into());
+        args.push("allow".into());
+    }
+}
+
 /// The builder's run as cargo's `RUSTC_WRAPPER`, for every rustc cargo starts: the macro crate
 /// named by `BLAZE_PM_WRAP` gets the `proc-macro` crate type back and the shim linked in;
 /// everything else runs as cargo asked.
@@ -1418,6 +1486,7 @@ fn wrap(args: Vec<OsString>, macro_crate: &str) -> ! {
     let named = text.windows(2).any(|pair| pair[0] == "--crate-name" && pair[1] == macro_crate);
     let lib = text.windows(2).any(|pair| pair[0] == "--crate-type" && pair[1] == "cdylib");
     let target = text.iter().any(|it| it == "--target" || it.starts_with("--target="));
+    let cap_lints_pkg = std::env::var_os("BLAZE_PM_CAP_LINTS").filter(|v| !v.is_empty());
     let mut command = toolchain_command(rustc);
     let shim = text.windows(2).any(|pair| pair[0] == "--crate-name" && pair[1] == "blaze_pm_shim");
     if shim && target {
@@ -1427,6 +1496,12 @@ fn wrap(args: Vec<OsString>, macro_crate: &str) -> ! {
         blaze_script::exit(status);
     }
     if !(named && lib && target) {
+        let is_macro_build_script = cap_lints_pkg.is_some()
+            && text.windows(2).any(|pair| pair[0] == "--crate-name" && pair[1] == "build_script_build")
+            && std::env::var_os("CARGO_PKG_NAME") == cap_lints_pkg;
+        if is_macro_build_script {
+            push_cap_lints_if_missing(&mut rest);
+        }
         let status = command.args(&rest).status().map(|it| it.code().unwrap_or(1)).unwrap_or(1);
         blaze_script::exit(status);
     }
@@ -1474,6 +1549,9 @@ fn wrap(args: Vec<OsString>, macro_crate: &str) -> ! {
         "-Clink-arg=--export=blaze_proc_macro_expand".to_owned(),
     ] {
         rest.push(arg.into());
+    }
+    if cap_lints_pkg.is_some() {
+        push_cap_lints_if_missing(&mut rest);
     }
     let status = command.args(&rest).status().map(|it| it.code().unwrap_or(1)).unwrap_or(1);
     if status != 0 {
@@ -1632,7 +1710,14 @@ impl Plan<'_> {
                 features.sort();
                 features.dedup();
                 let default = features.iter().any(|it| it == "default");
-                let named: Vec<&String> = features.iter().filter(|it| *it != "default").collect();
+                let declared = match origin {
+                    Origin::Path { manifest, .. } | Origin::Git { manifest, .. } => Some(feature_names(manifest)),
+                    Origin::Registry { .. } => None,
+                };
+                let named: Vec<&String> = features
+                    .iter()
+                    .filter(|it| *it != "default" && declared.as_ref().is_none_or(|known| known.iter().any(|k| k == *it)))
+                    .collect();
                 let from = match origin {
                     Origin::Registry { .. } => format!("package = {:?}, version = \"={}\"", wanted.name, wanted.version),
                     Origin::Path { .. } | Origin::Git { .. } => {
@@ -1807,6 +1892,9 @@ impl Plan<'_> {
         env.push(("RUSTC_WRAPPER".to_owned(), self.me.clone()));
         env.push(("BLAZE_PM_WRAP".to_owned(), lib.clone().into()));
         env.push(("BLAZE_PM_MANIFEST_DIR".to_owned(), source.clone().into_os_string()));
+        // Set explicitly (empty for path crates) so an inherited env var never leaks across builds.
+        let cap_lints = if should_cap_lints(origin) { OsString::from(&wanted.name) } else { OsString::new() };
+        env.push(("BLAZE_PM_CAP_LINTS".to_owned(), cap_lints));
         // Where the wrapper notes the module it made: its own folder is the toolchain's choice.
         let note = self.work.join("target").join(format!("{lib}.blaze-module"));
         let _ = std::fs::remove_file(&note);
@@ -2368,5 +2456,42 @@ version = "1"
             Ok(count) => assert_eq!(count, 2),
             Err(failure) => panic!("the lock's own versions were refused: {failure}"),
         }
+    }
+
+    #[test]
+    fn member_manifest_strips_default_run_when_autobins_is_disabled() {
+        let manifest = r#"[package]
+name = "schemafy"
+version = "0.5.2"
+default-run = "main"
+
+[lib]
+proc-macro = true
+"#;
+        let made = generated_member(manifest, &[]);
+        assert!(!made.contains("default-run"), "{made}");
+        assert!(made.contains("autobins = false"), "{made}");
+    }
+
+    #[test]
+    fn cap_lints_enabled_only_for_registry_and_git_origins() {
+        assert!(should_cap_lints(&Origin::Registry { checksum: "deadbeef".to_owned() }));
+        assert!(should_cap_lints(&Origin::Git {
+            commit: "0123456789abcdef".to_owned(),
+            path: ".".to_owned(),
+            dir: PathBuf::from("/tmp/git-macro"),
+            manifest: String::new(),
+        }));
+        assert!(!should_cap_lints(&Origin::Path {
+            dir: PathBuf::from("/tmp/local-macro"),
+            files: String::new(),
+            manifest: String::new(),
+        }));
+
+        let mut args: Vec<OsString> = vec!["--crate-name".into(), "ts_rs_macros".into()];
+        push_cap_lints_if_missing(&mut args);
+        assert_eq!(args, vec![OsString::from("--crate-name"), "ts_rs_macros".into(), "--cap-lints".into(), "allow".into()]);
+        push_cap_lints_if_missing(&mut args);
+        assert_eq!(args.len(), 4, "must not duplicate --cap-lints");
     }
 }

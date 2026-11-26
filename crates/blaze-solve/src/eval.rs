@@ -250,12 +250,13 @@ pub struct Solver<'a, E = NoDerivation> {
     maybe: MaybeLog<'a>,
     /// Whether [`Solver::why_maybe`] is running: every hook of its rows tests this one flag.
     maybe_on: bool,
-    /// The plain-goal memo: a goal with no inference variable, by its own identity (mode,
-    /// env id, interned predicate handles, bound count), to its interned canonical input.
-    /// Such a goal's canonical words are a function of those handles alone (`goal_input`
-    /// reads `tys` only to resolve variables), so a hit skips the canonical walk. Only goals
-    /// whose canonical form has no variable are kept; at most [`MAX_PLAIN`] entries.
-    plain: Map<(TypingMode, Goal), u32, FixedState, Alloc<'a>>,
+    /// The plain-goal memo: a goal whose shallow-resolved top-level terms hold no bindable
+    /// inference variable, keyed by its resolved handles (mode, env id, bound count, resolved
+    /// predicate), to its interned canonical input. Such a goal's canonical words are a function
+    /// of those handles alone (`goal_input` reads `tys` only to resolve variables), so a hit
+    /// skips the canonical walk. Only goals whose canonical form has no variable are kept; at
+    /// most [`MAX_PLAIN`] entries.
+    plain: Map<PlainKey, u32, FixedState, Alloc<'a>>,
     /// Whether the root being solved shares its goals (its source hands a table:
     /// `facts::Source::goals`): `finish` then keeps each final goal in `share_new`.
     sharing: bool,
@@ -269,6 +270,11 @@ pub struct Solver<'a, E = NoDerivation> {
     share_ids: Vec<u32, Alloc<'a>>,
     share_reads: Vec<Read, Alloc<'a>>,
     share_work: Vec<(Ty, u32), Alloc<'a>>,
+    /// Per-body memo of facts already verified and replayed under [`share::ReplayMode::SameScope`]
+    /// (capped at [`MAX_PLAIN`], rule 18): maps `Question -> (digest, Option<read_id>)` so
+    /// repeated shared-goal hits verify and collect interned read ids in O(1) without calling
+    /// `Ask::replay`, `Source::fill`, or `ReadLog::intern` again.
+    share_verified: Map<Question, (u64, Option<u32>), FixedState, Alloc<'a>>,
     /// The step count ([`Solver::steps_now`]) when the root being solved started.
     steps_at: u64,
 }
@@ -501,6 +507,80 @@ impl<'a> Solver<'a, Derivations<'a>> {
     }
 }
 
+/// Key of the plain-goal memo (`Solver::plain`): a goal whose shallow-resolved top-level terms
+/// hold no bindable inference variable. Storing shallow-resolved term handles for the common
+/// predicate shapes avoids re-canonicalizing nested goals whose arguments are already-bound
+/// inference variables or freshly interned argument lists.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PlainKey {
+    mode: TypingMode,
+    env: EnvId,
+    bound: u32,
+    pred: PlainPred,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum PlainPred {
+    Trait1(Def, Polarity, Ty),
+    Trait2(Def, Polarity, Ty, Ty),
+    Trait3(Def, Polarity, Ty, Ty, Ty),
+    WellFormed(Ty),
+    NormalizesTo(Ty, Ty),
+    Projection(Ty, Ty),
+    Other(Pred),
+}
+
+fn plain_key<T: Tys>(tys: &T, mode: TypingMode, goal: Goal) -> Result<Option<PlainKey>, Stop> {
+    let infer_flags = if T::REGIONS_BIND { Flags::HAS_INFER | Flags::HAS_RE_INFER } else { Flags::HAS_INFER };
+    let resolve_plain = |t: Ty| -> Option<Ty> {
+        let r = tys.shallow_resolve(t);
+        (!tys.flags(r).has(infer_flags)).then_some(r)
+    };
+    let pred = match goal.pred {
+        Pred::Trait { trait_, args, polarity } if args.len == 1 => {
+            let Some(a0) = resolve_plain(tys.list_get(args, 0)) else { return Ok(None) };
+            PlainPred::Trait1(trait_, polarity, a0)
+        }
+        Pred::Trait { trait_, args, polarity } if args.len == 2 => {
+            let Some(a0) = resolve_plain(tys.list_get(args, 0)) else { return Ok(None) };
+            let Some(a1) = resolve_plain(tys.list_get(args, 1)) else { return Ok(None) };
+            PlainPred::Trait2(trait_, polarity, a0, a1)
+        }
+        Pred::Trait { trait_, args, polarity } if args.len == 3 => {
+            let Some(a0) = resolve_plain(tys.list_get(args, 0)) else { return Ok(None) };
+            let Some(a1) = resolve_plain(tys.list_get(args, 1)) else { return Ok(None) };
+            let Some(a2) = resolve_plain(tys.list_get(args, 2)) else { return Ok(None) };
+            PlainPred::Trait3(trait_, polarity, a0, a1, a2)
+        }
+        Pred::WellFormed(t) => {
+            let Some(r) = resolve_plain(t) else { return Ok(None) };
+            PlainPred::WellFormed(r)
+        }
+        Pred::NormalizesTo { alias, term } => {
+            let Some(a) = resolve_plain(alias) else { return Ok(None) };
+            let Some(t) = resolve_plain(term) else { return Ok(None) };
+            PlainPred::NormalizesTo(a, t)
+        }
+        Pred::Projection { alias, term } => {
+            let Some(a) = resolve_plain(alias) else { return Ok(None) };
+            let Some(t) = resolve_plain(term) else { return Ok(None) };
+            PlainPred::Projection(a, t)
+        }
+        other => {
+            let mut ok = true;
+            pred_terms(tys, other, &mut |t| {
+                ok &= !tys.flags(t).has(infer_flags);
+                Ok(())
+            })?;
+            if !ok {
+                return Ok(None);
+            }
+            PlainPred::Other(other)
+        }
+    };
+    Ok(Some(PlainKey { mode, env: goal.env, bound: goal.bound, pred }))
+}
+
 impl<'a, E: Emit> Solver<'a, E> {
     /// A solver recording into `emit`. A recording solver turns the auto-trait summaries off
     /// (every structural step is then a goal of its own, with its own choice) and skips the
@@ -556,6 +636,7 @@ impl<'a, E: Emit> Solver<'a, E> {
             share_ids: Vec::new_in(alloc),
             share_reads: Vec::new_in(alloc),
             share_work: Vec::new_in(alloc),
+            share_verified: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             steps_at: 0,
         };
         if E::ON {
@@ -1093,14 +1174,10 @@ impl<'a, E: Emit> Solver<'a, E> {
     /// (`canonicalized`). `self.words` holds the canonical words only after a walk: read them
     /// back by `Inputs::words_of`.
     fn input_of<T: Tys>(&mut self, tys: &T, mode: TypingMode, goal: Goal) -> Result<u32, Stop> {
-        let mut plain = !self.scratch.off.memo;
-        if plain {
-            pred_terms(tys, goal.pred, &mut |t| {
-                plain &= !tys.flags(t).has(Flags::HAS_INFER | Flags::HAS_RE_INFER);
-                Ok(())
-            })?;
-        }
-        if plain && let Some(&input) = self.plain.get(&(mode, goal)) {
+        let key = if !self.scratch.off.memo { plain_key(tys, mode, goal)? } else { None };
+        if let Some(k) = key
+            && let Some(&input) = self.plain.get(&k)
+        {
             self.canon.clear();
             self.scratch.stats.canon_skipped += 1;
             return Ok(input);
@@ -1109,8 +1186,11 @@ impl<'a, E: Emit> Solver<'a, E> {
         self.scratch.stats.canonicalized += 1;
         self.scratch.stats.canon_words += self.words.len() as u64;
         let input = self.inputs.intern(&self.words)?;
-        if plain && self.canon.orig.is_empty() && self.plain.len() < MAX_PLAIN {
-            let _ = self.plain.insert((mode, goal), input);
+        if let Some(k) = key
+            && self.canon.orig.is_empty()
+            && self.plain.len() < MAX_PLAIN
+        {
+            let _ = self.plain.insert(k, input);
         }
         Ok(input)
     }
@@ -1322,16 +1402,31 @@ impl<'a, E: Emit> Solver<'a, E> {
         if !found {
             return Ok(Shared::Miss);
         }
+        let plant = opts.plant_hit_without_read;
+        let record_ids = !opts.one_read_only && !plant && !opts.audit;
+        let mut ids = core::mem::replace(&mut self.share_ids, Vec::new_in(self.alloc));
+        ids.clear();
         // THE SCOPE: the entry is taken only if every fact it read answers the same digest in
         // this body's facts (filled where they lack one, as solving the goal here would).
-        if !opts.one_read_only && !self.share_replay(tys, src, &got.reads)? {
-            self.count_refused(Refuse::Scope);
-            return Ok(Shared::Miss);
+        if !opts.one_read_only {
+            let replayed = self.share_replay(tys, src, &got.reads, opts.replay, record_ids, &mut ids);
+            match replayed {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.share_ids = ids;
+                    self.count_refused(Refuse::Scope);
+                    return Ok(Shared::Miss);
+                }
+                Err(e) => {
+                    self.share_ids = ids;
+                    return Err(e);
+                }
+            }
         }
-        let plant = opts.plant_hit_without_read;
         self.scratch.stats.shared_hits += 1;
         self.share_hits.push(GoalHit { key: digest, reads_digest: got.reads_digest });
         if opts.audit {
+            self.share_ids = ids;
             // THE AUDIT: the hit is solved again by the caller (`evaluate_root`), the fresh
             // solve's reads are the ones recorded, and `share_after` compares.
             let hit_reads = if plant || opts.one_read_only { share::reads_digest(&[]) } else { got.reads_digest };
@@ -1343,11 +1438,11 @@ impl<'a, E: Emit> Solver<'a, E> {
             Some((c, via)) => Some(self.resps.push_cached(&got.words, c, via)?),
             None => None,
         };
-        let mut ids = core::mem::replace(&mut self.share_ids, Vec::new_in(self.alloc));
-        ids.clear();
-        if !opts.one_read_only && !plant {
-            for &r in got.reads.iter() {
-                ids.push(self.reads.intern(r)?);
+        if record_ids {
+            if matches!(opts.replay, share::ReplayMode::Standard) {
+                for &r in got.reads.iter() {
+                    ids.push(self.reads.intern(r)?);
+                }
             }
             // SOUND WITH TODAY'S ENGINE (plan row A4, this piece): the hit ALSO appends the
             // goal's own reads to the body's list, exactly as solving the goal in the body
@@ -1370,14 +1465,64 @@ impl<'a, E: Emit> Solver<'a, E> {
     /// the digest the entry holds. A fact the facts lack is filled by the source (and noted in
     /// the body's own list by it, as solving would); one it does not fill stops the root
     /// (`Stop::Need`), and the caller fills it and asks again.
-    fn share_replay<T: Tys, S: FactSource<T>>(&mut self, tys: &mut T, src: &mut S, reads: &[Read]) -> Result<bool, Stop> {
+    ///
+    /// Under [`share::ReplayMode::SameScope`], verified non-opaque questions and their interned
+    /// read ids are memoized in `share_verified` so repeated hits in the same body verify and
+    /// populate `ids` in O(1).
+    fn share_replay<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        reads: &[Read],
+        mode: share::ReplayMode,
+        record_ids: bool,
+        ids: &mut Vec<u32, Alloc<'a>>,
+    ) -> Result<bool, Stop> {
+        let same_scope = matches!(mode, share::ReplayMode::SameScope);
         for r in reads {
+            if same_scope
+                && let Some(&(seen, cached_id)) = self.share_verified.get(&r.question)
+            {
+                if seen != r.digest {
+                    return Ok(false);
+                }
+                if record_ids {
+                    let id = match cached_id {
+                        Some(id) => id,
+                        None => {
+                            let id = self.reads.intern(*r)?;
+                            if let Some(slot) = self.share_verified.get_mut(&r.question) {
+                                slot.1 = Some(id);
+                            }
+                            id
+                        }
+                    };
+                    ids.push(id);
+                }
+                continue;
+            }
             let mut filled = 0u32;
             loop {
                 let got = Ask::new(src.facts()).replay(r.question);
                 match got {
-                    Ok(d) if d == r.digest => break,
-                    Ok(_) => return Ok(false),
+                    Ok(d) => {
+                        if d != r.digest {
+                            return Ok(false);
+                        }
+                        let mut cached_id = None;
+                        if same_scope && record_ids {
+                            let id = self.reads.intern(*r)?;
+                            ids.push(id);
+                            cached_id = Some(id);
+                        }
+                        if same_scope
+                            && !matches!(r.question, Question::Opaque(_) | Question::OpaqueHidden(_) | Question::ConstHolds(..))
+                            && self.share_verified.len() < MAX_PLAIN
+                        {
+                            let _ = self.share_verified.insert(r.question, (d, cached_id));
+                        }
+                        break;
+                    }
                     Err(Stop::Need(q)) if S::PULLS && filled < MAX_PULLS => {
                         if !src.fill(tys, q) {
                             return Err(Stop::Need(q));
@@ -1450,22 +1595,49 @@ impl<'a, E: Emit> Solver<'a, E> {
                 self.count_refused(why);
                 continue;
             }
-            rs.clear();
             let mut const_holds = false;
+            let mut local_read = false;
             for &id in self.inputs.reads_of(&n.entry) {
-                let read = self.reads.read(id);
-                const_holds |= matches!(read.question, Question::ConstHolds(..));
-                rs.push(read);
+                match self.reads.read(id).question {
+                    Question::ConstHolds(..) => const_holds = true,
+                    // An opaque's hidden type (and its digest when read inside its defining body)
+                    // and any closure/coroutine impl bucket depend on the asking body's scope:
+                    // never put into the shared table, lest another body replay reads that sort
+                    // before the scope mismatch (rules 21, 25).
+                    Question::Opaque(_)
+                    | Question::OpaqueHidden(_)
+                    | Question::Impls(_, crate::term::Shape::Closure(_) | crate::term::Shape::Coroutine(_)) => {
+                        local_read = true;
+                    }
+                    _ => {}
+                }
             }
             if const_holds {
                 self.count_refused(Refuse::ConstHolds);
                 continue;
             }
+            if local_read {
+                self.count_refused(Refuse::Local);
+                continue;
+            }
+            self.key_words(n.input, kw)?;
+            let key = GoalKey { digest: share::key_digest(&kw[..]), words: &kw[..] };
+            match table.contains(key) {
+                Ok(true) => {
+                    self.scratch.stats.shared_present += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(ShareRefused::Collision { digest }) => return Err(Stop::Error(SolveError::Share(ShareError::Collision { digest }))),
+                Err(ShareRefused::Full { .. }) => {}
+            }
+            rs.clear();
+            for &id in self.inputs.reads_of(&n.entry) {
+                rs.push(self.reads.read(id));
+            }
             rs.sort_unstable();
             rs.dedup();
             let reads_digest = share::reads_digest(rs);
-            self.key_words(n.input, kw)?;
-            let key = GoalKey { digest: share::key_digest(&kw[..]), words: &kw[..] };
             let ans = n.entry.ans.map(|id| SharedAns { certainty: self.resps.certainty(id), via: self.resps.via(id), words: self.resps.words_of(id) });
             let put = table.put(key, SharedGoal { ans, required_depth: n.entry.required_depth, overflow: n.overflow, reads: &rs[..], reads_digest });
             match put {

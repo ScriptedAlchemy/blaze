@@ -31,7 +31,7 @@ impl<A: Allocator> Bits<A> {
     }
 
     pub fn get(&self, r: usize, c: usize) -> bool {
-        self.data.get(r * self.words + c / 64).is_some_and(|&w| (w >> (c % 64)) & 1 == 1)
+        self.data.get(r * self.words + c / 64).is_some_and(|w| (w >> (c % 64)) & 1 == 1)
     }
 
     /// Sets the bit; says whether it was clear.
@@ -91,7 +91,7 @@ pub fn intersect_into(dst: &mut [u64], src: &[u64]) -> bool {
 }
 
 pub fn test(row: &[u64], c: usize) -> bool {
-    row.get(c / 64).is_some_and(|&w| (w >> (c % 64)) & 1 == 1)
+    row.get(c / 64).is_some_and(|w| (w >> (c % 64)) & 1 == 1)
 }
 
 pub fn put(row: &mut [u64], c: usize, on: bool) {
@@ -160,15 +160,11 @@ impl<A: Allocator + Copy> BitWorklist<A> {
         }
         let mut index = 0usize;
         for &start in self.levels.iter().rev() {
-            let Some(&word) = self.bits.get(start + index) else {
-                return None;
-            };
+            let &word = self.bits.get(start + index)?;
             if word == 0 {
                 return None;
             }
-            let Ok(tz) = usize::try_from(word.trailing_zeros()) else {
-                return None;
-            };
+            let tz = usize::try_from(word.trailing_zeros()).ok()?;
             index = index * 64 + tz;
         }
         let rank = index;

@@ -97,11 +97,11 @@ fn dedent_and_indent_preserve_blank_lines_and_endings() {
     let h = heap();
     let alloc = h.alloc();
 
-    let src = "    fn main() {\n        println!(\"hi\");\n    \n    }\n";
+    let src = "    fn main() {\n        greet(\"hi\");\n    \n    }\n";
     let dedented = dedent_in(src, alloc);
     assert_eq!(
         dedented.as_ref().map(OwnString::as_str),
-        Ok("fn main() {\n    println!(\"hi\");\n\n}\n")
+        Ok("fn main() {\n    greet(\"hi\");\n\n}\n")
     );
 
     let crlf = "\t\ta\r\n\t\t\r\n\tb";

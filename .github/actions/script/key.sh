@@ -26,7 +26,7 @@ else
   status=$?
   [ "$status" = 1 ] || die "cannot read sparse checkout configuration"
 fi
-for need in .github/blaze-version pins/toolchain Cargo.toml Cargo.lock blaze.lock .cargo/config.toml scripts/Cargo.toml; do
+for need in .github/blaze-version .github/blaze-cli-version pins/toolchain Cargo.toml Cargo.lock blaze.lock .cargo/config.toml scripts/Cargo.toml; do
   [ -f "$need" ] && [ ! -L "$need" ] || die "missing or symlinked input $need"
 done
 command -v bun >/dev/null || die "Bun 1.4.5 is required to parse Cargo manifests"
@@ -59,7 +59,7 @@ while IFS= read -r dir; do
     printf '%s\n' "$file" >> "$work/files"
   done < "$work/tree"
 done < "$work/sorted-directories"
-printf '%s\n' .github/blaze-version pins/toolchain Cargo.toml blaze.lock .cargo/config.toml >> "$work/files"
+printf '%s\n' .github/blaze-version .github/blaze-cli-version pins/toolchain Cargo.toml blaze.lock .cargo/config.toml >> "$work/files"
 sort -u "$work/files" > "$work/sorted-files"
 {
   printf 'host %s %s\n' "$(uname -s)" "$(uname -m)"

@@ -114,6 +114,16 @@ impl Table {
     pub fn new_in(alloc: Alloc<'static>) -> Table {
         Table { entries: Vec::new_in(alloc), refusals: None }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.refusals.as_ref().is_none_or(|v| v.is_empty())
+    }
+
+    pub fn clear(&mut self) {
+        let Table { entries, refusals } = self;
+        entries.clear();
+        *refusals = None;
+    }
 }
 
 /// Reads the typed refusal of the leaf `need` (`None`: not refused) with `f`, while the table
@@ -535,7 +545,7 @@ fn file<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, need: LibKey, out: R
         Ok(None) => State::NotLeaf,
         Err(e) => {
             // Kept typed, in the allocator of the store's type table (the store's own).
-            let alloc = r.store.tys.alloc();
+            let alloc = r.store.work_alloc();
             let mut t = r.store.maps.inherents.borrow_mut();
             t.refusals.get_or_insert_with(|| Vec::new_in(alloc)).push((need, e));
             State::Refused
@@ -561,6 +571,8 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         let Some((slot, e)) = next else { break };
         from = slot + 1;
         r.store.maps.inherents.borrow_mut().set(e.need, State::Running);
+        let active_before = r.store.active_consts_len();
+        r.store.push_active_const(e.need);
         let out = match find(r, e) {
             Ok(Some((constant, ty))) => match r.consts.take() {
                 Some((consts, prepared)) => {
@@ -577,6 +589,12 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         };
+        r.store.truncate_active_consts(active_before);
+        if r.store.clear_provisional_for(e.need)
+            && let Some(b) = r.buckets.as_ref()
+        {
+            b.clear_provisional();
+        }
         file(r, e.need, out);
     }
     true

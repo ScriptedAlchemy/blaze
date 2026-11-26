@@ -212,9 +212,10 @@ mod scratch_tests;
 mod sota;
 pub mod table_gen;
 mod tier;
+pub use blaze_tier::Machine;
 pub use sota::{
     CallMode, CompiledModuleFn, ModuleFn, Sota, SotaModuleOpts, SotaModuleOut, compile_module_a64,
-    emit_sota_record_measured,
+    emit_sota_record_for_machine, emit_sota_record_measured,
 };
 pub use tier::Reference;
 pub use asm::AsmToken;

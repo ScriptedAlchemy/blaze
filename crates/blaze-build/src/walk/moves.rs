@@ -157,6 +157,20 @@ impl<A: Allocator + Copy> Moves<A> {
             box_self: None,
         }
     }
+
+    /// Reports every slot still referenced by open move roots or a pending temporary box deref.
+    pub(super) fn for_each_live_slot(&self, mut f: impl FnMut(SlotId), value_slot: impl Fn(Value) -> Option<SlotId>) {
+        for r in self.roots.iter() {
+            if let Some(s) = r.mask {
+                f(s);
+            }
+        }
+        if let Some((_, v)) = self.box_self
+            && let Some(s) = value_slot(v)
+        {
+            f(s);
+        }
+    }
 }
 
 /// A node of a value being dropped: its type, its offset from the value, the length of its
@@ -179,6 +193,10 @@ enum Do {
     Visit(Node),
     Begin(Block),
     Jump(Block),
+    /// The `dyn` contents of a `Box` of type `g` at `place` (wide pointer at `off`), dropped via
+    /// `dyn_glue` only if `bit` of `mask` is still set (otherwise moved out, e.g. `Box<dyn
+    /// FnOnce>::call_once`), with `BoxFree` owed on unwind when `free` is true.
+    BoxDyn { g: PTy, place: (Value, i32), off: i32, bit: u32, free: bool },
     /// The `Box` of type `g` at `place`, its contents visited: its allocation freed alone.
     BoxFree { g: PTy, place: (Value, i32) },
 }
@@ -227,10 +245,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(unsupported(scrutinee, "a temporary scrutinee that needs drop held as other than an aggregate (a `Box`), in a match by tests"));
         };
         self.hold_temp(scrutinee, (p, off), srepr)?;
-        let slot = self.b.slot(8, 3, SlotKind::Named);
-        let fa = self.b.slot_addr(slot);
-        let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
-        self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+        let slot = self.new_temp_mask((p, off), scrutinee);
         // `hold_temp`'s entry for it (a whole `Held::Rest` at its place) takes the word.
         let held = self.scope_pats.iter().rposition(|h| matches!(*h, Held::Rest { at, variant: None, .. } if at == (p, off)));
         let held = held.ok_or(malformed("a held temporary scrutinee missing from its scope"))?;
@@ -254,6 +269,31 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
         self.scope_pats.push(Held::Moved { at, g, mask: slot });
         self.moves.roots.push(Root { m, expr: self.body.root, owner: Owner::Temp, mask: Some(slot), g, field: None });
+    }
+
+    /// Allocates and initializes an 8-byte partial-move field-flags word (`Held::Moved::mask`)
+    /// for a temporary at `at` (from expression `expr`), naming it as that temporary's `rest`
+    /// sub-slot in a laid coroutine state when the flow saves it.
+    pub(super) fn new_temp_mask(&mut self, at: (Value, i32), expr: ExprId) -> SlotId {
+        let slot = self.b.slot(8, 3, SlotKind::Named);
+        if let Some(id) = self.whole_slot(at).and_then(|s| self.slot_identity(s)) {
+            self.name_rest(slot, id);
+        } else {
+            let mut cur = expr;
+            while let Ok(Expr::Paren(inner)) = self.expr(cur) {
+                cur = inner;
+            }
+            let role = if matches!(self.expr(cur), Ok(Expr::Await(_))) {
+                blaze_flow_lower::identity::Role::Result
+            } else {
+                blaze_flow_lower::identity::Role::Value
+            };
+            self.name_rest(slot, blaze_flow_lower::identity::Identity::Temp(cur, role));
+        }
+        let fa = self.b.slot_addr(slot);
+        let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
+        self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+        slot
     }
 
     /// Arm `pat` of match `m` is about to bind (`guarded`: it has a guard): its moves are of
@@ -334,6 +374,25 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             (Owner::Temp, None) => cx.root.mask.ok_or(malformed("a temporary scrutinee without its word"))?,
             (Owner::None, None) => return Err(malformed("a part moved out of a scrutinee no one owns")),
         };
+        // A direct variant field `(v, j)` of a local enum already has its bit in `0..base`
+        // (`field_bit`), which both `drop_owned` (on earlier whole-local assignments in a loop)
+        // and `drop_tree` (`root_switch`) already test. Clearing that bit directly avoids
+        // allocating a new `part_bit` past `base` and lets loops like `output = Some(v); if let
+        // Some(v) = output { break v; }` build cleanly without double-drop.
+        if matches!(cx.root.owner, Owner::Local(_))
+            && prefix.is_none()
+            && len == 1
+            && let Some(Step::Variant { v, row }) = self.moves.steps.get(start as usize).copied()
+            && let Ok(l) = self.layout(cx.root.g)
+            && let Shape::Enum { first, .. } = self.layouts[l as usize].shape
+            && let (ff, fl) = self.layout_variants[(first + v) as usize]
+            && row >= ff
+            && row < ff + fl
+            && let Some(bit) = self.field_bit(l, v, row - ff)?
+        {
+            self.moves.steps.truncate(start as usize);
+            return self.arm_effect(Pending::Clear { mask, bits: 1u64 << bit }, cx.guarded);
+        }
         // A local enum's switch owns its first `field_bit`s (a whole local's only: a local with
         // a field scrutinee is a struct or tuple, `field_path`'s `Shape::Fields`).
         let base = match (cx.root.owner, prefix, self.layout(cx.root.g).map(|l| self.layouts[l as usize].shape)) {
@@ -633,6 +692,28 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 Do::Begin(b) => self.begin(b),
                 Do::Jump(b) => self.jump(b, &[]),
                 Do::Visit(n) => self.drop_node(n, at, mask, switch_bits && n.depth == 0, ps, &mut todo)?,
+                Do::BoxDyn { g, place, off, bit, free } => {
+                    let fa = self.b.slot_addr(mask);
+                    let word = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
+                    let one = self.b.iconst(Ty::I64, 1u128 << bit);
+                    let held = self.b.binary(Op::And, Flags::NONE, word, one);
+                    let zero = self.b.iconst(Ty::I64, 0);
+                    let set = self.b.icmp(IntCond::Ne, held, zero);
+                    let yes = self.create();
+                    let skip = self.create();
+                    self.br(set, (yes, &[]), (skip, &[]));
+                    self.begin(yes);
+                    let data = self.b.load(Ty::PTR, Flags::NONE, place.0, place.1 + off, MemAttrs::aligned(3));
+                    let vt = self.b.load(Ty::PTR, Flags::NONE, place.0, place.1 + off + 8, MemAttrs::aligned(3));
+                    if free {
+                        let p = self.address(place);
+                        self.drop_owing(super::unwind_ladder::DropStep::DynGlue { data, vt }, super::unwind_ladder::DropStep::BoxFree { g, p })?;
+                    } else {
+                        self.dyn_glue(data, vt)?;
+                    }
+                    self.jump(skip, &[]);
+                    self.begin(skip);
+                }
                 Do::BoxFree { g, place } => {
                     let p = self.address(place);
                     self.drop_box_free(g, p)?;
@@ -737,10 +818,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             _ => {
                 let t = self.expr_ty(base)?;
                 let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
-                let slot = self.b.slot(8, 3, SlotKind::Named);
-                let fa = self.b.slot_addr(slot);
-                let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
-                self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+                let slot = self.new_temp_mask(held_at, base);
                 self.scope_pats[i] = Held::Moved { at: held_at, g, mask: slot };
                 slot
             }
@@ -773,7 +851,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     let col = self.checked.fields.column::<0>();
                     let row = col.binary_search(&cur).map_err(|_| malformed("a field access without its record row"))?;
                     let k = self.checked.fields.column::<2>()[row];
-                    let Repr::Agg(l) = self.adjusted_repr(base)? else { break None };
+                    // A temporary cannot be unsized; stop before `repr` refuses a nested DST
+                    // field base (`self.inner.header.owned`) with `UNSIZED_BY_VALUE`.
+                    let base_ty = self.adjusted_ty(base)?;
+                    let base_g = self.ground_ty(base_ty).map_err(|error| Self::ty_err(base, error))?;
+                    let base_ls = self.ls_of(base_g).map_err(|error| Self::ty_err(base, error))?;
+                    if self.ls.get(base_ls).tail != crate::layout::Tail::Sized {
+                        break None;
+                    }
+                    let Repr::Agg(l) = self.repr(base_g).map_err(|error| Self::ty_err(base, error))? else { break None };
                     if self.layouts[l as usize].is_union {
                         break None;
                     }

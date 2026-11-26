@@ -68,7 +68,8 @@ const CI_ONLY_STEPS: [(&str, &str); 2] = [
 ];
 
 /// The scripts another job of the workflow calls, each with why it is not a row.
-const CI_ONLY_SCRIPTS: [(&str, &str); 12] = [
+const CI_ONLY_SCRIPTS: [(&str, &str); 13] = [
+    ("lean_gate", "the Lean job builds the proof packages and checks the axioms used by their theorems"),
     ("gate_changes", "the `changes` job: which tier of the workflow runs, from GitHub's comparison of the event's commits (needs GH_TOKEN)"),
     ("gate", "the runner itself, called by the `scripts` job's one gate step"),
     ("toolchain_cut", "the `cargo` job: cuts the pinned toolchain shelf into $HOME/.blaze/v2/toolchain before `cargo test` so tests that open the shelf find it on a fresh runner"),
@@ -463,6 +464,8 @@ fn selftest() {
     let inline = flow.replace("      - uses: actions/checkout@v7\n", "      - uses: actions/checkout@v7\n      - run: '\"$BLAZE_SCRIPTS/rustcsites\"'\n");
     expect(matches!(check_workflow(&inline), Err(GateError::Step { what: "calls a script", .. })), "an inline script step is refused");
     let exported = flow.replace("lake build", "\"$BLAZE_SCRIPTS/docs\" write");
+    let lean = flow.replace("lake build", "\"$BLAZE_SCRIPTS/lean_gate\" check");
+    expect(check_workflow(&lean).is_ok(), "the Lean job can run the proof gate");
     expect(check_workflow(&exported).is_ok(), "a named diagnostic generator is accepted outside the gate");
     let elsewhere = flow.replace("lake build", "\"$BLAZE_SCRIPTS/rustcsites\"");
     expect(matches!(check_workflow(&elsewhere), Err(GateError::Script { line: 21, .. })), "a script another job calls is refused unless named");

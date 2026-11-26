@@ -73,8 +73,6 @@ blaze-manifest	3	0	86
 blaze-mem	1	0	1
 blaze-memo	1	0	65
 blaze-memo-macros	3	0	4
-blaze-names-demand	0	0	7
-blaze-names-source	0	0	86
 blaze-native	0	0	7
 blaze-new	1	0	87
 blaze-pack	0	0	62

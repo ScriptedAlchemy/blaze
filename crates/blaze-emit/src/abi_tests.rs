@@ -13,8 +13,8 @@ use blaze_lir::{
 };
 
 use crate::{
-    EmitError, Fixup, RelocTo, Routine, Via,
-    tests::{emitted, run},
+    EmitError, Fixup, Isa, Os, RelocTo, Routine, Via,
+    tests::{emitted, emitted_for, run},
 };
 
 /// 32 bytes: AAPCS64 returns it through x8 and passes it as a pointer to a copy.
@@ -68,13 +68,16 @@ const fn by_value(size: u32, align: u8) -> Param {
 
 const SRET: Param = Param { kind: ParamKind::Sret, ..Param::of(Ty::PTR) };
 
-fn begin(params: &[Param], rets: &[Param]) -> (Builder<Global, Full>, Vec<Value>) {
+fn begin(params: &[Param], rets: &[Param]) -> (Builder<Global, Full>, blaze_own::AVec<'static, Value>) {
     let mut b = Builder::<Global, Full>::new_in(64, Global);
     let sig = b.sig(Conv::C, Variadic::No, params, rets);
     b.set_signature(sig);
     let entry = b.create_block(BlockKind::Normal);
     b.begin(entry);
-    let values = params.iter().map(|it| b.param(it.ty)).collect();
+    let mut values = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+    for it in params {
+        values.push(b.param(it.ty));
+    }
     (b, values)
 }
 
@@ -152,8 +155,12 @@ fn a_byval_call_passes_a_copy() {
         let called = code.relocs.iter().any(|r| r.to == RelocTo::Routine(Routine::Memcpy));
         assert_eq!(called, u64::from(size) > crate::BULK_INLINE_MOST, "{size} bytes: copied by memcpy");
         let exec = placed(&func, callee);
-        let mut value: Vec<u64> = (1..=u64::from(size) / 8).collect();
-        let before = value.clone();
+        let mut value = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+        let mut before = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+        for i in 1..=u64::from(size) / 8 {
+            value.push(i);
+            before.push(i);
+        }
         let got = run::call(&exec, [value.as_mut_ptr() as u64, 0, 0, 0]);
         let want: u64 = match size {
             32 => value.iter().sum(),
@@ -259,19 +266,38 @@ fn stack_arguments_and_variadic_definitions_are_refused() {
     let built = emitted(func.view(), &[Via::Address]);
     assert!(built.is_ok(), "a variadic call is built: {:?}", built.err());
 
-    // A function whose own signature is variadic.
+    // A function whose own signature is variadic: built on Apple arm64 (variadic args sit on
+    // the caller's stack at `fp + 16 + nsaa`), refused on Linux (AAPCS64 register save area).
     let mut b = Builder::<Global, Full>::new_in(64, Global);
     let own = b.sig(Conv::C, Variadic::Yes, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
     b.set_signature(own);
     let entry = b.create_block(BlockKind::Normal);
     b.begin(entry);
     let x = b.param(Ty::I64);
-    b.ret(&[x]);
+    let va_sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::PTR)]);
+    let va_intr = b.intrinsic("blaze.va_start", va_sig);
+    let va_ptr = b.target_intrinsic(va_intr, &[]);
+    let first = b.load(Ty::I32, Flags::NONE, va_ptr, 0, MemAttrs::aligned(2));
+    let first64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, first);
+    let second = b.load(Ty::I64, Flags::NONE, va_ptr, 8, MemAttrs::aligned(3));
+    let sum1 = b.binary(Op::Add, Flags::NONE, x, first64);
+    let sum2 = b.binary(Op::Add, Flags::NONE, sum1, second);
+    b.ret(&[sum2]);
     let func = b.finish_checked().expect("builds");
-    let refused = emitted(func.view(), &[Via::Address]).err();
+    let linux_isa = Isa { os: Os::Linux, ..crate::tests::ISA };
+    let refused = emitted_for(func.view(), &[Via::Address], linux_isa).err();
     assert_eq!(
         refused,
         Some(EmitError::Signature { why: crate::pass::variadic::VARIADIC_DEFINITION }),
-        "a variadic definition is refused by name"
+        "a Linux variadic definition stays refused by name"
     );
+    let mac_code = emitted_for(func.view(), &[], Isa { os: Os::MacOs, ..crate::tests::ISA }).expect("Mac variadic definition emits");
+    #[cfg(target_os = "macos")]
+    {
+        let exec = run::place(&mac_code, |_| unreachable!());
+        // SAFETY: an emitted Apple arm64 C-variadic fn `(u64, ...) -> u64` reading `(u32, u64)` from `...`.
+        let f = unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(u64, ...) -> u64>(exec.code_address() as usize) };
+        assert_eq!(unsafe { f(100, 23u32, 4000u64) }, 4123);
+    }
+    let _ = mac_code;
 }
