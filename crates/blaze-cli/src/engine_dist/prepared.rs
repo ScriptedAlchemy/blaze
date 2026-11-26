@@ -296,7 +296,7 @@ where
         let mut emissions = WireVec::new_in(self.wire);
         let mut stored = 0;
         let mut compiled = 0;
-        for task in tasks {
+        for (task, name) in tasks.into_iter().zip(names) {
             let rows = task.compile(self.backend, self.store, self.alloc).map_err(|why| {
                 refused(self.heap, format_args!("native emission for {}: {why}", self.krate.name))
             })?;
@@ -311,7 +311,14 @@ where
                     OutputKind::FoldedBody | OutputKind::Thunk => Some(BackendKind::FoldedOutput),
                 };
                 compiled += 1;
-                emissions.push(Emission { key: row.content.0.0, backend });
+                emissions.push(Emission {
+                    key: row.receipt.0.0,
+                    backend,
+                    native: Some(agent::NativeEmission {
+                        grant: name.0.0,
+                        content: row.content.0.0,
+                    }),
+                });
             }
         }
         let values = self.store.drain_tracked_values().map_err(DistError::Store)?;
@@ -437,7 +444,7 @@ where
                 krate.members.len(),
                 &[],
                 wire,
-            );
+            )?;
         }
     }
     if fingerprint.is_none() {

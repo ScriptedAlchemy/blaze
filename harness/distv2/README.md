@@ -30,14 +30,14 @@ Root should derive a fresh input from `/fast/projects/blaze-v2-linux-state/distv
 a new `scratch`, leave `faults` true and supply measured resource hints, then run:
 
 ```sh
-python3 harness/distv2.py /path/to/new-distv2-input.json > /path/to/distv2-acceptance.log 2>&1
+uv run --frozen python harness/distv2.py /path/to/new-distv2-input.json > /path/to/distv2-acceptance.log 2>&1
 ```
 
 Lightweight preflight (no Blaze binary or daemon is started):
 
 ```sh
 python3 -m py_compile harness/distv2.py harness/distv2/evidence.py harness/distv2/selfcheck.py
-python3 harness/distv2/selfcheck.py
+uv run --frozen python harness/distv2/selfcheck.py
 ```
 
 ## Required product telemetry (API request to root)
@@ -132,7 +132,13 @@ loop oracle; the application and native dependencies exercise LLVM at release se
 
 `backend_work` events name the real daemon pid, unit digest, granted protocol WorkNames, raw compiled keys,
 and the intersection of those emissions with the canonical release and fold output keys. The
-oracle joins them to real accepted grant/lease events and final reports. Each backend kind must
+oracle joins them to real accepted grant/lease events and final reports. Each native emission
+includes a `native_outputs` triple containing its granted WorkName, output receipt key and
+machine-code content key. The oracle reads the published recipe binding, receipt and code record,
+rehashes both content addresses, and derives the WorkName from the stored recipe or entire fold
+group. Two source outputs can share their machine code while each has its own receipt. Portable
+wasm folds carry the family, role, function index and emitted body in their published records.
+Each backend kind must
 have two distinct emitting daemons within one successful unit/execution/attempt; merely planning
 work, cached hits, another unit, or stale refused results cannot satisfy it. The existing raw-key,
 manifest, tail nonduplication, cold-cache, edit and executable-byte oracles still run. Missing

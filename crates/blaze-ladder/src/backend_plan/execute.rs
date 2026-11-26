@@ -7,7 +7,8 @@ use blaze_code::record::{CodeView, DecodeError};
 use blaze_ids::ContentId;
 use blaze_own::{AVec, Alloc, BTreeMap, Vec};
 
-const BINDING_DOMAIN: &str = "blaze-ladder backend output binding 1";
+const BINDING_DOMAIN: &str = "blaze-ladder backend output binding 2";
+const RECEIPT_MAGIC: [u8; 8] = *b"bznout01";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum OutputKind {
@@ -65,6 +66,9 @@ pub struct Compiled {
     pub output: Output,
     pub recipe: CodeKey,
     pub content: CodeKey,
+    /// Content address of the actual output's receipt, distinct for different recipes
+    /// even when LLVM makes byte-identical machine code.
+    pub receipt: CodeKey,
     pub source: Source,
 }
 
@@ -74,6 +78,7 @@ pub enum Error<E> {
     Renderer(E),
     Binding { recipe: CodeKey },
     Content { recipe: CodeKey, expected: CodeKey },
+    Receipt { recipe: CodeKey, expected: CodeKey, output: Output },
     InvalidRecord { output: Output, why: DecodeError },
     Missing(Output),
     Unexpected(Output),
@@ -91,6 +96,11 @@ impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
             Self::Content { recipe, expected } => {
                 write!(f, "recipe {recipe} requires missing or changed record {expected}")
             }
+            Self::Receipt { recipe, expected, output } => write!(
+                f,
+                "receipt {expected} does not bind recipe {recipe} to {:?} for {}",
+                output.kind, output.symbol,
+            ),
             Self::InvalidRecord { output, why } => {
                 write!(f, "invalid {:?} record for {}: {why}", output.kind, output.symbol)
             }
@@ -111,6 +121,31 @@ impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
 /// different content keys written under this same immutable binding.
 fn binding(recipe: CodeKey) -> CodeKey {
     CodeKey(Hasher::new(BINDING_DOMAIN).id(&recipe.0).finish())
+}
+
+/// The immutable output record: version, emitter role, pre-emission recipe, actual output
+/// symbol and the digest of the raw machine record. Its encoding is identical in a pack.
+pub fn receipt(output: Output, recipe: CodeKey, content: CodeKey) -> [u8; 105] {
+    let role = match output.kind {
+        OutputKind::Standalone => 0,
+        OutputKind::ReleaseBlob => 1,
+        OutputKind::FoldedBody => 2,
+        OutputKind::Thunk => 3,
+    };
+    let mut bytes = [0; 105];
+    bytes[..8].copy_from_slice(&RECEIPT_MAGIC);
+    bytes[8] = role;
+    bytes[9..41].copy_from_slice(&recipe.0.0);
+    bytes[41..73].copy_from_slice(&output.symbol.0);
+    bytes[73..].copy_from_slice(&content.0.0);
+    bytes
+}
+
+/// A receipt and machine record verified against the output the local plan expects.
+pub struct Bound<'s> {
+    pub receipt: CodeKey,
+    pub content: CodeKey,
+    pub record: CodeView<'s>,
 }
 
 impl Task<'_> {
@@ -150,8 +185,14 @@ impl Task<'_> {
         });
         let mut rows = Vec::with_capacity_in(expected.len(), alloc);
         for (&output, &recipe) in &expected {
-            if let Some((content, _)) = read::<B::Error>(store, output, recipe)? {
-                rows.push(Compiled { output, recipe, content, source: Source::Store });
+            if let Some(held) = read::<B::Error>(store, output, recipe)? {
+                rows.push(Compiled {
+                    output,
+                    recipe,
+                    content: held.content,
+                    receipt: held.receipt,
+                    source: Source::Store,
+                });
             }
         }
         if rows.len() == expected.len() {
@@ -180,26 +221,30 @@ impl Task<'_> {
             let output = emitted.output;
             let &recipe = expected.get(&output).ok_or(Error::Unexpected(output))?;
             CodeView::read(&emitted.record).map_err(|why| Error::InvalidRecord { output, why })?;
+            let content = content_key(&emitted.record);
+            let written = receipt(output, recipe, content);
             let row = Compiled {
                 output,
                 recipe,
-                content: content_key(&emitted.record),
+                content,
+                receipt: content_key(&written),
                 source: Source::Emitted,
             };
             if held.get(&output).is_some_and(|previous| *previous != row.content) {
                 return Err(Error::Store(StoreError::TwoValues { key: binding(recipe) }));
             }
-            if checked.insert(output, (row, emitted.record)).is_some() {
+            if checked.insert(output, (row, emitted.record, written)).is_some() {
                 return Err(Error::Repeated(output));
             }
         }
         if let Some(output) = expected.keys().find(|output| !checked.contains_key(*output)) {
             return Err(Error::Missing(*output));
         }
-        for (_, (row, bytes)) in checked {
+        for (_, (row, bytes, written)) in checked {
             store.put(CodeClass::Program, row.content, &bytes).map_err(Error::Store)?;
+            store.put(CodeClass::Program, row.receipt, &written).map_err(Error::Store)?;
             store
-                .put(CodeClass::Program, binding(row.recipe), &row.content.0.0)
+                .put(CodeClass::Program, binding(row.recipe), &row.receipt.0.0)
                 .map_err(Error::Store)?;
             rows.push(row);
         }
@@ -215,7 +260,7 @@ pub fn read<E>(
     store: &dyn CodeStore,
     output: Output,
     recipe: CodeKey,
-) -> Result<Option<(CodeKey, CodeView<'_>)>, Error<E>> {
+) -> Result<Option<Bound<'_>>, Error<E>> {
     read_with(|key| store.get(key), output, recipe)
 }
 
@@ -225,15 +270,22 @@ pub fn read_with<'s, E>(
     mut get: impl FnMut(CodeKey) -> Result<Option<&'s [u8]>, StoreError>,
     output: Output,
     recipe: CodeKey,
-) -> Result<Option<(CodeKey, CodeView<'s>)>, Error<E>> {
+) -> Result<Option<Bound<'s>>, Error<E>> {
     let Some(bytes) = get(binding(recipe)).map_err(Error::Store)? else { return Ok(None) };
     let key = bytes.try_into().map_err(|_| Error::Binding { recipe })?;
-    let content = CodeKey(ContentId(key));
+    let output_receipt = CodeKey(ContentId(key));
+    let wrong = || Error::Receipt { recipe, expected: output_receipt, output };
+    let written = get(output_receipt).map_err(Error::Store)?.ok_or_else(wrong)?;
+    let (_, raw) = written.split_last_chunk::<32>().ok_or_else(wrong)?;
+    let content = CodeKey(ContentId(*raw));
+    if content_key(written) != output_receipt || written != receipt(output, recipe, content).as_slice() {
+        return Err(wrong());
+    }
     let bytes =
         get(content).map_err(Error::Store)?.ok_or(Error::Content { recipe, expected: content })?;
     if content_key(bytes) != content {
         return Err(Error::Content { recipe, expected: content });
     }
     let record = CodeView::read(bytes).map_err(|why| Error::InvalidRecord { output, why })?;
-    Ok(Some((content, record)))
+    Ok(Some(Bound { receipt: output_receipt, content, record }))
 }

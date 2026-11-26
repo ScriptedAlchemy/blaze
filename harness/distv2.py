@@ -800,7 +800,7 @@ def main(given: Input) -> None:
         check(bool(shared), "both daemons actually compile the same unit in the same execution and attempt")
         evidence.publication(run.root / "blobs", rows_a + rows_b, run.events())
         if given.release_fold:
-            evidence.release_fold(rows_a + rows_b, run.events())
+            evidence.release_fold(run.root / "blobs", rows_a + rows_b, run.events())
             check(True, "two holders actually emitted LLVM work and two holders emitted folded bundles in shared executions")
         check(True, "no granted template was recompiled in the tail or by another daemon; every raw emitted key was committed in the full manifest")
         for name, behaviour in (("a", run.behaviour("a")), ("b", run.behaviour("b"))):

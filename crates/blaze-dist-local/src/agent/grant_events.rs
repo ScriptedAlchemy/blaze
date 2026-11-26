@@ -15,7 +15,7 @@ pub(super) fn issued(unit: &Unit, plan: &Plan, roots: &[usize], pid: u32, alloc:
     }
     work.extend(plan.grant.names.iter().map(|name| name.0));
     let lease = &plan.grant.lease;
-    let mut fields = Vec::with_capacity_in(11, alloc);
+    let mut fields = Vec::with_capacity_in(12, alloc);
     fields.extend([
         ("pid", json(&pid, alloc)),
         ("unit_digest", json(&unit.spec, alloc)),
@@ -34,8 +34,12 @@ pub(super) fn backend(fields: &mut Fields, unit: Digest, emissions: &[Emission],
     let mut kinds = BTreeMap::new_in(alloc);
     let mut release = Vec::new_in(alloc);
     let mut folded = Vec::new_in(alloc);
+    let mut native = Vec::new_in(alloc);
     for emission in emissions {
         raw.push(emission.key);
+        if let Some(output) = emission.native {
+            native.push((wire_name(&unit, &output.grant, alloc).0, emission.key, output.content));
+        }
         if let Some(kind) = emission.backend {
             match kinds.insert(emission.key, kind) {
                 Some(previous) if previous != kind => return Err(BatchError::ConflictingEmission { unit, key: emission.key }),
@@ -51,6 +55,7 @@ pub(super) fn backend(fields: &mut Fields, unit: Digest, emissions: &[Emission],
         ("compiled_keys", json(&raw, alloc)),
         ("release_keys", json(&release, alloc)),
         ("folded_keys", json(&folded, alloc)),
+        ("native_outputs", json(&native, alloc)),
     ]);
     Ok(())
 }
@@ -76,13 +81,16 @@ mod tests {
         };
         let mut fields = issued(&unit, &plan, &[1], 31, alloc).unwrap();
         let work = vec_in![alloc; wire_name(&unit.spec, &[3; 32], alloc).0, [4; 32]];
-        assert_ne!(work[0], unit.names[1]);
-        let actual = |key, kind| Emission { key: [key; 32], backend: kind };
+        assert_eq!(json(&work[0], alloc).as_str(), "\"96f7df1cb0f7249afc2e67903fac12e9b9156571d2b685c84e1472411a58c4bb\"");
+        let actual = |key, kind| Emission { key: [key; 32], backend: kind, native: None };
+        let native = Emission { native: Some(super::super::NativeEmission { grant: [3; 32], content: [14; 32] }),
+            ..actual(13, Some(BackendKind::FoldedOutput)) };
         backend(&mut fields, unit.spec, &[
             actual(11, None), actual(12, Some(BackendKind::ReleaseBlob)),
-            actual(13, Some(BackendKind::FoldedOutput)), actual(12, Some(BackendKind::ReleaseBlob)),
+            native, actual(12, Some(BackendKind::ReleaseBlob)),
         ], alloc).unwrap();
         let digest = json(&unit.spec, alloc);
+        let typed = json(&vec_in![alloc; (work[0], [13u8; 32], [14u8; 32])], alloc);
         let work = json(&work, alloc);
         let raw = json(&vec_in![alloc; [11u8; 32], [12; 32], [13; 32], [12; 32]], alloc);
         let release = json(&vec_in![alloc; [12u8; 32]], alloc);
@@ -91,6 +99,7 @@ mod tests {
             ("pid", "31"), ("unit_digest", digest.as_str()), ("execution", "7"), ("attempt", "2"),
             ("holder", "\"helper\""), ("generation", "5"), ("seq", "8"), ("work", work.as_str()),
             ("compiled_keys", raw.as_str()), ("release_keys", release.as_str()), ("folded_keys", folded.as_str()),
+            ("native_outputs", typed.as_str()),
         ];
         assert!(fields.iter().map(|(k, v)| (*k, v.as_str())).eq(expected));
 

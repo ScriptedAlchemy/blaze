@@ -639,6 +639,15 @@ jobs:
       - uses: ./.github/actions/script
         with:
           job: production-acceptance
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu
+          enable-cache: false
+      - name: install locked Python dependencies for the distributed oracle
+        run: |
+          timeout 180 uv sync --frozen --no-dev
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: user namespaces for source test sandboxes
         run: |
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then

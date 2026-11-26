@@ -130,6 +130,7 @@ crates/blaze-keyed/src/kind.rs	LAYOUT	none
 crates/blaze-keyed/src/kind.rs	VERSION	none
 crates/blaze-keyed/src/store.rs	FORMAT	none
 crates/blaze-keyed/src/store.rs	MAGIC	none
+crates/blaze-ladder/src/backend_plan/execute.rs	RECEIPT_MAGIC	none
 crates/blaze-ladder/src/code_records.rs	ENTRY_MAGIC	none
 crates/blaze-ladder/src/front2/adt_facts.rs	ADT_FACTS_VERSION	none
 crates/blaze-ladder/src/front2/buckets/records.rs	FRAMED_MAGIC	none

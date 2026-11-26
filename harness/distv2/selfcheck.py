@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from blake3 import blake3
+
 HARNESS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARNESS))
 from distv2 import evidence as e
@@ -35,6 +37,14 @@ def row(**extra):
 def grant(**extra):
     return {"event": "grant", "pid": 123, "unit_digest": UNIT, "execution": 7, "attempt": 2,
             "holder": "a", "generation": 3, "seq": 4, "work": [KEY, OTHER], **extra}
+
+
+def write_pack(blobs, values):
+    raw = b"blzdpk\0\x01" + b"".join(bytes.fromhex(key) + bytes((kind,))
+        + len(value).to_bytes(8, "little") + value for key, kind, value in values)
+    name = hashlib.sha256(raw).hexdigest()
+    (blobs / "packs" / f"{name}.pack").write_bytes(raw)
+    return name, len(raw)
 
 
 def fixture_cbor(value):
@@ -296,11 +306,7 @@ class Oracles(unittest.TestCase):
             (blobs / "manifests").mkdir()
 
             def pack(values):
-                raw = b"blzdpk\0\x01" + b"".join(bytes.fromhex(key) + bytes((kind,))
-                    + len(value).to_bytes(8, "little") + value for key, kind, value in values)
-                name = hashlib.sha256(raw).hexdigest()
-                (blobs / "packs" / f"{name}.pack").write_bytes(raw)
-                return name, len(raw)
+                return write_pack(blobs, values)
 
             a = (KEY, 1, b"x")
             b = (OTHER, 2, b"y")
@@ -522,21 +528,62 @@ class Oracles(unittest.TestCase):
 
 
 class ReleaseFoldEvidence(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.blobs = Path(directory.name)
+        (self.blobs / "packs").mkdir()
+        (self.blobs / "manifests").mkdir()
+        self.values = {}
+        self.events = []
+        self.rows = []
+        # All these distinct templates genuinely share the same minimal 'ret' machine record.
+        machine = b"bzcode07" + bytes(4) + bytes((4, 3, 0, 0, 4)) + bytes(47) + bytes.fromhex("c0035fd6") + bytes(4)
+        content_domain = "blaze-ladder code entry content 1"
+        content = blake3(machine, derive_key_context=content_domain).digest()
+        self.values[content.hex()] = (0, machine)
+
+        def wire(recipe):
+            cbor = fixture_cbor([0, {0: bytes.fromhex(UNIT), 1: recipe, 2: bytes(32)}])
+            return hashlib.sha256(b"blaze/WorkName/v5\0" + cbor).hexdigest()
+
+        for pid in (123, 124):
+            def item(n):
+                return bytes((pid, n)) * 16
+            body = item(3)
+            members = [(item(4), item(5)), (item(6), item(7))]
+            group = blake3(body + (2).to_bytes(8, "little") + b"".join(s + r for s, r in members),
+                           derive_key_context="blaze-ladder folded grant 1").digest()
+            release, fold = wire(item(1)), wire(group)
+            native = []
+            for work, role, recipe, symbol in [(release, 1, item(1), item(2)), (fold, 2, body, body),
+                                                *((fold, 3, r, s) for s, r in members)]:
+                receipt = b"bznout01" + bytes((role,)) + recipe + symbol + content
+                key = blake3(receipt, derive_key_context=content_domain).digest()
+                self.values[key.hex()] = (0, receipt)
+                binding = blake3(recipe, derive_key_context="blaze-ladder backend output binding 2").hexdigest()
+                self.values[binding] = (0, key)
+                native.append([work, key.hex(), content.hex()])
+            g = grant(pid=pid, holder=str(pid), seq=pid, work=[release, fold])
+            made = [key for _, key, _ in native]
+            self.events.extend([g, {**g, "event": "result_accepted"}, {**g, "event": "backend_work",
+                "compiled_keys": made, "release_keys": made[:1], "folded_keys": made[1:], "native_outputs": native}])
+            self.rows.append(row(compiled_for_work=len(made), work_compiled_keys=made))
+        self.publish(self.values)
+
+    def publish(self, values):
+        pack, size = write_pack(self.blobs, [(k, *values[k]) for k in sorted(values)])
+        (self.blobs / "manifests" / UNIT).write_text(f"{pack} {size} {e.pack_keys_digest(set(values))}\n")
+
     def test_actual_kinds_need_two_accepted_holders(self):
-        grants = [grant(pid=pid, holder=str(pid), seq=pid, work=[key])
-                  for pid, key in ((123, KEY), (124, OTHER))]
-        events = [*grants, *[{**g, "event": "result_accepted"} for g in grants]]
-        outputs = []
-        for g, folded in zip(grants, ("44" * 32, "55" * 32), strict=True):
-            made = [*g["work"], folded]
-            events.append({**g, "event": "backend_work", "compiled_keys": made,
-                           "release_keys": g["work"], "folded_keys": [folded]})
-            outputs.extend(made)
-        rows = [row(compiled_for_work=len(outputs), work_compiled_keys=outputs)]
-        e.release_fold(rows, events)
+        # Shared with the native grant_events test, which obtains this name via WorkName::of.
+        self.assertEqual(e.wire_work("01" * 32, bytes((3,)) * 32),
+                         "96f7df1cb0f7249afc2e67903fac12e9b9156571d2b685c84e1472411a58c4bb")
+        e.release_fold(self.blobs, self.rows, self.events)
         for plant in ("one_holder", "no_accept", "planned_only", "unreported", "same_key",
-                      "wrong_execution", "expired_lease", "other_batch", "different_result"):
-            changed = json.loads(json.dumps(events))
+                      "wrong_execution", "expired_lease", "other_batch", "different_result",
+                      "swapped_grants", "missing_receipt", "duplicate_credit", "wrong_content", "incomplete_fold"):
+            changed = json.loads(json.dumps(self.events))
             if plant == "one_holder":
                 changed = [event for event in changed if event.get("pid") != 124 and event.get("holder") != "124"]
             elif plant == "no_accept":
@@ -549,10 +596,49 @@ class ReleaseFoldEvidence(unittest.TestCase):
                 changed[-1]["folded_keys"] = changed[-1]["release_keys"]
             elif plant == "different_result":
                 next(ev for ev in changed if ev["event"] == "result_accepted")["work"] = []
+            elif plant == "swapped_grants":
+                outputs = changed[-1]["native_outputs"]
+                outputs[0][0], outputs[1][0] = outputs[1][0], outputs[0][0]
+            elif plant == "missing_receipt":
+                changed[-1]["native_outputs"].pop()
+            elif plant == "duplicate_credit":
+                changed.append(changed[-1])
+            elif plant == "wrong_content":
+                changed[-1]["native_outputs"][0][2] = KEY
+            elif plant == "incomplete_fold":
+                for field in ("native_outputs", "folded_keys", "compiled_keys"):
+                    changed[-1][field].pop()
             else:
                 changed[-1][{"wrong_execution": "execution", "expired_lease": "generation", "other_batch": "seq"}[plant]] += 1
             with self.subTest(plant=plant), self.assertRaises(e.Failed):
-                e.release_fold(rows, changed)
+                e.release_fold(self.blobs, self.rows, changed)
+
+    def test_rehashes_accepted_receipt_binding_and_machine_bytes(self):
+        _, receipt, content = self.events[-1]["native_outputs"][0]
+        raw = self.values[receipt][1]
+        binding = blake3(raw[9:41], derive_key_context="blaze-ladder backend output binding 2").hexdigest()
+        for key, replaced in ((receipt, None), (receipt, (2, raw)), (receipt, (0, raw[:8] + b"\x03" + raw[9:])),
+                              (binding, (0, bytes.fromhex(content))), (content, (0, self.values[content][1][:-1] + b"x"))):
+            values = self.values.copy()
+            if replaced is None:
+                del values[key]
+            else:
+                values[key] = replaced
+            self.publish(values)
+            with self.subTest(key=key), self.assertRaises(e.Failed):
+                e.release_fold(self.blobs, self.rows, self.events)
+
+    def test_portable_fold_uses_stored_family_role_function_and_issued_work(self):
+        header = bytes.fromhex(KEY) + b"\x01" + (17).to_bytes(4, "little")
+        key = hashlib.sha256(b"blaze portable wasm body 1\0" + header).hexdigest()
+        value = b"BWF1" + header + b"\x00\x0b"
+        work = e.wire_work(UNIT, bytes.fromhex(key))
+        event = grant(compiled_keys=[key], native_outputs=[], work=[work])
+        self.assertEqual(e.backend_outputs(event, {key: (2, value)})["folded_keys"], {key})
+        for changed, record in (({**event, "work": [KEY]}, value), (event, value[:41]),
+                                (event, value[:36] + b"\x02" + value[37:])):
+            with self.assertRaises(e.Failed):
+                e.backend_outputs(changed, {key: (2, record)})
 
 if __name__ == "__main__":
     unittest.main()

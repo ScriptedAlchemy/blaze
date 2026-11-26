@@ -104,7 +104,8 @@ impl Preparation for Prepare {
             }
         };
         let unit_name = blaze_own::format_in!(wire_alloc, "wasm:{}", module.name);
-        append_report_row(self.dist.report.as_ref().map(|path| path.as_str()), unit_name.as_str(), &unit, &arrived, 0, 0, work.len(), &[], wire_alloc);
+        append_report_row(self.dist.report.as_ref().map(|path| path.as_str()), unit_name.as_str(), &unit, &arrived, 0, 0, work.len(), &[], wire_alloc)
+            .map_err(|error| PreparationError::Distributed { detail: blaze_own::format_in!(alloc, "{error}") })?;
         Ok(assembled)
     }
 }

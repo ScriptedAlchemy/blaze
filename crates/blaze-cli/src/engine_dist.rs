@@ -100,6 +100,8 @@ pub(crate) enum DistError {
     Claimant { shown: AString<'static> },
     /// Reading the distributed export sidecar or the executable it identifies failed.
     Fingerprint { path: WireString, errno: blaze_sys::Errno },
+    /// A requested per-unit execution report could not be appended.
+    Report { path: WireString, error: blaze_dist_local::sys::IoError },
     /// A distributed unit failed and `LocalPolicy` (or corruption/compile refusal) stopped the build.
     UnitFailed { unit: AString<'static>, shown: AString<'static> },
     /// Local compilation inside a distributed unit failed.
@@ -139,6 +141,7 @@ impl fmt::Display for DistError {
                 write!(f, "the distributed build failed: naming this agent: {}", shown.as_str())
             }
             DistError::Fingerprint { path, errno } => write!(f, "checking the distributed export fingerprint at {}: {errno}", bstd::report::Code(path.as_str())),
+            DistError::Report { path, error } => write!(f, "appending the distributed unit report to {}: {error}", bstd::report::Code(path.as_str())),
             DistError::UnitFailed { unit, shown } => {
                 write!(
                     f,
@@ -657,8 +660,8 @@ pub(crate) fn append_report_row(
     instances: usize,
     tail_compiled_keys: &[Digest],
     alloc: WireAlloc,
-) {
-    let Some(path) = report_path else { return };
+) -> Result<(), DistError> {
+    let Some(path) = report_path else { return Ok(()) };
     let source = match arrived.source {
         Source::Published => "published",
         Source::Executed => "executed",
@@ -690,7 +693,7 @@ pub(crate) fn append_report_row(
         work_keys.as_str(),
         tail_keys.as_str(),
     );
-    let _ = append_file(path, line.as_bytes());
+    append_file(path, line.as_bytes()).map_err(|error| DistError::Report { path: wire_str(path, alloc), error })
 }
 
 /// Result of running the distributed export pass across all workspace crate units.
@@ -786,7 +789,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                     };
                     let written = Written::check(item.key, pointed, content).map_err(DistError::Store)?;
                     compiled += 1;
-                    emissions.push(Emission { key: written.content().0.0, backend: None });
+                    emissions.push(Emission { key: written.content().0.0, backend: None, native: None });
                 }
                 Stepped::Unkeyed(why) => {
                     let mut shown = String::new_in(self.heap.alloc());
@@ -996,7 +999,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             tail_instances,
             tail_keys.as_slice(),
             wire_alloc,
-        );
+        )?;
     }
 
     Ok((DistExportOutcome::Completed { compiled: total_compiled, cached: total_cached }, fp))

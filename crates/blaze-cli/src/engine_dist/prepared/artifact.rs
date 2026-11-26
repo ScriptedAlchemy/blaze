@@ -38,7 +38,7 @@ impl<'a> Artifact<'a> {
             let mut outputs = Vec::new_in(alloc);
             task.outputs(|output, recipe| outputs.push((output, recipe)));
             for (output, recipe) in outputs {
-                let (content, view) =
+                let held =
                     execute::read::<core::convert::Infallible>(store, output, recipe)
                         .map_err(|why| {
                             refused(
@@ -58,8 +58,8 @@ impl<'a> Artifact<'a> {
                         format_args!("two native definitions of {}", output.symbol),
                     ));
                 }
-                has_tls |= crate::engine_export::code_touches_tls(&view, getter, descriptor);
-                functions.push((output.symbol, content));
+                has_tls |= crate::engine_export::code_touches_tls(&held.record, getter, descriptor);
+                functions.push((output.symbol, held.content));
             }
         }
         let mut targets = BTreeMap::new_in(alloc);

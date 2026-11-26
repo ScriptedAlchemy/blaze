@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import struct
 
 
 class Failed(Exception):
@@ -315,9 +316,86 @@ def gate_answer(gate: Path, grant: dict, *, refused: bool) -> bool:
     return True
 
 
-def release_fold(rows: list[dict], events: list[dict]) -> None:
-    """Planned kinds count only when joined to raw emissions and accepted real grants."""
+def wire_work(unit: str, stable: bytes) -> str:
+    """Wire v5 WorkKey::Item with the fixed unit, stable recipe and empty environment."""
+    cbor = b"\x82\x00\xa3\x00\x58\x20" + bytes.fromhex(unit) + b"\x01\x58\x20" + stable + b"\x02\x58\x20" + bytes(32)
+    return hashlib.sha256(b"blaze/WorkName/v5\0" + cbor).hexdigest()
+
+
+def machine_record(raw: bytes) -> bool:
+    """Check the bzcode07 header and section extents used by CodeView::read."""
+    if (len(raw) < 64 or raw[:8] != b"bzcode07" or raw[14:16] != bytes(2)
+            or raw[60:64] != bytes(4) or not 4 <= raw[12] <= 12 or not 3 <= raw[13] <= 12):
+        return False
+    code, relro, targets, sites, words, pads, names, text, traps, subjects, positions = struct.unpack_from("<11I", raw, 16)
+    padded = sum((size + 7) & ~7 for size in (code, relro, text))
+    size = 64 + padded + 40 * (targets + names) + 16 * (sites + words + pads) + 32 * (traps + positions) + 88 * subjects
+    return code > 0 and size == len(raw)
+
+
+def backend_outputs(event: dict, values: dict[str, tuple[int, bytes]]) -> dict[str, set[str]]:
+    """Recover the emitting grant and role independently from its accepted stored values."""
+    from blake3 import blake3
+
+    unit = event["unit_digest"]
+    work = set(event["work"])
+    actual = set(event["compiled_keys"])
+    require(len(actual) == len(event["compiled_keys"]) and actual <= values.keys(), "duplicate or unpublished backend output")
+    native = event.get("native_outputs")
+    require(isinstance(native, list), "backend_work needs native output receipts")
+    content_domain = "blaze-ladder code entry content 1"
+    receipts: set[str] = set()
+    groups: dict[str, list[tuple[int, bytes, bytes]]] = {}
+    roles: dict[str, set[str]] = {"release_keys": set(), "folded_keys": set()}
+    for triple in native:
+        require(isinstance(triple, list) and len(triple) == 3 and all(digest(key) for key in triple),
+                "native output must name the work, receipt and machine content")
+        issued, key, content = triple
+        require(issued in work and key in actual and key not in receipts, "native receipt repeated or outside emitted grant")
+        receipts.add(key)
+        kind, written = values[key]
+        require(kind == 0 and len(written) == 105 and written[:8] == b"bznout01"
+                and blake3(written, derive_key_context=content_domain).hexdigest() == key, f"invalid native receipt {key}")
+        role, recipe, symbol = written[8], written[9:41], written[41:73]
+        binding = blake3(recipe, derive_key_context="blaze-ladder backend output binding 2").hexdigest()
+        require(values.get(binding) == (0, bytes.fromhex(key)), f"native recipe does not bind receipt {key}")
+        require(content == written[73:].hex() and content in values, f"receipt {key} lacks its named machine output")
+        kind, record = values[content]
+        require(kind == 0 and machine_record(record) and blake3(record, derive_key_context=content_domain).hexdigest() == content,
+                f"receipt {key} has invalid machine content {content}")
+        require(role in (0, 1, 2, 3), f"unknown native receipt role {role}")
+        groups.setdefault(issued, []).append((role, recipe, symbol))
+        if role:
+            roles["release_keys" if role == 1 else "folded_keys"].add(key)
+    for issued, outputs in groups.items():
+        if len(outputs) == 1 and outputs[0][0] in (0, 1):
+            stable = outputs[0][1]
+        else:
+            bodies = [recipe for role, recipe, symbol in outputs if role == 2 and recipe == symbol]
+            members = sorted((symbol, recipe) for role, recipe, symbol in outputs if role == 3)
+            require(len(bodies) == 1 and len(members) >= 2 and len(members) + 1 == len(outputs)
+                    and len({symbol for _, _, symbol in outputs}) == len(outputs)
+                    and len({recipe for _, recipe, _ in outputs}) == len(outputs), f"incomplete native fold {issued}")
+            rows = b"".join(symbol + recipe for symbol, recipe in members)
+            stable = blake3(bodies[0] + len(members).to_bytes(8, "little") + rows,
+                            derive_key_context="blaze-ladder folded grant 1").digest()
+        require(wire_work(unit, stable) == issued, f"receipt outputs belong to a different grant than {issued}")
+    for key in actual - receipts:
+        kind, record = values[key]
+        require(not (kind == 0 and record.startswith(b"bznout01")), f"missing native receipt evidence for {key}")
+        if kind == 2:
+            require(len(record) > 41 and record[:4] == b"BWF1" and record[36] in (0, 1)
+                    and hashlib.sha256(b"blaze portable wasm body 1\0" + record[4:41]).hexdigest() == key
+                    and wire_work(unit, bytes.fromhex(key)) in work, f"invalid portable folded output {key}")
+            roles["folded_keys"].add(key)
+    return roles
+
+
+def release_fold(blobs: Path, rows: list[dict], events: list[dict]) -> None:
+    """Verify backend output records against the grants and the accepted full manifests."""
     holders: dict[str, dict[tuple, set[int]]] = {"release_keys": {}, "folded_keys": {}}
+    records = {}
+    credited: dict[tuple, set[str]] = {}
     emitted = [event for event in events if event.get("event") == "backend_work"]
     require(bool(emitted), "release/fold acceptance needs backend_work emission evidence")
     validate_events(events)
@@ -331,21 +409,25 @@ def release_fold(rows: list[dict], events: list[dict]) -> None:
                     and (lease(grant), frozenset(grant["work"])) in accepted_work]
         if not matching:
             continue  # A failed/stale attempt cannot supply successful emission evidence.
-        for grant in matching:
-            reports = [row for row in rows if row["unit_digest"] == grant["unit_digest"]
-                       and row["execution"] == grant["execution"] and row["attempt"] == grant["attempt"]]
-            reported = {key for row in reports for key in row["work_compiled_keys"]}
-            require(set(actual) <= reported, "backend emission was absent from final work reports")
-            identity = (grant["unit_digest"], grant["execution"], grant["attempt"])
-            classified = set()
-            for kind in holders:
-                keys = event.get(kind)
-                require(isinstance(keys, list) and all(digest(key) for key in keys), f"backend_work needs {kind}")
-                require(set(keys) <= set(actual), f"{kind} includes an uncompiled planned key")
-                require(classified.isdisjoint(keys), "release blobs and folded outputs use distinct store keys")
-                classified.update(keys)
-                if keys:
-                    holders[kind].setdefault(identity, set()).add(grant["pid"])
+        unit = event["unit_digest"]
+        identity = (unit, event["execution"], event["attempt"])
+        reports = [row for row in rows if (row["unit_digest"], row["execution"], row["attempt"]) == identity]
+        reported = {key for row in reports for key in row["work_compiled_keys"]}
+        require(set(actual) <= reported, "backend emission was absent from final work reports")
+        seen = credited.setdefault(identity, set())
+        require(seen.isdisjoint(actual), "a backend output was credited twice")
+        seen.update(actual)
+        if unit not in records:
+            packs, _ = manifest(blobs, unit)
+            records[unit] = logical_outputs(blobs, packs)
+        roles = backend_outputs(event, records[unit])
+        for kind in holders:
+            keys = event.get(kind)
+            require(isinstance(keys, list) and all(digest(key) for key in keys)
+                    and len(keys) == len(roles[kind]) and set(keys) == roles[kind],
+                    f"{kind} disagrees with the accepted output roles")
+            if keys:
+                holders[kind].setdefault(identity, set()).add(event["pid"])
     for kind, units in holders.items():
         require(any(len(pids) >= 2 for pids in units.values()),
                 f"two real holders must emit {kind} in one successful unit/execution/attempt")

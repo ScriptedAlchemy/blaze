@@ -57,7 +57,7 @@ impl Emit for Renderer {
         rows.push(emitted(body, u8::from(matches!(self.change, Change::DifferentBytes)), alloc));
         for member in &group.members {
             let output = Output { symbol: member.function.symbol, kind: OutputKind::Thunk };
-            rows.push(emitted(output, output.symbol.0[0], alloc));
+            rows.push(emitted(output, 0, alloc));
         }
         match self.change {
             Change::Missing => {
@@ -93,11 +93,12 @@ fn partial_fold_needs_every_real_record_and_an_immutable_result() {
     let mut complete = MemoryStore::new_in(alloc);
     let cold = task.compile(&mut backend, &mut complete, alloc).unwrap();
     assert_eq!(cold.len(), 3);
+    assert_eq!(complete.len(), 7, "three recipes and receipts share one machine record");
     for row in &cold {
         assert_eq!(row.source, Source::Emitted);
-        let (content, view) = read::<()>(&complete, row.output, row.recipe).unwrap().unwrap();
-        assert_eq!(content, row.content);
-        assert_eq!(view.code().len(), 8);
+        let held = read::<()>(&complete, row.output, row.recipe).unwrap().unwrap();
+        assert_eq!((held.receipt, held.content), (row.receipt, row.content));
+        assert_eq!(held.record.code().len(), 8);
     }
     let warm = task.compile(&mut backend, &mut complete, alloc).unwrap();
     assert!(warm.iter().all(|row| row.source == Source::Store));
@@ -112,7 +113,7 @@ fn partial_fold_needs_every_real_record_and_an_immutable_result() {
     ] {
         let mut partial = MemoryStore::new_in(alloc);
         let old = cold.iter().find(|row| row.recipe == body).unwrap();
-        for key in [old.content, binding(body)] {
+        for key in [old.content, old.receipt, binding(body)] {
             partial.put(CodeClass::Program, key, complete.get(key).unwrap().unwrap()).unwrap();
         }
         backend.change = change;
@@ -123,7 +124,7 @@ fn partial_fold_needs_every_real_record_and_an_immutable_result() {
             Change::None => assert_eq!(result.unwrap(), cold),
             _ => {
                 assert!(result.is_err());
-                assert_eq!(partial.len(), 2);
+                assert_eq!(partial.len(), 3);
             }
         }
     }

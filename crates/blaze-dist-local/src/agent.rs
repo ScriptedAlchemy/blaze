@@ -139,6 +139,17 @@ pub struct Emission {
     pub key: Digest,
     /// The compiler backend that produced this value, when it was a code output.
     pub backend: Option<BackendKind>,
+    /// For a native output, its issuing grant and the machine record its receipt names.
+    pub native: Option<NativeEmission>,
+}
+
+/// The two identities a native output receipt binds apart from its own store key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeEmission {
+    /// The compiler's canonical grant name inside the unit.
+    pub grant: Digest,
+    /// The content key of the machine record produced during this emission.
+    pub content: Digest,
 }
 
 /// The compiler operation that produced a distributed code output.

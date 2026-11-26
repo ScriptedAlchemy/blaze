@@ -233,7 +233,7 @@ impl Granted for Compiler {
         let mut emissions = Vec::with_capacity_in(names.len(), alloc);
         for at in names {
             values.push(value_of(&self.names[*at], alloc));
-            emissions.push(Emission { key: self.names[*at], backend: None });
+            emissions.push(Emission { key: self.names[*at], backend: None, native: None });
         }
         Ok(Grant {
             values,
@@ -555,7 +555,7 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
             }
             let mut emissions = Vec::with_capacity_in(names.len(), alloc);
             for at in names {
-                emissions.push(Emission { key: self.0[*at], backend: None });
+                emissions.push(Emission { key: self.0[*at], backend: None, native: None });
             }
             Ok(Grant {
                 values,
@@ -676,7 +676,7 @@ impl Granted for Holding {
         let mut emissions = Vec::with_capacity_in(names.len(), alloc);
         for at in names {
             values.push(value_of(&self.names[*at], alloc));
-            emissions.push(Emission { key: self.names[*at], backend: None });
+            emissions.push(Emission { key: self.names[*at], backend: None, native: None });
         }
         Ok(Grant {
             values,
