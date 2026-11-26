@@ -99,15 +99,11 @@ class RealSmokeTests(unittest.TestCase):
         )
         rows: list[tuple[str, dict[str, str]]] = []
 
-        def ran(command: rs.Command, proof: rs.Proof) -> rs.Ran:
+        def ran(command: rs.Command, proof: rs.Proof) -> rs.ran.Ran:
             rows.append((command.args[3], command.env))
             return rs.ran.Ran(1.0, 0, proof.stdout, "")
 
-        with (
-            builder,
-            patch.object(rs.ran, "run", side_effect=ran),
-            patch.object(rs.subprocess, "run", wraps=None) if False else contextlib.nullcontext(),
-        ):
+        with builder, patch.object(rs.ran, "run", side_effect=ran):
             self.invoke(code=0)
         self.assertEqual([("build_scripts" in it) for it in requests], [False, True])
         for request in requests:

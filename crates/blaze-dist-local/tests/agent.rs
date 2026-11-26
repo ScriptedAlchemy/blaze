@@ -90,14 +90,6 @@ fn world_with(namespaces: &[Namespace], work: WorkConfig, carrier: CarrierConfig
     let serve = blaze_serve::Server::bind(serve_config, alloc).unwrap();
     let address = serve.local_addr();
     let serve_stop = serve.shutdown_handle().unwrap();
-    let serve_thread = spawn(
-        move || {
-            let _ = serve.run();
-        },
-        alloc,
-    )
-    .unwrap();
-
     let mut admission = Admission::new(AdmissionConfig::default(), alloc);
     let executors = u32::try_from(namespaces.len()).unwrap();
     let capacity = Reservation {
@@ -106,9 +98,10 @@ fn world_with(namespaces: &[Namespace], work: WorkConfig, carrier: CarrierConfig
         disk: u64::from(executors),
     };
     admission.add_machine("machine", agent::platform(TRIPLE), capacity.clone());
+    let mut slots = Vec::with_capacity_in(namespaces.len(), alloc);
     for (at, namespace) in namespaces.iter().enumerate() {
-        let executor = match namespace {
-            Namespace::Main => admission.add_builder(0, "machine", NEED, alloc).unwrap(),
+        slots.push(match namespace {
+            Namespace::Main => (admission.add_builder(0, "machine", NEED, alloc).unwrap(), None),
             Namespace::Pr(_) => {
                 // A PR slot is created by real admission and kept idle after its setup job.
                 // Reserving every slot for Main would leave this namespace waiting forever.
@@ -128,10 +121,16 @@ fn world_with(namespaces: &[Namespace], work: WorkConfig, carrier: CarrierConfig
                 assert!(admitted.created);
                 assert_eq!(admitted.execution, execution);
                 assert_eq!(&admitted.namespace, namespace);
-                admission.finished(0, &admitted.executor, execution, Attempt(1));
-                admitted.executor
+                // Keep this slot occupied until every requested slot exists. Admission
+                // otherwise reuses it for the next job in the same PR namespace.
+                (admitted.executor, Some(execution))
             }
-        };
+        });
+    }
+    for ((executor, setup), namespace) in slots.into_iter().zip(namespaces) {
+        if let Some(execution) = setup {
+            admission.finished(0, &executor, execution, Attempt(1));
+        }
         let slot = admission.executor(&executor).unwrap();
         assert_eq!(&slot.namespace, namespace);
         assert_eq!(slot.phase, ExecutorPhase::Ready);
@@ -157,17 +156,19 @@ fn world_with(namespaces: &[Namespace], work: WorkConfig, carrier: CarrierConfig
     .unwrap();
     let stop = Arc::new_in(AtomicBool::new(false), alloc);
     let signal = stop.clone();
-    let coord_thread = spawn(move || server.run(&signal).unwrap(), alloc).unwrap();
-    World {
+    let mut world = World {
         socket,
         blobs: Blobs { address, timeout: Duration::from_secs(30), alloc },
         stop,
         serve_stop,
-        coord_thread: Some(coord_thread),
-        serve_thread: Some(serve_thread),
+        coord_thread: None,
+        serve_thread: None,
         dir,
         alloc,
-    }
+    };
+    world.serve_thread = Some(spawn(move || serve.run().unwrap(), alloc).unwrap());
+    world.coord_thread = Some(spawn(move || server.run(&signal).unwrap(), alloc).unwrap());
+    world
 }
 
 fn config(socket: &str, blobs: &Blobs) -> agent::Config {
