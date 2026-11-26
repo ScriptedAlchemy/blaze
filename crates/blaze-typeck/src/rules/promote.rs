@@ -103,7 +103,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         }
                     }
                     _ => {
-                        if let Some(AdjustKind::Borrow { mutbl, raw: false, .. }) = first_adjust[x.ix()]
+                        if let Some(AdjustKind::Borrow { mutbl, raw: false, .. }) = first_adjust.get(x.ix()).copied().flatten()
                             && let Some(&ty) = self.expr_ty.get(x.ix())
                         {
                             let promote = match mutbl {

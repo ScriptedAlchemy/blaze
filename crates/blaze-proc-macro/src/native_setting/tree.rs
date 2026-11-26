@@ -118,24 +118,23 @@ mod tests {
 
     #[test]
     fn every_input_and_negative_lookup_changes_the_tree_identity() {
-        let root = std::env::temp_dir().join(format!("blaze-native-tree-{}", std::process::id()));
-        fs::create_dir(&root).expect("fresh test tree");
+        let alloc = blaze_own::testing::heap().alloc();
+        let root = blaze_core::temp::TempDir::for_test("blaze-native-tree-");
         fs::create_dir(root.join("include")).expect("include directory");
         let header = root.join("include/a.h");
         fs::write(&header, b"#define VALUE 1\n").expect("header");
-        let before = digest(&root, Alloc::global()).expect("verified tree");
+        let before = digest(root.path(), alloc).expect("verified tree");
         assert_eq!(before, [134, 21, 158, 12, 123, 72, 6, 120, 74, 106, 40, 222, 228, 178, 250, 181, 64, 206, 31, 108, 178, 220, 61, 198, 196, 55, 120, 92, 79, 100, 75, 25], "installer/runtime v1 encoding vector");
         fs::write(&header, b"#define VALUE 2\n").expect("changed header");
-        assert_ne!(before, digest(&root, Alloc::global()).expect("changed tree"));
+        assert_ne!(before, digest(root.path(), alloc).expect("changed tree"));
         fs::write(&header, b"#define VALUE 1\n").expect("restored header");
-        assert_eq!(before, digest(&root, Alloc::global()).expect("restored tree"));
+        assert_eq!(before, digest(root.path(), alloc).expect("restored tree"));
         fs::write(root.join("include/optional.h"), b"").expect("new optional header");
-        assert_ne!(before, digest(&root, Alloc::global()).expect("negative lookup changed"));
+        assert_ne!(before, digest(root.path(), alloc).expect("negative lookup changed"));
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("/", root.join("outside")).expect("escaping link");
-            assert!(digest(&root, Alloc::global()).is_err(), "a tree cannot grant bytes outside its identity");
+            assert!(digest(root.path(), alloc).is_err(), "a tree cannot grant bytes outside its identity");
         }
-        fs::remove_dir_all(root).expect("remove test tree");
     }
 }

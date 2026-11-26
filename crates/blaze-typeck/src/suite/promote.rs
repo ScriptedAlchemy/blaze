@@ -42,20 +42,19 @@ fn mutable_empty_array_temporary_is_promoted_but_a_local_is_not() {
         let elem = fx.ty(PNode::Uint(UintTy::U8));
         let array = fx.array(elem, 0);
         let out = fx.r(Mutbl::Mut, array);
-        let owner = fx.func("empty", 0, &[], out, Vec::new());
+        let owner = fx.func("empty", 0, &[], out, Default::default());
         fx.finish();
         let mut bb = Bb::new();
         let empty = bb.e(crate::body::Expr::Array { elems: crate::List::EMPTY });
-        let mut statements = Vec::new();
-        let operand = if local {
+        let (operand, statement) = if local {
             let binding = bb.bind("array");
-            statements.push(bb.let_(binding, None, empty));
-            bb.local(binding)
+            let statement = bb.let_(binding, None, empty);
+            (bb.local(binding), Some(statement))
         } else {
-            empty
+            (empty, None)
         };
         let borrow = bb.borrow(Mutbl::Mut, operand);
-        let root = bb.block(&statements, Some(borrow));
+        let root = bb.block(statement.as_slice(), Some(borrow));
         let checked = check_body(&fx, &bb, owner, root, Plant::None, InferPlant::None);
         if !local {
             assert!(checked.diags.is_empty(), "the promoted empty array checks clean: {:?}", checked.diags);
