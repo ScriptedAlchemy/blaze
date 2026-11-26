@@ -6,6 +6,11 @@ on:
         description: Exact compiler source commit
         type: string
         required: true
+      suite:
+        description: Validation suite to run
+        type: choice
+        options: [all, protocol]
+        default: all
 permissions:
   contents: read
 defaults:
@@ -54,8 +59,10 @@ jobs:
           sha256sum "$CARGO_TARGET_DIR"/release/{blaze,blaze-launcher,blaze-fact-shim} > "$evidence/binaries.txt"
           timeout -k 10 90 cp -a "$HOME/.blaze/v2/toolchain" "$RUNNER_TEMP/protocol-shelf"
       - name: Install the pinned C toolchain for the native-archive fixture
+        if: ${{ inputs.suite == 'all' }}
         uses: ./.github/actions/linux-c-shelf
       - name: Run every retained compiler migration fixture
+        if: ${{ inputs.suite == 'all' }}
         run: |
           scratch="$RUNNER_TEMP/blaze-fs/selected-module-forkfixes"
           # shellcheck disable=SC2016
@@ -77,8 +84,31 @@ jobs:
           timeout -k 30 3500 python3 harness/v2/exec_observer.py "$evidence/exec-input.json" || status=$?
           timeout 30 sha256sum --check "$evidence/binaries.txt"
           exit "$status"
+      - name: Preserve the protocol observer result
+        if: ${{ !cancelled() && inputs.suite == 'protocol' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: protocol-observer-evidence
+          path: |
+            ${{ runner.temp }}/selection-evidence/exec
+            ${{ runner.temp }}/selection-evidence/source.txt
+            ${{ runner.temp }}/selection-evidence/binaries.txt
+          if-no-files-found: warn
+      - name: Run the flow and AArch64 assembly regressions
+        if: ${{ !cancelled() && steps.shelf.outcome == 'success' && inputs.suite == 'protocol' }}
+        run: |
+          evidence="$RUNNER_TEMP/selection-evidence"
+          tc="$(cat pins/toolchain)"
+          status=0
+          timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-flow-lower --lib \
+            2>&1 | tee "$evidence/flow-regressions.log" || status=1
+          timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-emit --lib asm_table_tests \
+            2>&1 | tee "$evidence/asm-regressions.log" || status=1
+          grep -Fq 'a_diverging_call_keeps_its_branch_out_of_the_join ... ok' "$evidence/flow-regressions.log" || status=1
+          grep -Fq 'rows_match_the_a64_layouts ... ok' "$evidence/asm-regressions.log" || status=1
+          exit "$status"
       - name: Verify the generated-file and search-directory receipt
-        if: ${{ !cancelled() && steps.shelf.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.shelf.outcome == 'success' && inputs.suite == 'all' }}
         run: |
           evidence="$RUNNER_TEMP/selection-evidence"
           tc="$(cat pins/toolchain)"
@@ -87,7 +117,7 @@ jobs:
             2>&1 | tee "$evidence/producer-grant.log"
           grep -Fq 'a_wasi_producer_receipt_serves_the_compiled_path_and_search_list ... ok' "$evidence/producer-grant.log"
       - name: Verify GAT bounds and associated const arguments
-        if: ${{ !cancelled() && steps.shelf.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.shelf.outcome == 'success' && inputs.suite == 'all' }}
         run: |
           evidence="$RUNNER_TEMP/selection-evidence"
           tc="$(cat pins/toolchain)"
@@ -95,7 +125,7 @@ jobs:
             bounds_through_front2 -- --exact --nocapture 2>&1 | tee "$evidence/gat-bounds.log"
           grep -Fq 'bounds_through_front2 ... ok' "$evidence/gat-bounds.log"
       - name: Run the Linux workspace regression controls
-        if: ${{ !cancelled() && steps.shelf.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.shelf.outcome == 'success' && inputs.suite == 'all' }}
         run: |
           evidence="$RUNNER_TEMP/selection-evidence"
           tc="$(cat pins/toolchain)"
