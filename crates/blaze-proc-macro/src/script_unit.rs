@@ -77,8 +77,6 @@ pub enum UnitScriptError {
     NoModule { package: String, features: Vec<String>, store: PathBuf },
     /// The module store could not answer the lookup.
     Lookup(ModuleLookupError),
-    /// The module record's bytes could not be read.
-    ReadModule { path: PathBuf, error: std::io::Error },
     /// The caller has no files for the package.
     NoFiles { package: String },
     /// The script's own failure: a load, a limit, a refusal, an exit, the records.
@@ -109,7 +107,6 @@ impl std::fmt::Display for UnitScriptError {
                 store.display()
             ),
             UnitScriptError::Lookup(error) => write!(f, "{error}"),
-            UnitScriptError::ReadModule { path, error } => write!(f, "{}: {error}", path.display()),
             UnitScriptError::NoFiles { package } => write!(f, "no files of {package} to run its build script over"),
             UnitScriptError::Script(error) => write!(f, "{error}"),
             UnitScriptError::Dependency { package, dependency, links } => write!(
@@ -152,6 +149,10 @@ pub enum ModuleLookupError {
     List { folder: PathBuf, error: std::io::Error },
     /// A record's `identity` could not be read: a record without one is not a record.
     Identity { path: PathBuf, error: std::io::Error },
+    /// A module or its producer's digest could not be read.
+    ReadModule { path: PathBuf, error: std::io::Error },
+    /// A module's bytes differ from the digest its record names.
+    Digest { path: PathBuf, expected: String, actual: String },
     /// Two records answer one ask (a toolchain or closure each, same name, version, features
     /// and runner): which is meant is not decided by the store's listing order (rules 21, 25).
     Ambiguous { first: PathBuf, second: PathBuf },
@@ -162,6 +163,8 @@ impl std::fmt::Display for ModuleLookupError {
         match self {
             ModuleLookupError::List { folder, error } => write!(f, "{}: the module store could not be listed: {error}", folder.display()),
             ModuleLookupError::Identity { path, error } => write!(f, "{}: a module record's identity could not be read: {error}", path.display()),
+            ModuleLookupError::ReadModule { path, error } => write!(f, "{}: the build-script module record could not be read: {error}", path.display()),
+            ModuleLookupError::Digest { path, expected, actual } => write!(f, "{}: the build-script module names SHA-256 {expected}, but its bytes have SHA-256 {actual}", path.display()),
             ModuleLookupError::Ambiguous { first, second } => write!(
                 f,
                 "{} and {}: two module records answer one ask (name, version, features, runner); remove the stale one",
@@ -225,7 +228,8 @@ pub fn wasm_runner_lines() -> [String; 2] {
 
 /// The record whose identity names `name`, `version`, `features` and, for `host`, `target
 /// <host>`; for `None`, one with no `target` line and this host's [`wasm_runner_lines`].
-/// Two such records are a typed refusal, never the first in the listing's order.
+/// Several checkout revisions can name the same WASI executable. They give one answer if
+/// their verified module bytes agree. Different answers are refused.
 fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
     let mut sorted = features.to_vec();
     sorted.sort_unstable();
@@ -241,11 +245,33 @@ fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host
         };
         runner_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
     });
-    let Some((first, _)) = fits.next() else { return Ok(None) };
-    match fits.next() {
-        Some((second, _)) => Err(ModuleLookupError::Ambiguous { first, second }),
-        None => Ok(Some(first)),
+    let Some((first, identity)) = fits.next() else { return Ok(None) };
+    let checkout_wasm = |identity: &str| host.is_none() && identity.lines().any(|line| line.starts_with("files "));
+    let mut first_bytes = None;
+    for (second, other) in fits {
+        if !checkout_wasm(&identity) || !checkout_wasm(&other) {
+            return Err(ModuleLookupError::Ambiguous { first, second });
+        }
+        if first_bytes.is_none() {
+            first_bytes = Some(read_verified_wasm(&first)?);
+        }
+        if first_bytes.as_deref() != Some(read_verified_wasm(&second)?.as_slice()) {
+            return Err(ModuleLookupError::Ambiguous { first, second });
+        }
     }
+    Ok(Some(first))
+}
+
+fn read_verified_wasm(record: &Path) -> Result<Vec<u8>, ModuleLookupError> {
+    let digest_path = record.join("wasm-sha256");
+    let expected = std::fs::read_to_string(&digest_path).map_err(|error| ModuleLookupError::ReadModule { path: digest_path, error })?;
+    let path = record.join("module.wasm");
+    let bytes = std::fs::read(&path).map_err(|error| ModuleLookupError::ReadModule { path: path.clone(), error })?;
+    let actual = crate::module::sha256_hex(&bytes);
+    if expected.trim() != actual {
+        return Err(ModuleLookupError::Digest { path, expected: expected.trim().to_owned(), actual });
+    }
+    Ok(bytes)
 }
 
 /// The unit build-script unit `script` serves: the library (or proc macro) whose
@@ -337,8 +363,7 @@ pub fn prepare_viewing_on<'a>(
         features: features.iter().map(|f| (*f).to_owned()).collect(),
         store: setting.store.to_owned(),
     })?;
-    let path = module.join("module.wasm");
-    let wasm = std::fs::read(&path).map_err(|error| UnitScriptError::ReadModule { path, error })?;
+    let wasm = read_verified_wasm(&module).map_err(UnitScriptError::Lookup)?;
     let loaded = runtime.load(&package, &wasm).map_err(UnitScriptError::Script)?;
     let facts = PackageFacts {
         name: unit.name.as_str(),

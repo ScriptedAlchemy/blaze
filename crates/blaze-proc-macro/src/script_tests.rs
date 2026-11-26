@@ -38,6 +38,33 @@ fn folder(name: &str) -> PathBuf {
     dir
 }
 
+#[test]
+fn checkout_script_revisions_with_identical_verified_wasm_share_one_answer() {
+    use crate::module::sha256_hex;
+    use crate::script_unit::{ModuleLookupError, module_of, wasm_runner_lines};
+
+    let store = folder("equal-module-revisions");
+    let publish = |revision: &str, bytes: &[u8]| {
+        let root = store.join("build-script/modules").join(revision);
+        std::fs::create_dir_all(&root).unwrap();
+        let [shim, recipe] = wasm_runner_lines();
+        let identity = format!("blaze build-script module 3\nname shapes\nversion 0.1.0\nfiles {revision}\nfeatures \n{shim}\n{recipe}\n");
+        std::fs::write(root.join("identity"), identity).unwrap();
+        std::fs::write(root.join("module.wasm"), bytes).unwrap();
+        std::fs::write(root.join("wasm-sha256"), sha256_hex(bytes)).unwrap();
+        root
+    };
+    let wasm = b"\0asm\x01\0\0\0";
+    let first = publish("first", wasm);
+    let second = publish("second", wasm);
+    assert_eq!(module_of(&store, "shapes", "0.1.0", &[]).unwrap(), Some(first));
+    std::fs::write(second.join("module.wasm"), b"corrupt").unwrap();
+    assert!(matches!(module_of(&store, "shapes", "0.1.0", &[]), Err(ModuleLookupError::Digest { path, .. }) if path == second.join("module.wasm")));
+    publish("second", b"\0asm\x01\0\0\0\0\x01\0");
+    assert!(matches!(module_of(&store, "shapes", "0.1.0", &[]), Err(ModuleLookupError::Ambiguous { .. })));
+    std::fs::remove_dir_all(store).unwrap();
+}
+
 fn uleb(mut value: u64, out: &mut Vec<u8>) {
     loop {
         let byte = (value & 0x7f) as u8;
