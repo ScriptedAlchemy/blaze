@@ -32,14 +32,18 @@
 //!      becomes dead at `SlotDead(slot)` unless its pointer entered a block `Param` or `Select`.
 //!    - Slots in disjoint `if/else` or `match` arms never conflict even without `SlotDead`, and
 //!      sequential temporaries bounded by `SlotDead` share stack bytes.
-//!    - Greedy placement in deterministic `(Reverse(size), Reverse(align), slot_idx)` order.
+//!    - First-fit placement in deterministic `(Reverse(size), Reverse(align), slot_idx)` order.
+//!      Each slot sorts its already placed conflicts by address and finds the first aligned gap
+//!      in one scan. Placement for a row with K prior conflicts costs O(K log K) after reading
+//!      its bitset, even when all the conflicting ranges touch.
 
 use core::alloc::Allocator;
 use core::cmp::Reverse;
+use core::ops::Range;
 
 use blaze_lir::{
     Block, Op, Scalar, Ty, Value, View,
-    func::NONE,
+    func::{NONE, SlotRec},
     op::{Layout, Word, walk},
 };
 use blaze_own::Vec;
@@ -559,6 +563,23 @@ fn for_each_bit(bits: &[u64], mut f: impl FnMut(usize)) {
     }
 }
 
+/// First aligned range of `slot.size` bytes from `base` outside the conflicting ranges.
+fn first_slot_start(base: u64, slot: SlotRec, occupied: &mut [Range<u64>]) -> u64 {
+    occupied.sort_unstable_by_key(|range| range.start);
+    let align = 1u64 << slot.align;
+    let size = u64::from(slot.size);
+    let mut start = base.next_multiple_of(align);
+    for range in occupied {
+        if start + size <= range.start {
+            break;
+        }
+        if start < range.end {
+            start = range.end.next_multiple_of(align);
+        }
+    }
+    start
+}
+
 /// Computes reverse postorder of reachable blocks (followed by any unreachable blocks).
 fn block_rpo<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Vec<u32, A> {
     let blocks = view.blocks();
@@ -917,45 +938,25 @@ pub(crate) fn pack_slots<A: Allocator + Copy>(
     //    descending align, ascending slot index).
     let mut placed_start = filled(tracked_count, 0u64, alloc);
     let mut placed_end = filled(tracked_count, 0u64, alloc);
+    let mut occupied = Vec::new_in(alloc);
     let mut max_end = base_offset;
 
     for (t, &s_u32) in tracked.iter().enumerate() {
         let s = idx(s_u32);
         let Some(&rec) = view.slots.get(s) else { continue };
-        let align = 1u64 << rec.align;
         let size = u64::from(rec.size);
-        let row = conflict.get(t * words..(t + 1) * words).unwrap_or(&[]);
-
-        let mut off = base_offset.next_multiple_of(align);
-        loop {
-            let end = off + size;
-            let mut next_off = None;
-            // Check against all earlier-placed conflicting slots (`u < t`).
-            for (wi, &word) in row.iter().enumerate() {
-                let mut mask = word;
-                while mask != 0 {
-                    let u = wi * 64 + idx(mask.trailing_zeros());
-                    mask &= mask - 1;
-                    if u >= t {
-                        break;
-                    }
-                    let u_s = placed_start.get(u).copied().unwrap_or(0);
-                    let u_e = placed_end.get(u).copied().unwrap_or(0);
-                    if off < u_e && u_s < end {
-                        let cand = u_e.next_multiple_of(align);
-                        next_off = Some(match next_off {
-                            Some(prev) if prev >= cand => prev,
-                            _ => cand,
-                        });
-                    }
-                }
+        let row_start = t * words;
+        let earlier = conflict.get(row_start..row_start + t.div_ceil(64)).unwrap_or(&[]);
+        occupied.clear();
+        for_each_bit(earlier, |u| {
+            // The last word can also name slots whose placement has yet to be decided.
+            if u < t
+                && let (Some(&start), Some(&end)) = (placed_start.get(u), placed_end.get(u))
+            {
+                occupied.push(start..end);
             }
-            match next_off {
-                Some(n_off) => off = n_off,
-                None => break,
-            }
-        }
-
+        });
+        let off = first_slot_start(base_offset, rec, &mut occupied);
         let end = off + size;
         if end >= FRAME_LIMIT {
             return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });
@@ -1043,4 +1044,37 @@ pub(crate) fn sole_switch_defaults<A: Allocator + Copy>(view: View<'_>, alloc: A
         }
     }
     switch_term
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_lir::func::SlotRec;
+    use blaze_sim::{Config, Tape};
+
+    use super::first_slot_start;
+
+    #[test]
+    fn slot_placement_finds_the_first_aligned_gap() {
+        blaze_sim::check(Config::cases(256), |tape: &Tape| {
+            let mut occupied = tape.vec(0..=12, "conflicting ranges", |tape| {
+                let align = 1u64 << tape.int_in(0..=4u8, "conflict alignment");
+                let start = tape.int_in(0..=48u64, "conflict start").next_multiple_of(align);
+                start..start + tape.int_in(1..=16u64, "conflict size")
+            });
+            let base = tape.int_in(0..=32u64, "frame base");
+            let slot = SlotRec {
+                size: tape.int_in(1..=16u32, "slot size"),
+                align: tape.int_in(0..=4u8, "slot alignment"),
+                ..SlotRec::default()
+            };
+            let align = 1u64 << slot.align;
+            let size = u64::from(slot.size);
+            // Every generated conflict ends by byte 64, so this search always has a result.
+            let first = (base..=64)
+                .filter(|start| start % align == 0)
+                .find(|&start| occupied.iter().all(|range| start + size <= range.start || range.end <= start))
+                .expect("there is an aligned start by byte 64");
+            assert_eq!(first_slot_start(base, slot, &mut occupied), first, "{occupied:?}");
+        });
+    }
 }
