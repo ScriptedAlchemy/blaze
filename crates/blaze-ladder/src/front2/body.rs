@@ -1141,13 +1141,8 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
             if !heads.trait_has_assoc(owner, name).ok_or(Why::Need(owner))? {
                 return Ok(None);
             }
-            let Some(params) = heads.assoc_const_params(owner, name) else {
-                return if heads.trait_supers(owner).is_none() {
-                    Err(Why::Need(owner))
-                } else {
-                    Err(Why::Unsupported("a generic associated type whose declared const parameters are missing", r))
-                };
-            };
+            let params = heads.assoc_const_params(owner, name)
+                .ok_or(Why::Unsupported("a generic associated type whose declared const parameters are missing", r))?;
             return Ok(params.iter().find(|(i, _)| *i == at.index).map(|&(_, ty)| ty));
         }
         let Ok((abs, texts, segs, range)) = super::types::path_texts_of(view, at.path, false) else { return Ok(None) };
