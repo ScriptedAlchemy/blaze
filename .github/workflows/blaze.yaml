@@ -1,5 +1,11 @@
 name: PR 81 macOS project and migration acceptance
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Exact compiler commit
+        type: string
+        required: true
 permissions:
   contents: read
 defaults:
@@ -14,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: f0864482689a347c8f76c67ebcd9017e6534816c
+          ref: ${{ inputs.source }}
           persist-credentials: false
       - uses: actions/setup-python@v7
         with:
