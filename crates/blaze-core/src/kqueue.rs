@@ -1744,7 +1744,7 @@ impl<S: Split, O: Opening> Driver for Kqueue<S, O> {
     }
 
     fn confined_files(&self) -> Option<crate::fs::ConfinedFiles> {
-        Some(crate::fs::ConfinedFiles::new(Arc::clone(&self.root)))
+        Some(crate::fs::ConfinedFiles::new(&self.root))
     }
 }
 
