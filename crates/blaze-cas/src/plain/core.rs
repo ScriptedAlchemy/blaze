@@ -1406,12 +1406,6 @@ struct CompactCandidates<A: Allocator> {
     newest_unleased: Option<u64>,
 }
 
-impl<A: Allocator> CompactCandidates<A> {
-    fn empty(alloc: A) -> Self {
-        Self { ids: Vec::new_in(alloc), newest_unleased: None }
-    }
-}
-
 /// Why a head is being read: at the open, or under the lock for a flip.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Ctx {
@@ -2857,6 +2851,13 @@ impl<A: Allocator + Clone> Plain<A> {
         self.broken.as_ref()
     }
 
+    fn ensure_healthy(&self) -> Result<(), StoreError> {
+        match self.broken() {
+            Some(why) => Err(why.clone()),
+            None => Ok(()),
+        }
+    }
+
     /// The generation this process reads.
     pub fn generation(&self) -> u64 {
         self.manifest.generation
@@ -2908,6 +2909,10 @@ impl<A: Allocator + Clone> Plain<A> {
     /// Allocates an empty vector in the store's allocator.
     fn alloc_vec<T>(&self) -> Vec<T, A> {
         Vec::new_in(self.alloc.clone())
+    }
+
+    fn empty_candidates(&self) -> CompactCandidates<A> {
+        CompactCandidates { ids: self.alloc_vec(), newest_unleased: None }
     }
 
     /// Allocates a `blaze_own::Vec` with capacity `cap` in the store's allocator.
@@ -3834,9 +3839,7 @@ impl<A: Allocator + Clone> Plain<A> {
     /// Stages a lease that pins the readable segments through the request's root publication.
     /// The caller commits it before reading any records from the refreshed generation.
     pub(super) fn stage_publication_pin(&mut self, now_ns: u64) -> Result<bool, StoreError> {
-        if let Some(why) = &self.broken {
-            return Err(why.clone());
-        }
+        self.ensure_healthy()?;
         if !self.ready() || self.holds_uncommitted() || !self.roots_pending.is_empty() || self.folding.is_some() {
             return Err(StoreError::Busy { phase: "starting a publication pin with pending store work" });
         }
@@ -3916,9 +3919,7 @@ impl<A: Allocator + Clone> Plain<A> {
         effects: &mut Vec<Effect, E>,
     ) -> Result<bool, StoreError> {
         const LATE_COMMIT_MAP: &str = "named by the generation this process opened, and its first commit-targeted probe came more than the grace period after the open: another process's compaction may have unlinked it since; a command maps every segment (Driven::map_all) before its first pool task";
-        if let Some(why) = &self.broken {
-            return Err(why.clone());
-        }
+        self.ensure_healthy()?;
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
         }
@@ -6221,7 +6222,7 @@ impl<A: Allocator + Clone> Plain<A> {
         // starved by a concurrent foreground commit conflicting with a segment copy slice.
         if expired && !self.fold_asked && self.plant() != Plant::MixRetiredWithCopy {
             let stats = Sliced { orphans: u32::try_from(orphans.len()).unwrap_or(u32::MAX), ..Sliced::default() };
-            let candidates = CompactCandidates::empty(self.alloc.clone());
+            let candidates = self.empty_candidates();
             self.slice_ready(None, candidates, orphans, None, stats, effects);
             return;
         }
@@ -6259,7 +6260,7 @@ impl<A: Allocator + Clone> Plain<A> {
                 self.phase = Phase::Ready;
                 return;
             }
-            let candidates = CompactCandidates::empty(self.alloc.clone());
+            let candidates = self.empty_candidates();
             self.slice_ready(None, candidates, orphans, evict, stats, effects);
             return;
         }
@@ -7185,10 +7186,11 @@ impl<A: Allocator + Clone> Plain<A> {
         if keys.peek().is_none() {
             return;
         }
-        let satisfied = self.satisfied_in_commit.get_or_insert_with(|| blaze_own::Vec::new_in(self.alloc.clone()));
+        let mut satisfied = self.satisfied_in_commit.take().unwrap_or_else(|| self.own_vec());
         satisfied.extend(keys);
         satisfied.sort_unstable();
         satisfied.dedup();
+        self.satisfied_in_commit = Some(satisfied);
     }
 
     /// Check a mutable name against the manifest read at the failed flip. Keep any newly
@@ -8059,7 +8061,7 @@ impl<A: Allocator + Clone> Plain<A> {
                     let empty_orphans = self.alloc_vec();
                     let orphans = core::mem::replace(&mut self.orphans_for_compact, empty_orphans);
                     if evict.is_some() || !orphans.is_empty() {
-                        let candidates = CompactCandidates::empty(self.alloc.clone());
+                        let candidates = self.empty_candidates();
                         self.slice_ready(None, candidates, orphans, evict, Sliced { segments: 0, ..*stats }, effects);
                         return Ok(());
                     }
