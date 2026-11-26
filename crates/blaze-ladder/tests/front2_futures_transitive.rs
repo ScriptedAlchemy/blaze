@@ -40,12 +40,12 @@
 #![feature(allocator_api)]
 
 use blaze_id::{ContentId, CrateItemKey};
-use blaze_ladder::crates::{DirShelf, Inputs, Texts, Toolchain, UserCrate};
+use blaze_ladder::crates::{DirShelf, Inputs, ScratchSerial, Texts, Toolchain, UserCrate};
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::refusal::SourceFile;
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
-use blaze_scope::task::Serial;
+use blaze_scope::surface::BlockScopes;
 
 /// The single-crate program; `HELD` is the value `c` holds across its await.
 const ONE_CRATE: &str = r#"
@@ -168,7 +168,8 @@ fn check_bodies(user: &str, dep: Option<&str>, bodies: &[&str]) -> Vec<Got> {
                 script: None,
             });
             let texts = WithDep { base: &inputs.texts, dep: dep_at, files: &dep_files };
-            resolve_crates(&crates, sysroot, &texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"))
+            let serial = ScratchSerial::new(BlockScopes::Modules);
+            resolve_crates(&crates, sysroot, &texts, &serial, bump).unwrap_or_else(|e| panic!("resolve_crates (two crates): {e}"))
         }
     };
     let sources = [SourceFile { path: "src/main.rs", text: user }];

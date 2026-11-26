@@ -19,6 +19,7 @@ use blaze_mem::{Arena, Frame, Tag};
 use blaze_own::{AVec, Alloc, Bump, Erased};
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, Names, NamesError, SourceTexts, resolve_crates};
+use blaze_scope::surface::BlockScopes;
 use blaze_scope::task::{Par, Scratch, Serial};
 use blaze_surface::Edition;
 use blaze_toolchain::{Role, Shelf, ToolchainError, ToolchainId, ToolchainView, UnitKind};
@@ -429,7 +430,7 @@ impl<'t> Inputs<'t> {
     /// Every crate's names, resolved together, held in `bump` (the caller's arena, alive as long as
     /// the names), with per-call macro scratch rolled back after each expansion.
     pub fn resolve(&'t self, crates: &[CrateInput<'t>], bump: Bump<'t>) -> Result<Names<'t>, NamesError<'t>> {
-        let par = ScratchSerial::new();
+        let par = ScratchSerial::new(BlockScopes::Modules);
         self.resolve_with(crates, &par, bump)
     }
 
@@ -448,19 +449,24 @@ impl<'t> Inputs<'t> {
 
 /// Serial `Par` whose macro-expansion work runs in a reusable scratch `Frame` reset after each
 /// call (`Par::call_scratch`), preventing bump-arena exhaustion when resolving the toolchain.
-pub(crate) struct ScratchSerial {
+pub struct ScratchSerial {
     frame: RefCell<Option<Frame>>,
+    block_scopes: BlockScopes,
 }
 
 impl ScratchSerial {
-    pub(crate) fn new() -> Self {
-        Self { frame: RefCell::new(Frame::new(Tag::Expand).ok()) }
+    pub fn new(block_scopes: BlockScopes) -> Self {
+        Self { frame: RefCell::new(Frame::new(Tag::Expand).ok()), block_scopes }
     }
 }
 
 impl Par for ScratchSerial {
     fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
         Serial.map(n, f, out);
+    }
+
+    fn block_scopes(&self) -> BlockScopes {
+        self.block_scopes
     }
 
     fn call_scratch(&self, work: &mut dyn FnMut(Alloc<'_>)) -> Scratch {

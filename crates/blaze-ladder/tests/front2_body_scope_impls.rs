@@ -20,7 +20,7 @@
 //! toolchain under `$HOME/.blaze/v2/toolchain`. Prints the verdicts first:
 //! `impls differential: AGREE ..`, `impls control: ..`.
 
-use blaze_ladder::crates::{DirShelf, Inputs, Texts, Toolchain, UserCrate};
+use blaze_ladder::crates::{DirShelf, Inputs, ScratchSerial, Texts, Toolchain, UserCrate};
 use blaze_own::{AVec, Bump, Erased};
 use blaze_scope::body_scope::{BodyScope, BodyScopeReadError, BodyScopeView, ImplHeaders, ImplRow, bodies_impl_table, body_scope, impl_diff, modules_impl_table};
 use blaze_scope::items_record::buckets::Filing;
@@ -30,7 +30,6 @@ use blaze_scope::items_record::impl_filing;
 use blaze_scope::prepares::Prepares;
 use blaze_scope::resolve::{BodyDeps, CrateInput, Names, ReachPlant, SourceTexts, resolve_crates};
 use blaze_scope::surface::BlockScopes;
-use blaze_scope::task::{Par, Serial};
 
 const USER: &str = "pub trait Show { fn show(&self) -> u8; }
 pub struct Outer;
@@ -81,19 +80,6 @@ pub fn block_extern() -> u8 {
 }
 pub fn main() {}
 ";
-
-/// The serial solve with D189's seam set to `Bodies`.
-struct Bodies;
-
-impl Par for Bodies {
-    fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
-        Serial.map(n, f, out);
-    }
-
-    fn block_scopes(&self) -> BlockScopes {
-        BlockScopes::Bodies
-    }
-}
 
 #[test]
 fn the_impl_table_is_the_same_under_both_strategies() {
@@ -290,8 +276,8 @@ impl<'t> SourceTexts<'t> for Unplaced<'t> {
 fn both_strategies<'a>(crates: &[CrateInput<'a>], texts: &Texts<'a>, modules_bump: Bump<'a>, bodies_bump: Bump<'a>) -> (Names<'a>, Names<'a>) {
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
     let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
-    let modules = resolve_crates(crates, sysroot, texts, &Serial, modules_bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"));
-    let bodies = resolve_crates(crates, sysroot, texts, &Bodies, bodies_bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"));
+    let modules = resolve_crates(crates, sysroot, texts, &ScratchSerial::new(BlockScopes::Modules), modules_bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"));
+    let bodies = resolve_crates(crates, sysroot, texts, &ScratchSerial::new(BlockScopes::Bodies), bodies_bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"));
     (modules, bodies)
 }
 
