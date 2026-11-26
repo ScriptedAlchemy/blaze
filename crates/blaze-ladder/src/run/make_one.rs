@@ -1881,8 +1881,12 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     let held = held_owners(program, ground.view(), roots, tabled, alloc)?;
     // An old question may name an owner that today's program removed. Its failed read
     // makes the entry stale, and the new build determines whether the owner is still needed.
-    if make_held_owners(program, typing, state, checks, &held.owners).is_err() {
-        return Ok(first);
+    for owner in held.owners {
+        match state.ensure(program, typing, owner, checks) {
+            Ok(_) => {}
+            Err(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::NotFound { key, .. }))) if key == owner => return Ok(first),
+            Err(error) => return Err(error),
+        }
     }
     verify_ready(program, typing, state, checks, tabled, entry)
 }
