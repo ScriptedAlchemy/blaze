@@ -78,6 +78,32 @@ jobs:
           timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-ladder --test front2_bounds \
             bounds_through_front2 -- --exact --nocapture 2>&1 | tee "$evidence/gat-bounds.log"
           grep -Fq 'bounds_through_front2 ... ok' "$evidence/gat-bounds.log"
+      - name: Run the Linux workspace regression controls
+        if: ${{ !cancelled() && steps.shelf.outcome == 'success' }}
+        run: |
+          evidence="$RUNNER_TEMP/selection-evidence"
+          tc="$(cat pins/toolchain)"
+          status=0
+          timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-cli --test build_scripts \
+            2>&1 | tee "$evidence/cli-build-scripts.log" || status=1
+          timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-ladder --lib \
+            an_absent_member_is_observed_before_and_after_importing_its_trait \
+            2>&1 | tee "$evidence/member-observation.log" || status=1
+          timeout -k 30 1200 cargo +"$tc" test --release --locked -p scripts --bin proc_macro_modules \
+            a_std_only_unit_does_not_remove_the_checkout_compile_receipt \
+            2>&1 | tee "$evidence/std-dependency-graph.log" || status=1
+          if timeout -k 30 1200 cargo +"$tc" test --release --locked -p blaze-ladder \
+            --test front2_body_scope_surface --no-run --message-format=json > "$evidence/body-scope-build.jsonl"; then
+            binary=$(timeout 10 jq -er 'select(.target.name=="front2_body_scope_surface" and .executable!=null).executable' \
+              "$evidence/body-scope-build.jsonl")
+            timeout -k 20 600 /usr/bin/time -v "$binary" --nocapture --test-threads=4 \
+              2>&1 | tee "$evidence/body-scope.log" || status=1
+          else
+            status=1
+          fi
+          grep -Fq 'an_absent_member_is_observed_before_and_after_importing_its_trait ... ok' "$evidence/member-observation.log" || status=1
+          grep -Fq 'a_std_only_unit_does_not_remove_the_checkout_compile_receipt ... ok' "$evidence/std-dependency-graph.log" || status=1
+          exit "$status"
       - name: Preserve source, binary and runtime evidence
         if: always()
         uses: actions/upload-artifact@v7
