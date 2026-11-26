@@ -454,7 +454,7 @@ pub(crate) struct ScriptsStage<'f> {
     pub(crate) results: Vec<Published<'f>, &'f Frame>,
     /// Each planned `Given` cell of a build script's read, by name, sorted, with today's answer
     /// from the sweep's row (engine_script_reads.rs `plan`).
-    given: Vec<(Name, ContentId, crate::engine_script_reads::ReadKind), &'f Frame>,
+    given: Vec<(Name, ContentId, Option<crate::engine_script_reads::ReadKind>), &'f Frame>,
     /// Each read of the checkout a run of this request made, with the script that read it: the
     /// leaf rows the answer keeps, and the `Given` records of reads no plan holds.
     fresh: Vec<(Name, crate::engine_script_reads::CheckoutRead), &'f Frame>,
@@ -610,7 +610,7 @@ impl<'f> ScriptsStage<'f> {
         previous.reads.iter().filter(|(cell, _)| cell.of.kind == Kind::Given).find_map(|(cell, digest)| {
             let at = self.given.binary_search_by_key(&cell.of, |(name, _, _)| *name).ok()?;
             let (name, answer, kind) = self.given[at];
-            (answer != *digest).then_some((name, kind))
+            (answer != *digest).then_some((name, kind?))
         })
     }
 
@@ -626,8 +626,10 @@ impl<'f> ScriptsStage<'f> {
         use core::fmt::Write as _;
         use crate::engine_script_reads::ReadKind;
         let mut cells = blaze_own::BTreeMap::new_in(*text.allocator());
-        for (name, _, kind) in self.given.iter() {
-            cells.insert(*name, *kind);
+        for &(name, _, kind) in self.given.iter() {
+            if let Some(kind) = kind {
+                cells.insert(name, kind);
+            }
         }
         for (_, read) in self.fresh.iter() {
             cells.insert(read.name(), read.kind);
@@ -672,13 +674,13 @@ impl<'f> ScriptsStage<'f> {
 
     /// The `Given` tasks of the build scripts' reads of the checkout, one a script-read row of
     /// today's leaf rows (engine_check.rs hook H1: `planned.extend(scripts.plan_reads(&followed.now, alloc))`).
-    pub(crate) fn plan_reads<'h>(&mut self, rows: &crate::sweep::Rows<'_>, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
+    pub(crate) fn plan_reads<'h>(&mut self, rows: &crate::sweep::Rows<'_>, caller: blaze_build_script::env::CallerEnv<'_>, alloc: SharedAlloc<'h>) -> SVec<'h, Planned> {
         self.reads_planned = true;
-        let reads = crate::engine_script_reads::plan(rows, alloc);
+        let reads = crate::engine_script_reads::plan(rows, caller, alloc);
         let mut planned = SVec::with_capacity_in(reads.len(), alloc);
-        for (one, answer, kind) in reads.iter() {
-            self.given.push((one.name, *answer, *kind));
-            planned.push(*one);
+        for input in reads.iter() {
+            self.given.push((input.planned.name, input.answer, input.checkout));
+            planned.push(input.planned);
         }
         self.given.sort_unstable_by_key(|(name, _, _)| *name);
         self.given.dedup_by_key(|(name, _, _)| *name);
@@ -775,6 +777,11 @@ impl<'f> ScriptsStage<'f> {
         // `ListFacts` wrote it from the graph): the runs the world's crates read, never every
         // unit of the graph on both sides, and no graph decoded to plan them.
         for (name, source) in crate::scripts::parts(names.script_keys(), crate::scripts::sdk_identity(env)) {
+            let source = if env.caller_env.identity().is_some() && names.script_readers(name).any(|at| names.list().member(at)) {
+                env.caller_env.with_source(source)
+            } else {
+                source
+            };
             let mut reads = reads_only(&[unit_graph]);
             if let Some(run) = names.script_run(name.subject) {
                 // Its module's lookup: the one its reading crate names (scripts.rs `job`).

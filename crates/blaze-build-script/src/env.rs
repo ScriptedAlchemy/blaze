@@ -39,9 +39,116 @@
 #![blaze::sans_io]
 
 use blaze_expand::seen::SeenRoot;
-use blaze_ids::Hasher;
+use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 use blaze_unit_graph::{CfgAtom, PackageMetaVars, Text};
+
+/// The names authorized by one command, their optional values, and their home-private MAC.
+/// The rows are transient. A job key takes only the MAC.
+#[derive(Clone, Copy, Default)]
+pub struct CallerEnv<'a> {
+    rows: &'a [(&'a str, Option<&'a str>, ContentId)],
+    mac: Option<ContentId>,
+}
+
+impl<'a> CallerEnv<'a> {
+    /// A grant names an application setting. Runner, shell, loader and tool configuration
+    /// are owned by the command and cannot be supplied by this channel.
+    pub fn allows(name: &str) -> bool {
+        let mut bytes = name.bytes();
+        if name.len() > 128 || !bytes.next().is_some_and(|b| b.is_ascii_alphabetic()) || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return false;
+        }
+        let prefix = name.split('_').next().unwrap_or(name);
+        !matches!(name, "HOME" | "PATH" | "PWD" | "OLDPWD" | "USER" | "LOGNAME" | "TMP" | "TEMP" | "TMPDIR"
+            | "LANG" | "LANGUAGE" | "TZ" | "TZDIR" | "IFS" | "ENV" | "SHELL" | "SHELLOPTS" | "BASHOPTS" | "CDPATH"
+            | "OUT_DIR" | "OPT_LEVEL" | "NUM_JOBS" | "PROFILE" | "DEBUG" | "TARGET" | "HOST" | "SOURCE_DATE_EPOCH"
+            | "RUSTFLAGS" | "RUSTDOCFLAGS" | "SDKROOT" | "TOOLCHAINS" | "MAKEFLAGS" | "MFLAGS" | "MAKEFILES" | "RANLIB"
+            | "VERGEN_IDEMPOTENT" | "AWK" | "NM" | "AR" | "AS" | "STRIP" | "OBJCOPY" | "OBJDUMP" | "READELF" | "CPATH"
+            | "CFLAGS" | "CPPFLAGS" | "CXXFLAGS" | "LDFLAGS" | "BINDGEN_EXTRA_CLANG_ARGS" | "DEVELOPER_DIR" | "SSLKEYLOGFILE")
+            && !matches!(prefix, "BLAZE" | "CARGO" | "DEP" | "RUST" | "RUSTC" | "RUSTDOC" | "RUSTUP" | "CC" | "CPP" | "CXX"
+                | "LD" | "DYLD" | "GLIBC" | "GCONV" | "MALLOC" | "BASH" | "LC" | "LIBCLANG" | "LIBRARY" | "COMPILER" | "SDK"
+                | "GCC" | "CLANG" | "LLVM" | "MACOSX" | "IPHONEOS" | "CMAKE" | "PKG" | "OPENSSL" | "SSL" | "GIT" | "XDG")
+            && !name.starts_with("PERL") && !name.starts_with("PYTHON") && !name.starts_with("RUBY")
+    }
+
+    /// Construct from already projected rows. Invalid or duplicate names never reach a runner.
+    pub fn new(rows: &'a [(&'a str, Option<&'a str>, ContentId)], mac: ContentId) -> Option<Self> {
+        if rows.len() > 64 || !rows.iter().all(|(name, v, fact)| Self::allows(name) && (v.is_some() || *fact == ContentId::default())) || !rows.windows(2).all(|p| p[0].0 < p[1].0) {
+            return None;
+        }
+        Some(Self { rows, mac: (!rows.is_empty()).then_some(mac) })
+    }
+
+    /// The named grant's value, when set.
+    pub fn get(self, name: &str) -> Option<&'a str> {
+        self.rows.binary_search_by_key(&name, |row| row.0).ok().and_then(|at| self.rows[at].1)
+    }
+
+    /// All granted names in ascending order, including explicit absences.
+    pub fn iter(self) -> impl ExactSizeIterator<Item = (&'a str, Option<&'a str>)> {
+        self.rows.iter().map(|&(name, value, _)| (name, value))
+    }
+
+    /// Authentication tag for an authorized read. Absent and present-empty are distinct.
+    pub fn fact(self, name: &str) -> Option<ContentId> {
+        self.rows.binary_search_by_key(&name, |row| row.0).ok().map(|at| self.rows[at].2)
+    }
+
+    /// An ungranted or absent name answers the same absent cell.
+    pub fn answer(self, name: &str) -> ContentId {
+        self.fact(name).unwrap_or_default()
+    }
+
+    /// Verified rows, for transferring a projection into a worker's memory.
+    pub fn rows(self) -> &'a [(&'a str, Option<&'a str>, ContentId)] {
+        self.rows
+    }
+
+    /// Digest of the named grants and their individual facts. An empty grant has no identity.
+    pub fn identity(self) -> Option<ContentId> {
+        self.mac
+    }
+
+    /// Workspace membership limits which user code receives the caller's projection.
+    pub fn for_root(self, seen: SeenRoot<'_>) -> Self {
+        match seen {
+            SeenRoot::Member { .. } => self,
+            SeenRoot::Package => Self::default(),
+        }
+    }
+
+    /// Construct the guest environment only after computing the private run key.
+    pub fn serve<'r>(self, mut env: Env<'r>, alloc: Alloc<'r>) -> Env<'r> {
+        for (name, value) in self.iter() {
+            if let Some(value) = value {
+                env.vars.push((String::from_str_in(name, alloc), String::from_str_in(value, alloc)));
+            }
+        }
+        if self.mac.is_some() {
+            env.vars.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        }
+        env
+    }
+
+    /// Fold the complete projection into the key for a build script that may enumerate it.
+    pub fn with_source(self, source: ContentId) -> ContentId {
+        match self.mac {
+            None => source,
+            Some(mac) => {
+                let mut h = Hasher::new("blaze workspace caller environment 1");
+                h.id(&source).id(&mac);
+                h.finish()
+            }
+        }
+    }
+}
+
+impl core::fmt::Debug for CallerEnv<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.rows.iter().map(|row| row.0)).finish()
+    }
+}
 
 /// The manifest's package facts a script is told (`CARGO_PKG_*`); an absent value is `""`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -81,9 +188,15 @@ pub struct Given<'s, 'u> {
 }
 
 /// The variables, sorted by name, each once.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Env<'a> {
     pub vars: AVec<'a, (AString<'a>, AString<'a>)>,
+}
+
+impl core::fmt::Debug for Env<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.vars.iter().map(|(name, _)| name)).finish()
+    }
 }
 
 impl Env<'_> {
@@ -125,9 +238,15 @@ impl Env<'_> {
 
 /// The environment a run is given ([`Env::for_run`]): the keyed variables and the job
 /// variables, sorted by name, each once. A separate type so no key can hold it (rule 25).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RunEnv<'a> {
     pub vars: AVec<'a, (AString<'a>, AString<'a>)>,
+}
+
+impl core::fmt::Debug for RunEnv<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.vars.iter().map(|(name, _)| name)).finish()
+    }
 }
 
 impl RunEnv<'_> {

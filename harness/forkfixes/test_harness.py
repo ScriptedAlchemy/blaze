@@ -424,6 +424,8 @@ class ForkfixHarness(unittest.TestCase):
                     self.make_modules(json.loads(argv[1]))
                     return {"returncode": 0, "timed_out": False}
                 value = env.get("FORKFIXES_CALLER_VALUE", "unset")
+                self.assertEqual(argv[argv.index("--build-env") + 1], "FORKFIXES_CALLER_VALUE")
+                self.assertNotIn(f"FORKFIXES_CALLER_VALUE={value}", argv)
                 observed.append(value)
                 return {"returncode": 0, "stdout": f"{value} {value}\n", "stderr": "", "timed_out": False}
             with patch.dict(os.environ, {"FORKFIXES_CALLER_VALUE": "ambient"}), \

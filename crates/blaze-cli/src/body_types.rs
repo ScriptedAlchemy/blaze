@@ -535,6 +535,7 @@ pub(crate) fn owner_env_by<'j>(
     list: &CrateList<'static>,
     at: usize,
     home: Option<&str>,
+    caller_env: blaze_build_script::env::CallerEnv<'_>,
     jobs: &'j Frame,
 ) -> Result<Result<OwnerEnv<'j>, &'static str>, CliError> {
     let script = match owner_script(list, at) {
@@ -554,7 +555,7 @@ pub(crate) fn owner_env_by<'j>(
             Some(bytes)
         }
     };
-    match row_env(list, at, payload, home, jobs) {
+    match row_env(list, at, payload, home, caller_env, jobs) {
         Ok(env) => Ok(Ok((Some(EnvLent::new(env)), read))),
         Err(refused) => Ok(Err(refused)),
     }
@@ -569,7 +570,7 @@ pub(crate) fn owner_env_by<'j>(
 /// files join (the files read from the home's file area as the names task reads them). Made in
 /// `jobs`. Refused by name: a script record that is not an outputs record, a version that is
 /// not SemVer.
-pub(crate) fn row_env<'j>(list: &CrateList<'static>, at: usize, script: Option<&'j [u8]>, home: Option<&str>, jobs: &'j Frame) -> Result<&'j blaze_scope::crate_env::CrateEnv<'j>, &'static str> {
+pub(crate) fn row_env<'j>(list: &CrateList<'static>, at: usize, script: Option<&'j [u8]>, home: Option<&str>, caller_env: blaze_build_script::env::CallerEnv<'_>, jobs: &'j Frame) -> Result<&'j blaze_scope::crate_env::CrateEnv<'j>, &'static str> {
     let erased: &'j blaze_own::Erased<&'j Frame> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(blaze_own::Erased::new(jobs), jobs));
     let alloc = erased.handle();
     let mut facts: blaze_scope::crate_env::EnvFacts<'j> = list.env_facts(at);
@@ -583,9 +584,10 @@ pub(crate) fn row_env<'j>(list: &CrateList<'static>, at: usize, script: Option<&
         let area: &'j blaze_world::StoredFiles = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(crate::scripts::file_area(home, &outputs), jobs));
         facts.script = Some(outputs.with_area(area));
     }
-    let Ok(env) = blaze_scope::crate_env::CrateEnv::of(facts, alloc) else {
+    let Ok(mut env) = blaze_scope::crate_env::CrateEnv::of(facts, alloc) else {
         return Err("a crate's package version is not MAJOR.MINOR.PATCH (the cargo book, \"The `version` field\")");
     };
+    env.grant_caller(caller_env, alloc);
     Ok(blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(env, jobs)))
 }
 

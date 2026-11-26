@@ -1907,6 +1907,10 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
         record.reads.push((input.name, input.out));
         reads.push(input_cell(input, absent));
     }
+    for &(cell, digest) in &resolved.caller_reads {
+        record.reads.push((cell.of, digest));
+        reads.push((cell, digest));
+    }
     reads.sort_unstable_by_key(|row| row.0);
     reads.dedup_by_key(|row| row.0);
     let payload = resolved.payload();

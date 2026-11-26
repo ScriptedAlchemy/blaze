@@ -92,6 +92,7 @@ pub(crate) struct ScopeOwner<'n> {
 }
 
 pub(crate) struct JobTexts<'n> {
+    pub(crate) caller_reads: RefCell<std::vec::Vec<(blaze_engine::CellId, blaze_ids::ContentId), Global>>,
     pub(crate) cx: &'n Cx,
     pub(crate) root: &'n Dir<ReadWrite>,
     pub(crate) frame: &'n Frame,
@@ -405,6 +406,10 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         }
     }
 
+    fn caller_env_read(&self, name: &str, fact: Option<blaze_ids::ContentId>) {
+        self.caller_reads.borrow_mut().push((crate::engine_caller_env::cell(name), fact.unwrap_or(blaze_drive::key::ABSENT)));
+    }
+
     /// The runner key of the names job's crate when it is a proc-macro crate: its module
     /// identity's key (proc_runner.rs). It does not depend on whether the store has the
     /// module, so a missing module is refused at each call and named by the `MacroModule` task,
@@ -499,9 +504,39 @@ mod tests {
     /// A maker's planted refusal: what the job's refusals must name.
     const WORDS: &str = "the proc-macro runner: planted refusal (job_texts.rs tests)";
 
+    #[test]
+    fn builtin_reads_observe_only_the_names_the_body_asks() {
+        use blaze_build_script::env::CallerEnv;
+        use blaze_ids::ContentId;
+        use blaze_scope::crate_env::{BinNames, EnvFacts};
+        let io = Io::simulated(SimWorld::new(92, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+        let erased = blaze_own::Erased::new(cx.frame());
+        let alloc = erased.bump().alloc();
+        let mut env = CrateEnv::of(EnvFacts {
+            crate_name: "app", package: Some(("app", "1.0.0")), bin: None,
+            seen: blaze_expand::seen::SeenRoot::Member { dir: "app" }, read_folder: "/app/",
+            build_script: false, script: None, test_or_bench: false, bin_exes: BinNames::NONE, meta: None,
+        }, alloc).unwrap();
+        let used = crate::engine_caller_env::cell("APP_USED");
+        let missing = crate::engine_caller_env::cell("APP_MISSING");
+        for unread in [4, 5] {
+            let rows = [("APP_UNREAD", Some("ignored"), ContentId([unread; 32])), ("APP_USED", Some("read"), ContentId([2; 32]))];
+            env.grant_caller(CallerEnv::new(&rows, ContentId([unread; 32])).unwrap(), alloc);
+            let mut job = texts(&cx, &root, Procs::None);
+            job.env = Some((0, &env));
+            assert_eq!(job.read_env(0, "APP_USED").unwrap(), Some("read"));
+            assert_eq!(job.read_env(0, "APP_MISSING").unwrap(), None);
+            assert_eq!(job.read_env(0, "CARGO_PKG_NAME").unwrap(), Some("app"));
+            assert_eq!(&*job.caller_reads.borrow(), &[(used, ContentId([2; 32])), (missing, blaze_drive::key::ABSENT)]);
+        }
+    }
+
     /// A names job of the crate 0 (so its runner key is asked) with no files and `procs`.
     fn texts<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, procs: Procs<'n>) -> JobTexts<'n> {
         JobTexts {
+            caller_reads: RefCell::new(std::vec::Vec::new_in(Global)),
             cx,
             root,
             frame: cx.frame(),

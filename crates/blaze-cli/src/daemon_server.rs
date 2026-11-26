@@ -468,7 +468,7 @@ impl CheckoutState<'_> {
             self.watcher.disarm();
             return;
         };
-        if !pointer.certifies_under(&self.tools) {
+        if !pointer.certifies_under(&self.tools) || pointer.caller != blaze_drive::key::ABSENT {
             self.hot_answer = None;
             self.watcher.disarm();
             return;
@@ -849,6 +849,7 @@ fn execute_check_request(
     // 3. ULTRA-FAST CERTIFIED WARM HIT (< 0.2 ms daemon time!).
     let eligible_fast = !reopened
         && poll_was_clean
+        && flags.build_env.is_empty()
         && flags.fix.is_none()
         && !flags.names_oracle.on()
         && flags.origin.is_none()
@@ -995,7 +996,7 @@ fn execute_check_request(
         || dout.leaf_set_changed
         || !state.watcher.is_armed();
 
-    if certified_update.is_none() && !poll_was_clean {
+    if !flags.build_env.is_empty() || (certified_update.is_none() && !poll_was_clean) {
         // Consumed dirty/rescan events without producing a new certified Pointer: clear
         // `hot_answer` AND disarm the watcher so the next request cannot treat the drained
         // kqueue as clean against the stale pre-edit Pointer.

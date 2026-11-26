@@ -376,18 +376,30 @@ pub(crate) fn source(kind: ReadKind, path: &str, answer: ContentId) -> ContentId
 /// The scripts stage's wave 0, where every read's cell is defined.
 pub(crate) const PHASE: Phase = Phase::new(Stage::Scripts, 0);
 
-/// One `Given` task a script-read row of today's leaf rows, each its own file (a row that goes
-/// retires its task, and the cell moves to absent for its readers), with today's answer.
-pub(crate) fn plan<'h>(rows: &Rows<'_>, alloc: SharedAlloc<'h>) -> SVec<'h, (Planned, ContentId, ReadKind)> {
+/// A command input in the scripts-stage wave. Checkout reads also feed the script profile.
+pub(crate) struct GivenInput {
+    pub(crate) planned: Planned,
+    pub(crate) answer: ContentId,
+    pub(crate) checkout: Option<ReadKind>,
+}
+
+/// One task per observed checkout input or present caller grant. Dropping its file from the
+/// next plan retires the cell and moves its readers to absence.
+pub(crate) fn plan<'h>(rows: &Rows<'_>, caller: blaze_build_script::env::CallerEnv<'_>, alloc: SharedAlloc<'h>) -> SVec<'h, GivenInput> {
     let mut planned = SVec::new_in(alloc);
     for leaf in rows.rows.iter() {
         let Some(kind) = ReadKind::of_leaf(leaf.kind) else { continue };
         let path = rows.path(leaf);
         let name = cell_name(kind, path);
-        planned.push((Planned { name, phase: PHASE, source: source(kind, path, leaf.id), file: name }, leaf.id, kind));
+        planned.push(GivenInput {
+            planned: Planned { name, phase: PHASE, source: source(kind, path, leaf.id), file: name },
+            answer: leaf.id,
+            checkout: Some(kind),
+        });
     }
-    planned.sort_unstable_by_key(|(one, _, _)| one.name);
-    planned.dedup_by_key(|(one, _, _)| one.name);
+    planned.extend(crate::engine_caller_env::plan(caller).map(|(planned, answer)| GivenInput { planned, answer, checkout: None }));
+    planned.sort_unstable_by_key(|one| one.planned.name);
+    planned.dedup_by_key(|one| one.planned.name);
     planned
 }
 

@@ -357,7 +357,7 @@ impl core::fmt::Debug for Script {
             .field("package", &self.package)
             .field("tree", &self.tree)
             .field("root", &self.root)
-            .field("env", &self.env)
+            .field("env_count", &self.env.len())
             .field("target", &self.target)
             .field("host", &self.host)
             .field("c_mode", &self.c_mode)
@@ -367,6 +367,17 @@ impl core::fmt::Debug for Script {
             .field("step", &self.step)
             .field("spawn_setting", &self.spawn_setting)
             .finish()
+    }
+}
+
+impl Script {
+    /// A child process whose environment is persisted receives no caller-granted values.
+    pub(crate) fn work_env(&self, spawned: &Decoded) -> Result<Vec<(String, String)>, SpawnRefusal> {
+        let env = child_env(&self.env, spawned);
+        if let Some((name, _)) = env.iter().find(|(name, _)| self.private_env_names.binary_search(name).is_ok()) {
+            return Err(SpawnRefusal::PrivateEnv { name: name.clone() });
+        }
+        Ok(env)
     }
 }
 
@@ -582,7 +593,7 @@ impl ScriptSandbox {
             arg_list.push(text(arg));
         }
         let mut env = blaze_own::Vec::new_in(alloc);
-        for (key, value) in child_env(&script.env, spawned) {
+        for (key, value) in script.work_env(spawned).map_err(|why| self.refuse(Refusal::Spawn(why)))? {
             env.push((text(&key), text(&value)));
         }
         let cwd = spawned.cwd.clone().unwrap_or_else(|| script.cwd());

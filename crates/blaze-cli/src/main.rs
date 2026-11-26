@@ -59,6 +59,7 @@ mod producers;
 mod program;
 // `--grant <parameter>=<scope>` as bstd's host's `(kind, name)` (run.md; D104 lane's finding).
 mod host_grants;
+mod caller_env;
 // `blaze run` of a Rust-edition program: in its own process, under the run parent (D103).
 mod own_process;
 // The run parent's sans-IO half; its driver loop waits on the bstd surface its head names.
@@ -149,6 +150,7 @@ mod engine_scope_reads;
 mod engine_start;
 mod engine_scripts;
 mod engine_script_reads;
+mod engine_caller_env;
 mod engine_seeds;
 mod engine_shelf_pages;
 mod engine_store;
@@ -176,6 +178,7 @@ use crate::phases::Phases;
 #[derive(Debug)]
 pub enum CliError {
     Usage(&'static str),
+    BuildEnv(caller_env::Error),
     /// A word that is no command of blaze and never will be: the commands that do its work.
     NoSuchCommand { command: &'static str, instead: &'static str },
     /// A flag of `check` that the engine's check (check_command.rs) does not honour yet: refused
@@ -308,6 +311,7 @@ impl fmt::Display for ManifestRefused {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            CliError::BuildEnv(error) => write!(f, "{error}"),
             CliError::Usage(what) => write!(
                 f,
                 "usage: blaze check [dir] [--color ...] [--view ...] [--each] [--workers N] [--status-every S], blaze ci [dir] [--format ...] [--todo ...], blaze inspect <file.rs[::fn]> [--json] [--all-exprs], blaze run [dir] [--open] [--stats] [--workers N], blaze test [dir] [--stats] [--workers N], blaze export [dir] [-p pkg] [--bin name] [-o path] [--workers N] [--stats], blaze clean|gc|explain: {what}"
@@ -400,6 +404,7 @@ struct Flags<'a> {
     origin_key: Option<&'a str>,
     /// `--grant name=value`, each a capability the program is given (run.md).
     grants: std::vec::Vec<(&'a str, &'a str)>,
+    build_env: std::vec::Vec<&'a str>,
     /// The words after `--`: the program's own arguments.
     program: std::vec::Vec<&'a str>,
     /// `--workers N`: at most N of a batch's tasks at once (default: one per core). For
@@ -453,6 +458,7 @@ impl<'a> Flags<'a> {
             origin: None,
             origin_key: None,
             grants: std::vec::Vec::new(),
+            build_env: std::vec::Vec::new(),
             program: std::vec::Vec::new(),
             workers: None,
             status_every: None,
@@ -530,6 +536,18 @@ fn parse_flags_with<'a>(args: &'a Args, mut package: impl FnMut(&'a str), mut fe
                     at += 1;
                 }
                 flags.fix = Some((start, at));
+            }
+            "--build-env" => {
+                let name = value()?;
+                if !blaze_build_script::env::CallerEnv::allows(name) {
+                    return Err(CliError::Usage("--build-env requires an unreserved application variable such as APP_SETTING"));
+                }
+                if let Err(at) = flags.build_env.binary_search(&name) {
+                    if flags.build_env.len() == 64 {
+                        return Err(CliError::Usage("--build-env grants at most 64 distinct variable names"));
+                    }
+                    flags.build_env.insert(at, name);
+                }
             }
             "--grant" => {
                 let grant = value()?;

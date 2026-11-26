@@ -543,6 +543,7 @@ mod tests {
             tree: Tree::Mem { files: files(&[("zstd/lib/zstd.h", b"the reader's own zstd.h")]), git: None },
             root: ScriptRoot::package(),
             env,
+            private_env_names: Vec::new(),
             target: "aarch64-apple-darwin".to_owned(),
             host: "aarch64-apple-darwin".to_owned(),
             c_mode: CMode::Deferred,

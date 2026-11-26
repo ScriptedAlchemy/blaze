@@ -84,6 +84,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
         toolchain: shelf(io),
         heap: blaze_own::testing::heap(),
         place: engine_check::Place {
+            caller_env: Default::default(),
             checkout: "ws",
             served: crate::engine_script_reads::Served::Simulated,
             cert_file: None,
