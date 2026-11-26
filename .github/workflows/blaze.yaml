@@ -1,4 +1,4 @@
-name: PR 81 pinned LLVM record verification
+name: PR 81 pinned LLVM unwind object probe
 on: workflow_dispatch
 permissions:
   contents: read
@@ -17,7 +17,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 87eca7e66c6c1984de1119d042bee7321c0f55b2
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
@@ -34,22 +33,20 @@ jobs:
           input=$(timeout 10 jq -nc --arg prefix "$prefix" '{command:"fetch",target:"aarch64-unknown-linux-gnu",dir:$prefix}')
           timeout -k 10 900 python3 .github/scripts/llvm.py "$input"
           echo "LLVM_SYS_231_PREFIX=$prefix" >> "$GITHUB_ENV"
-      - name: compile and execute LLVM records and fold thunks
-        id: emitter
+      - name: emit optimized invoke object files for both ARM64 formats
         run: |
-          log="$RUNNER_TEMP/llvm-evidence/emit.txt"
-          timeout -k 30 1800 cargo +"$(cat pins/toolchain)" test --locked -p blaze-emit --features llvm --lib llvm:: -- --nocapture 2>&1 | tee "$log"
-          grep -Fq 'llvm::emit_tests::release_record_runs ... ok' "$log"
-          grep -Fq 'llvm::emit_tests::native_call_and_tail_branch_execute_with_the_original_return_address ... ok' "$log"
-          grep -Fq 'llvm::emit_tests::folded_body_and_each_member_thunk_execute_their_own_constants ... ok' "$log"
-      - name: execute exported ARM64 relocations
-        if: ${{ !cancelled() && steps.emitter.outcome == 'success' }}
-        run: |
-          timeout -k 20 900 cargo +"$(cat pins/toolchain)" test --locked -p blaze-export --test arm64_relocations -- --nocapture 2>&1 | tee "$RUNNER_TEMP/llvm-evidence/export.txt"
+          log="$RUNNER_TEMP/llvm-evidence/unwind.txt"
+          timeout -k 30 1800 cargo +"$(cat pins/toolchain)" test --locked -p blaze-emit --features llvm --lib llvm_invoke_object_unwind_probe -- --ignored --nocapture 2>&1 | tee "$log"
+          grep -Fq 'llvm::emit_tests::llvm_invoke_object_unwind_probe ... ok' "$log"
+          for kind in catch cleanup terminate; do
+            for format in elf macho; do
+              grep -Fq "BLAZE_LLVM_UNWIND_OBJECT $kind-$format " "$log"
+            done
+          done
       - name: keep the exact source and test logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: pinned-llvm-record-evidence
+          name: pinned-llvm-unwind-evidence
           path: ${{ runner.temp }}/llvm-evidence
           if-no-files-found: error

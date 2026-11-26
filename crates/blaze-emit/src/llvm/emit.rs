@@ -424,6 +424,15 @@ fn record<'a>(
     super::object::read(&object, module, &tags, alloc).map_err(EmitError::Read)
 }
 
+#[cfg(test)]
+pub(super) fn object_for_unwind_probe<'a>(
+    module: &LlvmModule<'_>,
+    machine: Machine,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u8>, EmitError> {
+    Session::new(&module.ir, &[], machine)?.emit(3, alloc)
+}
+
 /// Emits a folded group: its body and one thunk per other member.
 pub fn emit_fold<'a>(task: FoldTask<'_>, alloc: Alloc<'a>) -> Result<FoldOutput<'a>, EmitError> {
     let mut body: Option<Emission<'a>> = None;

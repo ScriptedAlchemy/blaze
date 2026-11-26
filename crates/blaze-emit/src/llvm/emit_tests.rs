@@ -30,6 +30,62 @@ fn machine() -> blaze_tier::Machine {
     blaze_tier::Machine { arch, os, features: 0 }
 }
 
+#[test]
+#[ignore = "prints raw ARM64 objects for unwind format inspection"]
+fn llvm_invoke_object_unwind_probe() {
+    use std::fmt::Write as _;
+
+    let alloc = blaze_own::testing::heap().alloc();
+    for (kind, name) in [
+        (BlockKind::Catch, "catch"),
+        (BlockKind::Cleanup, "cleanup"),
+        (BlockKind::Terminate, "terminate"),
+    ] {
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let ret = Param::of(Ty::I32);
+        let entry_sig = b.sig(Conv::C, Variadic::No, &[], &[ret]);
+        let call_sig = b.sig(Conv::C, Variadic::No, &[], &[]);
+        b.set_signature(entry_sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let normal = b.create_block(BlockKind::Normal);
+        let landing = b.create_block(kind);
+        let callee = b.reference(blaze_lir::func::RefKind::Func, 0);
+        b.begin(entry);
+        b.invoke(Flags::NONE, callee, call_sig, &[], normal, landing);
+        b.begin(normal);
+        b.call(Flags::NONE, callee, call_sig, &[]);
+        let normal_value = b.iconst(Ty::I32, 7);
+        b.ret(&[normal_value]);
+        b.begin(landing);
+        let exception = b.param(Ty::PTR);
+        match kind {
+            BlockKind::Catch => {
+                let caught_value = b.iconst(Ty::I32, 42);
+                b.ret(&[caught_value]);
+            }
+            BlockKind::Cleanup => {
+                b.call(Flags::NONE, callee, call_sig, &[]);
+                b.resume(exception);
+            }
+            BlockKind::Terminate => b.trap(123),
+            _ => unreachable!(),
+        }
+        let function = b.finish_verified().unwrap();
+        let module = prepare(Symbol([5; 32]), function.verified(), &ByPlace, alloc).unwrap();
+        let ir = core::str::from_utf8(&module.ir).unwrap();
+        println!("BEGIN BLAZE INVOKE {name}\n{ir}END BLAZE INVOKE {name}");
+        for (os, format) in [(blaze_tier::Os::Linux, "elf"), (blaze_tier::Os::MacOs, "macho")] {
+            let machine = blaze_tier::Machine { os, ..machine() };
+            let object = super::emit::object_for_unwind_probe(&module, machine, alloc).unwrap();
+            let mut hex = std::string::String::with_capacity(2 * object.len());
+            for byte in &object {
+                write!(&mut hex, "{byte:02x}").unwrap();
+            }
+            println!("BLAZE_LLVM_UNWIND_OBJECT {name}-{format} {hex}");
+        }
+    }
+}
+
 struct ByPlace;
 impl Names for ByPlace {
     fn name(&self, outside: Outside) -> Option<Named<'_>> {
