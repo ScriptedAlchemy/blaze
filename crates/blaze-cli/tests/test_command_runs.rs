@@ -932,6 +932,22 @@ fn scoped_test_checks_only_selected_member_and_its_deps() {
 /// kept `BZTR` pass records (`kept == 0`).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn collect_bzth_and_bztr(store_root: &Path) -> (blaze_own::AVec<'static, blaze_own::AVec<'static, u8>>, usize) {
+    use blaze_cas::plain::ExclusiveLock;
+    use blaze_core::{FileName, threads::Threads};
+
+    // Foreground `blaze test` has exited, but its detached collector can move or remove
+    // segments between listing and reading them. Use the collector's lock for the scan.
+    let lock_file = FileName::new("gc.lock").expect("the collector lock is relative");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let _held = loop {
+        let driver = Threads::new(store_root, 1);
+        match ExclusiveLock::try_acquire(driver, lock_file.clone()) {
+            Ok(Some(held)) => break held,
+            Ok(None) if Instant::now() < deadline => pause_poll(),
+            Ok(None) => panic!("collector lock at {} did not become available", store_root.display()),
+            Err(error) => panic!("locking the collector at {}: {error}", store_root.display()),
+        }
+    };
     let alloc = blaze_own::testing::heap().alloc();
     let mut heads = blaze_own::AVec::new_in(alloc);
     let mut bztr_kept = blaze_own::AVec::new_in(alloc);
