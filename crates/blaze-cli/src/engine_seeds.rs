@@ -1341,6 +1341,14 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
         NamesSource::crate_of(self.names, want.key()).and_then(|k| NamesSource::crate_key(self.names, k))
     }
 
+    /// Whether a dependency head is valid by its current names key, including its fetched
+    /// transitive inputs. A body records that proof whether it imports or freezes the head.
+    pub(crate) fn covered_by_names(&self, want: Want) -> bool {
+        self.krate(want)
+            .and_then(|key| crate_keyed(&self.table.crates, key))
+            .is_some_and(|krate| krate.closed && self.table.names_of(&krate).is_some())
+    }
+
     /// Why member cell `id` (of want `cell`) was not taken from its head task's record, as
     /// the body's typed refusal (rule 19), its words made ONCE a cell a request: the first kept
     /// in the table's `refused` map is every asker's (another worker's for the same cell is the

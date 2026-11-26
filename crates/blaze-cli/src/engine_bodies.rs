@@ -57,7 +57,7 @@ use blaze_ladder::front2::source::NamesSource;
 use blaze_ladder::front2::tables::cost::{Cost, Gauge};
 use blaze_ladder::front2::heads::Want;
 use blaze_ladder::front2::tables::head::{CellFailure, ConstValues, FreezeError, NotTheirs, SeededHeads, SeededHeadsOpts, cell_id as head_cell_id};
-use blaze_ladder::front2::tables::recorder::{PlacedCell, Recorder, RecorderOpts, TableRead};
+use blaze_ladder::front2::tables::recorder::{PlacedCell, ReadSink, Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::seeds::{HeadSeed, RequestSeedOpts, SeedError};
 use blaze_ladder::front2::tables::task::{BodyFrame, ReadIds, ReadKeyer, Said as Line, SaidWhat, StretchStore, StretchStoreOpts, TaskError, WorkBytes, check_body_item};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
@@ -7513,6 +7513,29 @@ impl core::fmt::Display for LangIndexRefused {
     }
 }
 
+/// A closed dependency head's crate proof covers its fetched inputs.
+struct CoveredHeadReads;
+
+impl ReadSink for CoveredHeadReads {
+    fn read(&self, _: TableRead) {}
+    fn binding(&self, _: ItemKey, _: blaze_surface::Namespace, _: &str) {}
+}
+
+/// Keep the evaluators' prepared definitions separate so an open head records the inputs
+/// of every definition it uses, including definitions a closed head already evaluated.
+struct BodyHeadConsts<'n> {
+    open: crate::engine_head_consts::HeadConsts<'n, 'n, Tables<'n, 'n>>,
+    closed: crate::engine_head_consts::HeadConsts<'n, 'n, Tables<'n, 'n>>,
+    covered_by_names: &'n core::cell::Cell<bool>,
+}
+
+impl<'n> ConstValues<'n> for BodyHeadConsts<'n> {
+    fn eval(&mut self, store: &mut blaze_ladder::front2::heads::Store<'n>, keys: &mut blaze_ladder::front2::keys::Keys, key: ItemKey) -> Result<(), blaze_ladder::front2::consts::ConstFail> {
+        let consts = if self.covered_by_names.get() { &mut self.closed } else { &mut self.open };
+        consts.eval(store, keys, key)
+    }
+}
+
 /// Per-stretch lazy wrapper over `BodySeed`: serves all already-frozen member and dependency heads
 /// (`Known::Bytes`) and member refusals (`Known::Refused`) directly in O(1) without constructing
 /// `lang_index`, `Pointers`, `HeadConsts`, or `SeededHeads`. Only on a cold dependency head miss
@@ -7522,6 +7545,7 @@ struct LazyBodySeed<'k, 'r, 'm, 'n, 't> {
     heads: &'k crate::engine_seeds::StretchHeads<'k, 'k, 'n>,
     tables: Tables<'t, 'n>,
     evaluated: &'n Recorder<'n>,
+    covered_by_names: &'n core::cell::Cell<bool>,
     lang_crates: &'t [usize],
     frame: &'n Frame,
     fb: blaze_own::Bump<'n>,
@@ -7566,7 +7590,12 @@ impl<'k, 'r, 'm, 'n, 't> LazyBodySeed<'k, 'r, 'm, 'n, 't> {
 
     #[inline(never)]
     fn build_head_consts(&self, index: &'n blaze_ladder::front2::index::Index<'n>) -> &'n mut (dyn ConstValues<'n> + 'n) {
-        self.frame.alloc(crate::engine_head_consts::HeadConsts::new(self.tables.reading_into(self.evaluated), index, self.fb))
+        use crate::engine_head_consts::HeadConsts;
+        self.frame.alloc(BodyHeadConsts {
+            open: HeadConsts::new(self.tables.reading_into(self.evaluated), index, self.fb),
+            closed: HeadConsts::new(self.tables.reading_into(&CoveredHeadReads), index, self.fb),
+            covered_by_names: self.covered_by_names,
+        })
     }
 
     #[inline(never)]
@@ -7589,7 +7618,7 @@ impl<'k, 'r, 'm, 'n, 't> LazyBodySeed<'k, 'r, 'm, 'n, 't> {
     fn build_freezer(&self) -> Result<&'n crate::engine_seeds::BodySeed<'k, 'n, 'n, &'n blaze_ladder::front2::source::Records<'n>, crate::engine_seeds::StretchHeads<'k, 'k, 'n>>, LangIndexRefused> {
         let (index, pointers) = if let Some(sf) = self.front {
             for &read in sf.reads() {
-                blaze_ladder::front2::tables::recorder::ReadSink::read(self.evaluated, read);
+                self.evaluated.read(read);
             }
             self.index_reads.set(self.evaluated.tally().offered);
             (&*self.frame.alloc(sf.borrow_index()), Some(sf.pointers()))
@@ -7629,9 +7658,12 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, '_, '_, 'n, '_> {
                     depth: &'a core::cell::Cell<u32>,
                     reset: &'k blaze_ladder::front2::tables::head::FreezeReset<'k, 'm>,
                     exhausted: &'k core::cell::Cell<Option<(usize, usize)>>,
+                    covered_by_names: &'a core::cell::Cell<bool>,
+                    previous_coverage: bool,
                 }
                 impl Drop for FreezeResetGuard<'_, '_, '_> {
                     fn drop(&mut self) {
+                        self.covered_by_names.set(self.previous_coverage);
                         let next = self.depth.get().saturating_sub(1);
                         self.depth.set(next);
                         if next == 0
@@ -7642,7 +7674,17 @@ impl<'n> HeadSeed<'n> for LazyBodySeed<'_, '_, '_, 'n, '_> {
                     }
                 }
                 self.freeze_depth.set(self.freeze_depth.get().saturating_add(1));
-                let _reset = FreezeResetGuard { depth: &self.freeze_depth, reset: self.freeze_reset, exhausted: self.freeze_exhausted };
+                // Match imports: a caller's read of this head already ends at the closed
+                // crate's proof. Scratch lookups while freezing it must not become body reads.
+                let covered_by_names = self.covered_by_names;
+                let previous_coverage = covered_by_names.replace(self.heads.covered_by_names(cell));
+                let _reset = FreezeResetGuard {
+                    depth: &self.freeze_depth,
+                    reset: self.freeze_reset,
+                    exhausted: self.freeze_exhausted,
+                    covered_by_names,
+                    previous_coverage,
+                };
                 body_seed.seed(store, keys, need, scratch)
             }
             Err(refused) => Err(SeedError::of_freeze(FreezeError::NotTheirs {
@@ -7806,6 +7848,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
             heads: table,
             tables,
             evaluated,
+            covered_by_names: frame.alloc(core::cell::Cell::new(false)),
             lang_crates: &group.lang,
             frame,
             fb,
@@ -8309,8 +8352,8 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
                 scope_required = true;
                 seed_refused = false;
             }
-            // A checked verdict and a refusal at a seed both depend on the evaluator. Its
-            // prepared definitions persist across this stretch, so each row takes its prefix.
+            // The evaluator records mutable inputs of open dependency heads. Its prepared
+            // definitions persist across this stretch, so each row takes the recorded prefix.
             mem.allocating = "the constant evaluator's cell ID list";
             let index_reads = seed.map_or(0, |s| s.index_reads());
             let placed = if !scope_required {
