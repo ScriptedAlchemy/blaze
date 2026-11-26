@@ -39,6 +39,10 @@ fn ordinary_edges<'v>(view: View<'v>, i: usize, mut edge: impl FnMut(usize, Bran
 /// ordinary edges from them. An invoke's exceptional edge starts its own landing.
 pub(super) fn cleanup_blocks<'a>(view: View<'_>, alloc: Alloc<'a>) -> AVec<'a, bool> {
     let mut cleanup = AVec::new_in(alloc);
+    // This landing marker is only defined by the native AArch64 record ABI.
+    if view.head.ptr_bits != 64 {
+        return cleanup;
+    }
     let mut pending = AVec::new_in(alloc);
     for (b, _) in (0u32..).zip(view.block_starts) {
         let block = Block(b);
@@ -240,7 +244,7 @@ impl Lower<'_, '_> {
             Op::Resume => {
                 format_into!(
                     ir,
-                    "  call void @_Unwind_Resume(ptr %v{})\n  unreachable",
+                    "  notail call void @_Unwind_Resume(ptr %v{})\n  unreachable",
                     o.value().0
                 );
                 self.declaration(
