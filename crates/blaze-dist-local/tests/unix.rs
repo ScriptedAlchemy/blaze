@@ -29,6 +29,10 @@ fn test_alloc() -> WireAlloc {
     blaze_own::testing::heap().shared()
 }
 
+// The test process may compile a server or holder path on its first call. This guards
+// fixture IO only. The coordinator's lease and subscriber tests advance TestClock.
+const FIXTURE_IO_DEADLINE: Duration = Duration::from_secs(20);
+
 #[derive(Default)]
 struct TestClock(AtomicU64);
 impl Clock for TestClock {
@@ -229,7 +233,7 @@ fn read_body_for(stream: &mut UnixStream, alloc: WireAlloc, reply_to: &str) -> W
 
 fn raw(f: &Fixture) -> UnixStream {
     let stream = UnixStream::connect(f.path.as_str()).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    stream.set_read_timeout(Some(FIXTURE_IO_DEADLINE)).unwrap();
     stream
 }
 
@@ -2322,7 +2326,7 @@ fn the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls(
         let gate_path = WireString::from_str_in(directory.path(), alloc);
         let config = DriverConfig {
             result_gate: Some(
-                ResultGate::new(gate_path.clone(), Duration::from_secs(3), alloc).unwrap(),
+                ResultGate::new(gate_path.clone(), Duration::from_secs(40), alloc).unwrap(),
             ),
             ..Default::default()
         };
@@ -2362,7 +2366,8 @@ fn the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls(
                     result
                 })
                 .unwrap();
-            let deadline_ns = clock_sys.monotonic_nanos().unwrap().saturating_add(2_000_000_000);
+            let wait_ns = u64::try_from(FIXTURE_IO_DEADLINE.as_nanos()).unwrap();
+            let deadline_ns = clock_sys.monotonic_nanos().unwrap().saturating_add(wait_ns);
             let ready_file = directory.join("ready.json");
             while !path_is_file(ready_file.as_str()) {
                 if finished.load(Ordering::Acquire) {
