@@ -26,6 +26,9 @@
 //!   `call_once`): [`crate::Adts::def_site`] of the shim's owner. So
 //!   `Some(()).map(tracked_fn)` reports core's `ops/function.rs` at the `Fn*` method, as rustc's
 //!   build does.
+//! - **A call through a trait object** uses the trait declaration's ABI. A tracked
+//!   declaration receives the caller's location through the slot. If only the selected
+//!   implementation is tracked, the slot's shim supplies its definition site.
 //! - **A tracked fn taken as a fn pointer**: points to its `ReifyShim`
 //!   ([`crate::build_reify_shim`], named by [`crate::REIFY_SHIM_ITEM`]), which has the plain fn
 //!   pointer signature (no hidden location parameter), materializes a `Location` row for the fn's
@@ -76,9 +79,6 @@ const NO_REIFY_DEF_SITE: &str =
     "a `#[track_caller]` fn taken as a fn pointer: the world does not say where the fn is defined (`Adts::def_site`), the place its reify shim passes";
 const NO_DEF_SITE: &str =
     "a `#[track_caller]` fn called through a `Fn*` shim: the world does not say where the shim's `Fn*` method is defined (`Adts::def_site`), the place the shim passes";
-const VTABLE: &str =
-    "a `#[track_caller]` method called through a trait object: its vtable shim, which passes the method's definition site, is not built yet";
-
 impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// The world's answer for the fn `instance` resolves to.
     fn tracked(&mut self, instance: Instance) -> Option<bool> {
@@ -111,9 +111,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         if self.tracked(callee) != Some(true) {
             return Ok(None);
         }
-        let refuse = |why| BuildError::TrackCaller { expr: at, item: callee.item, why, gap: None };
+        self.call_location(at, callee.item).map(Some)
+    }
+
+    pub(super) fn call_location(&mut self, at: Option<ExprId>, item: ItemKey) -> Result<Value, BuildError> {
+        let refuse = |why| BuildError::TrackCaller { expr: at, item, why, gap: None };
         match self.track {
-            Track::Passed(v) => Ok(Some(v)),
+            Track::Passed(v) => Ok(v),
             Track::Unsaid => Err(refuse(UNSAID_CALLER)),
             Track::No => {
                 let e = at.ok_or(refuse(NO_EXPR))?;
@@ -121,7 +125,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 // The call's site is in the CALLER's body (`e` is its expression): a missing site
                 // is named for that body, not for the callee (lane CX18).
                 let site = self.site_of(e, self.body.owner)?;
-                Ok(Some(self.location_row(Some(e), callee.item, Site::Here(site), loc_ty, ret)?))
+                self.location_row(Some(e), item, Site::Here(site), loc_ty, ret)
             }
         }
     }
@@ -279,15 +283,5 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     pub(super) fn reify_addr(&mut self, _e: ExprId, instance: Instance) -> Result<Value, BuildError> {
         let target = self.reify_target(instance)?;
         Ok(self.fn_addr(target))
-    }
-
-    /// Refuses a dynamic call at `e` of trait method `instance` the world says is tracked
-    /// (the attribute on a trait's declaration applies to every impl, so every slot needs the
-    /// shim).
-    pub(super) fn refuse_tracked_slot(&mut self, e: ExprId, instance: Instance) -> Result<(), BuildError> {
-        if self.tracked(instance) == Some(true) {
-            return Err(BuildError::TrackCaller { expr: Some(e), item: instance.item, why: VTABLE, gap: None });
-        }
-        Ok(())
     }
 }

@@ -497,3 +497,52 @@ pub extern \"C-unwind\" fn main() -> i32 {{
     assert_eq!(status, 0, "expected all 9 ReifyShim checks to pass, got failure code {status}");
     println!("TRACK CALLER REIFY: all 9 cases (free, generic agg, inherent, trait, HOF, Option::map, Result::map_err, const, static) passed whole + lazy");
 }
+
+#[test]
+fn dynamic_and_reified_trait_calls_use_their_declared_abi() {
+    let body = r#"
+#[lang = "unsize"]
+trait Unsize<T: PointeeSized>: PointeeSized {}
+#[lang = "coerce_unsized"]
+trait CoerceUnsized<T: PointeeSized> {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a U> for &'a T {}
+#[lang = "dispatch_from_dyn"]
+trait DispatchFromDyn<T> {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a U> for &'a T {}
+
+trait Calls {
+    #[track_caller]
+    fn inherited(&self) -> u32 { caller_location().line }
+    fn plain(&self) -> u32;
+}
+impl Calls for u8 {
+    #[track_caller]
+    fn plain(&self) -> u32 { caller_location().line } // TRACKED_BODY
+}
+impl Calls for i8 {
+    fn plain(&self) -> u32 {
+        caller_location().line // UNTRACKED_BODY
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    let value = 1u8;
+    let object: &dyn Calls = &value;
+    if object.inherited() != DYNAMIC { return 1; }
+    if object.plain() != DEFINITION { return 2; }
+    if value.plain() != DIRECT { return 3; }
+    let pointer: fn(&u8) -> u32 = <u8 as Calls>::plain;
+    if pointer(&value) != DEFINITION { return 4; }
+    if 1i8.plain() != OWN_LOCATION { return 5; }
+    0
+}
+"#;
+    let source = format!("{REIFY_PRELUDE}{body}");
+    let program = source
+        .replace("DYNAMIC", &line_col_of(&source, "if object.inherited()").0.to_string())
+        .replace("DIRECT", &line_col_of(&source, "if value.plain()").0.to_string())
+        .replace("DEFINITION", &line_col_of(&source, "caller_location().line } // TRACKED_BODY").0.to_string())
+        .replace("OWN_LOCATION", &line_col_of(&source, "caller_location().line // UNTRACKED_BODY").0.to_string());
+    walk_lazy_twice(&program);
+    assert_eq!(run_status(&program), 0);
+}

@@ -534,7 +534,7 @@ struct QueryCache {
     normalize: blaze_hash::HashMap<(ItemKey, blaze_typeck::Name, SmallArgs), PTy, Alloc<'static>>,
     drop_impl: blaze_hash::HashMap<ItemKey, Option<ItemKey>, Alloc<'static>>,
     resolve: blaze_hash::HashMap<(ItemKey, List), (ItemKey, List), Alloc<'static>>,
-    track_caller: blaze_hash::HashMap<ItemKey, bool, Alloc<'static>>,
+    track_caller: blaze_hash::HashMap<Instance, bool, Alloc<'static>>,
 }
 
 impl QueryCache {
@@ -1657,13 +1657,14 @@ impl<P: FrontEnd> blaze_build::Adts for CachedFront<'_, P> {
     fn nounwind(&self, owner: ItemKey) -> Option<bool> { self.front.nounwind(owner) }
     fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs { self.front.fn_attrs(owner) }
     fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
-        if let Some(&hit) = self.cache.borrow().track_caller.get(&instance.item) {
+        if let Some(&hit) = self.cache.borrow().track_caller.get(&instance) {
             return Some(hit);
         }
         let ans = self.front.track_caller(instance, ground)?;
-        self.cache.borrow_mut().track_caller.insert(instance.item, ans);
+        self.cache.borrow_mut().track_caller.insert(instance, ans);
         Some(ans)
     }
+    fn declared_track_caller(&self, item: ItemKey) -> Option<bool> { self.front.declared_track_caller(item) }
     fn location_adt(&self) -> Option<ItemKey> { self.front.location_adt() }
     fn caller_site(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> { self.front.caller_site(owner, expr) }
     fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> { self.front.def_site(item) }
@@ -2790,6 +2791,7 @@ fn vtable_rows<P: FrontEnd>(
             };
             // As a call's callee (`name_ref` above): a fn item of a trait's method resolved
             // to the body that runs, then what the language gives (`language_owner`).
+            let declaration = f.item;
             let f = match asking.shim_self(f, ground, alloc) {
                 Ok(f) => f,
                 Err(error) => {
@@ -2835,7 +2837,8 @@ fn vtable_rows<P: FrontEnd>(
             let target = Instance { item, args };
             let inst = match by_value_shim {
                 true => blaze_build::vtable_shim_instance(target, ground).map_err(|e| fail(VtableFail::Build(e)))?,
-                false => target,
+                false => crate::fn_item_resolve::vtable_target(adts, declaration, target, ground)
+                    .map_err(|e| fail(VtableFail::Build(e)))?,
             };
             word(reach.declare(program.function(c).key, inst, ground, alloc).map_err(|e| named(e, inst, &*ground))?);
         }

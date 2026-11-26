@@ -1218,8 +1218,17 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     /// The front end resolves the function's own or inherited caller-tracking attribute.
     /// At a call from an untracked function, the fast emitter records the item-relative
     /// caller site. Placement supplies its current line and column.
-    fn track_caller(&self, instance: Instance, _ground: &mut PortableTys<'_>) -> Option<bool> {
-        self.0.track_caller(instance.item)
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+        let declaration = self.0.track_caller(instance.item);
+        if instance.args == List::EMPTY || declaration == Some(true) {
+            return declaration;
+        }
+        let (item, _) = self.0.resolve(self.1, instance.item, instance.args, ground).ok()?;
+        self.0.track_caller(item)
+    }
+
+    fn declared_track_caller(&self, item: ItemKey) -> Option<bool> {
+        self.0.track_caller(item)
     }
 
     /// The library's `#[lang = "panic_location"]` struct (core/src/panic/location.rs).
@@ -2135,6 +2144,7 @@ fn build_vtable_in_tables<P: FrontEnd>(
             let word = match to {
                 VtableTarget::Fn(f) | VtableTarget::ByValueShim(f) => {
                     let by_value_shim = matches!(to, VtableTarget::ByValueShim(_));
+                    let declaration = f.item;
                     let f = crate::fn_item_resolve::resolved_shim_self(program, adts, caller_i, f, ground).map_err(|error| {
                         RunError::Resolve { function: caller_name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_shown(program, ground.view(), f.args), error }
                     })?;
@@ -2159,7 +2169,8 @@ fn build_vtable_in_tables<P: FrontEnd>(
                         let target = Instance { item, args };
                         let inst = match by_value_shim {
                             true => blaze_build::vtable_shim_instance(target, ground).map_err(|e| fail(VtableFail::Build(e)))?,
-                            false => target,
+                            false => crate::fn_item_resolve::vtable_target(adts, declaration, target, ground)
+                                .map_err(|e| fail(VtableFail::Build(e)))?,
                         };
                         let key = key_of(program, c, inst, ground, adts)?;
                         VtableWord::Slot(reached.slot(inst, c, key)?)

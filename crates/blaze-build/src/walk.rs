@@ -6907,7 +6907,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             _ => return Err(malformed("a call task on another expression")),
         };
         if let Some(DynSlot { slot, by_value, .. }) = self.dyn_slot(e, instance)? {
-            self.refuse_tracked_slot(e, instance)?;
             // A "rust-call" method called with its tuple written whole (`(**self).call_mut(args)`
             // in core's `impl FnMut<A> for &mut F` at `F = dyn FnMut(..)`): the slot's fn takes
             // the tuple's fields apart, as a direct call does (`spread_tuple`).
@@ -7078,6 +7077,21 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let off = 8 * (crate::vtable::HEADER_WORDS + slot);
         let off = i32::try_from(off).map_err(|_| malformed("a vtable slot past 2^31 bytes"))?;
         let f = self.b.load(Ty::PTR, Flags::NONE, vt, off, MemAttrs::aligned(3));
+        // The trait declaration fixes the slot ABI for every implementation.
+        if self.adts.declared_track_caller(item) == Some(true) {
+            if by_value {
+                return Err(BuildError::TrackCaller {
+                    expr: Some(e),
+                    item,
+                    why: "a by-value vtable shim cannot forward the trait's hidden caller location yet",
+                    gap: None,
+                });
+            }
+            let loc = self.call_location(Some(e), item)?;
+            reprs.push(Repr::Ptr);
+            passes.push(track_caller::PASS);
+            self.push_val(V::Scalar(loc), None);
+        }
         self.emit_call(Callee::Pointer(f), &reprs, &passes, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
