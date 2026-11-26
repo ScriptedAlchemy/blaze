@@ -136,7 +136,12 @@ fn owner_field_bounds_select_only_the_matching_impl() -> Result<(), crate::world
         fn resolve_path(&self, _: Seal, _: ScopeId, _: PathIdx, _: &[Name]) -> Fetch<crate::path_miss::PathAnswer> {
             Err(Missing)
         }
-        fn lang_item(&self, _: Seal, _: LangItem) -> Fetch<Option<ItemKey>> { Err(Missing) }
+        fn lang_item(&self, _: Seal, item: LangItem) -> Fetch<Option<ItemKey>> {
+            match item {
+                LangItem::TryAsDyn => Ok(None),
+                _ => Err(Missing),
+            }
+        }
         fn lang_path(&self, _: Seal, _: LangItem) -> Fetch<Option<Def>> { Err(Missing) }
         fn const_value(&self, _: Seal, _: ItemKey) -> Fetch<Option<u64>> { Err(Missing) }
         fn opaque_hidden(&self, _: Seal, _: ItemKey) -> Fetch<Option<Hidden<'_>>> { Err(Missing) }
