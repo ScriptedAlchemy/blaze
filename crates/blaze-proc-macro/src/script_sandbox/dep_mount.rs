@@ -31,9 +31,10 @@
 use core::fmt;
 use std::sync::Arc;
 
-use blaze_build_script::Outputs;
+use blaze_build_script::{Outputs, OutputsRef};
 use blaze_build_script::dep_paths::{self, DEPS_ROOT, DepMount, DepPathError, Producer, Sight};
 use blaze_build_script::env::DepMetadata;
+use blaze_build_script::producer_outputs::{self, Binding};
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, AVec, Alloc};
 use blaze_wasi::{Answer, Errno, Filestat, Filetype, Open, Stop};
@@ -148,9 +149,14 @@ enum Served {
 struct Mounted {
     /// Where the reader sees it, as parts from `/`.
     parts: Vec<String>,
-    /// The producer's `links`, for errors.
-    links: String,
+    owner: MountOwner,
     served: Served,
+}
+
+#[derive(Clone, Debug)]
+enum MountOwner {
+    Links(String),
+    BuildDependency(String),
 }
 
 impl Mounted {
@@ -175,6 +181,29 @@ pub struct DepViews {
     mounts: Vec<Mounted>,
     /// `None` when nothing is mounted.
     content: Option<ContentId>,
+    library_path: Option<String>,
+}
+
+/// A script output record whose compile inputs and search rows agree with its consumer module.
+pub struct VerifiedProducer<'a> {
+    binding: Binding<'a>,
+    outputs: OutputsRef<'a>,
+}
+
+impl<'a> VerifiedProducer<'a> {
+    pub fn verify(binding: Binding<'a>, outputs: OutputsRef<'a>) -> Result<Self, DepViewError> {
+        let refuse = |why: String| DepViewError::Producer { package: format!("{} {}", binding.name, binding.version), why };
+        let actual = producer_outputs::from_record(&outputs).map_err(|why| refuse(why.to_string()))?;
+        if actual != binding.outputs {
+            return Err(refuse("the generated compile inputs or search paths disagree with the module receipt".to_owned()));
+        }
+        for (_, path) in outputs.link_search() {
+            if path.contains(':') {
+                return Err(refuse(format!("the search path {path:?} contains the path-list delimiter")));
+            }
+        }
+        Ok(Self { binding, outputs })
+    }
 }
 
 impl DepViews {
@@ -185,6 +214,42 @@ impl DepViews {
 
     pub fn is_empty(&self) -> bool {
         self.mounts.is_empty()
+    }
+
+    pub(crate) fn library_path(&self) -> Option<&str> {
+        self.library_path.as_deref()
+    }
+
+    /// Serve only the bytes authenticated by the consuming module, at the same spelling
+    /// its WASI dependency was compiled with. The path list preserves producer order.
+    pub(crate) fn with_build_dependencies(mut self, producers: &[VerifiedProducer<'_>]) -> Self {
+        if producers.is_empty() {
+            return self;
+        }
+        let mut paths = Vec::new();
+        for producer in producers {
+            let outputs = producer.outputs;
+            let binding = producer.binding;
+            let at = format!("{}{}", producer_outputs::ROOT_PREFIX, binding.outputs.directory().text());
+            for (_, path) in outputs.link_search() {
+                let relative = producer_outputs::under(path, outputs.out_dir()).expect("verified producer search path");
+                paths.push(if relative.is_empty() { at.clone() } else { format!("{at}/{relative}") });
+            }
+            self.mounts.push(Mounted {
+                parts: at[1..].split('/').map(str::to_owned).collect(),
+                owner: MountOwner::BuildDependency(format!("{} {}", binding.name, binding.version)),
+                served: Served::Keyed {
+                    files: Arc::new(outputs.files().map(|(path, bytes)| (path.to_owned(), bytes.to_vec())).collect()),
+                    submodules: Arc::from([]),
+                },
+            });
+        }
+        self.mounts.sort_by(|a, b| a.parts.cmp(&b.parts));
+        // Equal producer roots bind equal file bytes. `links` mounts use other roots.
+        self.mounts.dedup_by(|a, b| a.parts == b.parts);
+        self.content = Some(content_id(&self.mounts));
+        self.library_path = (!paths.is_empty()).then(|| paths.join(":"));
+        self
     }
 
     /// The run's key `base` with what the mounts serve: `base` itself when nothing is mounted,
@@ -222,6 +287,7 @@ impl DepViews {
 /// A `links` dependency's metadata the reading script cannot be given, by name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DepViewError {
+    Producer { package: String, why: String },
     /// An absolute path under neither the producer's `OUT_DIR` nor its served tree.
     Outside { links: String, key: String, path: String },
     /// A pair whose `links` names no producer given.
@@ -249,6 +315,7 @@ impl From<DepPathError<'_>> for DepViewError {
 impl fmt::Display for DepViewError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DepViewError::Producer { package, why } => write!(f, "the WASI build dependency {package}: {why}"),
             DepViewError::Outside { links, key, path } => write!(
                 f,
                 "DEP_{links}_{key} names `{path}`, outside the `links = \"{links}\"` package's OUT_DIR and its tree: a path of the machine is never given to a build script (decision D96 (5))"
@@ -300,7 +367,7 @@ fn view_inner<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[Dep
     // One mount serves every pair under it (two pairs under one `OUT_DIR`, say).
     mounts.dedup_by(|a, b| a.parts == b.parts);
     let content = (!mounts.is_empty()).then(|| content_id(&mounts));
-    Ok(Viewed { values: resolved.values, views: DepViews { mounts, content } })
+    Ok(Viewed { values: resolved.values, views: DepViews { mounts, content, library_path: None } })
 }
 
 /// A reader's `links` values resolved for a run of one [`Sight`], and the trees they are under.
@@ -376,7 +443,7 @@ fn mounted(mount: DepMount<'_>, producer: &DepProducer, reader: &Tree, allow_sto
         }
     };
     let parts = at.split('/').filter(|part| !part.is_empty()).map(str::to_owned).collect();
-    Ok(Mounted { parts, links: links.to_owned(), served })
+    Ok(Mounted { parts, owner: MountOwner::Links(links.to_owned()), served })
 }
 
 fn find<'p>(producers: &[(&str, &'p DepProducer)], links: &str) -> Result<&'p DepProducer, DepViewError> {
@@ -438,10 +505,14 @@ impl ScriptSandbox {
     /// The stop for a write under the mount `mount` at `rel`.
     pub(super) fn dep_write(&mut self, mount: usize, rel: &str) -> Stop {
         let mounted = &self.script.deps.mounts[mount];
-        let (at, links) = (mounted.at(), mounted.links.clone());
+        let at = mounted.at();
+        let owner = match &mounted.owner {
+            MountOwner::Links(links) => format!("`links = \"{links}\"` dependency"),
+            MountOwner::BuildDependency(package) => format!("WASI build dependency {package}"),
+        };
         let path = if rel.is_empty() { at } else { format!("{at}/{rel}") };
         self.refuse(Refusal::Path(format!(
-            "wrote {path}, a file of the `links = \"{links}\"` dependency served read-only (its DEP_* paths), outside OUT_DIR, the only folder a build script may write"
+            "wrote {path}, a file of the {owner} served read-only, outside OUT_DIR, the only folder a build script may write"
         )))
     }
 
@@ -581,6 +652,44 @@ mod tests {
         };
         buf.truncate(n);
         Ok(buf)
+    }
+
+    #[test]
+    fn a_wasi_producer_receipt_serves_the_compiled_path_and_search_list() {
+        use blaze_build_script::{instr::OutputLimits, module_record::Digest, outputs::FileLimits};
+        const SEARCH: &str = "cargo::rustc-link-search=native=/producer/out/found\n";
+        let alloc = blaze_own::testing::heap().alloc();
+        let record = |search: &str, marker: &[u8]| {
+            let mut outputs = Outputs::read(search.as_bytes(), "/producer/out", OutputLimits::DEFAULT, alloc).unwrap();
+            outputs.add_file("found/from-dependency", marker, FileLimits::DEFAULT, alloc).unwrap();
+            let mut bytes = AVec::new_in(alloc);
+            outputs.encode(&mut bytes);
+            bytes
+        };
+        let original = record(SEARCH, b"exact path");
+        let no_search = record("", b"exact path");
+        let edited = record(SEARCH, b"changed path");
+        let original = OutputsRef::open(&original).unwrap();
+        let no_search = OutputsRef::open(&no_search).unwrap();
+        let edited = OutputsRef::open(&edited).unwrap();
+        let outputs = producer_outputs::from_record(&original).unwrap();
+        let binding = Binding { name: "dep", version: "0.1.0", source: "files:test", features: Digest::from_content(ContentId::default()), outputs };
+        let verified = VerifiedProducer::verify(binding, original).unwrap();
+        let root = format!("{}{}", producer_outputs::ROOT_PREFIX, outputs.directory().text());
+        let views = DepViews::none().with_build_dependencies(&[verified]);
+        let search = format!("{root}/found");
+        let marker = format!("{search}/from-dependency");
+        assert_eq!(views.library_path(), Some(search.as_str()));
+        let mut sandbox = ScriptSandbox::new(reader(views, &[]));
+        assert_eq!(read_whole(&mut sandbox, &marker), Ok(b"exact path".to_vec()));
+        assert!(sandbox.open(ROOT_FD, marker.as_bytes(), CREATE).is_err());
+        assert!(matches!(VerifiedProducer::verify(binding, edited), Err(DepViewError::Producer { .. })));
+        assert!(matches!(VerifiedProducer::verify(binding, no_search), Err(DepViewError::Producer { .. })));
+
+        let without = producer_outputs::from_record(&no_search).unwrap();
+        assert_eq!(without.directory(), outputs.directory());
+        let verified = VerifiedProducer::verify(Binding { outputs: without, ..binding }, no_search).unwrap();
+        assert_eq!(DepViews::none().with_build_dependencies(&[verified]).library_path(), None);
     }
 
     #[test]

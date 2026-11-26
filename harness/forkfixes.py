@@ -708,13 +708,14 @@ def clone_store(initial_home: Path, replay_home: Path) -> dict:
     if len(formats) != 1:
         raise CaseFailed(f"fresh HOME must have one CAS format to replay, found {[path.name for path in formats]}")
     source_cas = formats[0]
+    before = tree_hashes(source)
     destination = replay_home / ".blaze/v2/store"
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, destination)
-    before = tree_hashes(source)
     after = tree_hashes(destination)
-    if before != after:
-        raise CaseFailed("the copied replay store is not byte-identical to the initial store")
+    difference = artifact_identity_diff(before, after)
+    if difference:
+        raise CaseFailed(f"the copied replay store is not byte-identical to the initial store: {difference}")
     cas_before = tree_hashes(source_cas)
     cas_after = tree_hashes(destination / source_cas.name)
     if not cas_before:

@@ -109,6 +109,8 @@ use blaze_script::input::{self, Fields, Input, InputError};
 // The build-script mode: a folder of its own, so cargo does not take it for a binary.
 #[path = "proc_macro_modules/build_scripts.rs"]
 mod build_scripts;
+#[path = "proc_macro_modules/producer_capture.rs"]
+mod producer_capture;
 // `vendor_from`: the fetch step from blaze's fetch store, no network (D112 N2).
 #[path = "proc_macro_modules/store_vendor.rs"]
 mod store_vendor;
@@ -1241,6 +1243,18 @@ fn inherit(member: &str, root: &str, root_dir: &Path, path: &Path) -> Result<Str
 /// each as the path, a zero byte, its length as 8 little-endian bytes and its bytes. Walked with
 /// a stack of folders.
 fn files_digest(dir: &Path) -> Result<String, Failure> {
+    let files = package_files(dir)?;
+    let mut all = Vec::new();
+    for (path, bytes) in &files {
+        all.extend_from_slice(path.as_bytes());
+        all.push(0);
+        all.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        all.extend_from_slice(bytes);
+    }
+    Ok(sha256(&all))
+}
+
+fn package_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, Failure> {
     use blaze_build_script::served::{InPackage, in_package};
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut folders = vec![(dir.to_owned(), String::new())];
@@ -1263,14 +1277,7 @@ fn files_digest(dir: &Path) -> Result<String, Failure> {
         }
     }
     files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    let mut all = Vec::new();
-    for (path, bytes) in &files {
-        all.extend_from_slice(path.as_bytes());
-        all.push(0);
-        all.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        all.extend_from_slice(bytes);
-    }
-    Ok(sha256(&all))
+    Ok(files)
 }
 
 /// The names of a vendored manifest's `[features]` table, `default` among them when it has
@@ -2163,6 +2170,9 @@ fn main() {
     if let Ok(macro_crate) = std::env::var("BLAZE_PM_WRAP") {
         let args: Vec<OsString> = std::env::args_os().skip(1).collect();
         wrap(args, &macro_crate);
+    }
+    if let Ok(plan) = std::env::var(producer_capture::WRAPPER_PLAN) {
+        producer_capture::wrap(&plan, std::env::args_os().skip(1).collect());
     }
     let heap = blaze_own::Heap::process();
     let args: Vec<String> = std::env::args().skip(1).collect();

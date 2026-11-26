@@ -36,6 +36,8 @@ use blaze_build_script::{
     wasi_std::{self, PERM_ANCHOR, PERM_PATCH, RT_ANCHOR, RT_PATCH, UNIX_PATH_LIST_END, UNIX_PATH_LIST_START, WASI_PATHS_ANCHOR, WASI_PATHS_PATCH, WASI_PATH_LIST_HEADER},
 };
 
+use super::producer_capture;
+
 /// The input: the proc-macro mode's fields under `build_scripts`, and `native` for scripts
 /// built for the host (D65, D69).
 struct Wrapped(Args, Option<Native>);
@@ -461,7 +463,7 @@ fn has_dependency_producer(output: &str, library: &Path, checkout: &Path, member
 
 /// The uplifted Cargo dep-info records the actual path inputs of this root and its local
 /// dependencies. Registry and sysroot bytes already have pinned identities.
-fn checkout_inputs(checkout: &Path, source: &Path, script: &Path, artifact: &Path, supplied: &[&Path], alloc: blaze_own::Alloc<'_>) -> Result<String, Failure> {
+fn checkout_inputs(checkout: &Path, source: &Path, script: &Path, artifact: &Path, supplied: &[&Path], dependencies: &[&Path], alloc: blaze_own::Alloc<'_>) -> Result<String, Failure> {
     use std::fmt::Write as _;
 
     let depfile = artifact.with_extension("d");
@@ -476,9 +478,12 @@ fn checkout_inputs(checkout: &Path, source: &Path, script: &Path, artifact: &Pat
     let source_name = checkout_relative(source, checkout).ok_or_else(|| bad_path(source))?;
     let mut footprint = format!("checkout-package {}\n", if source_name.is_empty() { "." } else { source_name });
     let mut files = vec![checkout.join("Cargo.toml"), checkout.join("Cargo.lock"), source.join("Cargo.toml")];
+    for dependency in dependencies {
+        files.extend(super::package_files(dependency)?.into_iter().map(|(path, _)| dependency.join(path)));
+    }
     for path in &listed {
         let path = Path::new(path.as_str());
-        if path.starts_with(source) {
+        if path.starts_with(source) || dependencies.iter().any(|dependency| path.starts_with(dependency)) {
             files.push(path.to_owned());
         } else if !supplied.iter().any(|root| path.starts_with(root)) {
             return Err(refuse(format!("the compile read {} outside its checkout package and the pinned toolchain inputs", path.display())));
@@ -658,7 +663,59 @@ impl Plan<'_> {
             }
         }
         let what = format!("the build of {} {}'s script", wanted.name, wanted.version);
-        let mut ran = run(&argv, &ws, &env, Duration::from_secs(self.args.build_seconds), &what)?;
+        let limit = Duration::from_secs(self.args.build_seconds);
+        let started = Instant::now();
+        let mut ran = run(&argv, &ws, &env, limit, &what)?;
+        let mut producer_bindings = String::new();
+        let mut generated = Vec::new();
+        if ran.status == 0 && native.is_none() && matches!(origin, Origin::Path { .. }) && closure.iter().any(|row| row.contains(" files:")) {
+            use std::fmt::Write as _;
+
+            let previews = producer_capture::capture(&String::from_utf8_lossy(&ran.output), &target, &self.args.checkout, &closure, alloc)?;
+            if !previews.is_empty() {
+                let plan = producer_capture::plan(&previews, &target, alloc)?;
+                // Both builds use the same Cargo closure. This marker forces rustc to re-emit
+                // artifacts that the first build expanded with physical output paths.
+                flags.push("--remap-path-prefix=/__blaze_d52_candidate=/__blaze_d52_verified".to_owned());
+                let Some((_, rustflags)) = env.iter_mut().find(|(name, _)| name == "CARGO_ENCODED_RUSTFLAGS") else {
+                    return Err(no_module("the bootstrap's compile flags were not prepared".to_owned()));
+                };
+                *rustflags = flags.join("\u{1f}").into();
+                env.push(("RUSTC_WRAPPER".to_owned(), self.me.clone()));
+                env.push((producer_capture::WRAPPER_PLAN.to_owned(), plan.into()));
+                let left = limit.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return Err(Failure::Deadline { what, seconds: limit.as_secs() });
+                }
+                ran = run(&argv, &ws, &env, left, &format!("{what} with admitted producer outputs"))?;
+                if ran.status == 0 {
+                    let confirmed = producer_capture::capture(&String::from_utf8_lossy(&ran.output), &target, &self.args.checkout, &closure, alloc)?;
+                    let same = previews.iter().map(|entry| (&entry.name, &entry.version, entry.features, entry.receipt))
+                        .eq(confirmed.iter().map(|entry| (&entry.name, &entry.version, entry.features, entry.receipt)));
+                    if !same {
+                        return Err(no_module("a dependency's compile or link-search outputs changed during bootstrap replay".to_owned()));
+                    }
+                    if script_closure(&self.lock, wanted, &self.args.checkout, alloc, &original)? != closure {
+                        return Err(no_module("a build dependency's source changed during bootstrap replay".to_owned()));
+                    }
+                    if let Origin::Path { dir, files, .. } = origin
+                        && (files_digest(dir)? != *files || workspace_before != read(&self.args.checkout.join("Cargo.toml"))? || read(&self.args.checkout.join("Cargo.lock"))? != self.lock)
+                    {
+                        return Err(no_module("the checkout changed during bootstrap replay".to_owned()));
+                    }
+                    for dep in confirmed {
+                        let source = closure.iter().find_map(|pin| {
+                            let (name, tail) = pin.split_once(' ')?;
+                            let (version, source) = tail.split_once(' ')?;
+                            (name == dep.name && version == dep.version).then_some(source)
+                        }).ok_or_else(|| no_module(format!("{} {} has no dependency source pin", dep.name, dep.version)))?;
+                        let binding = blaze_build_script::producer_outputs::Binding { name: &dep.name, version: &dep.version, source, features: dep.features, outputs: dep.receipt };
+                        write!(producer_bindings, "{binding}").expect("writing text to a string succeeds");
+                        generated.push(PathBuf::from(format!("{}{}", blaze_build_script::producer_outputs::ROOT_PREFIX, dep.receipt.directory().text())));
+                    }
+                }
+            }
+        }
         let dependency_producer = has_dependency_producer(&String::from_utf8_lossy(&ran.output), library, &self.args.checkout, &ws.join("script"), &closure);
         let (compiled, readable) = artifacts_of(&String::from_utf8_lossy(&ran.output));
         ran.output = readable.clone().into_bytes();
@@ -677,8 +734,25 @@ impl Plan<'_> {
         let (module_file, digest_file) = (executable.filename(), executable.digest_filename());
         let wasm_path = target.join(artifact);
         let footprint = match origin {
-            Origin::Path { dir, files, .. } if native.is_none() && !dependency_producer => {
-                let footprint = checkout_inputs(&self.args.checkout, dir, &script, &wasm_path, &[&self.work, library, &self.tool.sysroot], alloc)?;
+            Origin::Path { dir, files, .. } if native.is_none() && (!dependency_producer || !producer_bindings.is_empty()) => {
+                let mut supplied = vec![self.work.as_path(), library, self.tool.sysroot.as_path()];
+                supplied.extend(generated.iter().map(PathBuf::as_path));
+                let mut local = Vec::new();
+                if !producer_bindings.is_empty() {
+                    for artifact in compiled.lines() {
+                        let Some((name, tail)) = artifact.split_once(' ') else { continue };
+                        let Some((version, path)) = tail.split_once(' ') else { continue };
+                        let path = Path::new(path);
+                        if path.starts_with(&self.args.checkout) && !path.starts_with(&self.work)
+                            && closure.iter().any(|pin| pin.starts_with(&format!("{name} {version} files:")))
+                        {
+                            local.push(path);
+                        }
+                    }
+                    local.sort_unstable();
+                    local.dedup();
+                }
+                let footprint = checkout_inputs(&self.args.checkout, dir, &script, &wasm_path, &supplied, &local, alloc)?;
                 let observed = files_digest(dir)?;
                 if observed != *files || workspace_before != read(&self.args.checkout.join("Cargo.toml"))? || read(&self.args.checkout.join("Cargo.lock"))? != self.lock {
                     return Err(no_module("the checkout package changed during the bootstrap build".to_owned()));
@@ -687,7 +761,7 @@ impl Plan<'_> {
             }
             _ => String::new(),
         };
-        let identity = format!("{header}{runner}{footprint}builder bootstrap\n");
+        let identity = format!("{header}{runner}{footprint}{producer_bindings}builder bootstrap\n");
         let key = sha256(identity.as_bytes());
         let wasm = std::fs::read(&wasm_path).map_err(io(&wasm_path))?;
         let wasm_sha256 = sha256(&wasm);

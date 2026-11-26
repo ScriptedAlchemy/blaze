@@ -40,7 +40,7 @@ use crate::sweep::{LeafKind, Plant, Rows, Stamps};
 const SUBJECT_DOMAIN: &str = "blaze-cli build-script module subject 2";
 // Module rows in version 1 did not include the selected executable record.
 const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 2";
-const OUT_DOMAIN: &str = "blaze-cli build-script module out 2";
+const OUT_DOMAIN: &str = "blaze-cli build-script module out 3";
 
 /// The rule a lookup's failure names.
 pub(crate) const RULE: &str = "script_modules.rs";
@@ -73,7 +73,7 @@ pub(crate) fn part_source(graph_source: ContentId, subject: ContentId) -> Conten
 }
 
 pub(crate) fn selected_out(selected: Selected) -> ContentId {
-    ContentId::of(OUT_DOMAIN, selected.digest().as_bytes())
+    ContentId::of(OUT_DOMAIN, &selected.encode())
 }
 
 /// A module lookup a crate's script reads: its subject, the world index of the crate reading
@@ -111,17 +111,27 @@ pub(crate) fn tracks_checkout(
     pending.extend(root.deps.iter().map(|dep| dep.unit));
     let mut seen = blaze_own::AVec::new_in(alloc);
     seen.resize(graph.units.len(), false);
+    let mut path_dependencies = false;
+    let mut path_producers = false;
     while let Some(id) = pending.pop() {
         if core::mem::replace(&mut seen[id.index()], true) {
             continue;
         }
         let unit = &graph.units[id.index()];
-        if !matches!(unit.kind, UnitKind::Lib) || unit.build_script.is_some() || !matches!(lock.package(unit.package).source, LockSource::Registry { .. }) {
+        if unit.kind != UnitKind::Lib {
             return false;
+        }
+        match lock.package(unit.package).source {
+            LockSource::Path => {
+                path_dependencies = true;
+                path_producers |= unit.build_script.is_some();
+            }
+            LockSource::Registry { .. } if unit.build_script.is_none() => {}
+            _ => return false,
         }
         pending.extend(unit.deps.iter().map(|dep| dep.unit));
     }
-    true
+    !path_dependencies || path_producers
 }
 
 /// What one lookup is for: the run's placement and the script unit's package, version and

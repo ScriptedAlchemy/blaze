@@ -118,7 +118,7 @@ fn scripts_plan_a_host_only_producer_without_a_checked_crate() {
     let graph = UnitGraph { units, resolver: Resolver::V1, meta: AVec::new_in(alloc), left_out: AVec::new_in(alloc) };
     let root = plan::RunId { unit: UnitId(0), side: Side::Target, consumer: Consumer::Checked };
     let host = |unit| plan::RunId { unit: UnitId(unit), side: Side::Target, consumer: Consumer::HostDependency };
-    let plans = plan::runs(&graph, core::iter::once(root), alloc);
+    let plans = plan::runs(&graph, core::iter::once(root), |_, _| false, alloc);
     let row = |id| plans.iter().find(|plan| plan.id == id).expect("the reachable script has a plan");
     assert_eq!(plans.len(), 3);
     assert_eq!(row(root).inputs.as_slice(), &[host(5), host(6)]);
@@ -127,6 +127,9 @@ fn scripts_plan_a_host_only_producer_without_a_checked_crate() {
     assert_eq!(served_for(&graph, UnitId(5), Consumer::HostDependency), Some(UnitId(3)));
     assert_eq!(links_closure_for(&graph, UnitId(5), Consumer::HostDependency), [(UnitId(6), "helper", true)]);
     assert!(links_closure(&graph, UnitId(0)).is_empty(), "build-dependency runs alone grant no DEP_* metadata");
+    let plans = plan::runs(&graph, core::iter::once(root), |_, _| true, alloc);
+    let app = plans.iter().find(|plan| plan.id == root).expect("app has a planned run");
+    assert_eq!(app.inputs.as_slice(), &[plan::RunId { side: Side::Macro, ..host(5) }, plan::RunId { side: Side::Macro, ..host(6) }]);
 }
 
 /// The runtime keys a try-compile by its `--target` (blaze-proc-macro script_sandbox.rs,

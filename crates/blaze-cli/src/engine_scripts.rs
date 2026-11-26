@@ -876,6 +876,11 @@ impl<'f> ScriptsStage<'f> {
                         continue;
                     }
                     reads.push(producer);
+                    if let Some(run) = names.script_run(producer.subject)
+                        && run.inputs.host_dependency && run.side == blaze_world::Side::Macro
+                    {
+                        reads.push(crate::script_modules::name(ContentId(run.inputs.module)));
+                    }
                 }
             }
             // A run the graph does not name is the job's own refusal, said when it is entered.

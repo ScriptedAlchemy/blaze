@@ -29,7 +29,7 @@ use crate::{
     script::{LoadedScript, ScriptError, ScriptRun, ScriptRuntime},
     script_sandbox::{
         Script, ScriptRoot, Tree,
-        dep_mount::{self, DepProducer, DepViewError, DepViews},
+        dep_mount::{self, DepProducer, DepViewError, DepViews, VerifiedProducer},
         owned_env,
     },
 };
@@ -304,7 +304,9 @@ fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host
         if checkout.is_some() {
             verify_module_record_key(&second, &other)?;
         }
-        if !checkout_wasm(&identity) || !checkout_wasm(&other) {
+        if !checkout_wasm(&identity) || !checkout_wasm(&other)
+            || !blaze_build_script::producer_outputs::Binding::in_identity(&identity).eq(blaze_build_script::producer_outputs::Binding::in_identity(&other))
+        {
             return Err(ModuleLookupError::Ambiguous { first, second });
         }
         if first_bytes.is_none() {
@@ -367,6 +369,15 @@ pub fn select_record(folder: &Path, executable: Executable) -> Result<Selected, 
 pub fn read_selected_module(store: &Path, selected: Selected) -> Result<Vec<u8>, ModuleLookupError> {
     let record = store.join("build-script/modules").join(selected.key());
     read_verified_module(&record, selected.executable(), selected.digest())
+}
+
+/// Read the identity authenticated by the selected module record's key.
+pub fn selected_identity(store: &Path, selected: Selected) -> Result<String, ModuleLookupError> {
+    let record = store.join("build-script/modules").join(selected.key());
+    let path = record.join("identity");
+    let identity = std::fs::read_to_string(&path).map_err(|error| ModuleLookupError::Identity { path, error })?;
+    verify_module_record_key(&record, &identity)?;
+    Ok(identity)
 }
 
 /// The configuration to serve with a build-script run.
@@ -506,7 +517,17 @@ fn prepare_viewing_for<'a>(
         None => &serves.cfg,
     };
     let given = Given { package: facts, seen: root.seen(), features: &unit.features, target_cfg, target: setting.target, host: setting.host, deps };
-    let env = blaze_build_script::env(&given, alloc);
+    let mut env = blaze_build_script::env(&given, alloc);
+    if consumer == Consumer::HostDependency && setting.target == "wasm32-wasip1" {
+        for (name, value) in [("DEBUG", "false"), ("OPT_LEVEL", "3"), ("PROFILE", "release")] {
+            let at = env.vars.partition_point(|(key, _)| key.as_str() < name);
+            env.vars[at].1 = blaze_own::AString::from_str_in(value, alloc);
+        }
+    }
+    if let Some(paths) = views.library_path() {
+        let at = env.vars.partition_point(|(name, _)| name.as_str() < "LD_LIBRARY_PATH");
+        env.vars.insert(at, (blaze_own::AString::from_str_in("LD_LIBRARY_PATH", alloc), blaze_own::AString::from_str_in(paths, alloc)));
+    }
     let caller = setting.caller_env.for_root(root.seen());
     let mut script = Script {
         package,
@@ -599,7 +620,7 @@ pub fn outputs_viewing_on<'a>(
     producers: &[(&str, &DepProducer)],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, UnitScriptError> {
-    outputs_viewing_for(runtime, setting, graph, script, side_cfg, tree, root, deps, producers, Consumer::Checked, alloc)
+    outputs_viewing_for(runtime, setting, graph, script, side_cfg, tree, root, deps, producers, Consumer::Checked, &[], alloc)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -614,6 +635,7 @@ fn outputs_viewing_for<'a>(
     deps: &[DepMetadata<'_>],
     producers: &[(&str, &DepProducer)],
     consumer: Consumer,
+    build_dependencies: &[VerifiedProducer<'_>],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, UnitScriptError> {
     let unit = graph.units.get(script.index()).ok_or(UnitScriptError::NotAScript { unit: script })?;
@@ -625,7 +647,8 @@ fn outputs_viewing_for<'a>(
             let viewed = dep_mount::view(&tree, producers, deps, alloc).map_err(|why| UnitScriptError::DepView { package: package(unit), why })?;
             let seen: Vec<DepMetadata<'_>> =
                 deps.iter().zip(viewed.values.iter()).map(|(dep, value)| DepMetadata { links: dep.links, key: dep.key, value: value.as_str() }).collect();
-            let prepared = prepare_viewing_for(runtime, setting, graph, script, side_cfg, tree, root, &seen, viewed.views, consumer, alloc)?;
+            let views = viewed.views.with_build_dependencies(build_dependencies);
+            let prepared = prepare_viewing_for(runtime, setting, graph, script, side_cfg, tree, root, &seen, views, consumer, alloc)?;
             runtime.fresh(&prepared.loaded, prepared.script, prepared.base, alloc).map_err(UnitScriptError::Script)
         }
         Runner::Native { .. } if side_cfg.is_some() && setting.target != setting.host => {
@@ -747,7 +770,7 @@ pub fn outputs_given<'a>(
     given: &[GivenRun<'_>],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, UnitScriptError> {
-    outputs_given_for(runtime, setting, graph, script, side_cfg, tree, root, given, Consumer::Checked, alloc)
+    outputs_given_for(runtime, setting, graph, script, side_cfg, tree, root, given, Consumer::Checked, &[], alloc)
 }
 
 /// The same task with a separately planned host producer as its consumer.
@@ -762,11 +785,12 @@ pub fn outputs_given_for<'a>(
     root: ScriptRoot,
     given: &[GivenRun<'_>],
     consumer: Consumer,
+    build_dependencies: &[VerifiedProducer<'_>],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, UnitScriptError> {
     let served = served_links_for(graph, script, given, consumer)?;
     let producers: Vec<(&str, &DepProducer)> = served.producers.iter().map(|(links, producer)| (*links, producer)).collect();
-    outputs_viewing_for(runtime, setting, graph, script, side_cfg, tree, root, &served.deps, &producers, consumer, alloc)
+    outputs_viewing_for(runtime, setting, graph, script, side_cfg, tree, root, &served.deps, &producers, consumer, build_dependencies, alloc)
 }
 
 /// The build-script units whose metadata `script` is given: for each direct dependency of the
