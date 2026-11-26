@@ -761,7 +761,7 @@ fn write_unit_plans<'a>(report_path: Option<&str>, plans: impl Iterator<Item = P
             body.push(',');
         }
         let names = json_digests(plan.unit.names.as_slice(), alloc);
-        let inputs = json_digests(plan.inputs.as_slice(), alloc);
+        let inputs = json_digests(plan.inputs, alloc);
         let _ = write!(body, "{{\"unit\":\"{}\",\"unit_digest\":\"{}\",\"plan_names\":{},\"plan_inputs\":{},\"work\":[",
             plan.name, hex(&plan.unit.spec), names.as_str(), inputs.as_str());
         for (index, (item, ids)) in plan.work.into_iter().flat_map(|work| work.items.iter().map(move |item| (item, work.ids))).enumerate() {
