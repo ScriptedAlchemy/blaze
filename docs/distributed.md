@@ -101,14 +101,15 @@ identity through `agent::Config`, rather than deriving them from a workspace its
 
 ## Environment variables and acceptance probes
 
-Only the two variables in the first table below are read by the retained carrier's
-runtime code. They request evidence or an explicit acceptance fault; they do not enable
-distributed compilation in the current CLI.
+The carrier reads the event path. The export command selects a test result gate for a
+planned unit and passes it to the carrier. These settings accompany an explicit
+distributed configuration.
 
 | Variable | Current behavior |
 |---|---|
 | `BLAZE_DIST_EVENTS` | Path for append-only JSON lines of actual agent and coordinator transitions. Each append holds a file lock, with a two-second lock bound, so processes do not interleave records. Write failure is logged as a warning; the acceptance harness separately rejects missing evidence. With the variable absent, no event file is opened. |
-| `BLAZE_DIST_TEST_RESULT_GATE` | Acceptance-only path to a fresh, already-created, empty absolute directory. The agent enables this only for a current lead and supplies a positive finite timeout. It captures one real result and pauses that sender's heartbeats until a `release` file appears or the deadline expires. Normal request input does not select the gate. |
+| `BLAZE_DIST_TEST_RESULT_GATE` | Acceptance-only path to a fresh, already-created, empty absolute directory. The agent enables this only for a current lead and supplies a positive finite timeout. It captures one real result and pauses that sender's heartbeats until a `release` file appears or the deadline expires. |
+| `BLAZE_DIST_TEST_RESULT_UNIT` | Optional planned unit name for the result gate. The gate can be shared by two export processes so the first lead result for that unit is held until its peer commits different work. |
 
 The result gate uses exclusive creation of `claimed` to select one result across callers.
 It writes the real canonical command to `result.cbor` and an accompanying `ready.json`

@@ -420,13 +420,16 @@ class Run:
                     shutil.copyfile(path, target)
 
     def build(self, home: str, dist: bool = True, wait: bool = True, project: Path | None = None,
-              *, result_gate: Path | None = None, **extra):
+              *, result_gate: Path | None = None, result_unit: str | None = None, **extra):
         self.prepare_modules(home, project or self.project)
         if result_gate is not None:
             check(dist, "a result gate belongs to a distributed export")
-            result_gate.mkdir(parents=True, exist_ok=False)
-            self.result_gates.append(result_gate)
+            if result_gate not in self.result_gates:
+                result_gate.mkdir(parents=True, exist_ok=False)
+                self.result_gates.append(result_gate)
             extra["BLAZE_DIST_TEST_RESULT_GATE"] = str(result_gate.resolve())
+            if result_unit is not None:
+                extra["BLAZE_DIST_TEST_RESULT_UNIT"] = result_unit
         self.sequence += 1
         out = self.program(home, project)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -502,28 +505,23 @@ class Run:
         check(not evidence.accepted(self.events()[after:], grant), "the exact captured result remains uncommitted at its gate")
         return grant
 
-    def suspend_grant(self, home: str, process: subprocess.Popen, after: int) -> dict:
-        pid = process.pid
-        def suspend():
+    def release_after_peer_result(self, gate: Path, a: subprocess.Popen, b: subprocess.Popen, after: int) -> None:
+        """Keep a real lead batch open until a second holder commits disjoint work."""
+        def captured():
             events = self.events()[after:]
-            for grant in reversed(events):
-                if grant["event"] != "grant" or grant["pid"] != pid or not grant["work"]:
-                    continue
-                if evidence.accepted(events, grant):
-                    continue
-                os.kill(pid, signal.SIGSTOP)
-                self.suspended.add(pid)
-                self.until(f"{home} acknowledges SIGSTOP",
-                           lambda: stopped_status(pid), [process], timeout=self.given.command_timeout)
-                # Catch the race where a result was accepted between observing and stopping.
-                # No next batch can run until SIGCONT, so retry only a genuinely live grant.
-                if evidence.accepted(self.events()[after:], grant):
-                    os.kill(pid, signal.SIGCONT)
-                    self.suspended.remove(pid)
-                    return None
-                return grant
+            for row in events:
+                if row["event"] == "result_held" and row["pid"] in (a.pid, b.pid):
+                    return evidence.held_result(gate, events, row["pid"])
             return None
-        return self.until(f"{home} holds uncommitted compile work (requires BLAZE_DIST_EVENTS)", suspend, [process])
+
+        grant = self.until("one worker captures a real mathy Result", captured, [a, b])
+        peer = b if grant["pid"] == a.pid else a
+        self.until("the peer submits its own mathy result before the first worker releases",
+                   lambda: evidence.peer_result_before_release(self.events()[after:], grant, peer.pid), [a, b])
+        (gate / "release").touch()
+        self.until("the released mathy result is accepted by Client and the coordinator",
+                   lambda: evidence.gate_answer(gate, grant, refused=False)
+                   and evidence.accepted(self.events()[after:], grant), [a, b])
 
 
 def file_hash(path: Path) -> str:
@@ -570,7 +568,7 @@ def faults(run: Run, edited: Path) -> None:
     wanted = control(run)
     valid_gate = run.root / "gates" / "valid-result"
     mark = len(run.events())
-    valid, valid_log = run.build("a", wait=False, result_gate=valid_gate)
+    valid, valid_log = run.build("a", wait=False, result_gate=valid_gate, result_unit="mathy")
     grant = run.held_result("a", valid, valid_gate, mark, suspend=False)
     (valid_gate / "release").touch()
     run.until("the released valid Result is accepted by the real coordinator and Client",
@@ -586,11 +584,12 @@ def faults(run: Run, edited: Path) -> None:
     # that the victim had outstanding work. Give the survivor the exact same edited input.
     edit(edited, 'format!("7:{sum}', 'format!("7 lost:{sum}')
     wanted = control(run)
+    lost_gate = run.root / "gates" / "killed-result"
     mark = len(run.events())
-    lost, lost_log = run.build("a", wait=False)
+    lost, lost_log = run.build("a", wait=False, result_gate=lost_gate, result_unit="mathy")
+    grant = run.held_result("a", lost, lost_gate, mark, suspend=True)
     survivor, survivor_log = run.build("b", wait=False)
-    grant = run.suspend_grant("a", lost, mark)
-    os.kill(grant["pid"], signal.SIGKILL)
+    os.killpg(grant["pid"], signal.SIGKILL)
     killed_at = len(run.events()) - mark
     run.suspended.discard(grant["pid"])
     check(run.wait(lost) == -signal.SIGKILL, f"worker {grant['pid']} exits from SIGKILL (log {lost_log})")
@@ -611,7 +610,7 @@ def faults(run: Run, edited: Path) -> None:
     wanted = control(run)
     stale_gate = run.root / "gates" / "stale-result"
     mark = len(run.events())
-    stalled, stalled_log = run.build("a", wait=False, result_gate=stale_gate)
+    stalled, stalled_log = run.build("a", wait=False, result_gate=stale_gate, result_unit="mathy")
     # The victim reaches its real result before the survivor submits, so the selected
     # holder is this execution's lead. Its silence advances the attempt even if the
     # survivor publishes Done before SIGCONT and the stale submission.
@@ -718,8 +717,11 @@ def main(given: Input) -> None:
         check(solo[0].startswith("40 functions, ") and solo[0].endswith(expected),
               "solo executes 40 functions, the expected unwind/drop, script, included file and proc macro")
 
-        a, a_log = run.build("a", wait=False)
-        b, b_log = run.build("b", wait=False)
+        overlap = run.root / "gates" / "shared-mathy"
+        mark = len(run.events())
+        a, a_log = run.build("a", wait=False, result_gate=overlap, result_unit="mathy")
+        b, b_log = run.build("b", wait=False, result_gate=overlap, result_unit="mathy")
+        run.release_after_peer_result(overlap, a, b, mark)
         code_a, code_b = run.wait(a), run.wait(b)
         require_build(code_a, Path(a_log).read_text() if code_a else "", "worker a builds", Path(a_log))
         require_build(code_b, Path(b_log).read_text() if code_b else "", "worker b builds", Path(b_log))

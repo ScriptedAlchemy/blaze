@@ -12,12 +12,12 @@ use blaze_wire::{WireAlloc, WireString, encode};
 use crate::Error;
 use crate::protocol::{Answer, Command};
 use crate::sys::{
-    Errno, IoError, SystemClock, current_pid, env_var, join_path, open_create_new, rename_path,
+    Errno, IoError, SystemClock, current_pid, join_path, open_create_new, rename_path,
     sleep, stat_path, unlink_path, write_all_fd,
 };
 use crate::telemetry::{emit, json, quoted};
 
-/// An opt-in test gate, shared by the units of one daemon and claimed once. The caller
+/// An opt-in test gate, shared by the selected workers and claimed once. The caller
 /// supplies a new empty directory and a finite timeout; retained captures are evidence,
 /// never durable coordinator state and never input to a later build.
 #[derive(Clone, Debug)]
@@ -60,15 +60,6 @@ impl ResultGate {
             ))
         })?;
         Ok(Self { directory, clock, deadline_ns, timeout, alloc })
-    }
-
-    /// The daemon-only test setting. Normal requests never select a gate from their input
-    /// environment; the agent enables this only for a current lead, before it loses authority.
-    pub(crate) fn from_env(timeout: Duration, alloc: WireAlloc) -> Result<Option<Self>, Error> {
-        let Some(directory) = env_var("BLAZE_DIST_TEST_RESULT_GATE", alloc) else {
-            return Ok(None);
-        };
-        Self::new(directory, timeout, alloc).map(Some)
     }
 
     pub(crate) fn hold(&self, command: &Command) -> Result<Option<Capture<'_>>, Error> {

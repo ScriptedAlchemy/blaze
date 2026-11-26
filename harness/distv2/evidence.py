@@ -105,6 +105,27 @@ def accepted(events: list[dict], grant: dict) -> bool:
     return any(e["event"] == "result_accepted" and lease(e) == lease(grant) for e in events)
 
 
+def peer_result_before_release(events: list[dict], held: dict, peer: int) -> bool:
+    require(not accepted(events, held), "the held result committed before its peer's")
+    other = {
+        lease(event): set(event["work"])
+        for event in events
+        if event["event"] == "grant" and event["pid"] == peer
+        and event["unit_digest"] == held["unit_digest"]
+        and event["execution"] == held["execution"] and event["attempt"] == held["attempt"]
+        and event["holder"] != held["holder"]
+    }
+    for event in events:
+        if event["event"] != "result_accepted" or lease(event) not in other:
+            continue
+        work = set(event["work"])
+        require(work <= other[lease(event)], "the peer committed work outside its grant")
+        require(not work.intersection(held["work"]), "the two holders committed overlapping work")
+        if work:
+            return True
+    return False
+
+
 def recovered(events: list[dict], grant: dict, accepted_after: int = 0) -> bool:
     """Every outstanding name was committed under a replacement grant before acceptance."""
     replacements: dict[tuple, set[str]] = {}

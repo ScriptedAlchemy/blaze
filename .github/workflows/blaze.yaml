@@ -773,6 +773,8 @@ jobs:
             ${{ runner.temp }}/blaze-fs/dist-*/provenance.json
             ${{ runner.temp }}/blaze-fs/dist-*/source.patch
             ${{ runner.temp }}/blaze-fs/dist-*/logs
+            ${{ runner.temp }}/blaze-fs/dist-*/gates
+            ${{ runner.temp }}/blaze-fs/dist-*/artifacts.json
             ${{ runner.temp }}/blaze-fs/dist-*/final-artifacts.json
             ${{ runner.temp }}/blaze-fs/forkfixes/*.json
             ${{ runner.temp }}/blaze-fs/forkfixes/evidence

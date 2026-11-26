@@ -96,6 +96,11 @@ pub trait Granted {
     /// The compiler/exporter's matchable refusal, retained until the carrier reports it.
     type Error: core::error::Error;
 
+    /// Acceptance-only directory for this unit's real lead result, if configured.
+    fn test_result_gate(&self) -> Option<&str> {
+        None
+    }
+
     /// The values of `names`, each index into [`Unit::names`]: from the store or compiled.
     /// `Err` gives the batch back: another executor or the final build gets to it, and a real
     /// compile error is reported there, by the build that links the unit.
@@ -1110,11 +1115,11 @@ fn hold(
         // A lead's intentional silence moves the attempt. A same-attempt helper can
         // legitimately receive Ended after the survivor finishes, which is not the
         // stale-attempt refusal this acceptance probe is intended to demonstrate.
-        result_gate: if lead {
-            crate::result_gate::ResultGate::from_env(gate_timeout, alloc)?
-        } else {
-            None
-        },
+        result_gate: granted
+            .test_result_gate()
+            .filter(|_| lead)
+            .map(|dir| crate::result_gate::ResultGate::new(WireString::from_str_in(dir, alloc), gate_timeout, alloc))
+            .transpose()?,
         ..DriverConfig::default()
     };
     let mut batches = Batches {

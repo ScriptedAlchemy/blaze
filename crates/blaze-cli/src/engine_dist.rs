@@ -69,6 +69,8 @@ const DEADLINE_VAR: &str = "BLAZE_DIST_DEADLINE_SECS";
 const PR_VAR: &str = "BLAZE_DIST_PR";
 /// Revision label within a pull request namespace.
 const SOURCE_VAR: &str = "BLAZE_DIST_SOURCE";
+const RESULT_GATE_VAR: &str = "BLAZE_DIST_TEST_RESULT_GATE";
+const RESULT_UNIT_VAR: &str = "BLAZE_DIST_TEST_RESULT_UNIT";
 
 /// Default per-unit execution deadline.
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(3_600);
@@ -82,6 +84,8 @@ pub(crate) const KIND_POINTER: u8 = 1;
 pub(crate) enum DistError {
     /// The worker has no LLVM or fold emitter for distributed release export.
     ReleaseBackendUnavailable,
+    /// A test result selector is missing its directory or names no planned unit.
+    BadResultGate { shown: AString<'static> },
     /// A distributed option was supplied without `BLAZE_DIST_SOCKET`.
     OptionWithoutSocket { name: &'static str, value: AString<'static> },
     /// `BLAZE_DIST_SOCKET` was set without `BLAZE_DIST_BLOBS`.
@@ -113,6 +117,9 @@ impl fmt::Display for DistError {
         match self {
             DistError::ReleaseBackendUnavailable => {
                 write!(f, "the distributed build failed: `blaze export --release` requires LLVM emission and folding in the distributed worker (engine_dist.rs)")
+            }
+            DistError::BadResultGate { shown } => {
+                write!(f, "the distributed build failed: {}", shown.as_str())
             }
             DistError::OptionWithoutSocket { name, value } => {
                 write!(f, "the distributed build failed: {name} is {}, with no {SOCKET_VAR} to run its units", value.as_str())
@@ -189,6 +196,12 @@ pub(crate) struct DistConfig {
     pub(crate) config: Config,
     pub(crate) report: Option<AString<'static>>,
     pub(crate) wire_alloc: WireAlloc,
+    result_gate: Option<TestResultGate>,
+}
+
+struct TestResultGate {
+    directory: AString<'static>,
+    unit: Option<AString<'static>>,
 }
 
 impl DistConfig {
@@ -202,7 +215,7 @@ impl DistConfig {
         let alloc = heap.alloc();
         let wire_alloc = heap.shared();
         let Some(socket) = env_get(env, SOCKET_VAR) else {
-            for name in [BLOBS_VAR, LOCAL_VAR, REPORT_VAR, DEADLINE_VAR, PR_VAR, SOURCE_VAR] {
+            for name in [BLOBS_VAR, LOCAL_VAR, REPORT_VAR, DEADLINE_VAR, PR_VAR, SOURCE_VAR, RESULT_GATE_VAR, RESULT_UNIT_VAR] {
                 if let Some(val) = env_get(env, name) {
                     return Err(DistError::OptionWithoutSocket { name, value: own_str(val, alloc) });
                 }
@@ -269,7 +282,15 @@ impl DistConfig {
             poll: Duration::from_millis(10),
         };
         let report = env_get(env, REPORT_VAR).map(|p| own_str(p, alloc));
-        Ok(Some(DistConfig { config, report, wire_alloc }))
+        let unit = env_get(env, RESULT_UNIT_VAR).map(|name| own_str(name, alloc));
+        let result_gate = match env_get(env, RESULT_GATE_VAR) {
+            Some(dir) => Some(TestResultGate { directory: own_str(dir, alloc), unit }),
+            None if unit.is_some() => return Err(DistError::BadResultGate {
+                shown: own_str("BLAZE_DIST_TEST_RESULT_UNIT requires BLAZE_DIST_TEST_RESULT_GATE", alloc),
+            }),
+            None => None,
+        };
+        Ok(Some(DistConfig { config, report, wire_alloc, result_gate }))
     }
 }
 
@@ -760,10 +781,15 @@ struct UnitExecutor<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>> {
     tail_instances: usize,
     tail_compiled_keys: WireVec<Digest>,
     ran_complete: bool,
+    result_gate: Option<&'a str>,
 }
 
 impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 'b, '_, '_, D, T> {
     type Error = DistError;
+
+    fn test_result_gate(&self) -> Option<&str> {
+        self.result_gate
+    }
 
     fn compile(&mut self, names: &[usize]) -> Result<Grant, DistError> {
         let mut grant_values: BTreeMap<Digest, Value, WireAlloc> = BTreeMap::new_in(self.wire_alloc);
@@ -967,6 +993,13 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
     if matches_output_fingerprint(output_path, &fp, wire_alloc) {
         return Ok((DistExportOutcome::NoOp, fp));
     }
+    if let Some(unit) = dist.result_gate.as_ref().and_then(|gate| gate.unit.as_ref())
+        && !plans.iter().any(|plan| plan.unit_name.as_str() == unit.as_str())
+    {
+        let mut shown = String::new_in(alloc);
+        let _ = write!(shown, "{RESULT_UNIT_VAR} names {unit}, which has no distributed unit");
+        return Err(DistError::BadResultGate { shown });
+    }
 
     let cancelled = AtomicBool::new(false);
     let mut total_compiled = 0usize;
@@ -988,6 +1021,9 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             tail_instances: 0,
             tail_compiled_keys: WireVec::new_in(wire_alloc),
             ran_complete: false,
+            result_gate: dist.result_gate.as_ref()
+                .filter(|gate| gate.unit.as_ref().is_none_or(|unit| unit.as_str() == plan.unit_name.as_str()))
+                .map(|gate| gate.directory.as_str()),
         };
         let arrived = match agent::run(&dist.config, &plan.unit, &mut exec, &cancelled) {
             Ok(arrived) => arrived,

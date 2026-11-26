@@ -90,6 +90,21 @@ def fixture_answer(gate, value):
 
 
 class ResultGateOracles(unittest.TestCase):
+    def test_peer_must_commit_disjoint_work_in_the_held_execution_and_attempt(self):
+        held = grant(work=[KEY])
+        other = grant(pid=124, holder="b", generation=4, work=[OTHER])
+        accepted = {**other, "event": "result_accepted"}
+        self.assertTrue(e.peer_result_before_release([held, other, accepted], held, 124))
+        self.assertFalse(e.peer_result_before_release([held, other], held, 124))
+        self.assertFalse(e.peer_result_before_release([held, other, accepted], held, 123))
+        for field, value in (("execution", 8), ("attempt", 3), ("unit_digest", KEY), ("holder", "a")):
+            changed = {**other, field: value}
+            self.assertFalse(e.peer_result_before_release([held, changed, {**changed, "event": "result_accepted"}], held, 124))
+        with self.assertRaisesRegex(e.Failed, "overlapping work"):
+            e.peer_result_before_release([held, {**other, "work": [KEY]}, {**accepted, "work": [KEY]}], held, 124)
+        with self.assertRaisesRegex(e.Failed, "before its peer"):
+            e.peer_result_before_release([held, {**held, "event": "result_accepted"}, other, accepted], held, 124)
+
     def test_capture_requires_exact_real_grant_carrier_and_product_event(self):
         with tempfile.TemporaryDirectory() as directory:
             gate, old = Path(directory), grant()
@@ -160,11 +175,14 @@ class ResultGateOracles(unittest.TestCase):
             child = unittest.mock.Mock(pid=123)
             gate = run.root / "gate"
             with patch.object(h.subprocess, "Popen", return_value=child) as start:
-                process, _ = run.build("a", wait=False, result_gate=gate)
+                process, _ = run.build("a", wait=False, result_gate=gate, result_unit="mathy")
+                run.build("b", wait=False, result_gate=gate, result_unit="mathy")
+            self.assertEqual(run.result_gates, [gate])
             self.assertIs(process, child)
             self.assertEqual(start.call_args.args[0][:2], ["/unused", "export"])
             self.assertTrue(start.call_args.kwargs["start_new_session"])
             self.assertEqual(start.call_args.kwargs["env"]["BLAZE_DIST_TEST_RESULT_GATE"], str(gate.resolve()))
+            self.assertEqual(start.call_args.kwargs["env"]["BLAZE_DIST_TEST_RESULT_UNIT"], "mathy")
             self.assertNotIn("BLAZE_DIST_TEST_RESULT_GATE", run.env("a", True))
             with patch.object(h.evidence, "held_result", return_value={"pid": 123}) as held, \
                  patch.object(h.evidence, "accepted", return_value=False), \
