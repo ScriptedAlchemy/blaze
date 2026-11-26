@@ -1,9 +1,13 @@
-name: PR 81 cut the canonical source shelf
+name: PR 81 compare complete bstd unit suites
 on:
   workflow_dispatch:
     inputs:
       source:
-        description: Exact compiler commit
+        description: Exact repaired compiler source
+        type: string
+        required: true
+      baseline:
+        description: Original compiler source
         type: string
         required: true
 permissions:
@@ -11,40 +15,44 @@ permissions:
 defaults:
   run:
     shell: bash
-env:
-  CARGO_BUILD_JOBS: "2"
 jobs:
-  shelf:
+  bstd:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source }}
           persist-credentials: false
       - uses: ./.github/actions/toolchain
-      - uses: ./.github/actions/script
-        with:
-          job: source-compiler
-      - name: Cut and verify the canonical shelf
+      - name: Compare all bstd unit tests before and after the patch
+        env:
+          BASELINE: ${{ inputs.baseline }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/bstd-target
         run: |
-          evidence="$RUNNER_TEMP/canonical-shelf"
-          mkdir -p "$evidence"
-          timeout 10 git rev-parse HEAD HEAD^{tree} > "$evidence/source.txt"
-          timeout -k 20 600 cargo +"$(cat pins/toolchain)" fetch --locked --quiet
-          shopt -s nullglob
-          registries=("${CARGO_HOME:-$HOME/.cargo}"/registry/cache/index.crates.io-*)
-          test "${#registries[@]}" -eq 1
-          # shellcheck disable=SC2016
-          input=$(timeout 10 jq -nc --arg reg "${registries[0]}" --arg shelf "$RUNNER_TEMP/shelf" '{tree:".",targets:["aarch64-apple-darwin","aarch64-unknown-linux-gnu"],registry:$reg,shelf:$shelf,write_pin:true,check:false,macro_side:true}')
-          timeout -k 20 600 "$BLAZE_SCRIPTS/toolchain_cut" "$input" | tee "$evidence/cut.log"
-          verify=$(timeout 10 jq -c '.write_pin=false | .check=true' <<< "$input")
-          timeout -k 20 600 "$BLAZE_SCRIPTS/toolchain_cut" "$verify" | tee "$evidence/verify.log"
-          timeout 10 cp crates/blaze-toolchain/PINNED "$evidence/PINNED"
-          timeout 10 git diff --exit-code -- . ':!crates/blaze-toolchain/PINNED'
-          timeout 10 cat "$evidence/PINNED"
+          timeout 20 git fetch --depth=1 origin "$BASELINE"
+          tc=$(timeout 10 cat pins/toolchain)
+          out="$RUNNER_TEMP/bstd-before-after"
+          mkdir -p "$out"
+          timeout 10 git rev-parse HEAD HEAD^{tree} "$BASELINE" > "$out/revisions"
+          timeout 10 git restore --source="$BASELINE" -- crates/blaze-std/src/{fs,io}.rs
+          before=0
+          timeout -k 15s 640s cargo +"$tc" test --locked -p blaze-std --lib > "$out/before.log" 2>&1 || before=$?
+          timeout 10 git restore -- crates/blaze-std/src/{fs,io}.rs
+          timeout 10 git diff --exit-code
+          after=0
+          timeout -k 15s 640s cargo +"$tc" test --locked -p blaze-std --lib > "$out/after.log" 2>&1 || after=$?
+          timeout 10 grep -F 'test result:' "$out/before.log"
+          timeout 10 grep -F 'test result:' "$out/after.log"
+          test "$before" = "$after"
+          for phase in before after; do
+            timeout 10 grep -E '^test .* \.\.\. FAILED$' "$out/$phase.log" | timeout 10 sort > "$out/$phase-failures" || test "$before" = 0
+          done
+          timeout 10 diff -u "$out/before-failures" "$out/after-failures"
+          timeout 10 grep -Fx 'test fs::overlapping_publishes_from_two_worlds_keep_their_bytes ... ok' "$out/after.log"
+          timeout 10 grep -Fx 'test tests::reach::no_file_but_the_backends_names_a_reach ... ok' "$out/after.log"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: canonical-shelf-pin
-          path: ${{ runner.temp }}/canonical-shelf
+          name: bstd-before-after
+          path: ${{ runner.temp }}/bstd-before-after
