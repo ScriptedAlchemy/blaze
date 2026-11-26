@@ -1,4 +1,4 @@
-name: PR 81 pinned LLVM record verification
+name: PR 81 native unwind record verification
 on: workflow_dispatch
 permissions:
   contents: read
@@ -13,43 +13,43 @@ env:
 jobs:
   native:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 65
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 87eca7e66c6c1984de1119d042bee7321c0f55b2
+          ref: 6fa04b9cf361b6e6ecf1698cc59991db3a4ffc0f
           persist-credentials: false
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
       - uses: ./.github/actions/toolchain
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-      - name: verify source and install the pinned LLVM prefix
+      - name: verify unwind records and both export formats
         run: |
-          mkdir -p "$RUNNER_TEMP/llvm-evidence"
-          git rev-parse HEAD 'HEAD^{tree}' | tee "$RUNNER_TEMP/llvm-evidence/source.txt"
-          prefix="$RUNNER_TEMP/pinned-llvm"
-          # shellcheck disable=SC2016
-          input=$(timeout 10 jq -nc --arg prefix "$prefix" '{command:"fetch",target:"aarch64-unknown-linux-gnu",dir:$prefix}')
-          timeout -k 10 900 python3 .github/scripts/llvm.py "$input"
-          echo "LLVM_SYS_231_PREFIX=$prefix" >> "$GITHUB_ENV"
-      - name: compile and execute LLVM records and fold thunks
-        id: emitter
+          evidence="$RUNNER_TEMP/cfi-evidence"
+          mkdir -p "$evidence"
+          git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
+          tc="$(cat pins/toolchain)"
+          timeout -k 20 1200 cargo +"$tc" test --locked --lib \
+            -p blaze-code -p blaze-tier -p blaze-export -p blaze-launch-rt -- --test-threads=4 \
+            2>&1 | tee "$evidence/records-and-runtime.log"
+          for test in machine_cfi_preserves_llvm_rows_and_explicit_lsda export_machine_cfi_preserves_program_extent_and_shares_cie \
+            machine_cfi_participates_in_optimized_folding machine_cfi_survives_the_direct_and_tier_forms; do
+            grep -Fq "$test ... ok" "$evidence/records-and-runtime.log"
+          done
+          timeout -k 20 900 cargo +"$tc" test --locked -p blaze-export --test arm64_relocations \
+            2>&1 | tee "$evidence/relocations.log"
+      - name: verify CLI source-position materialization
+        if: ${{ !cancelled() }}
         run: |
-          log="$RUNNER_TEMP/llvm-evidence/emit.txt"
-          timeout -k 30 1800 cargo +"$(cat pins/toolchain)" test --locked -p blaze-emit --features llvm --lib llvm:: -- --nocapture 2>&1 | tee "$log"
-          grep -Fq 'llvm::emit_tests::release_record_runs ... ok' "$log"
-          grep -Fq 'llvm::emit_tests::native_call_and_tail_branch_execute_with_the_original_return_address ... ok' "$log"
-          grep -Fq 'llvm::emit_tests::folded_body_and_each_member_thunk_execute_their_own_constants ... ok' "$log"
-      - name: execute exported ARM64 relocations
-        if: ${{ !cancelled() && steps.emitter.outcome == 'success' }}
-        run: |
-          timeout -k 20 900 cargo +"$(cat pins/toolchain)" test --locked -p blaze-export --test arm64_relocations -- --nocapture 2>&1 | tee "$RUNNER_TEMP/llvm-evidence/export.txt"
-      - name: keep the exact source and test logs
+          evidence="$RUNNER_TEMP/cfi-evidence"
+          mkdir -p "$evidence"
+          timeout -k 30 2100 cargo +"$(cat pins/toolchain)" test --locked -p blaze-cli --bin blaze \
+            materialize_positionless_patches_line_and_column_slots \
+            2>&1 | tee "$evidence/position.log"
+          grep -Fq 'materialize_positionless_patches_line_and_column_slots ... ok' "$evidence/position.log"
+      - name: keep the exact source and test evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: pinned-llvm-record-evidence
-          path: ${{ runner.temp }}/llvm-evidence
-          if-no-files-found: error
+          name: machine-cfi-record-evidence
+          path: ${{ runner.temp }}/cfi-evidence
+          if-no-files-found: warn
