@@ -1,78 +1,129 @@
-name: PR 81 compiler fixture regressions
+name: PR 81 macOS project and migration acceptance
 on:
   workflow_dispatch:
     inputs:
       source:
-        required: true
+        description: Exact compiler commit
         type: string
-      suite:
         required: true
-        type: choice
-        options: [items, front-equal, ladder-lib, test-cache]
 permissions:
   contents: read
 defaults:
   run:
     shell: bash
 env:
-  CARGO_BUILD_JOBS: "2"
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_BACKTRACE: "0"
-  BLAZE_CORES: all
 jobs:
-  fixtures:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 43
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source }}
           persist-credentials: false
-      - uses: ./.github/actions/locked-memory
-      - uses: ./.github/actions/reflink
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          enable-cache: false
+      - name: confirm the ARM64 Mac and establish bounded commands
+        run: |
+          test "$(uname -s -m)" = "Darwin arm64"
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          python3 -c 'import subprocess; subprocess.run(["brew", "install", "coreutils"], check=True, timeout=360)'
+          coreutils=$(python3 -c 'import subprocess; print(subprocess.check_output(["brew", "--prefix", "coreutils"], text=True, timeout=15).strip())')
+          test -x "$coreutils/libexec/gnubin/timeout"
+          echo "$coreutils/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/blaze-target" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/mac-evidence"
+          git rev-parse HEAD 'HEAD^{tree}' > "$RUNNER_TEMP/mac-evidence/source.txt"
+          df -h "$RUNNER_TEMP"
       - uses: ./.github/actions/toolchain
-      - name: Give workspace tests a short same-filesystem home
-        run: |
-          mkdir "$RUNNER_TEMP/blaze-fs/workspace-home"
-          test_home=$(timeout 10 mktemp -d /tmp/bc.XXXXXX)
-          timeout 10 sudo mount --bind "$RUNNER_TEMP/blaze-fs/workspace-home" "$test_home"
-          echo "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
-          echo "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" >> "$GITHUB_ENV"
-          echo "HOME=$test_home" >> "$GITHUB_ENV"
-      - uses: ./.github/actions/script
         with:
-          job: cargo
+          components: rust-src
+          targets: wasm32-wasip1
+      - name: Install pinned Darwin LLVM
+        run: |
+          prefix="$RUNNER_TEMP/pinned-llvm"
+          input=$(timeout 10 jq -nc --arg prefix "$prefix" '{command:"fetch",target:"aarch64-apple-darwin",dir:$prefix}')
+          timeout -k 15 720 python3 .github/scripts/llvm.py "$input"
+          echo "LLVM_SYS_231_PREFIX=$prefix" >> "$GITHUB_ENV"
+      - name: build pinned tools and source CLI
+        run: |
+          tc="$(cat pins/toolchain)"
+          timeout -k 30 3600 nice -n 10 cargo +"$tc" build -j 6 --release --locked \
+            --features blaze-cli/llvm \
+            -p blaze-cli -p blaze-launcher -p scripts --bin blaze --bin blaze-fact-shim \
+            --bin blaze-launcher --bin toolchain_cut --bin proc_macro_modules --bin smoke \
+            2>&1 | tee "$RUNNER_TEMP/mac-evidence/build.log"
+          install_dir="$RUNNER_TEMP/source-binaries"
+          mkdir -p "$install_dir"
+          for name in blaze blaze-launcher blaze-fact-shim toolchain_cut proc_macro_modules smoke; do
+            install -m 0755 "$CARGO_TARGET_DIR/release/$name" "$install_dir/$name"
+          done
+          sha256sum "$install_dir"/* > "$RUNNER_TEMP/mac-evidence/binaries.txt"
+          echo "BLAZE_SCRIPTS=$install_dir" >> "$GITHUB_ENV"
       - uses: ./.github/actions/toolchain-shelf
-      - name: Build and run the selected regression
-        env:
-          SUITE: ${{ inputs.suite }}
+      - name: Record the exact-tree hello smoke
         run: |
-          evidence="$RUNNER_TEMP/fixture-evidence"
-          mkdir -p "$evidence"
-          timeout 15 git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
-          tc=$(timeout 10 cat pins/toolchain)
-          case "$SUITE" in
-            items) crate=blaze-ladder; target=front2_items; cargo_target=(--test "$target"); selection=(--test-threads=4) ;;
-            front-equal) crate=blaze-ladder; target=front_equal; cargo_target=(--test "$target"); selection=(--test-threads=4) ;;
-            ladder-lib) crate=blaze-ladder; target=blaze_ladder; cargo_target=(--lib); selection=(--test-threads=4) ;;
-            test-cache)
-              crate=blaze-cli; target=test_command_runs; cargo_target=(--test "$target")
-              selection=(pooled_workers_match_serial_bztr_and_purity --exact)
-              timeout -k 20 780 cargo +"$tc" build --locked -p blaze-launcher --bins
-              ;;
-            *) exit 2 ;;
-          esac
-          timeout -k 20 1760 cargo +"$tc" test --locked -p "$crate" "${cargo_target[@]}" \
-            --no-run --message-format=json-render-diagnostics > "$evidence/build.jsonl"
-          binary=$(timeout 20 jq -er --arg target "$target" \
-            'select(.target.name==$target and .executable!=null).executable' "$evidence/build.jsonl")
-          timeout -k 20 480 /usr/bin/time -v "$binary" --nocapture "${selection[@]}" 2>&1 | tee "$evidence/test.log"
-      - uses: actions/upload-artifact@v7
+          # shellcheck disable=SC2016
+          input=$(timeout 10 jq -nc --arg bin "$BLAZE_SCRIPTS" --arg work "$RUNNER_TEMP/mac-hello-smoke" '{blaze:($bin+"/blaze"),work:$work}')
+          timeout -k 20 480 "$BLAZE_SCRIPTS/smoke" "$input" | tee "$RUNNER_TEMP/mac-evidence/hello-smoke.txt"
+      - name: unpack the authenticated pinned native C shelf
+        id: clang
+        run: |
+          pin=pins/clang.json
+          target=aarch64-apple-darwin
+          archive=$(jq -er --arg t "$target" '.targets[$t].name' "$pin")
+          digest=$(jq -er --arg t "$target" '.targets[$t].sha256' "$pin")
+          size=$(jq -er --arg t "$target" '.targets[$t].size' "$pin")
+          url="$(jq -er '.release' "$pin")/$archive"
+          bytes="$RUNNER_TEMP/$archive"
+          timeout -k 10 900 curl --fail --silent --show-error --location --proto '=https' \
+            --proto-redir '=https' --max-time 870 --max-filesize "$size" --output "$bytes" "$url"
+          test "$(stat -c %s "$bytes")" = "$size"
+          printf '%s  %s\n' "$digest" "$bytes" | sha256sum --check
+          shelf="$HOME/.blaze/v2/toolchain/clang/$digest"
+          mkdir -p "$shelf"
+          top=${archive%.tar.xz}
+          timeout -k 10 360 tar -xJf "$bytes" -C "$shelf" --strip-components 1 \
+            "$top"/bin/{clang,clang++,clang-23,ld64.lld,lld,llvm-ar,llvm-nm} \
+            "$top"/lib/{clang,libclang.dylib}
+          rows="$RUNNER_TEMP/mac-evidence/clang-members.jsonl"
+          jq -cer --arg t "$target" '.shelf_programs[$t][] | objects' "$pin" > "$rows"
+          while IFS= read -r row; do
+            member=$(jq -er '.member' <<< "$row")
+            expected=$(jq -er '.sha256' <<< "$row")
+            printf '%s  %s\n' "$expected" "$shelf/${member#*/}" | sha256sum --check
+          done < "$rows"
+      - name: run all unchanged fork migration fixtures
+        run: |
+          scratch="$RUNNER_TEMP/mac-forkfixes"
+          # shellcheck disable=SC2016
+          input=$(timeout 10 jq -nc --arg blaze "$BLAZE_SCRIPTS/blaze" --arg scratch "$scratch" \
+            --arg source "$GITHUB_WORKSPACE" --arg builder "$BLAZE_SCRIPTS/proc_macro_modules" \
+            '{blaze:$blaze,scratch:$scratch,source:$source,module_builder:$builder,timeout:700,workers:2}')
+          timeout -k 20 2100 python3 harness/forkfixes.py "$input" 2>&1 | tee "$RUNNER_TEMP/mac-evidence/forkfixes.log"
+      - name: run the sandboxed real-project smoke
+        if: ${{ !cancelled() && steps.clang.outcome == 'success' }}
+        run: |
+          work="$RUNNER_TEMP/mac-real-smoke"
+          # shellcheck disable=SC2016
+          input=$(timeout 10 jq -nc --arg bin "$BLAZE_SCRIPTS" --arg work "$work" --arg home "$HOME" \
+            '{blaze:$bin,work:$work,tmpfs:"",modules:($bin+"/proc_macro_modules"),toolchain_home:$home,workers:2}')
+          timeout -k 20 1200 uv run --frozen --no-dev python -I harness/v2/real_smoke.py "$input" 2>&1 | tee "$RUNNER_TEMP/mac-evidence/real-smoke.log"
+      - name: keep the exact source and fixture evidence
         if: always()
+        uses: actions/upload-artifact@v7
         with:
-          name: focused-compiler-fixtures
+          name: macos-source-acceptance-evidence
           path: |
-            ${{ runner.temp }}/fixture-evidence
+            ${{ runner.temp }}/mac-evidence
             ${{ runner.temp }}/toolchain-cut
+            ${{ runner.temp }}/mac-forkfixes/*.json
+            ${{ runner.temp }}/mac-forkfixes/evidence
+            ${{ runner.temp }}/mac-real-smoke/**/logs/*
           if-no-files-found: warn
