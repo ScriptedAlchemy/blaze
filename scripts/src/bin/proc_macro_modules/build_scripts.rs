@@ -436,9 +436,9 @@ struct BuiltScript {
     fresh: bool,
 }
 
-/// Rustc reports source files. A dependency's build script or procedural macro needs an
-/// explicit output receipt of its own before the local module can use that finer identity.
-fn has_dependency_producer(output: &str, library: &Path, checkout: &Path, member: &Path, closure: &[String]) -> bool {
+/// Artifact messages lack unit edges and the `is_std` role. These messages tell us when
+/// the checkout compile receipt needs the resolved unit graph to classify a dependency.
+fn needs_dependency_graph(output: &str, library: &Path, checkout: &Path, member: &Path, closure: &[String]) -> bool {
     output.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).any(|message| {
         let text = |field: &str| message.get(field).and_then(serde_json::Value::as_str).unwrap_or("");
         let manifest = Path::new(text("manifest_path"));
@@ -459,6 +459,79 @@ fn has_dependency_producer(output: &str, library: &Path, checkout: &Path, member
         message.get("target").and_then(|target| target.get("kind")).and_then(serde_json::Value::as_array)
             .is_some_and(|kinds| kinds.iter().any(|kind| matches!(kind.as_str(), Some("custom-build" | "proc-macro"))))
     })
+}
+
+/// Does a dependency of the script's compiled binary require a separate producer receipt?
+/// Cargo can compile an optional lock dependency for `-Zbuild-std` even though the script
+/// never selected it. Skip the standard-library subtree, which is already pinned.
+fn has_dependency_producer(report: &str) -> Option<bool> {
+    let graph = report.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|graph| graph.get("units").is_some())?;
+    if graph.get("version")?.as_u64()? != 1 {
+        return None;
+    }
+    let units = graph.get("units")?.as_array()?;
+    let roots = graph.get("roots")?.as_array()?;
+    if roots.is_empty() {
+        return None;
+    }
+    let index = |id: &serde_json::Value| usize::try_from(id.as_u64()?).ok().filter(|&at| at < units.len());
+    let mut pending = roots.iter().map(index).collect::<Option<Vec<_>>>()?;
+    let mut root = vec![false; units.len()];
+    for &at in &pending {
+        root[at] = true;
+    }
+    let mut seen = vec![false; units.len()];
+    while let Some(at) = pending.pop() {
+        if std::mem::replace(&mut seen[at], true) {
+            continue;
+        }
+        let unit = &units[at];
+        if unit.get("is_std").map_or(Some(false), serde_json::Value::as_bool)? {
+            continue;
+        }
+        if !root[at] {
+            let package = unit.get("pkg_id")?.as_str()?;
+            let kinds = unit.get("target")?.get("kind")?.as_array()?;
+            if package.starts_with("path+") || kinds.iter().any(|kind| matches!(kind.as_str(), Some("custom-build" | "proc-macro"))) {
+                return Some(true);
+            }
+        }
+        for dep in unit.get("dependencies")?.as_array()? {
+            pending.push(index(dep.get("index")?)?);
+        }
+    }
+    Some(false)
+}
+
+#[cfg(test)]
+#[test]
+fn a_std_only_unit_does_not_remove_the_checkout_compile_receipt() {
+    let libc = "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.191";
+    let artifact = serde_json::json!({
+        "reason": "compiler-artifact", "package_id": libc,
+        "manifest_path": "/bootstrap/vendor/libc-0.2.191/Cargo.toml",
+        "target": {"kind": ["custom-build"]},
+    });
+    let closure = ["libc 0.2.191 checksum".to_owned()];
+    assert!(needs_dependency_graph(&artifact.to_string(), Path::new("/bootstrap/library"), Path::new("/checkout"), Path::new("/bootstrap/workspace/script"), &closure));
+
+    let mut graph = serde_json::json!({
+        "version": 1, "roots": [0], "units": [
+            {"pkg_id": "path+file:///bootstrap/workspace/script#smoke-sys@0.1.0", "target": {"kind": ["bin"]}, "dependencies": [{"index": 1}, {"index": 2}]},
+            {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#cc@1.11.1", "target": {"kind": ["lib"]}, "dependencies": []},
+            {"pkg_id": "path+file:///bootstrap/library/std#0.0.0", "target": {"kind": ["lib"]}, "is_std": true, "dependencies": [{"index": 3}]},
+            {"pkg_id": libc, "target": {"kind": ["lib"]}, "is_std": true, "dependencies": [{"index": 4}]},
+            {"pkg_id": libc, "target": {"kind": ["custom-build"]}, "dependencies": []},
+            {"pkg_id": libc, "target": {"kind": ["lib"]}, "dependencies": [{"index": 4}]},
+        ],
+    });
+    assert_eq!(has_dependency_producer(&graph.to_string()), Some(false));
+
+    // The same package's ordinary library can reach the same producer. Now the
+    // checkout receipt must account for the producer, even if std also reaches it.
+    graph["units"][1]["dependencies"] = serde_json::json!([{"index": 5}]);
+    assert_eq!(has_dependency_producer(&graph.to_string()), Some(true));
 }
 
 /// The uplifted Cargo dep-info records the actual path inputs of this root and its local
@@ -716,13 +789,29 @@ impl Plan<'_> {
                 }
             }
         }
-        let dependency_producer = has_dependency_producer(&String::from_utf8_lossy(&ran.output), library, &self.args.checkout, &ws.join("script"), &closure);
+        let classify_producers = native.is_none() && matches!(origin, Origin::Path { .. }) && producer_bindings.is_empty()
+            && needs_dependency_graph(&String::from_utf8_lossy(&ran.output), library, &self.args.checkout, &ws.join("script"), &closure);
         let (compiled, readable) = artifacts_of(&String::from_utf8_lossy(&ran.output));
         ran.output = readable.clone().into_bytes();
         let log = self.work.join("logs").join(format!("{}-{}.script.txt", wanted.name, wanted.version));
         write(&log, &readable)?;
         let what = format!("{what} (its whole output: {})", log.display());
         ran_ok(ran, &what)?;
+        let dependency_producer = if classify_producers {
+            let left = limit.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(Failure::Deadline { what, seconds: limit.as_secs() });
+            }
+            let mut graph_argv = argv.clone();
+            graph_argv.push("--unit-graph".into());
+            graph_argv.push("-Zunstable-options".into());
+            let graph_what = format!("the resolved Cargo units for {} {}'s script", wanted.name, wanted.version);
+            let graph = ran_ok(run(&graph_argv, &ws, &env, left, &graph_what)?, &graph_what)?;
+            has_dependency_producer(&String::from_utf8_lossy(&graph.output))
+                .ok_or_else(|| no_module("Cargo did not report a version-1 unit graph for the compiled script".to_owned()))?
+        } else {
+            false
+        };
         // A native build compiles no std of its own: the toolchain's host std is used.
         let std_lock = if native.is_none() { read(&library.join("Cargo.lock"))? } else { String::new() };
         check_compiled(&compiled, &closure, &std_lock, library, &wanted.name, &wanted.version)?;
