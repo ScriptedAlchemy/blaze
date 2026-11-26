@@ -65,7 +65,7 @@ impl<'a> Candidate<'a> {
                 | Operator::LocalTee { local_index } => Piece::Local { opcode: raw[0], index: local_index },
                 Operator::End if reader.eof() => Piece::Raw(raw),
                 // No memory, globals, calls, branches, exceptions or reference instructions:
-                // substituting a constant by an immutable parameter preserves this stack trace.
+                // substituting a constant by an immutable parameter preserves operand values.
                 Operator::Nop | Operator::Drop | Operator::Select
                 | Operator::I32Eqz | Operator::I32Eq | Operator::I32Ne
                 | Operator::I32LtS | Operator::I32LtU | Operator::I32GtS | Operator::I32GtU

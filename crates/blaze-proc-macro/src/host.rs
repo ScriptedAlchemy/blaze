@@ -285,6 +285,26 @@ struct Slot {
 }
 
 /// The engine, its linker, and each module it loaded in this process.
+/// A keyed portable transformation before sandboxed AOT. Implementations may obtain the
+/// portable records from accepted distributed grants; native Wasmtime objects never cross it.
+pub trait Preparation: Send + Sync {
+    fn identity(&self) -> &[u8];
+    fn prepare<'a>(&self, module: &ModuleRecord, wasm: &'a [u8], alloc: Alloc<'a>) -> Result<blaze_own::AVec<'a, u8>, String>;
+}
+
+pub struct Opts {
+    pub heap: &'static blaze_own::Heap,
+    pub settings: Settings,
+    pub clock: Option<Clock>,
+    pub preparation: Option<Arc<dyn Preparation>>,
+}
+
+impl Opts {
+    pub fn new(heap: &'static blaze_own::Heap) -> Self {
+        Self { heap, settings: Settings::standard(), clock: None, preparation: None }
+    }
+}
+
 pub struct Runtime {
     engine: Engine,
     linker: Linker<Host>,
@@ -305,6 +325,7 @@ pub struct Runtime {
     /// The heap each call's server lexes in (D102: handed in by the runtime's maker; a `&Heap`,
     /// not an `Alloc`, so the runtime stays `Sync` for its load workers).
     heap: &'static blaze_own::Heap,
+    preparation: Option<Arc<dyn Preparation>>,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -363,13 +384,8 @@ pub struct Loaded {
 }
 
 impl Runtime {
-    /// The runtime with the standard [`Settings`].
-    pub fn new(heap: &'static blaze_own::Heap) -> Result<Runtime, RuntimeError> {
-        Runtime::with_settings(&Settings::standard(), heap)
-    }
-
-    /// The runtime with `settings`; its calls' servers lex in `heap`.
-    pub fn with_settings(settings: &Settings, heap: &'static blaze_own::Heap) -> Result<Runtime, RuntimeError> {
+    /// One immutable configuration for every module loaded by this runtime.
+    pub fn new(Opts { heap, settings, clock, preparation }: Opts) -> Result<Runtime, RuntimeError> {
         let engine = Engine::new(&settings.config()).map_err(|e| RuntimeError::Engine(format!("{e:#}")))?;
         let mut bytes = Bytes::default();
         bytes.write(b"blaze proc-macro host 2\n");
@@ -379,6 +395,10 @@ impl Runtime {
         engine.precompile_compatibility_hash().hash(&mut bytes);
         bytes.write(std::env::consts::ARCH.as_bytes());
         bytes.write(std::env::consts::OS.as_bytes());
+        if let Some(preparation) = &preparation {
+            bytes.write(b"\nportable preparation\n");
+            preparation.identity().hash(&mut bytes);
+        }
         let code_id = sha256_hex(&bytes.0);
         let mut linker = Linker::new(&engine);
         imports(&mut linker).map_err(|e| RuntimeError::Linker(format!("{e:#}")))?;
@@ -393,17 +413,10 @@ impl Runtime {
             taken: AtomicU64::new(0),
             temps: AtomicU64::new(0),
             findings: Mutex::new(Vec::new()),
-            parts: Parts::counted(),
+            parts: match clock { Some(clock) => Parts::timed(clock), None => Parts::counted() },
             heap,
+            preparation,
         })
-    }
-
-    /// The runtime with the standard [`Settings`], its calls' parts timed by `clock` (a
-    /// profile's driver gives its own: rule 75).
-    pub fn timed(clock: Clock, heap: &'static blaze_own::Heap) -> Result<Runtime, RuntimeError> {
-        let mut runtime = Runtime::new(heap)?;
-        runtime.parts = Parts::timed(clock);
-        Ok(runtime)
     }
 
     /// Where the calls' time went so far.
@@ -551,7 +564,12 @@ impl Runtime {
                 // The wasm read and checked only here, for this compile, and dropped with it
                 // (module.rs `ModuleRecord::wasm`).
                 let wasm = module.wasm().map_err(RuntimeError::Wasm)?;
-                let code = self.engine.precompile_module(&wasm).map_err(|e| compile(format!("{e:#}")))?;
+                let prepared = match &self.preparation {
+                    Some(preparation) => Some(preparation.prepare(module, &wasm, self.heap.alloc()).map_err(&compile)?),
+                    None => None,
+                };
+                let code = self.engine.precompile_module(prepared.as_deref().unwrap_or(&wasm)).map_err(|e| compile(format!("{e:#}")))?;
+                drop(prepared);
                 drop(wasm);
                 let len = u64::try_from(code.len()).unwrap_or(u64::MAX);
                 self.write_synced(dir, &path, &code)?;

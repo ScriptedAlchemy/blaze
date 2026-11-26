@@ -669,7 +669,7 @@ fn main() {
     // The process heap, named once at the entry: the runtime's, and every allocator the file
     // loop hands down.
     let heap = blaze_own::Heap::process();
-    let runtime = Runtime::new(heap).expect("the runtime");
+    let runtime = Runtime::new(blaze_proc_macro::host::Opts::new(heap)).expect("the runtime");
     let records = expansion_records(&out);
     let mut procs = ProcMacros::new(&runtime, &records, Limits::STANDARD);
     // The module keys' closures walk the lock blaze-manifest's one reader read (rule 30); the

@@ -44,6 +44,7 @@ pub(crate) struct MacroSide<'s, 'p, 'r> {
     pub place: crate::macros::Place<'p, 'r>,
     /// The process's heap, handed from `main` (`FetchEnv::heap`): the runtime's.
     pub heap: &'static blaze_own::Heap,
+    pub wasm_dist: Option<&'p crate::engine_dist::DistConfig>,
 }
 
 /// Why the runner could not be made: names what and where (rule 19).
@@ -328,7 +329,14 @@ mod with_sandbox {
         let locked = LockedPackages::of(side.lock.lock);
         let folders = git_folders(&modules).map_err(|e| MakeError::Store(e.to_string()))?;
         // The process's heap, handed from `main` through the side (D102, D120).
-        let runtime = blaze_proc_macro::host::Runtime::new(side.heap).map_err(|e| MakeError::Runtime(e.to_string()))?;
+        let preparation = side.wasm_dist.map(|dist| {
+            let prepare: std::sync::Arc<dyn blaze_proc_macro::host::Preparation> =
+                std::sync::Arc::new_in(crate::engine_dist::wasm::Prepare::new(dist), Global);
+            prepare
+        });
+        let runtime = blaze_proc_macro::host::Runtime::new(blaze_proc_macro::host::Opts {
+            preparation, ..blaze_proc_macro::host::Opts::new(side.heap)
+        }).map_err(|e| MakeError::Runtime(e.to_string()))?;
         let runtime: &'static blaze_proc_macro::host::Runtime = std::boxed::Box::leak(std::boxed::Box::new_in(runtime, Global));
         let records = blaze_proc_macro::record::DirStore::new(&modules.join(super::EXPANSIONS));
         let records: &'static blaze_proc_macro::record::DirStore = std::boxed::Box::leak(std::boxed::Box::new_in(records, Global));

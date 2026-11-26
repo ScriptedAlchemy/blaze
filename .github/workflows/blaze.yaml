@@ -263,6 +263,7 @@ jobs:
         with:
           components: llvm-tools
           targets: x86_64-unknown-linux-gnu aarch64-apple-darwin
+      - uses: ./.github/actions/llvm-prefix
       - name: short same-filesystem home for all workspace tests
         run: |
           mkdir "$RUNNER_TEMP/blaze-fs/workspace-home"
@@ -547,6 +548,7 @@ jobs:
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
       - uses: ./.github/actions/toolchain
+      - uses: ./.github/actions/llvm-prefix
       - uses: ./.github/actions/script
         with:
           job: source-compiler

@@ -19,13 +19,13 @@ use crate::{host::RuntimeError, module::ModuleError};
 #[test]
 fn lazy_wasm_a_load_from_a_compiled_record_reads_no_wasm() {
     let dir = folder("lazy-wasm-hit");
-    let first = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
+    let first = Runtime::new(crate::host::Opts::new(blaze_own::testing::heap())).expect("the runtime");
     let module = reader_in(&dir);
     let loaded = first.load(&module).expect("it compiles");
     assert!(loaded.compiled && compiled_path(&first, &module).exists(), "the first load compiles and keeps its record");
     let fresh = Setup { runtime: first, module, loaded };
     std::fs::remove_file(dir.join("module.wasm")).expect("the wasm removed");
-    let second = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
+    let second = Runtime::new(crate::host::Opts::new(blaze_own::testing::heap())).expect("the runtime");
     let module = reader_in_kept(&dir, &fresh.module);
     let loaded = second.load(&module).unwrap_or_else(|error| panic!("a load from its compiled record read the wasm: {error}"));
     println!("a load from its compiled record: 0 wasm bytes read (floor 0), compiled {}", second.compiles());
@@ -41,7 +41,7 @@ fn lazy_wasm_control_a_compile_without_its_wasm_is_refused() {
     let dir = folder("lazy-wasm-missing");
     let module = reader_in(&dir);
     std::fs::remove_file(dir.join("module.wasm")).expect("the wasm removed");
-    let runtime = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
+    let runtime = Runtime::new(crate::host::Opts::new(blaze_own::testing::heap())).expect("the runtime");
     match runtime.load(&module) {
         Err(RuntimeError::Wasm(ModuleError::Io { path, .. })) => assert_eq!(path, dir.join("module.wasm")),
         other => panic!("a compile without its wasm: {:?}", other.map(|loaded| loaded.compiled)),
@@ -58,7 +58,7 @@ fn lazy_wasm_a_wasm_not_its_digest_is_refused_at_its_compile() {
     let at = bytes.len() - 1;
     bytes[at] ^= 1;
     std::fs::write(&path, &bytes).expect("the flipped wasm");
-    let runtime = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
+    let runtime = Runtime::new(crate::host::Opts::new(blaze_own::testing::heap())).expect("the runtime");
     match runtime.load(&module) {
         Err(RuntimeError::Wasm(ModuleError::Digest { held, .. })) => assert_eq!(held, module.wasm_sha256),
         other => panic!("a flipped wasm: {:?}", other.map(|loaded| loaded.compiled)),
@@ -79,4 +79,43 @@ fn reader_in_kept(dir: &std::path::Path, module: &crate::module::ModuleRecord) -
         compiled: module.compiled.clone(),
         native_dylib: module.native_dylib.clone(),
     }
+}
+
+struct Preparation {
+    identity: &'static [u8],
+    refused: bool,
+    calls: std::sync::atomic::AtomicU64,
+}
+
+impl crate::host::Preparation for Preparation {
+    fn identity(&self) -> &[u8] { self.identity }
+    fn prepare<'a>(&self, _: &crate::module::ModuleRecord, wasm: &'a [u8], alloc: blaze_own::Alloc<'a>) -> Result<blaze_own::AVec<'a, u8>, std::string::String> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.refused { return Err("preparation refused by test".to_owned()); }
+        Ok(blaze_own::AVec::from_slice_in(wasm, alloc))
+    }
+}
+
+#[test]
+fn prepared_modules_hit_without_wasm_or_preparation_and_changes_are_keyed() {
+    use std::sync::{Arc, atomic::Ordering};
+    let dir = folder("prepared-warm");
+    let module = reader_in(&dir);
+    let heap = blaze_own::testing::heap();
+    let cold = Arc::new_in(Preparation { identity: b"fold1", refused: false, calls: 0.into() }, std::alloc::Global);
+    let first = Runtime::new(crate::host::Opts { preparation: Some(cold.clone()), ..crate::host::Opts::new(heap) }).unwrap();
+    assert!(first.load(&module).unwrap().compiled);
+    assert_eq!(cold.calls.load(Ordering::Relaxed), 1);
+    std::fs::remove_file(dir.join("module.wasm")).unwrap();
+
+    let warm = Arc::new_in(Preparation { identity: b"fold1", refused: true, calls: 0.into() }, std::alloc::Global);
+    let second = Runtime::new(crate::host::Opts { preparation: Some(warm.clone()), ..crate::host::Opts::new(heap) }).unwrap();
+    assert_eq!(first.code_key(&module), second.code_key(&module));
+    assert!(!second.load(&module).unwrap().compiled);
+    assert_eq!(warm.calls.load(Ordering::Relaxed), 0, "warm AOT hit performs no preparation or distributed work");
+
+    let changed = Arc::new_in(Preparation { identity: b"fold2", refused: true, calls: 0.into() }, std::alloc::Global);
+    let third = Runtime::new(crate::host::Opts { preparation: Some(changed), ..crate::host::Opts::new(heap) }).unwrap();
+    assert_ne!(first.code_key(&module), third.code_key(&module));
+    assert!(matches!(third.load(&module), Err(RuntimeError::Wasm(_))), "another strategy cannot reuse the earlier code");
 }

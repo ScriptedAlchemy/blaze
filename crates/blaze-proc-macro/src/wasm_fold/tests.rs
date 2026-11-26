@@ -1,4 +1,4 @@
-use super::{Error, Plan};
+use super::{Error, Plan, Record};
 use wasm_encoder::{CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module, TypeSection, ValType};
 
 fn fixture(lose_constant: bool) -> std::vec::Vec<u8> {
@@ -81,4 +81,29 @@ fn unknown_custom_metadata_is_refused_and_input_bytes_are_validated() {
     with_offsets.extend_from_slice(&[0, 2, 1, b'x']);
     assert!(matches!(Plan::new(&with_offsets, alloc), Err(Error::Metadata)));
     assert!(matches!(Plan::new(&input[..input.len() - 1], alloc), Err(Error::Invalid(_))));
+}
+
+#[test]
+fn assembly_requires_every_distinct_granted_body_of_one_group() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let input = fixture(false);
+    let plan = Plan::new(&input, alloc).unwrap();
+    let work = plan.work().unwrap();
+    assert_eq!(work.len(), 65, "one template and 64 distinct thunks");
+    assert!(work.windows(2).all(|pair| pair[0].key() < pair[1].key()));
+    let mut records = blaze_own::AVec::new_in(alloc);
+    // Delivery order cannot change either the group or the final module.
+    for task in work.iter().rev() { records.push(plan.emit(task).unwrap()); }
+    records.sort_unstable_by_key(|record| record.key);
+    let views = blaze_own::AVec::from_iter_in(records.iter().map(Record::view), alloc);
+    assert_eq!(plan.assemble_records(&views).unwrap(), plan.assemble().unwrap());
+    assert!(matches!(plan.assemble_records(&views[1..]), Err(Error::Record(_))), "an absent holder cannot be replaced by a local tail");
+    let mut duplicates = blaze_own::AVec::from_slice_in(&views, alloc);
+    duplicates[1] = duplicates[0];
+    assert!(matches!(plan.assemble_records(&duplicates), Err(Error::Record(_))));
+
+    let changed = fixture(true);
+    let other = Plan::new(&changed, alloc).unwrap();
+    assert!(matches!(other.emit(&work[0]), Err(Error::Record(_))), "a recipe cannot be reused against changed constants");
+    assert!(matches!(other.assemble_records(&views), Err(Error::Record(_))), "old outputs cannot satisfy the edited module");
 }

@@ -367,7 +367,7 @@ fn procs_of(
     use blaze_proc_macro::hook::ProcMacros;
     use blaze_world::procs::files::{PackageAt, sandbox_files};
     let runtime: &'static blaze_proc_macro::host::Runtime =
-        leak(blaze_proc_macro::host::Runtime::new(heap).map_err(|e| LoadError::Procs(format!("the proc-macro runtime: {e}")))?);
+        leak(blaze_proc_macro::host::Runtime::new(blaze_proc_macro::host::Opts::new(heap)).map_err(|e| LoadError::Procs(format!("the proc-macro runtime: {e}")))?);
     let records: &'static blaze_proc_macro::record::DirStore = leak(blaze_proc_macro::record::DirStore::new(out));
     let mut procs = ProcMacros::new(runtime, records, blaze_proc_macro::host::Limits::STANDARD);
     let mut macro_units = Vec::new();

@@ -174,7 +174,7 @@ impl<'n> RunProcs<'n, '_> {
         let names = crate::names::world(cx, self.root, graph, Some(lockfile.lock), members, env)
             .map_err(|error| said(format_args!("no proc-macro runner: the names world: {error}")))?;
         let world = names.made().ok_or_else(|| said(format_args!("no proc-macro runner: the names world was made and not kept (names.rs `world`)")))?;
-        let side = crate::proc_runner::MacroSide { lock: lockfile, place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows }, heap: env.heap };
+        let side = crate::proc_runner::MacroSide { lock: lockfile, place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows }, heap: env.heap, wasm_dist: env.wasm_dist };
         crate::proc_runner::make(world, *names.list(), &side).map_err(|error| said(format_args!("no proc-macro runner: {error} (proc_runner.rs `make`)")))
     }
 }

@@ -800,6 +800,10 @@ fn edge_at<'l, R>(
     // cargo's `CARGO_TARGET_<TRIPLE>_RUSTFLAGS` for this machine's target (rustflags.rs).
     let target_rustflags_var = blaze_manifest::rustflags::target_variable(crate::graph::TRIPLE, heap.alloc());
     let max_store_bytes = crate::gc::budget_from_env(env)?;
+    let wasm_dist = if flags.release {
+        crate::engine_dist::DistConfig::from_env(env, crate::graph::TRIPLE, heap)
+            .map_err(|error| CliError::Export(blaze_own::Box::new_in(crate::engine_export::ExportCliError::Dist(error), heap.alloc())))?
+    } else { None };
     let place = Place {
         checkout: served.root_text().unwrap_or(checkout_at),
         served,
@@ -818,6 +822,7 @@ fn edge_at<'l, R>(
         sdk,
         exe_dir: exe_dir.as_ref().map(|dir| dir.as_str()).map_err(|why| *why),
         lan_peer: crate::fetch::LanPeerConfig::from_env(var("BLAZE_NO_LAN_PEER")),
+        wasm_dist: wasm_dist.as_ref(),
     };
     let terminal = out.is_terminal();
     let caps = blaze_report::frame::detect(&var, terminal, out.size().map(|size| size.cols), flags.color);
@@ -1262,6 +1267,8 @@ pub(crate) struct Place<'f> {
     pub(crate) sdk: Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>>,
     pub(crate) exe_dir: Result<&'f str, crate::fetch::ExeDirWhy>,
     pub(crate) lan_peer: crate::fetch::LanPeerConfig,
+    /// Release-mode portable macro preparation, captured at the command edge.
+    pub(crate) wasm_dist: Option<&'f crate::engine_dist::DistConfig>,
 }
 
 impl<'f> Place<'f> {
@@ -1283,6 +1290,7 @@ impl<'f> Place<'f> {
             sdk: self.sdk,
             exe_dir: self.exe_dir,
             lan_peer: self.lan_peer,
+            wasm_dist: self.wasm_dist,
             // PHASE-MEM-DEBT(Units): the fetches' and every stage's `handles.env.heap` (fetch.rs
             // `FetchEnv::heap`, `&'static Heap`): the stages put what they make on the process
             // heap through it; each becomes the phase's handle when its stage takes one (`kept
@@ -2345,6 +2353,7 @@ fn checking<'f, 'd>(
         // (proc_runner.rs `MacroSide::heap`, `&'static Heap`): made in a Names phase, read by
         // the Scripts and Names phases after; the record is what should cross.
         heap,
+        wasm_dist: env.wasm_dist,
     });
     let handles = Handles {
         root,

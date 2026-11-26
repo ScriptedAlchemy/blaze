@@ -738,6 +738,7 @@ mod tests {
                 sdk: crate::sdk::NONE_IN_TESTS,
                 exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
                 lan_peer: LanPeerConfig { enabled: true, udp_port, unicast_target: Some(udp_addr) },
+                wasm_dist: None,
                 heap: blaze_own::testing::heap(),
             };
 

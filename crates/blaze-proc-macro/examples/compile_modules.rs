@@ -34,7 +34,7 @@ fn main() {
         .collect();
     let all: Vec<&ModuleRecord> = modules.iter().collect();
     for pass in ["first", "second"] {
-        let runtime = Runtime::new(blaze_own::Heap::process()).expect("the runtime");
+        let runtime = Runtime::new(blaze_proc_macro::host::Opts::new(blaze_own::Heap::process())).expect("the runtime");
         let started = Instant::now();
         let loaded = runtime.load_all(&all, workers).expect("the workers start");
         let took = started.elapsed();

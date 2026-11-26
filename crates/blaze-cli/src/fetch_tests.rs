@@ -81,6 +81,7 @@ fn env(io: &Io, checkout: &'static str) -> FetchEnv<'static> {
         sdk: crate::sdk::NONE_IN_TESTS,
         exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
         lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+        wasm_dist: None,
         heap: blaze_own::testing::heap(),
     }
 }

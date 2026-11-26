@@ -7,6 +7,8 @@ use wasmparser::{FuncType, Parser, Payload, TypeRef, Validator};
 
 mod body;
 use body::Candidate;
+mod records;
+pub use records::{Record, RecordView, Work};
 #[cfg(test)]
 mod tests;
 
@@ -20,7 +22,19 @@ pub enum Error {
     Limit(&'static str),
     Metadata,
     Unsupported(&'static str),
+    Record(&'static str),
 }
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Invalid(error) => write!(f, "portable wasm folding: {error}"),
+            Self::Limit(why) | Self::Unsupported(why) | Self::Record(why) => write!(f, "portable wasm folding: {why}"),
+            Self::Metadata => f.write_str("portable wasm folding: custom metadata may contain code offsets"),
+        }
+    }
+}
+impl core::error::Error for Error {}
 
 impl From<wasmparser::BinaryReaderError> for Error {
     fn from(value: wasmparser::BinaryReaderError) -> Self { Self::Invalid(value) }
@@ -96,7 +110,8 @@ impl<'a> Plan<'a> {
                 // These standard sections carry no code offsets. Unknown custom metadata may
                 // carry offsets (DWARF, relocation and source maps); preserving it would lie.
                 Payload::CustomSection(reader) => {
-                    metadata_safe &= matches!(reader.name(), "name" | "producers" | "target_features");
+                    // `.rustc` is Rust's embedded crate metadata, not code-offset debug data.
+                    metadata_safe &= matches!(reader.name(), ".rustc" | "name" | "producers" | "target_features");
                 }
                 _ => {}
             }
@@ -134,6 +149,22 @@ impl<'a> Plan<'a> {
 
     /// Assemble the pure transform. This is not a distributed publication receipt.
     pub fn assemble(&self) -> Result<AVec<'a, u8>, Error> {
+        let mut records = AVec::new_in(self.alloc);
+        for work in self.work()? { records.push(self.emit(&work)?); }
+        records.sort_unstable_by_key(|record| record.key);
+        let views = AVec::from_iter_in(records.iter().map(Record::view), self.alloc);
+        self.assemble_records(&views)
+    }
+
+    /// Assemble only a complete, canonical set of records of this input and recipe.
+    /// The transport must authenticate and digest-check the records before calling this.
+    pub fn assemble_records(&self, records: &[RecordView<'_>]) -> Result<AVec<'a, u8>, Error> {
+        let expected = self.groups.iter().try_fold(0usize, |count, group| {
+            count.checked_add(group.members.len() + 1).ok_or(Error::Limit("fold output count"))
+        })?;
+        if records.len() != expected || records.windows(2).any(|pair| pair[0].key >= pair[1].key) {
+            return Err(Error::Record("output set is missing, duplicated, extraneous or unsorted"));
+        }
         if self.groups.is_empty() { return Ok(AVec::from_slice_in(self.input, self.alloc)); }
         let mut out = AVec::from_slice_in(&self.input[..8], self.alloc);
         let mut extra_types = AVec::new_in(self.alloc);
@@ -143,9 +174,6 @@ impl<'a> Plan<'a> {
         for (number, group) in self.groups.iter().enumerate() {
             let first = &group.members[0];
             let ty = &self.types[first.ty as usize];
-            let template_index = self.imported.checked_add(count(self.functions.len())?)
-                .and_then(|index| index.checked_add(u32::try_from(number).ok()?))
-                .ok_or(Error::Limit("template function index"))?;
             extra_types.push(0x60);
             extra_types.put_uleb(u64::from(count(ty.params().len() + group.varying.len())?));
             for param in ty.params() { extra_types.push(numeric_byte(*param)?); }
@@ -153,10 +181,10 @@ impl<'a> Plan<'a> {
             extra_types.put_uleb(u64::from(count(ty.results().len())?));
             for result in ty.results() { extra_types.push(numeric_byte(*result)?); }
             extra_functions.put_uleb(u64::from(count(self.types.len() + number)?));
-            let template = first.template(ty, &group.varying, self.alloc)?;
-            extra_bodies.put_bytes_uleb(&template);
-            for member in &group.members {
-                let thunk = member.thunk(ty, &group.varying, template_index, self.alloc)?;
+            let template = records::body(records, &self.template_work(number)?)?;
+            extra_bodies.put_bytes_uleb(template);
+            for (member_index, member) in group.members.iter().enumerate() {
+                let thunk = records::body(records, &self.member_work(number, member_index)?)?;
                 replacements[(member.function.0 - self.imported) as usize] = Some(thunk);
             }
         }
@@ -171,7 +199,7 @@ impl<'a> Plan<'a> {
                         let mut code = AVec::new_in(self.alloc);
                         code.put_uleb(u64::from(count(self.bodies.len() + self.groups.len())?));
                         for (index, raw) in self.bodies.iter().enumerate() {
-                            code.put_bytes_uleb(replacements[index].as_deref().unwrap_or(raw));
+                            code.put_bytes_uleb(replacements[index].unwrap_or(raw));
                         }
                         code.put_bytes(&extra_bodies);
                         Some(code)

@@ -96,6 +96,7 @@ pub(super) fn opts(io: &Io, workers: u32, fresh: bool) -> engine_check::Opts<'st
             sdk: crate::sdk::NONE_IN_TESTS,
             exe_dir: Err(fetch::ExeDirWhy::NotRead),
             lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            wasm_dist: None,
         },
         fresh,
         heads_from: crate::engine_seeds::HeadsFrom::Frozen,

@@ -1141,7 +1141,7 @@ fn print_procs(t: usize, p: &Procs) {
 /// does not say it).
 fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, root: &FsPath, world: &World<'static>, graph: &UnitGraph<'static>, lock: &Lock<'static>, paths: &[blaze_world::CheckoutPath<'static>], places: &mut P, heap: &'static blaze_own::Heap) -> Procs {
     use blaze_proc_macro::hook::ProcMacros;
-    let runtime: &'static blaze_proc_macro::host::Runtime = Box::leak(Box::new(blaze_proc_macro::host::Runtime::timed(proc_clock, heap).unwrap_or_else(|e| panic!("the proc-macro runtime: {e}"))));
+    let runtime: &'static blaze_proc_macro::host::Runtime = Box::leak(Box::new(blaze_proc_macro::host::Runtime::new(blaze_proc_macro::host::Opts { clock: Some(proc_clock), ..blaze_proc_macro::host::Opts::new(heap) }).unwrap_or_else(|e| panic!("the proc-macro runtime: {e}"))));
     let records: &'static blaze_proc_macro::record::DirStore = Box::leak(Box::new(blaze_proc_macro::record::DirStore::new(out)));
     let mut procs = ProcMacros::new(runtime, records, blaze_proc_macro::host::Limits::STANDARD);
     let mut keys = vec![None; world.crates.len()];

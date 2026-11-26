@@ -1,0 +1,30 @@
+name: pinned LLVM prefix
+description: Install the verified native LLVM archive for Blaze compiler builds
+runs:
+  using: composite
+  steps:
+    # The pinned LLVM, as a contributor outside Nix gets it (docs/contributing.md, "LLVM"): llvm.py fetches the archive llvm.json names for this host, checks its
+    # sha256 and unpacks it; vendor/llvm-sys/pin.rs refuses any other prefix. Below
+    # /usr/local/lib because llvm-sys's build script names the prefix's `lib` to the linker, and a
+    # build script in blaze's sandbox may name only system directories of libraries
+    # (crates/blaze-cargo/src/cargo/directives.rs, SYSTEM). The same directory every run, so the
+    # store's runs of the build scripts that read LLVM_SYS_231_PREFIX are found.
+    # llvm.py takes JSON through typed_input, which needs Python 3.12; the oldest hosted Ubuntu has
+    # 3.10, so select Python explicitly.
+    - if: runner.environment == 'github-hosted'
+      uses: actions/setup-python@v7
+      with:
+        python-version: "3.13"
+    - name: LLVM (the pin)
+      shell: bash
+      run: |
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) triple=x86_64-unknown-linux-gnu ;;
+          Linux-ARM64) triple=aarch64-unknown-linux-gnu ;;
+          macOS-ARM64) triple=aarch64-apple-darwin ;;
+          *) echo "::error::pins/llvm.json has no LLVM for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+        esac
+        sudo mkdir -p /usr/local/lib/blaze-llvm
+        sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm
+        python3 .github/scripts/llvm.py "{\"command\": \"fetch\", \"target\": \"$triple\", \"dir\": \"/usr/local/lib/blaze-llvm/$triple\"}"
+        echo "LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/$triple" >> "$GITHUB_ENV"

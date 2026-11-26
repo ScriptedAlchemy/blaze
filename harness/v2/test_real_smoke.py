@@ -83,7 +83,7 @@ class RealSmokeTests(unittest.TestCase):
             request = json.loads(argv[1])
             requests.append(request)
             environments.append(kwargs["env"])
-            inner = request["build_scripts"] if "build_scripts" in request else request
+            inner = request.get("build_scripts", request)
             kind = "build-script" if "build_scripts" in request else "proc-macro"
             for at in range(made.get(kind, 0)):
                 record = Path(inner["store"]) / kind / "modules" / f"{at:064x}"
@@ -108,7 +108,7 @@ class RealSmokeTests(unittest.TestCase):
             self.invoke(code=0)
         self.assertEqual([("build_scripts" in it) for it in requests], [False, True])
         for request in requests:
-            inner = request["build_scripts"] if "build_scripts" in request else request
+            inner = request.get("build_scripts", request)
             self.assertEqual(Path(inner["checkout"]), self.root / "work" / "p")
             self.assertEqual(Path(inner["tree"]), rs.TREE)
             self.assertIs(inner["unsandboxed_build_scripts"], False)

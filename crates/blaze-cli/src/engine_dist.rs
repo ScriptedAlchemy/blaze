@@ -705,6 +705,7 @@ pub(crate) enum DistExportOutcome {
 
 mod fingerprint;
 pub(crate) mod prepared;
+pub(crate) mod wasm;
 use fingerprint::matches_output_fingerprint;
 pub(crate) use fingerprint::write_output_fingerprint;
 
