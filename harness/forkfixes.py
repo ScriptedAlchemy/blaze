@@ -348,8 +348,6 @@ def choose_target(root: Path, case: dict, step: dict) -> tuple[str, str]:
 def target_args(root: Path, case: dict, step: dict) -> list[str]:
     package, binary = choose_target(root, case, step)
     args = ["-p", package, "--bin", binary]
-    for name in sorted(step.get("env", {})):
-        args.extend(["--build-env", name])
     raw = list(step.get("args", []))
     index = 0
     while index < len(raw):
@@ -437,10 +435,25 @@ def check_rows(record: dict) -> tuple[list[dict], dict]:
         rows = [json.loads(line) for line in record["stdout"].splitlines() if line.strip()]
     except json.JSONDecodeError as error:
         raise CaseFailed(f"check --view json did not produce only JSON rows: {error}") from error
-    summaries = [row for row in rows if isinstance(row, dict) and "errors" in row]
-    if len(summaries) != 1 or rows[-1] is not summaries[0]:
+    summaries = [index for index, row in enumerate(rows) if isinstance(row, dict) and "errors" in row]
+    if len(summaries) != 1:
         raise CaseFailed("check --view json has no exactly-one closing summary")
-    return rows[:-1], summaries[0]
+    index = summaries[0]
+    # The item-coverage note is printed after the summary; validate it as part of the receipt.
+    notes = rows[index + 1:]
+    if any(not isinstance(row, dict) or set(row) != {"note"} or not isinstance(row["note"], str)
+           for row in notes):
+        raise CaseFailed("check --view json reported a row other than a note after its closing summary")
+    return rows[:index] + notes, rows[index]
+
+
+def require_complete_check(rows: list[dict], summary: dict, context: str) -> None:
+    require(summary.get("not_checked") == [],
+            f"check was incomplete {context}: not_checked={summary.get('not_checked')!r}")
+    for row in rows:
+        note = row.get("note") if isinstance(row, dict) else None
+        if isinstance(note, str) and note.startswith("the check is incomplete:"):
+            raise CaseFailed(f"check was incomplete {context}: {note}")
 
 
 def diagnostic_matches(rows: list[dict], expected: str) -> bool:
@@ -453,7 +466,12 @@ def diagnostic_matches(rows: list[dict], expected: str) -> bool:
             if "diagnostic_code" in row:
                 if row["diagnostic_code"] == expected:
                     return True
-            elif code == expected or (code == "types" and re.search(r"\(" + expected + r" [A-Za-z]+\)$", message)):
+            elif code == expected:
+                return True
+            elif code == "types" and re.search(
+                rf"\({expected} [A-Za-z]+\)(?:, at (?:expression|pattern) #\d+ "
+                r"\([^\n]+; its range is shared by \d+ nodes\): `[^\n]*`)?\Z", message
+            ):
                 return True
         elif expected in message or expected in code:
             return True
@@ -485,9 +503,7 @@ def perform_absent(given: Input, root: Path, env: dict[str, str], log: CommandLo
     rows, summary = check_rows(record)
     require(summary.get("errors") == 0,
             f"workspace check could not prove {name!r} absent with errors={summary.get('errors')!r}")
-    require(summary.get("not_checked") == [],
-            f"workspace check was incomplete while proving {name!r} absent: "
-            f"not_checked={summary.get('not_checked')!r}")
+    require_complete_check(rows, summary, f"while proving {name!r} absent")
     require(skipped_target_note(rows, name, package),
             f"check JSON has no maintained note that bin {name!r} of package {package!r} is not built")
 
@@ -501,8 +517,7 @@ def perform_diagnostic(given: Input, root: Path, env: dict[str, str], log: Comma
     rows, summary = check_rows(record)
     require(type(summary.get("errors")) is int and summary["errors"] > 0,
             f"check summary did not count an error for {expected}: {summary}")
-    require(summary.get("not_checked") == [],
-            f"check was incomplete for {expected}: not_checked={summary.get('not_checked')!r}")
+    require_complete_check(rows, summary, f"for {expected}")
     require(diagnostic_matches(rows, expected),
             f"check JSON has no error finding carrying {expected}")
 

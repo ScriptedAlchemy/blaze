@@ -130,6 +130,10 @@ class ForkfixHarness(unittest.TestCase):
         self.assertTrue(runner.diagnostic_matches(reported, "E0515"))
         self.assertFalse(runner.diagnostic_matches(reported, "E0597"))
         self.assertFalse(runner.diagnostic_matches([dict(rows[0], diagnostic_code="E0308")], "E0425"))
+        message = ("found `u32`, about `value` (E0599 NoMethod), at expression #5 "
+                   "(a method call; its range is shared by 7 nodes): `{integer}.value()`")
+        self.assertTrue(runner.diagnostic_matches([dict(rows[0], message=message)], "E0599"))
+        self.assertFalse(runner.diagnostic_matches([dict(rows[0], message=message + " E0252")], "E0252"))
         incomplete = {"stdout": '{"errors":1,"not_checked":["types"]}\n'}
         rows, summary = runner.check_rows(incomplete)
         self.assertEqual(summary["not_checked"], ["types"])
@@ -336,6 +340,9 @@ class ForkfixHarness(unittest.TestCase):
         for rows, code, ok in ((["E0252", summary], 1, False), ([{**row, "severity": "warning"}, summary], 1, False),
                 ([{**row, "code": "E0425", "message": "unknown name E0252"}, summary], 1, False),
                 ([row], 1, False), ([row, {**summary, "errors": 0}], 1, False), ([row, summary], 0, False),
+                ([row, summary, summary], 1, False), ([summary, row], 1, False),
+                ([row, summary, {"note": "the check is incomplete: blaze could not check 1 item"}], 1, False),
+                ([row, summary, {"note": "a note following the summary"}], 1, True),
                 ([row, summary], 1, True)):
             record = {"returncode": code, "stdout": "\n".join(map(json.dumps, rows)), "timed_out": False}
             with self.subTest(rows=rows, code=code):
@@ -383,8 +390,8 @@ class ForkfixHarness(unittest.TestCase):
                     self.make_modules(json.loads(argv[1]))
                     return {"returncode": 0, "timed_out": False}
                 value = env.get("FORKFIXES_CALLER_VALUE", "unset")
-                self.assertEqual(argv[argv.index("--build-env") + 1], "FORKFIXES_CALLER_VALUE")
-                self.assertNotIn(f"FORKFIXES_CALLER_VALUE={value}", argv)
+                self.assertEqual(argv, [given.blaze, "run", "-p", "caller_environment_changes_and_becomes_unset",
+                                        "--bin", "caller_environment_changes_and_becomes_unset", "--workers", "2"])
                 observed.append(value)
                 return {"returncode": 0, "stdout": f"{value} {value}\n", "stderr": "", "timed_out": False}
             with patch.dict(os.environ, {"FORKFIXES_CALLER_VALUE": "ambient"}), \
