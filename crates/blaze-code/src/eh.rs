@@ -40,6 +40,7 @@ use core::fmt;
 
 use blaze_own::AVec;
 
+use crate::unwind::cfi::Cfi;
 use crate::unwind::{Action, Frame, INST, Unwind, reg};
 
 /// `DW_EH_PE_absptr`, `DW_EH_PE_udata4`, `DW_EH_PE_omit`.
@@ -77,8 +78,10 @@ pub struct Placed {
 pub struct Entry {
     /// The FDE: what Apple's unwinder is told of; an ELF unwinder of the whole run (offset 0).
     pub fde: usize,
-    /// The LSDA, when a row lands.
+    /// The LSDA, when present.
     pub lsda: Option<usize>,
+    /// The original function extent covered by the FDE.
+    pub code_len: u32,
 }
 
 /// Why no entry was made.
@@ -86,7 +89,7 @@ pub struct Entry {
 pub enum EhError {
     /// The record has no frame description: nothing can be unwound through it.
     NoFrame,
-    /// A row lands and the run gave no personality routine.
+    /// An LSDA is present and the run gave no personality routine.
     NoPersonality,
     /// A length is past what its field holds.
     TooLarge { what: &'static str },
@@ -96,7 +99,7 @@ impl fmt::Display for EhError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EhError::NoFrame => write!(f, "a code record with no frame description has no unwind entry (blaze-code unwind.rs, \"The frame word\")"),
-            EhError::NoPersonality => write!(f, "a code record's pads land, and the run named no personality routine (the program's `eh_personality` lang item)"),
+            EhError::NoPersonality => write!(f, "a code record has an LSDA and the run named no personality routine (the program's `eh_personality` lang item)"),
             EhError::TooLarge { what } => write!(f, "an unwind entry's {what} is past what its field holds"),
         }
     }
@@ -182,12 +185,41 @@ pub fn frame_program(frame: Frame, out: &mut AVec<'_, u8>) {
     }
 }
 
+/// Writes the CIE alignment factors and return address register for either frame form.
+pub fn cie_factors(cfi: Option<Cfi<'_>>, out: &mut AVec<'_, u8>) {
+    uleb(out, cfi.map_or(CODE_ALIGN, |cfi| u64::from(cfi.code_align())));
+    sleb(out, cfi.map_or(DATA_ALIGN, |cfi| i64::from(cfi.data_align())));
+    uleb(out, u64::from(reg::LR));
+}
+
+/// Writes the CIE's common instructions for either frame form.
+pub fn cie_program(cfi: Option<Cfi<'_>>, out: &mut AVec<'_, u8>) {
+    if let Some(cfi) = cfi {
+        out.extend_from_slice(cfi.initial());
+    } else {
+        out.push(CFA_DEF_CFA);
+        uleb(out, u64::from(reg::SP));
+        uleb(out, 0);
+    }
+}
+
+/// Writes a record's FDE program after its address and LSDA fields.
+pub fn unwind_program(unwind: &Unwind<'_>, out: &mut AVec<'_, u8>) {
+    if let Some(cfi) = unwind.cfi() {
+        out.extend_from_slice(cfi.instructions());
+    } else if let Some(frame) = unwind.frame() {
+        frame_program(frame, out);
+    }
+}
+
 /// Clears `out` and writes the entry of `unwind`'s record placed as `at` says: a CIE (with a
 /// personality and an LSDA encoding when a row lands), the FDE, a zero length ending the run,
 /// then the LSDA. The same rows and addresses give the same bytes.
 pub fn entry(unwind: &Unwind<'_>, at: Placed, out: &mut AVec<'_, u8>) -> Result<Entry, EhError> {
-    let frame = unwind.frame().ok_or(EhError::NoFrame)?;
-    let personality = match unwind.lands() {
+    if !unwind.has_entry() {
+        return Err(EhError::NoFrame);
+    }
+    let personality = match unwind.has_lsda() {
         true => Some(at.personality.ok_or(EhError::NoPersonality)?),
         false => None,
     };
@@ -197,9 +229,7 @@ pub fn entry(unwind: &Unwind<'_>, at: Placed, out: &mut AVec<'_, u8>) -> Result<
     out.extend_from_slice(&[0; 8]);
     out.push(1);
     out.extend_from_slice(if personality.is_some() { b"zPLR\0" } else { b"zR\0" });
-    uleb(out, CODE_ALIGN);
-    sleb(out, DATA_ALIGN);
-    uleb(out, u64::from(reg::LR));
+    cie_factors(unwind.cfi(), out);
     match personality {
         Some(routine) => {
             uleb(out, 1 + 8 + 1 + 1);
@@ -213,9 +243,7 @@ pub fn entry(unwind: &Unwind<'_>, at: Placed, out: &mut AVec<'_, u8>) -> Result<
             out.push(ABSPTR);
         }
     }
-    out.push(CFA_DEF_CFA);
-    uleb(out, u64::from(reg::SP));
-    uleb(out, 0);
+    cie_program(unwind.cfi(), out);
     finish(out, 0)?;
     // The FDE: its length, then how far back its CIE begins, counted from this field.
     let fde = out.len();
@@ -236,7 +264,7 @@ pub fn entry(unwind: &Unwind<'_>, at: Placed, out: &mut AVec<'_, u8>) -> Result<
             None
         }
     };
-    frame_program(frame, out);
+    unwind_program(unwind, out);
     finish(out, fde)?;
     out.extend_from_slice(&[0; 4]);
     let lsda = match lsda_word {
@@ -249,7 +277,7 @@ pub fn entry(unwind: &Unwind<'_>, at: Placed, out: &mut AVec<'_, u8>) -> Result<
         }
         None => None,
     };
-    Ok(Entry { fde, lsda })
+    Ok(Entry { fde, lsda, code_len: unwind.code_len() })
 }
 
 /// The LSDA's action records: `(1, 0)` for a catch, `(-1, 0)` for a terminate, each two

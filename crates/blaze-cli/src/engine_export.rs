@@ -443,6 +443,9 @@ fn materialize_positionless<'a>(
     rec.code.extend_from_slice(view.code());
     rec.relro.extend_from_slice(view.relro());
     rec.frame = view.frame();
+    if let Some(cfi) = view.cfi() {
+        rec.machine_cfi.extend_from_slice(cfi.bytes());
+    }
     rec.code_align = view.code_align();
     rec.relro_align = view.relro_align();
 
@@ -1462,6 +1465,13 @@ mod tests {
 
         let mut rec = CodeRecord::new_in(alloc);
         rec.code.extend_from_slice(&0xD65F_03C0u32.to_le_bytes()); // ret
+        blaze_code::unwind::cfi::write(
+            blaze_code::unwind::cfi::CfiInput {
+                code_len: 4, code_align: 1, data_align: -8, has_lsda: false, initial: &[0x0c, 31, 0], instructions: &[],
+            },
+            4,
+            &mut rec.machine_cfi,
+        ).expect("CFI");
         rec.relro.extend_from_slice(&[0u8; 8]);
         rec.positions.push(PositionRow {
             part: PositionPart::Relro,
@@ -1502,6 +1512,7 @@ mod tests {
 
         assert_eq!(calls, 1, "adjacent position rows at the same site reuse the lookup");
         assert_eq!(materialized.positions(), 0);
+        assert_eq!(materialized.cfi(), raw_view.cfi());
         assert_eq!(&materialized.relro()[0..4], &42u32.to_le_bytes());
         assert_eq!(&materialized.relro()[4..8], &7u32.to_le_bytes());
     }

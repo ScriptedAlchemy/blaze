@@ -225,6 +225,9 @@ pub fn v1_to_v2<'a>(view: CodeView<'_>, by: &dyn Declares, out: &mut AVec<'a, u8
     r.code.extend_from_slice(view.code());
     r.relro.extend_from_slice(view.relro());
     r.frame = view.frame();
+    if let Some(cfi) = view.cfi() {
+        r.machine_cfi.extend_from_slice(cfi.bytes());
+    }
     for k in 0..view.targets() {
         r.targets.push(view.target(k));
     }
@@ -272,13 +275,13 @@ impl Declares for StartBound {
 
 /// Every member's unwind rows, made one blaze-code `Unwind` each from the rows in `rows` (which
 /// [`rows_of`] filled), in member order, paired with the member's symbol.
-fn unwinds<'a, 'r>(members: &[Member02<'_>], rows: &'r [Row], alloc: Alloc<'a>) -> Result<AVec<'a, (Symbol, Unwind<'r>)>, ExportError> {
+fn unwinds<'a, 'r>(members: &[Member02<'r>], rows: &'r [Row], alloc: Alloc<'a>) -> Result<AVec<'a, (Symbol, Unwind<'r>)>, ExportError> {
     let mut out: AVec<'a, (Symbol, Unwind<'r>)> = Vec::with_capacity_in(members.len(), alloc);
     let mut from = 0usize;
     for m in members {
         let r = m.record;
         let to = from + r.unwind_rows();
-        let unwind = unwind::of_rows(r.unwind_frame(), &rows[from..to], r.code().len() as u32)
+        let unwind = unwind::with_cfi(r.unwind_frame(), r.cfi(), &rows[from..to], r.code().len() as u32)
             .map_err(|error| ExportError::UnwindRows { symbol: m.symbol, error })?;
         out.push((m.symbol, unwind));
         from = to;
@@ -405,7 +408,7 @@ fn in_poll(r: &RecordView<'_>, at: u32) -> bool {
     lo > 0 && at < r.poll(lo - 1).at + 8
 }
 
-/// Whether two records lay out to the same bytes wherever they are placed.
+/// Whether two records lay out to the same bytes and unwind alike at that address.
 fn same(a: &RecordView<'_>, b: &RecordView<'_>) -> bool {
     a.code() == b.code()
         && a.relro() == b.relro()
@@ -417,6 +420,10 @@ fn same(a: &RecordView<'_>, b: &RecordView<'_>) -> bool {
         && (0..a.words()).all(|k| a.word(k) == b.word(k))
         && a.polls() == b.polls()
         && (0..a.polls()).all(|k| a.poll(k) == b.poll(k))
+        && a.unwind_frame() == b.unwind_frame()
+        && a.cfi() == b.cfi()
+        && a.unwind_rows() == b.unwind_rows()
+        && (0..a.unwind_rows()).all(|k| a.unwind_row(k) == b.unwind_row(k))
 }
 
 /// Whether the GOT pair whose `adrp` is relocation `k` of `r` is the call triple `adrp xN, word;
@@ -489,6 +496,9 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
         let mut h = Hasher::new(FOLD_DOMAIN);
         h.update(r.code());
         h.update(r.relro());
+        if let Some(cfi) = r.cfi() {
+            h.part(cfi.bytes());
+        }
         digests.push((h.finish().0, pos as u32));
     }
     digests.sort_unstable();

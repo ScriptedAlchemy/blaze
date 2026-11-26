@@ -64,6 +64,8 @@
 use core::fmt;
 
 use crate::record::{CodeRecord, CodeView, Pad};
+pub mod cfi;
+use cfi::{Cfi, CfiError};
 
 /// The form of the frame word: arm64's standard frame record.
 pub const FORM_FRAME: u32 = 1;
@@ -208,6 +210,11 @@ impl Row {
 /// offset it is about.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UnwindError {
+    Cfi(CfiError),
+    /// One function chooses a compact frame or machine CFI.
+    BothFrameForms,
+    /// Rows on a machine CFI record explicitly marked as having no LSDA.
+    PadsWithoutLsda,
     /// The frame word names a form this reader does not know.
     FrameForm { word: u32, form: u32 },
     /// The frame word sets a bit its form does not use.
@@ -233,6 +240,9 @@ impl fmt::Display for UnwindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rule = "(blaze-code unwind.rs, \"The frame word\", \"A pad\")";
         match *self {
+            UnwindError::Cfi(error) => fmt::Display::fmt(&error, f),
+            UnwindError::BothFrameForms => f.write_str("a code record has both a compact frame and machine CFI"),
+            UnwindError::PadsWithoutLsda => f.write_str("machine CFI without an LSDA has call-site rows"),
             UnwindError::FrameForm { word, form } => write!(f, "a code record's frame word {word:#x} names form {form}, which is not arm64's frame record (1) {rule}"),
             UnwindError::FrameBits { word } => write!(f, "a code record's frame word {word:#x} sets bits its form does not use {rule}"),
             UnwindError::PadsWithoutFrame { pads } => write!(f, "a code record has {pads} landing pads and no frame description {rule}"),
@@ -265,6 +275,7 @@ pub fn fill(record: &mut CodeRecord<'_>, frame: Frame, rows: &[Row]) -> Result<(
 #[derive(Clone, Copy)]
 pub struct Unwind<'b> {
     frame: Option<Frame>,
+    cfi: Option<Cfi<'b>>,
     rows: RowsIn<'b>,
 }
 
@@ -282,8 +293,11 @@ enum RowsIn<'b> {
 /// sorted and disjoint, and that each landing is where its action says.
 pub fn read(view: CodeView<'_>) -> Result<Unwind<'_>, UnwindError> {
     let frame = Frame::of_word(view.frame())?;
-    check(frame, view.pads(), view.code().len() as u64, |i| view.pad(i))?;
-    Ok(Unwind { frame, rows: RowsIn::View(view) })
+    let cfi = view.cfi();
+    if cfi.is_none() {
+        check(frame, None, view.pads(), view.code().len() as u64, |i| view.pad(i))?;
+    }
+    Ok(Unwind { frame, cfi, rows: RowsIn::View(view) })
 }
 
 /// The same [`Unwind`] as [`read`] gives, from a frame and rows in memory for `code_len` bytes
@@ -291,19 +305,31 @@ pub fn read(view: CodeView<'_>) -> Result<Unwind<'_>, UnwindError> {
 /// rules: a record made by any tier is unwound through by the one entry writer
 /// ([`crate::eh::entry`]).
 pub fn of_rows(frame: Option<Frame>, rows: &[Row], code_len: u32) -> Result<Unwind<'_>, UnwindError> {
-    check(frame, rows.len(), u64::from(code_len), |i| rows[i].pad())?;
-    Ok(Unwind { frame, rows: RowsIn::Rows { rows, code_len } })
+    with_cfi(frame, None, rows, code_len)
+}
+
+/// The shared unwind plan for a tier record, including any machine CFI.
+pub fn with_cfi<'a>(frame: Option<Frame>, cfi: Option<Cfi<'a>>, rows: &'a [Row], code_len: u32) -> Result<Unwind<'a>, UnwindError> {
+    check(frame, cfi, rows.len(), u64::from(code_len), |i| rows[i].pad())?;
+    Ok(Unwind { frame, cfi, rows: RowsIn::Rows { rows, code_len } })
 }
 
 /// [`read`]'s rules over `pads` pads of `code` bytes of code, pad `i` given by `pad(i)`.
-fn check(frame: Option<Frame>, pads: usize, code: u64, pad: impl Fn(usize) -> Pad) -> Result<(), UnwindError> {
-    let Some(frame) = frame else {
-        return match pads {
+pub fn check(frame: Option<Frame>, cfi: Option<Cfi<'_>>, pads: usize, code: u64, pad: impl Fn(usize) -> Pad) -> Result<(), UnwindError> {
+    let (prologue, code) = match (frame, cfi) {
+        (Some(_), Some(_)) => return Err(UnwindError::BothFrameForms),
+        (None, Some(cfi)) if !cfi.has_lsda() && pads != 0 => return Err(UnwindError::PadsWithoutLsda),
+        (None, Some(cfi)) if u64::from(cfi.code_len()) > code => return Err(UnwindError::Cfi(CfiError::Extent {
+            len: cfi.code_len(),
+            code: u32::try_from(code).unwrap_or(u32::MAX),
+        })),
+        (None, Some(cfi)) => (0, u64::from(cfi.code_len())),
+        (Some(frame), None) => (frame.prologue(), code),
+        (None, None) => return match pads {
             0 => Ok(()),
             n => Err(UnwindError::PadsWithoutFrame { pads: n as u32 }),
-        };
+        },
     };
-    let prologue = frame.prologue();
     let mut end = 0u64;
     for i in 0..pads {
         let pad = pad(i);
@@ -325,7 +351,7 @@ fn check(frame: Option<Frame>, pads: usize, code: u64, pad: impl Fn(usize) -> Pa
         let lands = action != Action::Continue;
         let landing_ok = match lands {
             false => pad.landing == 0,
-            true => pad.landing >= prologue && pad.landing % INST == 0 && u64::from(pad.landing) < code,
+            true => pad.landing != 0 && pad.landing >= prologue && pad.landing % INST == 0 && u64::from(pad.landing) < code,
         };
         if !landing_ok {
             return Err(UnwindError::PadLanding { start: pad.start, landing: pad.landing, action });
@@ -335,13 +361,24 @@ fn check(frame: Option<Frame>, pads: usize, code: u64, pad: impl Fn(usize) -> Pa
 }
 
 impl<'b> Unwind<'b> {
-    /// The frame, `None` when the record has no description (and so no pads).
+    /// The compact frame, when this is a record using Blaze's standard prologue.
     pub fn frame(&self) -> Option<Frame> {
         self.frame
     }
 
+    pub fn cfi(&self) -> Option<Cfi<'b>> {
+        self.cfi
+    }
+
+    pub fn has_entry(&self) -> bool {
+        self.frame.is_some() || self.cfi.is_some()
+    }
+
     /// The code's bytes: the range the unwind entry covers.
     pub fn code_len(&self) -> u32 {
+        if let Some(cfi) = self.cfi {
+            return cfi.code_len();
+        }
         match self.rows {
             RowsIn::View(view) => view.code().len() as u32,
             RowsIn::Rows { code_len, .. } => code_len,
@@ -368,9 +405,8 @@ impl<'b> Unwind<'b> {
         Row { start: pad.start, len: pad.len, landing: pad.landing, action }
     }
 
-    /// Whether any row lands: only then does the entry need a personality routine and a
-    /// language-specific data area.
-    pub fn lands(&self) -> bool {
-        (0..self.rows()).any(|i| self.row(i).action != Action::Continue)
+    /// An explicit table can make an uncovered call terminate even if every row continues.
+    pub fn has_lsda(&self) -> bool {
+        self.cfi.map_or_else(|| (0..self.rows()).any(|i| self.row(i).action != Action::Continue), Cfi::has_lsda)
     }
 }

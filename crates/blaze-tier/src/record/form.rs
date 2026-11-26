@@ -45,6 +45,8 @@
 //! names, in row order, tiling it exactly. A record of another form number (`bzcode03`, or
 //! blaze-code's `bzcode07`) is refused naming both numbers ([`FormError::OtherForm`]): an old
 //! record is reported and rebuilt, never migrated (rule 26).
+//! With machine CFI, `bzcode11` uses the reserved word for the payload's nonzero byte
+//! count and appends the payload, padded to 8, after the text and before the digest.
 //!
 //! | section | row |
 //! |---|---|
@@ -74,7 +76,8 @@ use blaze_code::record::{
     DecodeError, Held, LEAST_CODE_ALIGN, LEAST_RELRO_ALIGN, MOST_PART_ALIGN, OWN_CODE, OWN_RELRO, Pad, PositionField, PositionPart,
     PositionRow, RecordError, SUBJECT_SHOWN, Space, Subject, Symbol, Target, TrapKind, TrapRow, Word,
 };
-use blaze_code::unwind::{Action, Frame, INST, Row, UnwindError};
+use blaze_code::unwind::cfi::{Cfi, CfiError};
+use blaze_code::unwind::{self, Action, Frame, INST, Row, UnwindError};
 use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::InstanceKey;
@@ -86,6 +89,7 @@ use crate::Reg;
 
 /// The first eight bytes of every encoded record of this form: the ONE place its number is.
 pub const MAGIC: [u8; 8] = *b"bzcode08";
+pub const CFI_MAGIC: [u8; 8] = *b"bzcode11";
 
 /// [`MAGIC`]'s number, for [`FormError::OtherForm`].
 const FORM_NUMBER: u8 = (MAGIC[6] - b'0') * 10 + (MAGIC[7] - b'0');
@@ -212,6 +216,8 @@ pub enum FormError {
     PadOutside { start: u32 },
     /// The unwind frame or rows break blaze-code unwind.rs's rules.
     Unwind(UnwindError),
+    /// Compact-frame poll recovery cannot use a machine CFI program.
+    CfiPolls,
     /// The loop header at `at` is not after the one before it.
     LoopsUnsorted { at: u32 },
     /// The loop header at `at` is not inside the code.
@@ -339,6 +345,7 @@ impl fmt::Display for FormError {
             FormError::WordRelocOverlap { at } => write!(f, "a code record's relro word and Abs64 relocation overlap at {at} {rule}"),
             FormError::PadOutside { start } => write!(f, "a code record's landing pad from {start} is not inside its code {rule}"),
             FormError::Unwind(error) => write!(f, "{error}"),
+            FormError::CfiPolls => write!(f, "a code record with machine CFI has polls requiring a compact frame {rule}"),
             FormError::LoopsUnsorted { at } => write!(f, "a code record's loop header at {at} is not after the one before it {rule}"),
             FormError::LoopOutside { at } => write!(f, "a code record's loop header at {at} is not inside its code {rule}"),
             FormError::LiveRange { header } => write!(f, "a code record's loop header {header} has live values past the list {rule}"),
@@ -551,7 +558,12 @@ pub fn seal<'a>(e: Emitted<'a>) -> Result<Sealed<'a>, FormError> {
         Some(frame) => frame.word().map_err(FormError::Unwind)?,
         None => 0,
     };
-    check(&Mem(&e))?;
+    let cfi = if e.machine_cfi.is_empty() {
+        None
+    } else {
+        Some(Cfi::read(&e.machine_cfi, e.code.len() as u32).map_err(|error| FormError::Unwind(UnwindError::Cfi(error)))?)
+    };
+    check(&Mem(&e), cfi)?;
     Ok(Sealed { record: e, unwind_word })
 }
 
@@ -560,7 +572,7 @@ pub fn seal<'a>(e: Emitted<'a>) -> Result<Sealed<'a>, FormError> {
 pub fn encode(s: &Sealed<'_>, out: &mut AVec<'_, u8>) {
     let r = &s.record;
     let start = out.len();
-    out.extend_from_slice(&MAGIC);
+    out.extend_from_slice(if r.machine_cfi.is_empty() { &MAGIC } else { &CFI_MAGIC });
     put32(out, r.frame);
     put32(out, s.unwind_word);
     let counts = [
@@ -587,10 +599,10 @@ pub fn encode(s: &Sealed<'_>, out: &mut AVec<'_, u8>) {
     for count in counts {
         put32(out, count as u32);
     }
-    // The flags, the alignments' word, the reserved word.
+    // The flags, the alignments' word, the machine CFI length (zero in bzcode08).
     put32(out, 0);
     out.extend_from_slice(&[r.code_align, r.relro_align, 0, 0]);
-    put32(out, 0);
+    put32(out, r.machine_cfi.len() as u32);
     out.extend_from_slice(&r.code);
     pad8(out, start);
     out.extend_from_slice(&r.relro);
@@ -689,6 +701,8 @@ pub fn encode(s: &Sealed<'_>, out: &mut AVec<'_, u8>) {
         out.extend_from_slice(&[0; 6]);
     }
     out.extend_from_slice(&r.text);
+    pad8(out, start);
+    out.extend_from_slice(&r.machine_cfi);
     pad8(out, start);
     let sum = digest(&out[start..]);
     out.extend_from_slice(&sum);
@@ -917,6 +931,7 @@ pub struct RecordView<'b> {
     bytes: &'b [u8],
     frame: u32,
     unwind_frame: Option<Frame>,
+    cfi: Option<Cfi<'b>>,
     code_align: u8,
     relro_align: u8,
     /// Each section's used bytes (the byte sections without their padding).
@@ -930,7 +945,8 @@ pub fn read(bytes: &[u8]) -> Result<RecordView<'_>, FormError> {
     if bytes.len() < MAGIC.len() {
         return Err(FormError::Length { need: least, have: bytes.len() as u64 });
     }
-    if bytes[..8] != MAGIC {
+    let machine = bytes[..8] == CFI_MAGIC;
+    if !machine && bytes[..8] != MAGIC {
         return Err(match form_number(&bytes[..8]) {
             Some(found) => FormError::OtherForm { found, reads: FORM_NUMBER },
             None => FormError::Magic,
@@ -955,12 +971,12 @@ pub fn read(bytes: &[u8]) -> Result<RecordView<'_>, FormError> {
     if after_aligns != 0 {
         return Err(FormError::Reserved { word: after_aligns });
     }
-    let reserved = get32(bytes, RESERVED_AT);
-    if reserved != 0 {
-        return Err(FormError::Reserved { word: reserved });
+    let cfi_len = get32(bytes, RESERVED_AT);
+    if machine != (cfi_len != 0) {
+        return Err(FormError::Reserved { word: cfi_len });
     }
     let mut counts = [0u64; SECTIONS];
-    let mut need = least;
+    let mut need = least + up8(u64::from(cfi_len));
     for (i, count) in counts.iter_mut().enumerate() {
         *count = u64::from(get32(bytes, 16 + 4 * i));
         need += up8(*count * ROW[i] as u64);
@@ -975,6 +991,15 @@ pub fn read(bytes: &[u8]) -> Result<RecordView<'_>, FormError> {
         *part = &bytes[at..at + used];
         at += up8(used as u64) as usize;
     }
+    let cfi = if machine {
+        let end = at + cfi_len as usize;
+        if bytes[end..body].iter().any(|&byte| byte != 0) {
+            return Err(FormError::Unwind(UnwindError::Cfi(CfiError::Padding)));
+        }
+        Some(Cfi::read(&bytes[at..end], counts[CODE] as u32).map_err(|error| FormError::Unwind(UnwindError::Cfi(error)))?)
+    } else {
+        None
+    };
     let tag = |section: usize, row: usize, byte: u8| FormError::Tag { section: SECTION_NAME[section], row: row as u32, byte };
     for row in 0..counts[TARGETS] as usize {
         let byte = parts[TARGETS][row * ROW[TARGETS]];
@@ -1024,14 +1049,14 @@ pub fn read(bytes: &[u8]) -> Result<RecordView<'_>, FormError> {
     // Each subject row after the one before it and at a trap row's offset, so the view's
     // `trap` finds a row's subject by halving and none is left over. The trap rows' order is
     // `check`'s; a subject row is searched among them only after it held.
-    let view = RecordView { bytes, frame, unwind_frame, code_align, relro_align, parts };
+    let view = RecordView { bytes, frame, unwind_frame, cfi, code_align, relro_align, parts };
     for row in 0..view.rows_of(SUBJECTS) {
         let at = get32(view.row_of(SUBJECTS, row), 0);
         if row > 0 && get32(view.row_of(SUBJECTS, row - 1), 0) >= at {
             return Err(FormError::SubjectRow { row: row as u32 });
         }
     }
-    check(&view)?;
+    check(&view, cfi)?;
     for row in 0..view.rows_of(SUBJECTS) {
         let at = get32(view.row_of(SUBJECTS, row), 0);
         if search(view.traps(), |i| get32(view.row_of(TRAPS, i), 0), &at).is_none() {
@@ -1054,6 +1079,10 @@ impl<'b> RecordView<'b> {
 
     pub fn unwind_frame(&self) -> Option<Frame> {
         self.unwind_frame
+    }
+
+    pub fn cfi(&self) -> Option<Cfi<'b>> {
+        self.cfi
     }
 
     pub fn code(&self) -> &'b [u8] {
@@ -1283,6 +1312,9 @@ impl<'b> RecordView<'b> {
         e.relro.extend_from_slice(self.relro());
         e.frame = self.frame;
         e.unwind_frame = self.unwind_frame;
+        if let Some(cfi) = self.cfi {
+            e.machine_cfi.extend_from_slice(cfi.bytes());
+        }
         for i in 0..self.targets() {
             e.targets.push(self.target(i));
         }
@@ -1625,7 +1657,7 @@ impl Rows for RecordView<'_> {
 
 /// Every rule of the form (the module's documentation lists them), once, in one place: the seal
 /// runs it on the sorted record, [`read`] on the bytes.
-fn check(r: &impl Rows) -> Result<(), FormError> {
+fn check(r: &impl Rows, cfi: Option<Cfi<'_>>) -> Result<(), FormError> {
     let code = r.code_len();
     let relro = r.relro_len();
     for i in 1..r.targets() {
@@ -1740,7 +1772,11 @@ fn check(r: &impl Rows) -> Result<(), FormError> {
             return Err(FormError::PadOutside { start: pad.start });
         }
     }
-    check_unwind(r, code)?;
+    unwind::check(r.frame_of_unwind(), cfi, r.unwind_rows(), u64::from(code), |i| r.unwind_row(i).pad())
+        .map_err(FormError::Unwind)?;
+    if cfi.is_some() && r.polls() != 0 {
+        return Err(FormError::CfiPolls);
+    }
     // The loop map.
     for i in 0..r.loops() {
         let h = r.loop_header(i);
@@ -1822,44 +1858,6 @@ fn check(r: &impl Rows) -> Result<(), FormError> {
         |i| r.name_row(i),
         r.text().len(),
     )
-}
-
-/// The unwind frame and rows by blaze-code unwind.rs's rules (its `read`, on this form's rows).
-fn check_unwind(r: &impl Rows, code: u32) -> Result<(), FormError> {
-    let rows = r.unwind_rows();
-    let Some(frame) = r.frame_of_unwind() else {
-        return match rows {
-            0 => Ok(()),
-            n => Err(FormError::Unwind(UnwindError::PadsWithoutFrame { pads: n as u32 })),
-        };
-    };
-    let prologue = frame.prologue();
-    let mut end = 0u64;
-    for i in 0..rows {
-        let row = r.unwind_row(i);
-        if row.len == 0 || row.start % INST != 0 || row.len % INST != 0 {
-            return Err(FormError::Unwind(UnwindError::PadShape { start: row.start, len: row.len }));
-        }
-        if row.start < prologue {
-            return Err(FormError::Unwind(UnwindError::PadInPrologue { start: row.start, prologue }));
-        }
-        let past = u64::from(row.start) + u64::from(row.len);
-        if past > u64::from(code) {
-            return Err(FormError::Unwind(UnwindError::PadOutside { start: row.start, len: row.len, code }));
-        }
-        if u64::from(row.start) < end {
-            return Err(FormError::Unwind(UnwindError::PadsOverlap { start: row.start }));
-        }
-        end = past;
-        let landing_ok = match row.action {
-            Action::Continue => row.landing == 0,
-            _ => row.landing >= prologue && row.landing % INST == 0 && row.landing < code,
-        };
-        if !landing_ok {
-            return Err(FormError::Unwind(UnwindError::PadLanding { start: row.start, landing: row.landing, action: row.action }));
-        }
-    }
-    Ok(())
 }
 
 /// Trap rows: by offset, one a `brk`, each a whole instruction of the code, no site the form's

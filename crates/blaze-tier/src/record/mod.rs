@@ -42,7 +42,7 @@ mod place;
 mod v1;
 
 pub use declared::{Declare, Declared, DeclaredKind, DeclaredRow, Declares, declare};
-pub use form::{FormError, MAGIC, RecordView, Sealed, encode, read, seal};
+pub use form::{CFI_MAGIC, FormError, MAGIC, RecordView, Sealed, encode, read, seal};
 pub use place::{calls, page_offset, place, place_resolved};
 pub use v1::from_v1;
 
@@ -170,6 +170,7 @@ pub struct Emitted<'a> {
     pub pads: AVec<'a, Pad>,
     /// The unwind frame and rows (blaze-code unwind.rs), for every tier.
     pub unwind_frame: Option<Frame>,
+    pub machine_cfi: AVec<'a, u8>,
     pub unwind: AVec<'a, Row>,
     pub loops: AVec<'a, LoopHeader>,
     pub live: AVec<'a, Live>,
@@ -216,6 +217,7 @@ impl<'a> Emitted<'a> {
             frame: 0,
             pads: Vec::new_in(alloc),
             unwind_frame: None,
+            machine_cfi: Vec::new_in(alloc),
             unwind: Vec::new_in(alloc),
             loops: Vec::new_in(alloc),
             live: Vec::new_in(alloc),

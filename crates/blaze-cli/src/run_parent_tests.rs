@@ -517,7 +517,7 @@ impl Publication for ToyFront<'_> {
             return Ok(false);
         }
         let view = blaze_code::record::CodeView::read(record).map_err(|why| ParentError::Decode { symbol, why })?;
-        Ok(blaze_code::unwind::read(view).map_err(|why| ParentError::Unwind { symbol, why })?.lands())
+        Ok(blaze_code::unwind::read(view).map_err(|why| ParentError::Unwind { symbol, why })?.has_lsda())
     }
 }
 

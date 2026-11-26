@@ -82,6 +82,9 @@ pub fn from_v1<'a>(record: CodeRecord<'a>, alloc: Alloc<'a>) -> Result<Emitted<'
         e.pads.push(view.pad(i));
     }
     e.unwind_frame = rows.frame();
+    if let Some(cfi) = rows.cfi() {
+        e.machine_cfi.extend_from_slice(cfi.bytes());
+    }
     for i in 0..rows.rows() {
         e.unwind.push(rows.row(i));
     }

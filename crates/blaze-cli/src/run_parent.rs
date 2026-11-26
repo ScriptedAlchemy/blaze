@@ -893,7 +893,7 @@ pub(crate) fn record_publication<'h>(
     names: impl FnOnce() -> Result<NamesRecords<'h>, ParentError>,
 ) -> Result<bool, ParentError> {
     let view = blaze_code::record::CodeView::read(record).map_err(|why| ParentError::Decode { symbol, why })?;
-    if no_personality && blaze_code::unwind::read(view).map_err(|why| ParentError::Unwind { symbol, why })?.lands() {
+    if no_personality && blaze_code::unwind::read(view).map_err(|why| ParentError::Unwind { symbol, why })?.has_lsda() {
         return Ok(true);
     }
     if view.positions() != 0 {
