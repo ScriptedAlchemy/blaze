@@ -33,7 +33,7 @@ use super::keys::{KeyClash, Keys, MemberKind, checker_of};
 use super::preds::Preds;
 use super::source::NamesSource;
 use super::type_miss::{HeadMiss, MissOf, TypeMiss};
-use super::types::{AliasGap, AliasRegions, AliasSlot, Bounds, Builder, Captures, ContainerParamBound, Env, Heads, HeadsArity, NotLaidWhy, ParamBound, RegionRefusal, RegionSink, SelfGiven, SigPart, SelfTy, Slot, SlotKind, TraitAliasHead, Used, Why, intern, intern_list, used_lifetimes};
+use super::types::{AliasGap, AliasRegions, AliasSlot, Bounds, Builder, Captures, ContainerParamBound, Env, Heads, HeadsArity, NotLaidWhy, ParamBound, RegionRefusal, RegionSink, SelfGiven, SigPart, SelfTy, Slot, SlotKind, StaticDefaultRegions, TraitAliasHead, Used, Why, intern, intern_list, used_lifetimes};
 use blaze_typeck::region_facts::HeadRegions;
 use blaze_typeck::regions::{LifetimeParams, Numbering, Region, RegionCol};
 
@@ -193,6 +193,8 @@ pub struct Maps {
     /// Each struct's, enum's and union's type parameter count and their defaults (over its
     /// own parameters, `None` where none is written).
     pub generics: Rows<LibKey, (u32, blaze_own::Vec<Option<PTy>, Alloc<'static>>)>,
+    /// Region proofs for the ADT's defaulted arguments, in parameter order.
+    pub(super) static_defaults: Rows<LibKey, blaze_own::Vec<StaticDefaultRegions, Alloc<'static>>>,
     pub traits: Rows<LibKey, TraitHead>,
     /// Each trait's associated type's count of its OWN type and const parameters (`type
     /// MapStorage<V>`: one), by the trait and the name, filed with the trait's members
@@ -300,6 +302,7 @@ impl Maps {
         Maps {
             alloc,
             generics: Rows::new_in(alloc),
+            static_defaults: Rows::new_in(alloc),
             traits: Rows::new_in(alloc),
             assoc_generics: Rows::new_in(alloc),
             assoc_where: Rows::new_in(alloc),
@@ -336,6 +339,7 @@ impl Maps {
         let Maps {
             alloc: _,
             generics,
+            static_defaults,
             traits,
             assoc_generics,
             assoc_where,
@@ -366,6 +370,7 @@ impl Maps {
             record_field_names,
         } = self;
         generics.clear();
+        static_defaults.clear();
         traits.clear();
         assoc_generics.clear();
         assoc_where.clear();
@@ -565,6 +570,12 @@ impl Heads for Maps {
     }
     fn adt_generics(&self, adt: LibKey) -> Option<(u32, &[Option<PTy>])> {
         self.generics.get(&adt).map(|(g, d)| (*g, &d[..]))
+    }
+    fn adt_static_default(&self, adt: LibKey, parameter: usize) -> Option<u32> {
+        let parameter = u32::try_from(parameter).ok()?;
+        let defaults = self.static_defaults.get(&adt)?;
+        let at = defaults.binary_search_by_key(&parameter, |d| d.parameter).ok()?;
+        Some(defaults[at].slots)
     }
     fn trait_head(&self, trait_: LibKey) -> Option<(u32, &[Option<PTy>])> {
         self.traits.get(&trait_).map(|t| (t.generics, &t.defaults[..]))
@@ -4250,7 +4261,7 @@ impl<'n> Store<'n> {
                     }
                     self.fns.insert(key, head);
                 }
-                Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless, regions } => {
+                Head::Adt { key, row, defaults, static_defaults, const_params, field_defaults, preds, life, fieldless, regions } => {
                     if let Some(l) = life {
                         self.file_adt_life(key, l);
                     }
@@ -4266,6 +4277,11 @@ impl<'n> Store<'n> {
                         self.maps.fieldless_enums.insert(ck, n);
                     }
                     self.maps.generics.insert(key, (row.generics, defaults));
+                    if static_defaults.is_empty() {
+                        self.maps.static_defaults.remove(&key);
+                    } else {
+                        self.maps.static_defaults.insert(key, static_defaults);
+                    }
                     self.adt_declarations.insert(ck, AdtDeclaration { lifetimes: row.lifetimes, marks: row.marks });
                     self.maps.const_params.insert(key, const_params);
                     self.field_defaults.insert(ck, field_defaults);
@@ -4732,6 +4748,21 @@ impl<'n> Store<'n> {
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs, body: None };
         let mut defaults = blaze_own::Vec::new_in(alloc);
         own_defaults(&b, &mut self.tys, &env, v, 0, &mut defaults)?;
+        let mut parameter = 0;
+        let mut static_defaults = blaze_own::Vec::new_in(alloc);
+        for &row in v.rows(v.list(head::GENERICS))? {
+            let param = lf::GenericParam::decode(row)?;
+            if matches!(param, lf::GenericParam::Lifetime { .. }) {
+                continue;
+            }
+            if let lf::GenericParam::Type { default: Some(t), .. } = param
+                && let Some(Some(erased)) = defaults.get(parameter as usize)
+                && let Some(slots) = b.static_default_slots(&env, v, t, *erased)?
+            {
+                static_defaults.push(StaticDefaultRegions { parameter, slots });
+            }
+            parameter += 1;
+        }
         // A fieldless enum is filed before its generics are: a path to it has a type only
         // once `generics` holds it, and `own_generics` then finds it here.
         if let Some(variants) = super::const_enum::fieldless(names, key, v, g)? {
@@ -4746,6 +4777,11 @@ impl<'n> Store<'n> {
         // L1b: heads_regions call point (an ADT head: `adt_regions`, its fields' columns and
         // clauses, filed under `checker_of(key)`).
         self.maps.generics.insert(key, (g, defaults));
+        if static_defaults.is_empty() {
+            self.maps.static_defaults.remove(&key);
+        } else {
+            self.maps.static_defaults.insert(key, static_defaults);
+        }
         self.maps.const_params.insert(key, cs);
         // The declared count of a BODY-LOCAL ADT only (one the names world holds no item for):
         // every other ADT's is the names' (D155, types.rs `declared_lifetimes`, which asks

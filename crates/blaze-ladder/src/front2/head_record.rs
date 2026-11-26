@@ -66,7 +66,7 @@ use super::lifetimes::{AdtLife, ContainerLife, LifeOf, LifeRefusal, LifeVariance
 use super::preds::Preds;
 use super::rows::Rows;
 use super::type_miss::{HeadMiss, MissOf};
-use super::types::{AliasRegions, AliasSlot, NotLaidWhy, ParamBound, SelfTy, SigPart, TraitAliasHead};
+use super::types::{AliasRegions, AliasSlot, NotLaidWhy, ParamBound, SelfTy, SigPart, StaticDefaultRegions, TraitAliasHead};
 
 /// The allocator a decoded head's own lists and lifetime parts are kept in: the store's.
 type Mem = Alloc<'static>;
@@ -196,7 +196,8 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// prefix, `2` inline synthetic text for synthesized fn heads such as RFC 3681 field defaults).
 /// 39: `MemberFrame` carries `is_const` (`const impl` / `const trait` propagates `CONST` to member
 /// fns) and `#[rustc_comptime]` sets `FnQualifiers::CONST`.
-pub const VERSION: u32 = 39;
+/// 40: an ADT records the static region counts proved by its generic defaults' aliases.
+pub const VERSION: u32 = 40;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -407,6 +408,7 @@ pub enum HeadRef<'h, 'n> {
         key: LibKey,
         row: &'h AdtRow,
         defaults: &'h [Option<PTy>],
+        static_defaults: &'h [StaticDefaultRegions],
         const_params: &'h [(u32, PTy)],
         /// Its field defaults (`Store::field_defaults`): one per field, or empty when no
         /// field has one. Each default's own head is the fn record of its key.
@@ -617,6 +619,7 @@ pub enum Head<'n> {
         key: LibKey,
         row: AdtRow,
         defaults: Vec<Option<PTy>, Mem>,
+        static_defaults: Vec<StaticDefaultRegions, Mem>,
         const_params: Vec<(u32, PTy), Mem>,
         field_defaults: Vec<Option<ItemKey>, Mem>,
         preds: Option<HeadPreds>,
@@ -660,10 +663,11 @@ impl<'n> Head<'n> {
             Head::Fn { key, head, preds, static_, regions, misses } => {
                 HeadRef::Fn { key: *key, head, preds: preds.as_deref(), static_: *static_, regions: regions.as_ref(), misses: &misses[..] }
             }
-            Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless, regions } => HeadRef::Adt {
+            Head::Adt { key, row, defaults, static_defaults, const_params, field_defaults, preds, life, fieldless, regions } => HeadRef::Adt {
                 key: *key,
                 row,
                 defaults: &defaults[..],
+                static_defaults: &static_defaults[..],
                 const_params: &const_params[..],
                 field_defaults: &field_defaults[..],
                 preds: preds.as_deref(),
@@ -853,6 +857,7 @@ pub fn from_store<'h, 'n>(store: &'h Store<'n>, at: HeadAt) -> Result<HeadRef<'h
             let ck = checker_of(lib);
             let row = store.adts.get(&ck).ok_or(none)?;
             let defaults = store.maps.generics.get(&lib).map_or(&[][..], |(_, d)| &d[..]);
+            let static_defaults = store.maps.static_defaults.get(&lib).map_or(&[][..], |d| &d[..]);
             let const_params = store.maps.const_params.get(&lib).map_or(&[][..], |c| &c[..]);
             // Made with the row (`Store::adt`): a row without it is not this store's own.
             let field_defaults = store.field_defaults.get(&ck).ok_or(E::NotMade { at })?;
@@ -861,6 +866,7 @@ pub fn from_store<'h, 'n>(store: &'h Store<'n>, at: HeadAt) -> Result<HeadRef<'h
                 key: lib,
                 row,
                 defaults,
+                static_defaults,
                 const_params,
                 field_defaults: &field_defaults[..],
                 preds: store.preds.get(&ck),
@@ -1309,7 +1315,7 @@ fn encode_into_scratch<'b>(
             }
             K_FN
         }
-        HeadRef::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless, regions: _ } => {
+        HeadRef::Adt { key, row, defaults, static_defaults, const_params, field_defaults, preds, life, fieldless, regions: _ } => {
             o.lib(key);
             o.byte(match row.kind {
                 tc::AdtKind::Struct => 0,
@@ -1352,6 +1358,11 @@ fn encode_into_scratch<'b>(
                 o.body.extend_from_slice(&d.to_le_bytes());
             }
             o.defaults(defaults)?;
+            o.count(static_defaults.len(), "an ADT's static default regions")?;
+            for &StaticDefaultRegions { parameter, slots } in static_defaults {
+                o.u32(parameter);
+                o.u32(slots);
+            }
             o.const_params(const_params)?;
             // Its field defaults (form 8): one optional key per field, or none at all.
             o.count(field_defaults.len(), "an ADT's field defaults")?;
@@ -3438,6 +3449,14 @@ impl<'r> In<'r, '_, '_, '_> {
         }
         let discrs = self.own("an enum's discriminants", |r| Ok(i128::from_le_bytes(r.array("a discriminant")?)))?;
         let defaults = self.defaults()?;
+        let static_defaults = self.own("an ADT's static default regions", |r| {
+            Ok(StaticDefaultRegions { parameter: r.u32("a defaulted parameter")?, slots: r.u32("a default's static slot count")? })
+        })?;
+        if static_defaults.windows(2).any(|pair| pair[0].parameter >= pair[1].parameter)
+            || static_defaults.iter().any(|d| d.slots == 0 || d.parameter >= generics || !matches!(defaults.get(d.parameter as usize), Some(Some(_))))
+        {
+            return Err(E::Shape { what: "an ADT's static default regions must name distinct defaulted parameters in order" });
+        }
         let const_params = self.const_params_own()?;
         let field_defaults = self.own("an ADT's field defaults", |r| r.opt("a field default", |r| r.key("a field default's key")))?;
         let preds = self.opt("an ADT's where-clauses", |r| r.preds())?;
@@ -3468,7 +3487,7 @@ impl<'r> In<'r, '_, '_, '_> {
         if !field_defaults.is_empty() && field_defaults.len() != row.fields.len() {
             return Err(E::Shape { what: "an ADT's field defaults are not one per field" });
         }
-        Ok(self.box_head(Head::Adt { key, row, defaults, const_params, field_defaults, preds, life, fieldless, regions: None }))
+        Ok(self.box_head(Head::Adt { key, row, defaults, static_defaults, const_params, field_defaults, preds, life, fieldless, regions: None }))
     }
 
     fn repr(&mut self) -> Result<ReprAttrs, E> {
@@ -3788,8 +3807,8 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             None
         }
         (
-            HeadRef::Adt { key: k1, row: r1, defaults: d1, const_params: c1, field_defaults: f1, preds: p1, life: l1, fieldless: e1, regions: g1 },
-            HeadRef::Adt { key: k2, row: r2, defaults: d2, const_params: c2, field_defaults: f2, preds: p2, life: l2, fieldless: e2, regions: g2 },
+            HeadRef::Adt { key: k1, row: r1, defaults: d1, static_defaults: sd1, const_params: c1, field_defaults: f1, preds: p1, life: l1, fieldless: e1, regions: g1 },
+            HeadRef::Adt { key: k2, row: r2, defaults: d2, static_defaults: sd2, const_params: c2, field_defaults: f2, preds: p2, life: l2, fieldless: e2, regions: g2 },
         ) => {
             need!(regions_same(g1, g2), "an ADT's regions");
             need!(e1 == e2, "a fieldless enum's variant count");
@@ -3805,6 +3824,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(r1.field_regions.at[..] == r2.field_regions.at[..] && r1.field_regions.list[..] == r2.field_regions.list[..], "an ADT's field region positions");
             need!(r1.discrs[..] == r2.discrs[..], "an enum's discriminants");
             need!(d1 == d2, "an ADT's parameter defaults");
+            need!(sd1 == sd2, "an ADT's static default regions");
             need!(c1 == c2, "an ADT's const parameters");
             need!(preds(p1, p2), "an ADT's where-clauses");
             need!(

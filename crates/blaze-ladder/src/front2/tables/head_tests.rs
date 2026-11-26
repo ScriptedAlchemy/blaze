@@ -74,6 +74,12 @@ pub struct Rect<T> {
     pub h: T,
 }
 pub struct Square(pub u32);
+pub struct Alloc<'a>(pub &'a u8);
+pub type StaticAlloc = Alloc<'static>;
+pub struct Defaulted<T, A = StaticAlloc>(pub T, pub A);
+pub fn defaulted_item(set: &Defaulted<u8>) -> &u8 {
+    &set.0
+}
 pub enum Shape {
     Sq(Square),
     Pair(u32, u32),
@@ -455,8 +461,15 @@ fn a_frozen_head_carries_the_store_s_side_tables() {
         store.ensure(names, &mut keys, w).unwrap_or_else(|e| panic!("ensure {w:?}: {e}"));
     }
     let (mut rows, mut wheres, mut consts, mut fieldless, mut frames) = (0, 0, 0, 0, 0);
+    let mut saw_static_default = false;
+    let mut saw_defaulted_fn = false;
     for w in cells.iter().copied() {
         let f = freeze(names, sized, crate::front2::receiver::Pointers::NOT_LOOKED_UP, w, frame, a(), a()).unwrap_or_else(|e| panic!("freeze {w:?}: {e}"));
+        if names.name_of(w.key()) == Some("defaulted_item") {
+            assert!(f.reads.iter().any(|need| names.name_of(need.key()) == Some("Defaulted")),
+                "the defaulted signature must read the ADT carrying its region proof");
+            saw_defaulted_fn = true;
+        }
         let frozen = FrozenHead::read(&f.bytes).unwrap_or_else(|e| panic!("read {w:?}: {e}"));
         let mut texts: AVec<'static, (HeadAt, &'static str)> = AVec::new_in(a());
         for e in frozen.heads() {
@@ -478,9 +491,16 @@ fn a_frozen_head_carries_the_store_s_side_tables() {
                         consts += usize::from(r.consts.as_ref().is_some_and(|c| c.len() == 1));
                     }
                 }
-                head_record::Head::Adt { fieldless: f, life, .. } => {
+                head_record::Head::Adt { key, fieldless: f, life, static_defaults, .. } => {
                     assert!(life.is_some(), "ORACLE: {at:?}: an ADT's lifetime part is not in its record");
                     fieldless += usize::from(*f == Some(2));
+                    if names.name_of(*key) == Some("Defaulted") {
+                        use crate::front2::types::StaticDefaultRegions;
+                        assert_eq!(&static_defaults[..], &[StaticDefaultRegions { parameter: 1, slots: 1 }]);
+                        assert!(f.reads.iter().any(|need| names.name_of(need.key()) == Some("StaticAlloc")),
+                            "the ADT proof must read the alias that supplied the static region");
+                        saw_static_default = true;
+                    }
                 }
                 head_record::Head::Impl { frame: m, life, .. } => {
                     let m = m.as_ref().unwrap_or_else(|| panic!("ORACLE: {at:?}: an impl's frame is not in its record"));
@@ -512,6 +532,8 @@ fn a_frozen_head_carries_the_store_s_side_tables() {
     assert!(wheres >= 1, "ORACLE: `Walk::Iter`'s `where Self: 'a` is not in the frozen trait ({rows} rows)");
     assert!(consts >= 1, "ORACLE: `Walk::Buf`'s `const N` is not in the frozen trait ({rows} rows)");
     assert!(fieldless >= 1, "ORACLE: `Dir`'s fieldless count is not in the frozen ADT");
+    assert!(saw_static_default, "ORACLE: `Defaulted`'s static alias proof is in the frozen ADT");
+    assert!(saw_defaulted_fn, "ORACLE: `defaulted_item` consumed the ADT's proof");
     assert!(frames >= 1, "ORACLE: `Grid`'s impl frame with `const N` is not in the frozen impl");
     // Control: a filed enum with its fieldless count dropped is told apart by `same`.
     let mut caught = false;

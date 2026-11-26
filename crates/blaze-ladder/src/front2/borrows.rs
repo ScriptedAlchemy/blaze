@@ -3952,6 +3952,23 @@ fn calls_soft_refused() {
     let _ = *r;
 }
 
+struct Alloc<'a>(&'a u8);
+type WireAlloc = Alloc<'static>;
+struct Set<T, A = WireAlloc>(T, A);
+
+fn set_item(set: &Set<u8>) -> &u8 {
+    &set.0
+}
+
+fn calls_static_default(set: &Set<u8>) -> &u8 {
+    set_item(set)
+}
+
+fn calls_static_default_dangling() -> &'static u8 {
+    let set = Set(0, Alloc(&1));
+    set_item(&set)
+}
+
 fn main() {}
 "#;
 
@@ -4059,6 +4076,17 @@ fn main() {}
         let (types, mac) = world.check_borrows(body("calls_macro_type"), alloc);
         assert!(types.is_clean(), "calls_macro_type is typed: {types:?}");
         assert!(mac.is_clean(), "calls_macro_type is clean: {mac:?}");
+
+        // `Set<u8>` has one borrower-chosen input lifetime and one explicitly static
+        // lifetime from its omitted allocator argument. The output is tied to the former.
+        let (types, static_default) = world.check_borrows(body("calls_static_default"), alloc);
+        assert!(types.is_clean(), "calls_static_default is typed: {types:?}");
+        assert!(static_default.is_clean(), "calls_static_default is clean: {static_default:?}");
+        let (types, dangling) = world.check_borrows(body("calls_static_default_dangling"), alloc);
+        assert!(types.is_clean(), "calls_static_default_dangling is typed: {types:?}");
+        assert!(dangling.refused.is_none(), "the lifetime of the set is known: {dangling:?}");
+        assert!(dangling.findings.iter().any(|d| matches!(d.code, "E0515" | "E0597")),
+            "the default allocator's static lifetime must not let a local set escape: {dangling:?}");
 
         // A head whose regions alone were refused: typed, and the call refused by its name.
         let (types, soft) = world.check_borrows(body("calls_soft_refused"), alloc);

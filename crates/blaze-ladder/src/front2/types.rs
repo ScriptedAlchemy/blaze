@@ -122,6 +122,13 @@ pub struct AliasRegions {
     pub slots: blaze_own::Vec<AliasSlot, Alloc<'static>>,
 }
 
+/// A defaulted type parameter whose named alias supplies only explicit static regions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaticDefaultRegions {
+    pub parameter: u32,
+    pub slots: u32,
+}
+
 impl From<lf::BadRow> for Why {
     fn from(b: lf::BadRow) -> Why {
         Why::Program(format!("blaze-lower's record has a malformed row in column `{}`", b.column).into_boxed_str(), Range::new(0, 0))
@@ -283,6 +290,8 @@ pub trait Heads {
     }
     /// The ADT's type parameter count and each one's default (over the ADT's own parameters).
     fn adt_generics(&self, adt: LibKey) -> Option<(u32, &[Option<PTy>])>;
+    /// The number of explicit static slots a defaulted argument's alias proved at declaration.
+    fn adt_static_default(&self, adt: LibKey, parameter: usize) -> Option<u32>;
     /// The trait's generics (`Self` included) and its defaults, after `Self`.
     fn trait_head(&self, trait_: LibKey) -> Option<(u32, &[Option<PTy>])>;
     /// Whether the trait declares an associated type `name`.
@@ -1573,6 +1582,31 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             return Ok(found);
         }
         super::item_site::resolve_written(&self.resolver, self.marks, env.module, v, p, abs, texts, ns, r)
+    }
+
+    /// A monomorphic alias can supply its default's complete region column from its own head.
+    pub(super) fn static_default_slots(&self, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, erased: PTy) -> Result<Option<u32>, Why> {
+        let lf::TypeRef::Path(p) = v.ty(t)? else { return Ok(None) };
+        let (abs, texts, segs, at) = path_texts_of(v, p, true)?;
+        if segs.iter().any(|s| s.has_args || s.kind == lf::SegKind::Anchor)
+            || (!abs && texts.len() == 1 && env.params.iter().any(|&(n, _)| n == Name::of(texts[0])))
+        {
+            return Ok(None);
+        }
+        let Ok(found) = self.resolve_at(env, v, p, abs, &texts, Ns::Type, at) else {
+            return Ok(None);
+        };
+        if found.kind != Kind::TypeAlias
+            || found.consumed as usize != texts.len()
+            || self.heads.alias(found.key) != Some(Some((0, erased)))
+        {
+            return Ok(None);
+        }
+        let Some(laid) = self.heads.alias_slots(found.key) else { return Ok(None) };
+        if laid.lifetimes == 0 && !laid.slots.is_empty() && laid.slots.iter().all(|&slot| slot == AliasSlot::Static) {
+            return Ok(u32::try_from(laid.slots.len()).ok());
+        }
+        Ok(None)
     }
 
     fn path_ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, p: PathIdx, kids: &[PTy]) -> Result<PTy, Why> {
@@ -3754,6 +3788,11 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         }
                         None => {
                             let sub = soft!(subtree(tys.view(), a, &arity, alloc));
+                            if self.heads.adt_static_default(found.key, i) == Some(sub.slots) {
+                                s.scratch.extend(core::iter::repeat_n(Slot::quiet(SlotKind::Static), sub.slots as usize));
+                                binders += sub.binders;
+                                continue;
+                            }
                             if sub.slots != 0 {
                                 let raw_default = self.heads.adt_generics(found.key).and_then(|(_, ds)| ds.get(i).copied().flatten());
                                 let Some(raw_default) = raw_default else {
