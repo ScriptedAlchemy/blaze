@@ -39,7 +39,8 @@ fn tool(variable: &str, default: &str, host: &str, target: &str) -> OsString {
 
 fn main() {
     let Some(config) = pinned_llvm_config() else { return };
-    let prefix = PathBuf::from(env::var_os(PIN_PREFIX).expect("verified prefix"));
+    let prefix = fs::canonicalize(env::var_os(PIN_PREFIX).expect("verified prefix"))
+        .expect("canonical verified prefix");
     let marker = fs::read_to_string(prefix.join(PIN_MARKER)).expect("verified marker");
     let host = env::var("HOST").expect("cargo HOST");
     let target = env::var("TARGET").expect("cargo TARGET");
@@ -94,7 +95,7 @@ fn main() {
     println!("cargo::rustc-link-search=native={}", out.display());
     println!("cargo::rustc-link-lib=static=blaze_llvm_passes");
 
-    let libdir = PathBuf::from(query(&["--libdir"]));
+    let libdir = fs::canonicalize(query(&["--libdir"])).expect("LLVM library directory");
     assert!(
         libdir.starts_with(&prefix),
         "LLVM library directory is outside verified prefix: {}",
