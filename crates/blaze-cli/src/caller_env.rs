@@ -44,33 +44,36 @@ fn read_key(path: &Path) -> io::Result<[u8; 32]> {
 
 fn key(home: &Path) -> Result<[u8; 32], Error> {
     let path = home.join(KEY_FILE);
-    let error = |source| Error::Key { path: path.clone(), source };
-    match read_key(&path) {
+    read_or_publish_key(home, &path).map_err(|source| Error::Key { path, source })
+}
+
+fn read_or_publish_key(home: &Path, path: &Path) -> io::Result<[u8; 32]> {
+    match read_key(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        found => return found.map_err(error),
+        found => return found,
     }
     // Each contender publishes a complete key with link(2). A loser reads the installed key.
     // The temporary name uses independent entropy and reveals none of the key.
     let mut key = [0; 32];
     let mut nonce = [0; 16];
-    let entropy = |buf: &mut [u8]| getentropy(buf).map_err(|e| error(io::Error::other(format!("getentropy: {e:?}"))));
+    let entropy = |buf: &mut [u8]| getentropy(buf).map_err(|e| io::Error::other(format!("getentropy: {e:?}")));
     entropy(&mut key)?;
     entropy(&mut nonce)?;
     let temp = home.join(format!(".blaze-build-env-{:032x}.tmp", u128::from_le_bytes(nonce)));
-    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp).map_err(error)?;
+    let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temp)?;
     let publish = (|| {
         file.write_all(&key)?;
         file.sync_all()?;
-        match std::fs::hard_link(&temp, &path) {
+        match std::fs::hard_link(&temp, path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
             Err(e) => Err(e),
         }
     })();
-    std::fs::remove_file(&temp).map_err(error)?;
-    publish.map_err(error)?;
-    File::open(home).and_then(|dir| dir.sync_all()).map_err(error)?;
-    read_key(&path).map_err(error)
+    std::fs::remove_file(&temp)?;
+    publish?;
+    File::open(home).and_then(|dir| dir.sync_all())?;
+    read_key(path)
 }
 
 fn present(key: &[u8; 32], name: &str, value: &str) -> ContentId {

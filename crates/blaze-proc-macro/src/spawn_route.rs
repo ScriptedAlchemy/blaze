@@ -373,9 +373,10 @@ impl core::fmt::Debug for Script {
 impl Script {
     /// A child process whose environment is persisted receives no caller-granted values.
     pub(crate) fn work_env(&self, spawned: &Decoded) -> Result<Vec<(String, String)>, SpawnRefusal> {
-        let env = child_env(&self.env, spawned);
-        if let Some((name, _)) = env.iter().find(|(name, _)| self.private_env_names.binary_search(name).is_ok()) {
-            return Err(SpawnRefusal::PrivateEnv { name: name.clone() });
+        let mut env = child_env(&self.env, spawned);
+        if let Some(index) = env.iter().position(|(name, _)| self.private_env_names.binary_search(name).is_ok()) {
+            let (name, _) = env.swap_remove(index);
+            return Err(SpawnRefusal::PrivateEnv { name });
         }
         Ok(env)
     }
