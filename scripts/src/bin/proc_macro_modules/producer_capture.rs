@@ -33,6 +33,24 @@ struct UnitOutput<'a> {
     package: &'a str,
     /// Empty for OUT_DIR itself, a relative path under it, or absent for an invalid spelling.
     relative: Option<&'a str>,
+    layout: UnitLayout,
+}
+
+#[derive(Clone, Copy)]
+enum UnitLayout {
+    Legacy,
+    Nested,
+}
+
+impl UnitLayout {
+    fn stdout(self, placement: &Path) -> PathBuf {
+        // Pinned Cargo's `BuildScriptRunFiles::for_unit` keeps stdout in the run
+        // directory. In the nested layout, `run` and `out` are siblings.
+        match self {
+            Self::Legacy => placement.join("output"),
+            Self::Nested => placement.join("run/stdout"),
+        }
+    }
 }
 
 fn fingerprint(text: &str) -> bool {
@@ -45,18 +63,19 @@ fn unit_output<'a>(path: &'a str, builds: &str) -> Option<UnitOutput<'a>> {
     let relative = path.strip_prefix(builds)?.strip_prefix('/')?;
     let (folder, suffix) = relative.split_once('/')?;
     let (head, tail) = suffix.split_once('/').unwrap_or((suffix, ""));
-    let (package, relative) = if fingerprint(head) {
-        (folder, producer_outputs::under(tail, "out"))
+    let (package, relative, layout) = if fingerprint(head) {
+        (folder, producer_outputs::under(tail, "out"), UnitLayout::Nested)
     } else if let Some((package, _)) = folder.rsplit_once('-').filter(|(_, hash)| fingerprint(hash)) {
-        (package, producer_outputs::under(suffix, "out"))
+        (package, producer_outputs::under(suffix, "out"), UnitLayout::Legacy)
     } else {
-        (folder, None)
+        (folder, None, UnitLayout::Nested)
     };
-    Some(UnitOutput { package, relative })
+    Some(UnitOutput { package, relative, layout })
 }
 
-fn is_unit_out(path: &str, builds: &str, package: &str) -> bool {
-    unit_output(path, builds).is_some_and(|unit| unit.package == package && unit.relative == Some(""))
+fn output_layout(path: &str, builds: &str, package: &str) -> Option<UnitLayout> {
+    let unit = unit_output(path, builds)?;
+    (unit.package == package && unit.relative == Some("")).then_some(unit.layout)
 }
 
 /// Observe only WASI producers compiled into this member's locked closure. Cargo also
@@ -86,14 +105,17 @@ pub(super) fn capture<'a>(output: &str, target: &Path, checkout: &Path, closure:
             continue;
         }
         let Some(placement) = out.parent() else { return Err(refuse(out, "the output has no build unit directory")) };
-        if !is_unit_out(out_text, builds_text, name) || std::fs::canonicalize(out).map_err(io(out))? != out {
-            return Err(refuse(out, format!("{id}: the WASI build's OUT_DIR is not a confined unit output directory for {name}")));
+        let unconfined = || refuse(out, format!("{id}: the WASI build's OUT_DIR is not a confined unit output directory for {name}"));
+        let layout = output_layout(out_text, builds_text, name).ok_or_else(unconfined)?;
+        if std::fs::canonicalize(out).map_err(io(out))? != out {
+            return Err(unconfined());
         }
         if observed.iter().any(|entry| entry.name == name && entry.version == version) {
             return Err(refuse(out, format!("{name} {version} has more than one WASI producer execution")));
         }
         let features = artifact_features(output, target, checkout, id, source)?;
-        let (outputs, receipt) = one(&message, name, version, out, placement, alloc)?;
+        let stdout = layout.stdout(placement);
+        let (outputs, receipt) = one(&message, name, version, out, &stdout, alloc)?;
         observed.push(Captured { name: name.to_owned(), version: version.to_owned(), outputs, receipt, features });
     }
     observed.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
@@ -139,19 +161,22 @@ fn one<'a>(
     name: &str,
     version: &str,
     out: &Path,
-    placement: &Path,
+    stdout: &Path,
     alloc: blaze_own::Alloc<'a>,
 ) -> Result<(Outputs<'a>, Receipt), Failure> {
     let field = |key: &str| message.get(key).and_then(serde_json::Value::as_array).ok_or_else(|| refuse(out, format!("{name} {version}: {key} is not an array in the Cargo message")));
-    let stdout = placement.join("output");
     // The message is the actual Cargo view. Its output file supplies extra directives that
     // the message does not describe, and must agree on what Cargo hands to compilation.
-    let raw = read_bounded(&stdout, OutputLimits::DEFAULT.output as u64)?;
     let out_text = out.to_str().ok_or_else(|| refuse(out, "the producer OUT_DIR is not UTF-8"))?;
+    let root = stdout.with_file_name("root-output");
+    if read_bounded(&root, out_text.len() as u64)?.as_slice() != out_text.as_bytes() {
+        return Err(refuse(&root, format!("{name} {version}: Cargo's retained records name another OUT_DIR than {out_text:?}")));
+    }
+    let raw = read_bounded(stdout, OutputLimits::DEFAULT.output as u64)?;
     let mut outputs = Outputs::read(&raw, out_text, OutputLimits::DEFAULT, alloc)
-        .map_err(|why| refuse(&stdout, format!("{name} {version}: {why:?}")))?;
+        .map_err(|why| refuse(stdout, format!("{name} {version}: {why:?}")))?;
     if !outputs.notes.is_empty() || !outputs.errors.is_empty() || !outputs.link_args.is_empty() || !outputs.link_libs.is_empty() || !field("linked_libs")?.is_empty() {
-        return Err(refuse(&stdout, "these producer directives do not fit the WASI compile receipt"));
+        return Err(refuse(stdout, "these producer directives do not fit the WASI compile receipt"));
     }
     let cfgs = field("cfgs")?.iter().map(|cfg| {
         let line = format!("cargo::rustc-cfg={}", cfg.as_str()?);
@@ -161,7 +186,7 @@ fn one<'a>(
         }
     });
     if !cfgs.eq(outputs.cfgs.iter().map(|(name, value)| Some((name.as_str().to_owned(), value.as_ref().map(|value| value.as_str().to_owned()))))) {
-        return Err(refuse(&stdout, "Cargo's cfgs disagree with the producer's output"));
+        return Err(refuse(stdout, "Cargo's cfgs disagree with the producer's output"));
     }
     let env = field("env")?.iter().map(|pair| {
         let pair = pair.as_array()?;
@@ -169,7 +194,7 @@ fn one<'a>(
         Some((key.as_str()?, value.as_str()?))
     });
     if !env.eq(outputs.env.iter().map(|(name, value)| Some((name.as_str(), value.as_str())))) {
-        return Err(refuse(&stdout, "Cargo's environment disagrees with the producer's output"));
+        return Err(refuse(stdout, "Cargo's environment disagrees with the producer's output"));
     }
     let searches = field("linked_paths")?.iter().map(|value| {
         let line = format!("cargo::rustc-link-search={}", value.as_str()?);
@@ -179,7 +204,7 @@ fn one<'a>(
         }
     });
     if !searches.eq(outputs.link_search.iter().map(|(kind, path)| Some((*kind, path.as_str().to_owned())))) {
-        return Err(refuse(&stdout, "Cargo's link search disagrees with the producer's output"));
+        return Err(refuse(stdout, "Cargo's link search disagrees with the producer's output"));
     }
     read_files(out, &mut outputs, alloc)?;
     for (_, path) in &outputs.link_search {
@@ -330,7 +355,7 @@ pub(super) fn wrap(plan: &str, args: Vec<OsString>) -> ! {
         if let Some(producer) = producer {
             let physical = std::env::var("OUT_DIR").unwrap_or_else(|_| fail("Cargo did not supply the admitted producer's OUT_DIR"));
             let physical_path = Path::new(&physical);
-            if !name.as_deref().is_some_and(|name| is_unit_out(&physical, builds, name))
+            if name.as_deref().and_then(|name| output_layout(&physical, builds, name)).is_none()
                 || !std::fs::canonicalize(physical_path).is_ok_and(|path| path == physical_path)
             {
                 fail(&format!("Cargo supplied OUT_DIR {physical:?} outside the admitted producer's build directory"));
@@ -430,8 +455,8 @@ mod tests {
         })];
         let search = |value: &str| show_search(value, BUILDS, &inputs);
         for place in [format!("{BUILDS}/a-dep/{CARGO_UNIT}"), format!("{BUILDS}/a-dep-{CARGO_UNIT}")] {
-            assert!(is_unit_out(&format!("{place}/out"), BUILDS, "a-dep"));
-            assert!(!is_unit_out(&format!("{place}/out"), BUILDS, "another"));
+            assert!(output_layout(&format!("{place}/out"), BUILDS, "a-dep").is_some());
+            assert!(output_layout(&format!("{place}/out"), BUILDS, "another").is_none());
             assert_eq!(search(&format!("native={place}/out/found")), Ok(Some("native=/tmp/admitted/found".to_owned())));
             assert_eq!(search(&format!("{place}/out/found=exact")), Ok(Some("/tmp/admitted/found=exact".to_owned())));
             assert!(search(&format!("native={place}/out/unplanned")).is_err());
@@ -473,7 +498,12 @@ mod tests {
             "features": ["a"],
             "filenames": [target.join("wasm32-wasip1/release/deps/libdep.rlib")],
         });
-        write(&place.join("output"), format!("cargo::rustc-env=SEARCH_PATH={}\ncargo::rustc-link-search=native={}\n", found.display(), found.display())).unwrap_or_else(|error| panic!("{error}"));
+        let run = place.join("run");
+        let stdout = run.join("stdout");
+        let root = run.join("root-output");
+        let directives = format!("cargo::rustc-env=SEARCH_PATH={}\ncargo::rustc-link-search=native={}\n", found.display(), found.display());
+        write(&stdout, &directives).unwrap_or_else(|error| panic!("{error}"));
+        write(&root, out.as_os_str().as_encoded_bytes()).unwrap_or_else(|error| panic!("{error}"));
         let closure = [format!("dep 0.1.0 files:{}", files_digest(&source).unwrap_or_else(|error| panic!("{error}")))];
         let alloc = blaze_own::testing::heap().alloc();
         let report = format!("{message}\n{artifact}\n");
@@ -481,6 +511,14 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].features, producer_outputs::features(["a"]));
         assert_eq!(captured[0].outputs.files[0].bytes.as_slice(), b"exact path");
+
+        write(&root, "/elsewhere").unwrap_or_else(|error| panic!("{error}"));
+        assert!(matches!(capture(&report, &target, &checkout, &closure, alloc), Err(Failure::Manifest { path, .. }) if path == root));
+        write(&root, out.as_os_str().as_encoded_bytes()).unwrap_or_else(|error| panic!("{error}"));
+
+        write(&stdout, format!("{directives}cargo::rustc-link-arg=-unexpected\n")).unwrap_or_else(|error| panic!("{error}"));
+        assert!(matches!(capture(&report, &target, &checkout, &closure, alloc), Err(Failure::Manifest { path, .. }) if path == stdout));
+        write(&stdout, &directives).unwrap_or_else(|error| panic!("{error}"));
 
         let mut wrong_package = message.clone();
         let other_out = builds.join("other").join(CARGO_UNIT).join("out");
