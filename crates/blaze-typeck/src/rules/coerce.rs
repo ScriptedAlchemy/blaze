@@ -233,8 +233,10 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                 }
                 self.unsize_to_dyn(resolved, pointee_b, cause)?
             }
-            (TyView::Infer(_), _) | (_, TyView::Infer(_)) => return Ok(None),
+            // An inferred number already has a scalar kind. Its trait obligation can
+            // constrain it now or be checked after numeric fallback.
             (_, TyView::Dynamic(_)) => self.unsize_to_dyn(pointee_a, pointee_b, cause)?,
+            (TyView::Infer(_), _) | (_, TyView::Infer(_)) => return Ok(None),
             // A struct whose tail field unsizes (the Reference, "Type coercions", "Unsized
             // Coercions": "`Foo<.., T, ..>` to `Foo<.., U, ..>`, when `Foo` is a struct, `T`
             // implements `Unsize<U>`, the last field of `Foo` has a type involving `T` ..";
