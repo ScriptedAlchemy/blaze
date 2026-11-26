@@ -907,7 +907,7 @@ pub(crate) enum CheckScope<'f> {
     /// Only the selected packages' test targets (with optional `--bin` roots) and their transitive
     /// dependency closure.
     Test { packages: &'f [&'f str], bin: Option<&'f str>, bin_roots: &'f [&'f str] },
-    /// Only the selected binary target and its transitive dependency closure (`blaze run` / `blaze export`).
+    /// Only the selected source root and its transitive dependency closure (`blaze run` / `blaze export`).
     Bin { package: &'f str, root: &'f str },
 }
 
@@ -922,6 +922,7 @@ impl CheckScope<'_> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum StartScope<'a> {
     Bin(crate::run_package::Select<'a>),
+    Export(crate::run_package::Select<'a>, crate::run_package::ExportKind),
     Test(crate::run_package::Select<'a>),
 }
 
@@ -2119,6 +2120,12 @@ fn check_and_open<R>(
                 shown.quiet_when_clean = quiet_when_clean;
                 let select = crate::run_package::Select { member, ..sel };
                 let picked = crate::run_package::pick(cx, root, select, frame)?;
+                (true, CheckScope::Bin { package: picked.package, root: picked.root }, Some(picked), None)
+            }
+            OpenMode::Start { quiet_when_clean, scope: StartScope::Export(sel, kind) } => {
+                shown.quiet_when_clean = quiet_when_clean;
+                let select = crate::run_package::Select { member, ..sel };
+                let picked = crate::run_package::pick_export(cx, root, select, kind, frame)?;
                 (true, CheckScope::Bin { package: picked.package, root: picked.root }, Some(picked), None)
             }
             OpenMode::Start { quiet_when_clean, scope: StartScope::Test(sel) } => {

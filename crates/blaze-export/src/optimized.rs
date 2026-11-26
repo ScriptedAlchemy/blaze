@@ -301,7 +301,7 @@ pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: 
         return Err(ExportError::Wasm64RequiresWasmProgram);
     }
     let has = |symbol: Symbol| program.functions.iter().any(|f| f.symbol == symbol);
-    let main = main_of(program.entry);
+    let main = main_of(program.entry).ok_or(ExportError::OptimizedLibraryRequiresExports)?;
     if !matches!(program.entry, Entry::Hosted { .. }) && !has(main) {
         return Err(ExportError::NoEntry { symbol: main });
     }
@@ -339,7 +339,8 @@ pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: 
     let rows = rows_of(&members, alloc);
     let unwinds = unwinds(&members, &rows, alloc)?;
     let room = eh_room_rows(&unwinds, program.personality, platform, alloc)?;
-    let laid = lay_out_records_with_tls(&members, program.data, start.entry, program.profile, plan, room, tls_plan, alloc)?;
+    let entry = start.entry.ok_or(ExportError::OptimizedLibraryRequiresExports)?;
+    let laid = lay_out_records_with_tls(&members, program.data, entry, program.profile, plan, room, tls_plan, alloc)?;
     let eh = eh_sections_rows(&laid, &unwinds, program.personality, platform, alloc)?;
     let panics = match program.panic {
         Panic::Unwind => Panics::Unwind { functions: eh.functions },
@@ -486,7 +487,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
     let Some(entry_member) = find_member(members, &by_symbol, entry) else {
         return Err(ExportError::NoEntry { symbol: entry });
     };
-    let order = bolt_order_members(members, &by_symbol, entry_member, profile, page, alloc);
+    let order = bolt_order_members(members, &by_symbol, Some(entry_member), profile, page, alloc);
 
     // Folding: each position's representative is the first position with an equal record.
     let mut digests: AVec<'_, ([u8; 32], u32)> = Vec::with_capacity_in(n, alloc);
@@ -815,5 +816,5 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
         }
     }
 
-    regions.finish(members, &by_symbol, &order, &rep, &home, data, &by_target, entry_member, plan, tail, text, imports, fixups, placed)
+    regions.finish(members, &by_symbol, &order, &rep, &home, data, &by_target, Some(entry_member), plan, tail, text, imports, fixups, placed)
 }

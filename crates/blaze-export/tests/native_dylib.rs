@@ -15,6 +15,11 @@
 //!
 //! Without the piece: "unresolved import `blaze_export::native_dylib`".
 
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+mod host;
+#[path = "native_dylib/rust_cdylib.rs"]
+mod rust_cdylib;
+
 use blaze_export::native_dylib::{FLAT_LOOKUP, write};
 use blaze_native::Platform;
 use blaze_native::image::{FixTo, Fixup, Image, Import, Placed, Region};

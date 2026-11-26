@@ -205,6 +205,8 @@ pub struct Shim<'r> {
 /// roots; one builder).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MakerStart {
+    /// Shared library roots, with no process entry.
+    Library,
     /// THE start rule, decided again in the maker's own store (program.rs `start_of`, as
     /// [`roots`] decided it): a program's run.
     ByRule,
@@ -226,6 +228,7 @@ pub enum MakerStart {
 ///   [`crate::run::make_one::Maker::set_direct_entry`] without rebuilding cached state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MakerKind {
+    Library,
     ByRule(Option<ItemKey>),
     Direct,
 }
@@ -234,6 +237,7 @@ impl MakerKind {
     /// The start class for `(entry, start)`.
     pub const fn of(entry: Option<ItemKey>, start: MakerStart) -> MakerKind {
         match start {
+            MakerStart::Library => MakerKind::Library,
             MakerStart::ByRule => MakerKind::ByRule(entry),
             MakerStart::Direct(_) => MakerKind::Direct,
         }
@@ -295,6 +299,72 @@ impl<'a> Roots<'a> {
     pub fn shim(&self) -> Option<Shim<'_>> {
         self.shim.then(|| Shim { lang_start: self.root(0), main: self.root(1) })
     }
+}
+
+/// The exports and personality routine reached by a shared library.
+pub struct LibraryRoots<'a> {
+    table: RootTable<'a>,
+    pub personality: Option<Symbol>,
+}
+
+/// A code-record walk's roots for the selected export product.
+pub enum ProductRoots<'a> {
+    Executable(Roots<'a>),
+    Library(LibraryRoots<'a>),
+}
+
+impl ProductRoots<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Executable(roots) => roots.len(),
+            Self::Library(roots) => roots.table.rows.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn row(&self, at: usize) -> (ItemKey, &[u8]) {
+        match self {
+            Self::Executable(roots) => roots.row(at),
+            Self::Library(roots) => roots.table.rows.row(at),
+        }
+    }
+
+    pub fn symbol(&self, at: usize) -> Symbol {
+        match self {
+            Self::Executable(roots) => roots.root(at).symbol,
+            Self::Library(roots) => roots.table.symbols[at],
+        }
+    }
+
+    pub fn personality(&self) -> Option<Symbol> {
+        match self {
+            Self::Executable(roots) => roots.personality,
+            Self::Library(roots) => roots.personality,
+        }
+    }
+}
+
+/// Build exported C roots without invoking the process start rule.
+pub fn library_roots<'n, 'a, S: NamesSource<'n>>(
+    names: S,
+    lang_crates: &[usize],
+    panic: crate::code_records::PanicStrategy,
+    exports: &[blaze_id::ItemKey],
+    frame: &'n blaze_mem::Frame,
+    tables: Alloc<'static>,
+    alloc: Alloc<'a>,
+) -> Result<LibraryRoots<'a>, RootsError> {
+    let store = Store::new(None, frame, tables);
+    let mut table = RootTable { rows: DeclaredList::new_in(alloc), symbols: Vec::new_in(alloc), name: Vec::new_in(alloc), alloc };
+    push_exports(&mut table, exports, store.tys.view())?;
+    let personality = match crate::personality::personality_of(names, lang_crates, panic).map_err(RootsError::Personality)? {
+        Some(routine) => Some(table.push("the personality routine", checker_of(routine), List::EMPTY, store.tys.view())?),
+        None => None,
+    };
+    Ok(LibraryRoots { table, personality })
 }
 
 /// THE RUN'S ROOTS over any names source (the module doc). Reads, through `names`:

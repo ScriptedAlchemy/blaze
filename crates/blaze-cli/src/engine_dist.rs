@@ -37,7 +37,7 @@ use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, PanicSt
 use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::run::RunError;
 use blaze_ladder::run::make_one::{MOST_WALKED, Maker, NamesRecords, RecordsProgram, Typing};
-use blaze_ladder::run::special::{EntryForm, Roots};
+use blaze_ladder::run::special::{EntryForm, ProductRoots};
 use blaze_ladder::symbols::{encode_instance, fn_symbol_of_name};
 use blaze_own::{AString, AVec, Alloc, BTreeMap, BTreeSet, String, Vec};
 use blaze_scope::items_record::{ItemsRecord, TextSpan};
@@ -561,19 +561,25 @@ fn unit_digest_of(
 }
 
 /// Distinguishes the selected start and the explicit root closure of a final unit.
-fn program_roots_digest(name: &str, roots: &Roots<'_>, panic: PanicStrategy) -> Digest {
-    let form = match roots.form {
-        EntryForm::Unit => b"unit".as_slice(),
-        EntryForm::CMain => b"c-main".as_slice(),
-        EntryForm::Hosted => b"hosted".as_slice(),
-        EntryForm::Comptime => b"comptime".as_slice(),
+fn program_roots_digest(name: &str, roots: &ProductRoots<'_>, panic: PanicStrategy) -> Digest {
+    let (form, entry) = match roots {
+        ProductRoots::Executable(roots) => (match roots.form {
+            EntryForm::Unit => b"unit".as_slice(),
+            EntryForm::CMain => b"c-main".as_slice(),
+            EntryForm::Hosted => b"hosted".as_slice(),
+            EntryForm::Comptime => b"comptime".as_slice(),
+        }, Some(roots.entry)),
+        ProductRoots::Library(_) => (b"cdylib".as_slice(), None),
     };
     let panic = match panic {
         PanicStrategy::Unwind => b"unwind".as_slice(),
         PanicStrategy::Abort => b"abort".as_slice(),
     };
     let mut hash = blaze_ids::Hasher::new("blaze distributed program roots 1");
-    hash.part(name.as_bytes()).part(form).part(panic).part(&roots.entry.0);
+    hash.part(name.as_bytes()).part(form).part(panic);
+    if let Some(entry) = entry {
+        hash.part(&entry.0);
+    }
     for index in 0..roots.len() {
         let (item, instance) = roots.row(index);
         hash.part(&item.0.to_le_bytes()).part(instance);
@@ -839,7 +845,7 @@ struct UnitExecutor<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>> {
     builder: &'a Builder,
     maker: &'a mut Maker<'b, crate::run_ids::Runnable, T>,
     store: &'a mut DistStore<'s, 'm, D>,
-    roots: &'a Roots<'a>,
+    roots: &'a ProductRoots<'a>,
     scratch_alloc: Alloc<'a>,
     wire_alloc: WireAlloc,
     heap: &'static blaze_own::Heap,
@@ -1012,7 +1018,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
     builder: &'a Builder,
     maker: &'a mut Maker<'b, crate::run_ids::Runnable, T>,
     store: &'a mut DistStore<'s, 'm, D>,
-    roots: &'a Roots<'a>,
+    roots: &'a ProductRoots<'a>,
     release: bool,
     output_path: &str,
     scratch_alloc: Alloc<'a>,

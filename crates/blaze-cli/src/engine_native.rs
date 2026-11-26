@@ -218,9 +218,11 @@ pub(crate) struct ProgramImage<'w> {
 /// The program's laid-out native image and Rust C exports for `blaze export`
 /// (`engine_export.rs`, `blaze_export::ProgramIn::natives` and `exports`).
 pub(crate) struct ExportNative<'a> {
-    pub(crate) image: blaze_native::image::Image<'a>,
-    /// Sorted by `name`, for `blaze_export::ProgramIn::exports`.
-    pub(crate) exports: AVec<'a, blaze_export::CExport<'a>>,
+    pub(crate) image: Option<blaze_native::image::Image<'a>>,
+    /// The selected library's public symbols, sorted by name.
+    pub(crate) public: AVec<'a, blaze_export::CExport<'a>>,
+    /// Definitions requested by the native image's words, sorted by name.
+    pub(crate) bindings: AVec<'a, blaze_export::CExport<'a>>,
     /// The library items of the Rust functions the native image's C words call, for `run_roots`.
     pub(crate) items: AVec<'a, blaze_id::ItemKey>,
 }
@@ -933,16 +935,17 @@ pub(crate) fn image_for<'r>(
 }
 
 /// The laid-out native image (`blaze_native::image::Image`) and sorted Rust C exports for
-/// `blaze export`, allocated in `out_bump`. Returns `Ok(None)` when the program links no native
-/// objects, initializers, Rust words, or libraries beyond libSystem/libc.
+/// `blaze export`, allocated in `out_bump`. The optional image is absent when there are no
+/// native objects, initializers, Rust words, or extra libraries; a cdylib still has C exports.
 pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     cx: &Cx,
     standing: &mut Standing<'r, 'm>,
     closure: &[CrateAt],
+    kind: crate::run_package::ExportKind,
     watch: &dyn blaze_screen::Watch,
     out_frame: &'s Frame,
     out_bump: blaze_own::Bump<'s>,
-) -> Result<Option<ExportNative<'s>>, NativeError<'r>> {
+) -> Result<ExportNative<'s>, NativeError<'r>> {
     let cx = cx.span("native: layout for export");
     let prepared = prepare_crates(&cx, standing, closure, watch, out_frame)?;
     let ask = &standing.native;
@@ -986,39 +989,45 @@ pub(crate) fn export_native_for<'r, 'm: 's, 's>(
     };
     let has_text = image.region(blaze_native::image::Region::Text).is_some_and(|r| r.len > 0);
     let has_extra_lib = image.libraries.iter().any(|l| l.install().as_bytes() != LIB_SYSTEM && l.install().as_bytes() != LIBC_LINUX);
-    if !has_text && image.words.is_empty() && image.inits == 0 && image.tls.is_empty() && !has_extra_lib {
-        return Ok(None);
-    }
-    // Collect only the Rust C exports referenced by `image.words` (matching `send_of`), sorted by
-    // name for `native_merge`. Unreferenced `#[no_mangle]` items in the closure (such as Linux
-    // `compiler_builtins` outline-atomic helpers like `__aarch64_cas16_acq`) are never called by
-    // the native image and must not be forced as mandatory export roots.
+    let has_image = has_text || !image.words.is_empty() || image.inits != 0 || !image.tls.is_empty() || has_extra_lib;
+    // Native words may reach definitions from the dependency closure. Only the selected
+    // library's definitions are public loader symbols.
     let strip_underscore = prepared.platform == Platform::MacosArm64;
-    let mut exports: AVec<'s, blaze_export::CExport<'s>> = Vec::new_in(alloc);
+    let mut public: AVec<'s, blaze_export::CExport<'s>> = Vec::new_in(alloc);
+    let mut bindings: AVec<'s, blaze_export::CExport<'s>> = Vec::new_in(alloc);
     let mut items: AVec<'s, blaze_id::ItemKey> = Vec::new_in(alloc);
-    if !image.words.is_empty() {
-        for table in tables.iter() {
-            for export in table.exports.iter() {
-                let raw_name = export.name.as_bytes();
-                let needed = image.words.iter().any(|&word| {
-                    let word = if strip_underscore { word.strip_prefix(b"_").unwrap_or(word) } else { word };
-                    word == raw_name
-                });
-                if !needed {
-                    continue;
-                }
-                let checker = blaze_ladder::front2::keys::checker_of(export.item);
-                let symbol = blaze_ladder::symbols::fn_symbol(checker, blaze_typeck::List::EMPTY, blaze_typeck::PTys::EMPTY, alloc)
-                    .map_err(|why| NativeError::Send { words: held(bstd::mem::format_in!(out_frame, "export `{}` symbol: {why:?}", export.name).as_str(), ask) })?;
-                exports.push(blaze_export::CExport { name: raw_name, symbol });
-                if items.scan_for(&export.item).is_none() {
-                    items.push(export.item);
-                }
+    for (index, table) in tables.iter().enumerate() {
+        let is_library_root = index == 0 && kind == crate::run_package::ExportKind::Cdylib;
+        if !is_library_root && image.words.is_empty() {
+            continue;
+        }
+        for export in table.exports.iter() {
+            let raw_name = export.name.as_bytes();
+            let needed = image.words.iter().any(|&word| {
+                let word = if strip_underscore { word.strip_prefix(b"_").unwrap_or(word) } else { word };
+                word == raw_name
+            });
+            if !is_library_root && !needed {
+                continue;
+            }
+            let checker = blaze_ladder::front2::keys::checker_of(export.item);
+            let symbol = blaze_ladder::symbols::fn_symbol(checker, blaze_typeck::List::EMPTY, blaze_typeck::PTys::EMPTY, alloc)
+                .map_err(|why| NativeError::Send { words: held(bstd::mem::format_in!(out_frame, "export `{}` symbol: {why:?}", export.name).as_str(), ask) })?;
+            let export_name = blaze_export::CExport { name: raw_name, symbol };
+            if is_library_root {
+                public.push(export_name);
+            }
+            if needed {
+                bindings.push(export_name);
+            }
+            if items.scan_for(&export.item).is_none() {
+                items.push(export.item);
             }
         }
     }
-    exports.sort_unstable_by(|a, b| a.name.cmp(b.name));
-    Ok(Some(ExportNative { image, exports, items }))
+    public.sort_unstable_by(|a, b| a.name.cmp(b.name));
+    bindings.sort_unstable_by(|a, b| a.name.cmp(b.name));
+    Ok(ExportNative { image: has_image.then_some(image), public, bindings, items })
 }
 
 /// The link table of the crate whose `CrateScope` record `scope` names: that record's `links`

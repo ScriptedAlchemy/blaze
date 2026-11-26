@@ -94,6 +94,13 @@ pub struct Import<'r> {
     pub name: &'r str,
 }
 
+impl Import<'_> {
+    /// The C++ image identity symbol is the Mach header of the library that references it.
+    pub(crate) fn is_dso_handle(&self) -> bool {
+        self.name.strip_prefix('\x02').unwrap_or(self.name) == "__dso_handle"
+    }
+}
+
 /// The program laid out: each region's bytes at its image offset, and what the loader fixes.
 pub struct Laid<'a, 'r> {
     pub page: u64,
@@ -131,6 +138,8 @@ pub struct Laid<'a, 'r> {
     /// Whether the program has a Rust thread-local runtime (`TlsRuntime`): Linux emits `PT_TLS`
     /// for the per-thread `ROOT` slot.
     pub has_tls: bool,
+    /// Writable descriptor; ELF libraries relocate its root with TLS_TPREL64.
+    pub tls_desc_at: Option<u64>,
     /// Number of Rust thread-local statics (`Space::Tls`) laid out in `DESC.vars`.
     pub tls_count: u32,
 }
@@ -257,8 +266,8 @@ fn find_data(data: &[Data<'_>], by_target: &[u32], target: Target) -> Option<usi
 pub(crate) struct TlsPlan {
     /// The `Space::Static` symbol of the 40-byte `Desc` synthesized in writable data.
     pub descriptor: Symbol,
-    /// On macOS, the `tls_init` function symbol placed in `__DATA_CONST,__mod_init_func`.
-    /// `None` on Linux (where the start wrapper calls `tls_init` directly).
+    /// Loader initializer for macOS and Linux libraries. Linux executables call it
+    /// through their start wrapper instead.
     pub mod_init_fn: Option<Symbol>,
     /// Initial value of `DESC.root`: `0` on macOS (written by `tls_init` at startup as
     /// `key * 8`); `TLS_ROOT_OFFSET | ROOT_OWN` on Linux (`PT_TLS` static TLS slot).
@@ -537,7 +546,7 @@ impl<'a> ConstAndData<'a> {
         home: &[u64],
         data: &[Data<'r>],
         by_target: &[u32],
-        entry_member: usize,
+        entry_member: Option<usize>,
         plan: Plan,
         tail: u64,
         text: AVec<'a, u8>,
@@ -588,13 +597,7 @@ impl<'a> ConstAndData<'a> {
                 let target = usize::try_from(d)
                     .ok()
                     .and_then(|idx| data.get(idx).zip(data_home.get(idx)))
-                    .map_or(desc_at, |(datum, &h)| {
-                        if matches!(datum.place, DataPlace::Zeroed { .. }) || datum.bytes.is_empty() {
-                            desc_at
-                        } else {
-                            h
-                        }
-                    });
+                    .map_or(desc_at, |(datum, &h)| if matches!(datum.place, DataPlace::Zeroed { .. }) || datum.bytes.is_empty() { desc_at } else { h });
                 fixups.push(Fixup { at: row_at + row_init_off, to: FixTo::Rebase { target } });
             }
         }
@@ -627,14 +630,18 @@ impl<'a> ConstAndData<'a> {
                                 slot.copy_from_slice(&value.to_le_bytes());
                                 continue;
                             }
-                            Space::Outside if word.addend != 0 => return Err(ExportError::OutsideAddend { from: symbol, target: t }),
+                            Space::Outside if word.addend != 0 => {
+                                return Err(ExportError::OutsideAddend { from: symbol, target: t });
+                            }
                             Space::Outside => match import_of(t.symbol) {
                                 Some(import) => FixTo::Bind { import: import as u32 },
                                 None => unreachable!("every outside target of a placed record was gathered above"),
                             },
                             Space::Func | Space::Static | Space::Vtable => match home_of(t) {
                                 Some(to) => rebase_target(symbol, at, to as i64 + word.addend, end)?,
-                                None => return Err(ExportError::OutOfReach { from: symbol, target: t }),
+                                None => {
+                                    return Err(ExportError::OutOfReach { from: symbol, target: t });
+                                }
                             },
                         }
                     }
@@ -648,16 +655,24 @@ impl<'a> ConstAndData<'a> {
             for w in datum.words {
                 let at = base + u64::from(w.at);
                 let to = match w.target {
-                    None if datum.target.space == Space::Tls => return Err(ExportError::DataTlsTarget { from: datum.target, target: datum.target }),
+                    None if datum.target.space == Space::Tls => {
+                        return Err(ExportError::DataTlsTarget { from: datum.target, target: datum.target });
+                    }
                     None => rebase_target(datum.target.symbol, at, base as i64 + w.addend, end)?,
                     Some(t) => match (t.space, import_of(t.symbol)) {
-                        (Space::Tls, _) => return Err(ExportError::DataTlsTarget { from: datum.target, target: t }),
+                        (Space::Tls, _) => {
+                            return Err(ExportError::DataTlsTarget { from: datum.target, target: t });
+                        }
                         (Space::Outside, Some(import)) if w.addend == 0 => FixTo::Bind { import: import as u32 },
                         (Space::Func | Space::Static | Space::Vtable, _) => match home_of(t) {
                             Some(to) => rebase_target(datum.target.symbol, at, to as i64 + w.addend, end)?,
-                            None => return Err(ExportError::DataOutOfReach { from: datum.target, target: t }),
+                            None => {
+                                return Err(ExportError::DataOutOfReach { from: datum.target, target: t });
+                            }
                         },
-                        _ => return Err(ExportError::DataOutOfReach { from: datum.target, target: t }),
+                        _ => {
+                            return Err(ExportError::DataOutOfReach { from: datum.target, target: t });
+                        }
                     },
                 };
                 fixups.push(Fixup { at, to });
@@ -665,7 +680,7 @@ impl<'a> ConstAndData<'a> {
         }
         fixups.sort_unstable_by_key(|f| f.at);
 
-        let entry_at = home[entry_member];
+        let entry_at = entry_member.map_or(0, |i| home[i]);
         let tls_count = u32::try_from(tls_targets.len()).unwrap_or(u32::MAX);
         let has_tls = tls_desc.is_some();
         drop(relro_at);
@@ -690,6 +705,7 @@ impl<'a> ConstAndData<'a> {
             tables_room: tail,
             mod_init_at,
             has_tls,
+            tls_desc_at: tls_desc.map(|(_, at)| at),
             tls_count,
         })
     }
@@ -1062,7 +1078,7 @@ fn pack_tier_ext_tsp<'a>(
 pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
     members: &[M],
     by_symbol: &[u32],
-    entry: usize,
+    entry: Option<usize>,
     profile: Option<Profile<'_>>,
     page: u64,
     alloc: Alloc<'a>,
@@ -1072,10 +1088,7 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
         return Vec::new_in(alloc);
     }
     let page_cap = page.clamp(MIN_CLUSTER_PAGE_BYTES, APPLE_PAGE_BYTES);
-    let entry_sym_id = members
-        .get(entry)
-        .and_then(|m| find_sym_id(members, by_symbol, m.symbol()))
-        .unwrap_or(0);
+    let entry_sym_id = entry.and_then(|entry| members.get(entry)).and_then(|m| find_sym_id(members, by_symbol, m.symbol()));
 
     // 1. Build per-function canonical metadata and flat CSR direct call graph in `0..n` symbol
     //    order so nothing below ever observes the raw input slice permutation.
@@ -1098,7 +1111,7 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
         fn_bytes.push(align_up_u64(code_len, CODE_ALIGN_BYTES).max(CODE_ALIGN_BYTES));
         let start_flag = m.is_made_start();
         is_start.push(start_flag);
-        let stub_flag = sym_id != entry_sym_id && !start_flag && is_trap_stub(m);
+        let stub_flag = Some(sym_id) != entry_sym_id && !start_flag && is_trap_stub(m);
         trap_stub.push(stub_flag);
 
         let edge_start = call_edges.len();
@@ -1175,7 +1188,9 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
             bfs_queue.push(sym_id);
         }
     };
-    enqueue_direct(entry_sym_id, &mut direct_reach, &mut bfs_queue);
+    if let Some(entry_sym_id) = entry_sym_id {
+        enqueue_direct(entry_sym_id, &mut direct_reach, &mut bfs_queue);
+    }
     for &u in profile_hot_nodes.iter() {
         enqueue_direct(u, &mut direct_reach, &mut bfs_queue);
     }
@@ -1194,7 +1209,7 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
             }
         }
         // Start records (`_start` on Linux, `LangStart` wrapper) pass `main` via code-site `Load`.
-        if (u == entry_sym_id || at_bool(&is_start, u))
+        if (Some(u) == entry_sym_id || at_bool(&is_start, u))
             && let Some(m) = members.get(to_idx(at_u32(by_symbol, u)))
         {
             m.for_each_code_func_load(|target_sym| {
@@ -1250,7 +1265,7 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
     let mut dfs_stack: AVec<'_, usize> = Vec::with_capacity_in(n, alloc);
     let mut next_pre = 0u32;
     let mut dfs_seeds: AVec<'_, usize> = Vec::with_capacity_in(n.saturating_add(1), alloc);
-    dfs_seeds.push(entry_sym_id);
+    dfs_seeds.extend(entry_sym_id);
     for &u in profile_hot_nodes.iter() {
         dfs_seeds.push(u);
     }
@@ -1270,7 +1285,7 @@ pub(crate) fn bolt_order_members<'a, M: LayoutMember>(
             next_pre = next_pre.saturating_add(1);
             // Push start-wrapper loads first (so direct calls pop ahead of them), then direct calls
             // in reverse code order so the first callee in code pops first.
-            if (u == entry_sym_id || at_bool(&is_start, u))
+            if (Some(u) == entry_sym_id || at_bool(&is_start, u))
                 && let Some(m) = members.get(to_idx(at_u32(by_symbol, u)))
             {
                 let mut loaded: AVec<'_, usize> = Vec::new_in(alloc);
@@ -1508,6 +1523,45 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
     tls_plan: Option<TlsPlan>,
     alloc: Alloc<'a>,
 ) -> Result<Laid<'a, 'r>, ExportError> {
+    lay_out_impl(members, data, Some(entry), profile, plan, tail, tls_plan, alloc)
+}
+
+/// Layout a library without an entry, validating all public roots.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lay_out_library_with_tls<'a, 'r>(
+    members: &[Member<'r>],
+    data: &[Data<'r>],
+    exports: &[crate::CExport<'_>],
+    profile: Option<Profile<'_>>,
+    plan: Plan,
+    tail: u64,
+    tls_plan: Option<TlsPlan>,
+    alloc: Alloc<'a>,
+) -> Result<Laid<'a, 'r>, ExportError> {
+    let mut previous: Option<&[u8]> = None;
+    for e in exports {
+        if e.name.is_empty() || e.name.contains(&0) || previous.is_some_and(|p| p >= e.name) {
+            return Err(ExportError::ExportName { symbol: e.symbol });
+        }
+        previous = Some(e.name);
+        if !members.iter().any(|m| m.symbol == e.symbol) {
+            return Err(ExportError::ExportNotPlaced { symbol: e.symbol });
+        }
+    }
+    lay_out_impl(members, data, None, profile, plan, tail, tls_plan, alloc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lay_out_impl<'a, 'r>(
+    members: &[Member<'r>],
+    data: &[Data<'r>],
+    entry: Option<Symbol>,
+    profile: Option<Profile<'_>>,
+    plan: Plan,
+    tail: u64,
+    tls_plan: Option<TlsPlan>,
+    alloc: Alloc<'a>,
+) -> Result<Laid<'a, 'r>, ExportError> {
     let n = members.len();
     let page = plan.page;
     let mut by_symbol: AVec<'_, u32> = Vec::with_capacity_in(n, alloc);
@@ -1524,9 +1578,7 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
         }
     }
     let by_target = check_data(data, tls_plan.map(|t| t.descriptor), page, alloc)?;
-    let Some(entry_member) = find_member(members, &by_symbol, entry) else {
-        return Err(ExportError::NoEntry { symbol: entry });
-    };
+    let entry_member = entry.map(|symbol| find_member(members, &by_symbol, symbol).ok_or(ExportError::NoEntry { symbol })).transpose()?;
     let order = bolt_order_members(members, &by_symbol, entry_member, profile, page, alloc);
 
     // Folding: each position's representative is the first position with equal bytes.
