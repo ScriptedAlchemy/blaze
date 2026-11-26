@@ -590,7 +590,12 @@ fn slice_span<'a>(names: &NamesRecords<'a>, krate: usize, span: TextSpan) -> Opt
     whole.get(start..end)
 }
 
-/// Collects concrete non-generic runnable functions from one crate's `ItemsRecord`.
+struct CrateItems<'a> {
+    functions: AVec<'a, WorkItem<'a>>,
+    data: ContentId,
+}
+
+/// Collects grantable functions and the checked data bodies their compilation can read.
 fn collect_crate_items<'a, 'b>(
     names: NamesRecords<'b>,
     krate: usize,
@@ -598,8 +603,9 @@ fn collect_crate_items<'a, 'b>(
     ids: &RunIds<'b>,
     builder: &Builder,
     alloc: Alloc<'a>,
-) -> AVec<'a, WorkItem<'a>> {
+) -> CrateItems<'a> {
     let mut raw: AVec<'a, WorkItem<'a>> = Vec::new_in(alloc);
+    let mut data = Vec::new_in(alloc);
     let tys = PortableTys::new_in(alloc);
     let ground = tys.view();
 
@@ -628,6 +634,17 @@ fn collect_crate_items<'a, 'b>(
 
     for i in 0..rec.items() {
         let Ok(Some(item)) = rec.item_at(i) else { continue };
+        match item.kind {
+            ItemKind::Const | ItemKind::Static => data.push(checker_of(item.key)),
+            ItemKind::Impl | ItemKind::Trait => {
+                names.records.each_member_row(item.key, &mut |member| {
+                    if member.kind == ItemKind::Const {
+                        data.push(checker_of(member.key));
+                    }
+                });
+            }
+            _ => {}
+        }
         if item.kind != ItemKind::Function || item.foreign.is_some() {
             continue;
         }
@@ -678,7 +695,24 @@ fn collect_crate_items<'a, 'b>(
         }
         deduped.push(item);
     }
-    deduped
+    // A constant's checked body holds the reads of its initializer, including the bytes of
+    // an included file. These inputs affect the unit even when no function's text changes.
+    data.sort_unstable();
+    data.dedup();
+    let mut digest = blaze_ids::Hasher::new("blaze distributed checked data 1");
+    for item in data {
+        digest.part(&item.0.to_le_bytes());
+        if let Some(body) = ids.body_check(item) {
+            digest.part(&body.key.0);
+            digest.part(&(body.reads.len() as u64).to_le_bytes());
+            for read in body.reads {
+                digest.part(&read.fact).part(&read.digest);
+            }
+        } else {
+            digest.part(&[]);
+        }
+    }
+    CrateItems { functions: deduped, data: digest.finish() }
 }
 
 /// Formats a `WireVec<Digest>` as a JSON array of 64-char hex strings.
@@ -1034,14 +1068,15 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             continue;
         }
         let Ok(cname) = rec.name() else { continue };
-        let items = collect_crate_items(names, idx, rec, ids, builder, scratch_alloc);
+        let CrateItems { functions: items, data } = collect_crate_items(names, idx, rec, ids, builder, scratch_alloc);
         let mut work_names = WireVec::with_capacity_in(items.len(), wire_alloc);
         for item in items.iter() {
             work_names.push(item.key.0.0);
         }
         let is_final = idx == 0;
-        let mut extra: AVec<'a, Digest> = Vec::with_capacity_in(1 + if is_final { prior_digests.len() + 1 } else { 0 }, scratch_alloc);
+        let mut extra: AVec<'a, Digest> = Vec::with_capacity_in(2 + if is_final { prior_digests.len() + 1 } else { 0 }, scratch_alloc);
         extra.push(key.0.0);
+        extra.push(data.0);
         if is_final {
             extra.extend_from_slice(prior_digests.as_slice());
             extra.push(program_roots_digest(program_crate_name, roots, builder.settings.panic));
