@@ -3633,7 +3633,7 @@ pub(super) fn file_flow<'a>(
                 // the call chooses escaping into one the closure keeps is E0521; any other is
                 // refused (never dropped).
                 BorrowFinding::UnprovenOutlives { span, from, into, .. } if of.is_nested(view) => {
-                    if let Some(req) = externals.and_then(|ext| blaze_flow_lower::requirement(ext, from, into)) {
+                    if let Some(req) = externals.and_then(|ext| blaze_flow_lower::requirement(ext, &flow.known, from, into, alloc)) {
                         needs.push(req);
                         continue;
                     }

@@ -29,9 +29,8 @@
 //! closure requirements, the NLL RFC, "Closures"): [`lower_closure_external`] says what each
 //! placeholder is in the owner ([`External`]); an outlives result between two of the closure
 //! VALUE's positions (or `'static`) becomes a [`Requirement`] the owner's flow emits at the
-//! closure expression ([`crate::Facts::closure_requirements`]); one that names the
-//! environment's reference, a region the expecting clause binds, or a signature not read
-//! ([`requirement`] gives `None`) is still filed as a refusal, never as a finding.
+//! closure expression ([`crate::Facts::closure_requirements`]). A requirement that a capture
+//! outlive a late-bound region can use a known owner signature bound for that region.
 //!
 //! THE SIGNATURE'S REGIONS (D148, docs/v2/plan/design/flow.md "Lifetimes are produced once and
 //! carried beside the types", piece L5). The type check records WHERE a closure's signature was
@@ -40,8 +39,8 @@
 //!
 //! - a slot the clause's `for<..>` binds (`Late`, `Fn(&T)`'s elided input and its output) is a
 //!   UNIVERSAL region of the closure's body ([`SigSlot::Late`], [`External::Late`]): the body
-//!   must hold for every choice of it, and a relation it needs on it is refused, never pushed
-//!   on the owner (rustc reports those inside the closure: "borrowed data escapes");
+//!   must hold for every choice permitted by the signature's known bounds. That region itself
+//!   is unavailable to the owner;
 //! - every other position of a clause's part (under a type parameter of the clause, a
 //!   lifetime parameter of the callee, `'static`), and the output of a signature no clause
 //!   expected, is the OWNER's: a position of the closure VALUE after its captures'
@@ -80,6 +79,10 @@ use blaze_typeck::{BodyView, CaptureKind, Checked, ClosureKind, Expr, ExprId, It
 use core::alloc::Allocator;
 
 use crate::{At, ClosureSigWhy, Facts, Form, Lower, Lowered, MOST_POSITIONS, Refusal, Region, Task, TyD, Val, range_of};
+
+#[cfg(test)]
+#[path = "closure_requirement_edges_tests.rs"]
+mod requirement_tests;
 
 /// The body of closure `closure` (an `Expr::Closure` of `body`, not `async`) as its own flow:
 /// its captures, then its parameters, as the arguments (the module doc).
@@ -189,22 +192,72 @@ pub struct Requirement {
 }
 
 /// The requirement an outlives result of the closure's flow (`UnprovenOutlives { from, into }`:
-/// `from: into` needed between two placeholders, not known) puts on its owner, or `None` when it
-/// cannot be stated there: an end is the environment's reference (bound per call), a universal
-/// signature region ([`External::Late`]: the body must hold for every choice of it), an async
-/// block's output ([`External::Sig`]), or a placeholder this flow did not name. `None` stays
-/// `NestedOutlives`: not checked, never accepted.
-pub fn requirement(externals: &[(blaze_flow::Origin, External)], from: blaze_flow::Origin, into: blaze_flow::Origin) -> Option<Requirement> {
-    let end = |o: blaze_flow::Origin| match externals.iter().find(|(x, _)| *x == o).map(|&(_, w)| w) {
-        Some(External::Capture(j)) => Some(Need::Capture(j)),
-        Some(External::Static) => Some(Need::Static),
-        Some(External::SigOwner(k)) => Some(Need::Sig(k)),
-        Some(External::OwnerParam(i)) => Some(Need::OwnerParam(i)),
-        Some(External::Param(u)) => Some(Need::Param(u)),
-        Some(External::DynPlaceholder(ord)) => Some(Need::DynPlaceholder(ord)),
-        Some(External::Env | External::Sig | External::Late) | None => None,
+/// `from: into` needed between two placeholders) puts on its owner. A capture that must
+/// outlive a late-bound region can be required to outlive its unique owner signature bound.
+/// For `&'scope Scope<'scope, 'env>`, the closure knows `'env: 'scope`. Other relations
+/// that cannot be stated in the owner stay `NestedOutlives`.
+pub fn requirement<A: Allocator>(
+    externals: &[(Origin, External)],
+    known: &[(Origin, Origin)],
+    from: Origin,
+    into: Origin,
+    alloc: A,
+) -> Option<Requirement> {
+    let need = |end| match end {
+        External::Capture(j) => Some(Need::Capture(j)),
+        External::Static => Some(Need::Static),
+        External::SigOwner(k) => Some(Need::Sig(k)),
+        External::OwnerParam(i) => Some(Need::OwnerParam(i)),
+        External::Param(u) => Some(Need::Param(u)),
+        External::DynPlaceholder(ord) => Some(Need::DynPlaceholder(ord)),
+        External::Env | External::Sig | External::Late => None,
     };
-    Some(Requirement { from: end(from)?, into: end(into)? })
+    let start = external_of(externals, from)?;
+    let end = external_of(externals, into)?;
+    let target = match (start, end) {
+        (External::Capture(_), External::Late) => owner_signature_bound(externals, known, into, alloc),
+        _ => need(end),
+    }?;
+    Some(Requirement { from: need(start)?, into: target })
+}
+
+fn external_of(externals: &[(Origin, External)], origin: Origin) -> Option<External> {
+    externals.iter().find(|(o, _)| *o == origin).map(|&(_, external)| external)
+}
+
+/// Walk the known outlives edges backwards through late-bound origins, stopping at the first
+/// signature owner on each path. One such bound suffices by transitivity, but there must be a
+/// unique choice so the requirement does not choose an unrelated bound for the owner to prove.
+fn owner_signature_bound<A: Allocator>(
+    externals: &[(Origin, External)],
+    known: &[(Origin, Origin)],
+    into: Origin,
+    alloc: A,
+) -> Option<Need> {
+    let mut reached = Vec::new_in(alloc);
+    reached.push(into);
+    let mut bound = None;
+    let mut i = 0;
+    while let Some(&current) = reached.get(i) {
+        i += 1;
+        for &(longer, shorter) in known {
+            if shorter != current {
+                continue;
+            }
+            match external_of(externals, longer) {
+                Some(External::Late) if !reached.iter().any(|&seen| seen == longer) => reached.push(longer),
+                Some(External::SigOwner(slot)) => {
+                    let candidate = Need::Sig(slot);
+                    if bound.is_some_and(|prev| prev != candidate) {
+                        return None;
+                    }
+                    bound = Some(candidate);
+                }
+                _ => {}
+            }
+        }
+    }
+    bound
 }
 
 /// Whether an outlives result `from: into` of a closure's flow is rustc's E0521, "borrowed data
@@ -228,7 +281,7 @@ pub fn escapes_closure<A: Allocator>(
     into: Origin,
     alloc: A,
 ) -> bool {
-    let end = |o: Origin| externals.iter().find(|(x, _)| *x == o).map(|&(_, w)| w);
+    let end = |o| external_of(externals, o);
     let owner_names = |w: Option<External>| {
         matches!(w, Some(External::Capture(_) | External::SigOwner(_) | External::Static | External::OwnerParam(_) | External::Param(_) | External::DynPlaceholder(_)))
     };
