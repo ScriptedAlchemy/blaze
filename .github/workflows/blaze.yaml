@@ -85,7 +85,16 @@ jobs:
             install -m 755 "$CARGO_TARGET_DIR/release/$binary" "$RUNNER_TEMP/source-binaries/$binary"
           done
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"seal\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+      - name: Execute the native release splat regression
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
+        run: |
+          evidence="$RUNNER_TEMP/plan-evidence"
+          tc="$(cat pins/toolchain)"
+          timeout -k 30 1200 cargo +"$tc" test --locked --release -p blaze-emit --features llvm --lib \
+            release_record_stores_a_splat_to_every_lane 2>&1 | tee "$evidence/llvm-splat.log"
+          grep -Fq 'release_record_stores_a_splat_to_every_lane ... ok' "$evidence/llvm-splat.log"
       - name: Exercise the unchanged distributed fault harness in both profiles
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' }}
         run: |
           bin="$RUNNER_TEMP/source-binaries"
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$bin\",\"services\":true}"
@@ -104,6 +113,7 @@ jobs:
         if: ${{ !cancelled() && env.LLVM_SYS_231_PREFIX != '' }}
         run: |
           prefix="$LLVM_SYS_231_PREFIX"
+          # shellcheck disable=SC2016
           input=$(timeout 10 jq -nc --arg prefix "$prefix" --arg clang "$(command -v clang)" '{prefix:$prefix,clang:$clang,check:true}')
           timeout -k 20 1200 cargo +"$(cat pins/toolchain)" run --release --locked -p scripts --bin llvm_abi -- "$input" \
             2>&1 | tee "$RUNNER_TEMP/plan-evidence/llvm-generator.log"
