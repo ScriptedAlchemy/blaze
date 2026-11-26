@@ -1361,6 +1361,13 @@ impl<'a> Walk<'a> {
     /// Row `row` done as `stepped`: the rows `declared` names reached, in the entry's order; on
     /// a refusal the row's edges so far are dropped and its `How` is left as it was.
     fn reach_declared<E>(&mut self, row: usize, stepped: Stepped, most: usize, declared: &DeclaredList<'_>) -> Result<(), WalkError<E>> {
+        self.discover(row, most, declared)?;
+        self.how[row] = How::Done(stepped);
+        Ok(())
+    }
+
+    /// Traverse a prepared row's declarations before its backend task emits code.
+    pub(crate) fn discover<E>(&mut self, row: usize, most: usize, declared: &DeclaredList<'_>) -> Result<(), WalkError<E>> {
         let start = self.edges.len();
         let (instances, statics) = (declared.len(), declared.statics().len());
         for i in 0..instances + statics + declared.thread_locals().len() {
@@ -1384,7 +1391,6 @@ impl<'a> Walk<'a> {
             }
         }
         self.declares[row] = (start as u32, (self.edges.len() - start) as u32);
-        self.how[row] = How::Done(stepped);
         Ok(())
     }
 }
