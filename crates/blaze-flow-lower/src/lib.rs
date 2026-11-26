@@ -1251,6 +1251,7 @@ enum Agg {
 enum Task {
     Eval(ExprId, bool),
     Adjust(ExprId, bool),
+    AdjustAfter(ExprId, bool, usize),
     Stmt(StmtId),
     OpenTemps,
     CloseTemps(ExprId),
@@ -4561,6 +4562,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         match t {
             Task::Eval(e, m) => self.eval(e, m),
             Task::Adjust(e, m) => self.adjust(e, m),
+            Task::AdjustAfter(e, m, consumed) => self.adjust_after(e, m, consumed),
             Task::Stmt(s) => self.stmt(s),
             Task::OpenTemps => {
                 self.temp_marks.push(self.temps.len() as u32);
@@ -5524,7 +5526,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
 
     /// The expression's adjustments, in order, on its value.
     fn adjust(&mut self, e: ExprId, m: bool) -> Result<(), Refusal> {
+        self.adjust_after(e, m, 0)
+    }
+
+    fn adjust_after(&mut self, e: ExprId, m: bool, consumed: usize) -> Result<(), Refusal> {
         let (lo, hi) = self.adjust_rows(e);
+        let lo = lo + consumed;
         if lo == hi {
             return Ok(());
         }
