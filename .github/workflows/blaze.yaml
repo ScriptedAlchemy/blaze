@@ -1,13 +1,13 @@
-name: PR 81 compare complete bstd unit suites
+name: PR 81 store pointer relocation proof
 on:
   workflow_dispatch:
     inputs:
       source:
-        description: Exact repaired compiler source
+        description: Exact compiler commit containing the regression
         type: string
         required: true
       baseline:
-        description: Original compiler source
+        description: Parent commit containing the original store implementation
         type: string
         required: true
 permissions:
@@ -16,43 +16,42 @@ defaults:
   run:
     shell: bash
 jobs:
-  bstd:
+  cas:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source }}
+          fetch-depth: 2
           persist-credentials: false
       - uses: ./.github/actions/toolchain
-      - name: Compare all bstd unit tests before and after the patch
+      - name: Reproduce the conflict and execute the repaired store suite
         env:
           BASELINE: ${{ inputs.baseline }}
-          CARGO_TARGET_DIR: ${{ runner.temp }}/bstd-target
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cas-target
         run: |
           timeout 20 git fetch --depth=1 origin "$BASELINE"
           tc=$(timeout 10 cat pins/toolchain)
-          out="$RUNNER_TEMP/bstd-before-after"
-          mkdir -p "$out"
-          timeout 10 git rev-parse HEAD HEAD^{tree} "$BASELINE" > "$out/revisions"
-          timeout 10 git restore --source="$BASELINE" -- crates/blaze-std/src/{fs,io}.rs
-          before=0
-          timeout -k 15s 640s cargo +"$tc" test --locked -p blaze-std --lib > "$out/before.log" 2>&1 || before=$?
-          timeout 10 git restore -- crates/blaze-std/src/{fs,io}.rs
+          test_name=plain::tests::publication_preserves_the_newest_pointer_moved_by_compaction
+          mkdir -p "$RUNNER_TEMP/cas-proof"
+          timeout 10 git rev-parse HEAD HEAD^{tree} "$BASELINE" > "$RUNNER_TEMP/cas-proof/revisions"
+          timeout 15 git restore --source="$BASELINE" -- crates/blaze-cas/src/plain/core.rs
+          status=0
+          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-cas --lib "$test_name" -- --exact \
+            > "$RUNNER_TEMP/cas-proof/baseline.log" 2>&1 || status=$?
+          timeout 10 tail -45 "$RUNNER_TEMP/cas-proof/baseline.log"
+          test "$status" -eq 101
+          timeout 10 grep -F 'closing commit must keep the relocated pointer: Err(SweptUnder' "$RUNNER_TEMP/cas-proof/baseline.log"
+          timeout 15 git restore -- crates/blaze-cas/src/plain/core.rs
           timeout 10 git diff --exit-code
-          after=0
-          timeout -k 15s 640s cargo +"$tc" test --locked -p blaze-std --lib > "$out/after.log" 2>&1 || after=$?
-          timeout 10 grep -F 'test result:' "$out/before.log"
-          timeout 10 grep -F 'test result:' "$out/after.log"
-          test "$before" = "$after"
-          for phase in before after; do
-            timeout 10 grep -E '^test .* \.\.\. FAILED$' "$out/$phase.log" | timeout 10 sort > "$out/$phase-failures" || test "$before" = 0
-          done
-          timeout 10 diff -u "$out/before-failures" "$out/after-failures"
-          timeout 10 grep -Fx 'test fs::overlapping_publishes_from_two_worlds_keep_their_bytes ... ok' "$out/after.log"
-          timeout 10 grep -Fx 'test tests::reach::no_file_but_the_backends_names_a_reach ... ok' "$out/after.log"
+          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-cas --lib "$test_name" -- --exact \
+            2>&1 | tee "$RUNNER_TEMP/cas-proof/focused.log"
+          timeout 10 grep -F '1 passed; 0 failed' "$RUNNER_TEMP/cas-proof/focused.log"
+          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-cas --lib \
+            2>&1 | tee "$RUNNER_TEMP/cas-proof/suite.log"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: bstd-before-after
-          path: ${{ runner.temp }}/bstd-before-after
+          name: cas-pointer-relocation-evidence
+          path: ${{ runner.temp }}/cas-proof
