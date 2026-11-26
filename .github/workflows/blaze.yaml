@@ -721,8 +721,10 @@ jobs:
         run: |
           mkdir "$RUNNER_TEMP/source-binaries"
           tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries"
-          mkdir -p "$HOME/.blaze/v2" "$RUNNER_TEMP/dist-evidence"
+          mkdir -p "$HOME/.blaze/v2" "$RUNNER_TEMP/dist-evidence" "$RUNNER_TEMP/source-shelf"
           tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$HOME/.blaze/v2"
+          # The observer copies the source shelf. The migration job adds native compiler symlinks to HOME later.
+          tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$RUNNER_TEMP/source-shelf"
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
       # distv2 checks real export workers, published records and artifacts in both profiles.
       - name: full distributed worker and fault acceptance
@@ -773,7 +775,7 @@ jobs:
         timeout-minutes: 60
         run: |
           python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-          jq -n --arg blaze "$RUNNER_TEMP/source-binaries/blaze" --arg cwd "$GITHUB_WORKSPACE" --arg home "$RUNNER_TEMP/blaze-fs/protocol-home" --arg out "$RUNNER_TEMP/dist-evidence/exec" --arg shelf "$HOME/.blaze/v2/toolchain" \
+          jq -n --arg blaze "$RUNNER_TEMP/source-binaries/blaze" --arg cwd "$GITHUB_WORKSPACE" --arg home "$RUNNER_TEMP/blaze-fs/protocol-home" --arg out "$RUNNER_TEMP/dist-evidence/exec" --arg shelf "$RUNNER_TEMP/source-shelf/toolchain" \
             '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:3300,commands:(["blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"] | map({name:.,args:["test","-p",.,"--view","json","--","--run-all","--format","json"]}))}' \
             > "$RUNNER_TEMP/dist-evidence/exec-input.json"
           timeout -k 30 3500 python3 harness/v2/exec_observer.py "$RUNNER_TEMP/dist-evidence/exec-input.json"
