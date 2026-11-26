@@ -11,6 +11,7 @@ use blaze_own::{AVec, Alloc, Vec};
 
 use crate::eh::{self, EhError, Placed};
 use crate::record::{CodeRecord, CodeView, Pad};
+use crate::unwind::cfi::{self, CfiError, CfiInput};
 use crate::unwind::{self, Action, Frame, Row, UnwindError};
 
 const NOP: u32 = 0xd503_201f;
@@ -219,8 +220,11 @@ fn unwind_at(b: &[u8], pc: u64) -> Unwound {
     assert_eq!(u32::from_le_bytes(b[fde_end..fde_end + 4].try_into().unwrap()), 0, "the run ends");
     let mut cfa = (0u64, 0i64);
     let mut saved = StdVec::new();
+    let mut initial = StdVec::new();
+    let mut states = StdVec::new();
     let mut loc = pc_begin;
     'run: for (start, end) in [cie_program, fde_program] {
+        initial.clone_from(&saved);
         let mut p = Bytes { b, at: start };
         while p.at < end {
             let op = p.u8();
@@ -236,6 +240,13 @@ fn unwind_at(b: &[u8], pc: u64) -> Unwound {
                     saved.retain(|s: &(u64, i64)| s.0 != u64::from(op & 0x3f));
                     saved.push((u64::from(op & 0x3f), off));
                 }
+                (0xc0, _) => {
+                    let reg = u64::from(op & 0x3f);
+                    saved.retain(|s| s.0 != reg);
+                    saved.extend(initial.iter().copied().filter(|s| s.0 == reg));
+                }
+                (_, 0x0a) => states.push((cfa, saved.clone())),
+                (_, 0x0b) => (cfa, saved) = states.pop().expect("remembered CFI state"),
                 (_, eh::CFA_OFFSET_EXTENDED) => {
                     let reg = p.uleb();
                     let off = p.uleb() as i64 * data_align;
@@ -320,6 +331,44 @@ fn expected(row: Row) -> Found {
         Action::Catch => Found::Catch(lpad),
         Action::Terminate => Found::Filter(lpad),
     }
+}
+
+#[test]
+fn machine_cfi_preserves_llvm_rows_and_explicit_lsda() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut record = CodeRecord::new_in(alloc);
+    record.code.extend_from_slice(&[0; 52]);
+    // Non-padding FDE program from the pinned LLVM O3 AArch64 ELF catch probe.
+    let instructions = [0x44, 0x0e, 16, 0x9e, 4, 0x0a, 0x50, 0x0e, 0, 0xde, 0x44, 0x0b, 0x48, 0x0e, 0, 0xde];
+    let input = CfiInput { code_len: 36, code_align: 1, data_align: -4, has_lsda: true, initial: &[0x0c, 31, 0], instructions: &instructions };
+    cfi::write(input, 52, &mut record.machine_cfi).unwrap();
+    assert_eq!(cfi::write(CfiInput { instructions: &[0x01], ..input }, 52, &mut record.machine_cfi),
+        Err(CfiError::Opcode { at: 15, op: 0x01 }));
+    record.pads.push(row(8, 0, Action::Continue).pad());
+
+    let mut bytes = Vec::new_in(alloc);
+    record.seal().unwrap().encode(&mut bytes);
+    assert_eq!(&bytes[..8], b"bzcode10");
+    let view = CodeView::read(&bytes).unwrap();
+    let unwind = unwind::read(view).unwrap();
+    assert_eq!(unwind.cfi().unwrap().instructions(), instructions);
+    assert!(unwind.has_lsda());
+    assert_eq!(unwind.code_len(), 36);
+
+    let mut eh_bytes = Vec::new_in(alloc);
+    let at = Placed { entry_at: ENTRY_AT, code_at: CODE_AT, personality: None };
+    assert_eq!(eh::entry(&unwind, at, &mut eh_bytes), Err(EhError::NoPersonality));
+    let entry = eh::entry(&unwind, Placed { personality: Some(PERSONALITY), ..at }, &mut eh_bytes).unwrap();
+    assert_eq!(entry.code_len, 36);
+    for (pc, sp_offset) in [(0, 0), (4, 16), (20, 0), (24, 16), (32, 0)] {
+        let decoded = unwind_at(&eh_bytes, CODE_AT + pc);
+        assert_eq!(decoded.pc_range, 36);
+        assert_eq!(decoded.cfa, (31, sp_offset));
+        assert_eq!(&decoded.saved[..], if sp_offset == 0 { &[][..] } else { &[(30, -16)][..] });
+    }
+    let lsda = ENTRY_AT + entry.lsda.unwrap() as u64;
+    assert_eq!(find_action(&eh_bytes, lsda, CODE_AT, CODE_AT + 12), Found::None);
+    assert_eq!(find_action(&eh_bytes, lsda, CODE_AT, CODE_AT + 16), Found::Terminate);
 }
 
 /// Builds `rows`' entry (its pads written as `planted` says) and checks every call: each row's

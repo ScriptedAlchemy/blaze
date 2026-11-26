@@ -15,6 +15,7 @@ use blaze_code::record::{
     Subject, Symbol, Target, TrapKind, TrapRow, Word,
 };
 use blaze_code::unwind::{Action, Frame, Row};
+use blaze_code::unwind::cfi::{self, CfiInput};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::InstanceKey;
 use blaze_run::parent::Read;
@@ -40,6 +41,39 @@ const BL: u32 = 0x9400_0000;
 const LDR_XZR_X16: u32 = 0xF940_021F;
 const LDP_FRAME: u32 = 0xA8C1_7BFD;
 const RET: u32 = 0xD65F_03C0;
+
+#[test]
+fn machine_cfi_survives_the_direct_and_tier_forms() {
+    let alloc = Alloc::global();
+    let mut direct = CodeRecord::new_in(alloc);
+    direct.code.extend_from_slice(&RET.to_le_bytes());
+    let input = CfiInput { code_len: 4, code_align: 1, data_align: -8, has_lsda: true, initial: &[0x0c, 31, 0], instructions: &[] };
+    cfi::write(input, 4, &mut direct.machine_cfi).unwrap();
+    let emitted = from_v1(direct, alloc).unwrap();
+    let mut bytes = Vec::new_in(alloc);
+    encode(&seal(emitted).unwrap(), &mut bytes);
+    assert_eq!(&bytes[..8], b"bzcode11");
+    let view = read(&bytes).unwrap();
+    let cfi = view.cfi().unwrap();
+    assert_eq!(cfi.initial(), input.initial);
+    assert!(cfi.has_lsda());
+    assert_eq!(view.unwind_rows(), 0);
+
+    let mut round_trip = Vec::new_in(alloc);
+    encode(&seal(view.to_emitted(alloc)).unwrap(), &mut round_trip);
+    assert_eq!(bytes, round_trip);
+
+    let mut compact = view.to_emitted(alloc);
+    compact.machine_cfi.clear();
+    compact.unwind_frame = Some(Frame::PLAIN);
+    let mut one = Vec::new_in(alloc);
+    encode(&seal(compact).unwrap(), &mut one);
+    assert_eq!(&one[..8], b"bzcode08");
+    assert_eq!(&one[100..104], &[0; 4]);
+    let mut two = Vec::new_in(alloc);
+    encode(&seal(read(&one).unwrap().to_emitted(alloc)).unwrap(), &mut two);
+    assert_eq!(one, two);
+}
 
 fn func(name: &str) -> Target {
     Target { space: Space::Func, symbol: Symbol::of_name(name) }

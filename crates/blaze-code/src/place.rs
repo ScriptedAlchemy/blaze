@@ -23,7 +23,7 @@ use core::fmt;
 
 use crate::a64::{ADD64, ADRP, BLR, LDR64, adrp, add_lo12, expect, ldr_lo12, write32};
 use crate::image::ImageError;
-use crate::record::{CodeView, OWN_CODE, OWN_RELRO, PositionPart, PositionRow, SiteKind, Space, Symbol, Target};
+use crate::record::{CodeView, OWN_CODE, OWN_RELRO, PositionPart, PositionRow, Site, SiteKind, Space, Symbol, Target};
 
 /// What the run's table answers for a record's targets. The control thread implements it over
 /// its slot table; asking it a symbol first seen numbers a new slot whose word names its stub.
@@ -44,6 +44,17 @@ pub trait Words {
 pub struct At {
     pub code: u64,
     pub relro: u64,
+}
+
+impl At {
+    /// Address within a sealed site's own record, including the byte addend.
+    pub fn own(self, site: Site) -> Option<u64> {
+        if site.kind.own() {
+            let base = if site.target == OWN_CODE { self.code } else { self.relro };
+            return Some(base + u64::from(site.addend));
+        }
+        None
+    }
 }
 
 /// Why a record was not placed, naming the function.
@@ -153,6 +164,20 @@ pub fn place_positions(
         let site = record.site(s);
         let off = u64::from(site.at);
         let pc = at.code + off;
+        if site.kind.len() == 4 {
+            let to = match at.own(site) {
+                Some(local) => local,
+                None => {
+                    let word = words.word(record.target(blaze_int::idx(site.target)), false)?;
+                    if word % 8 != 0 {
+                        return Err(PlaceError::Misaligned { symbol, what: "a target's word", at: word, align: 8 });
+                    }
+                    word
+                }
+            };
+            crate::a64::single_site(code, off, pc, to, site.kind, symbol)?;
+            continue;
+        }
         let first = expect(code, off, ADRP, symbol, "adrp")?;
         if site.kind == SiteKind::Relro {
             let second = expect(code, off + 4, ADD64, symbol, "add")?;

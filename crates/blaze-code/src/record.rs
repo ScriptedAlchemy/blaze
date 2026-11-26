@@ -6,8 +6,8 @@
 //!   every address in data is a [`Word`] of the `relro` part.
 //! - `targets`: what the sites and words name, each a [`Target`] (a space and a symbol), sorted
 //!   and unique: never an address, a slot number or a path.
-//! - `frame`: the function's compact unwind word (the emitter's encoding, opaque here) and
-//!   `pads`: its landing pads, item-relative.
+//! - `frame` or `machine_cfi`: the function's unwind description, with item-relative
+//!   call-site rows in `pads`.
 //! - Outside names (the C library's) are kept as text by symbol, for the launcher's `dlsym`.
 //! - `positions`: the item-relative source of each zero line or column slot in code or relro.
 //!   Placement fills the slot from the item's current source.
@@ -25,18 +25,23 @@ use core::fmt;
 use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
 
+use crate::unwind::cfi::{Cfi, CfiError};
+use crate::unwind::{self, Frame, UnwindError};
+
 /// The first eight bytes of every encoded record: the form's version. `bzcode04` added the trap
 /// table ([`TrapRow`]), `bzcode05` its held values ([`Held`]) and subjects ([`Subject`]),
 /// `bzcode06` the alignment each part asks of its placement ([`CodeRecord::code_align`],
 /// [`CodeRecord::relro_align`]: data aligned past 16, as `vzipq_u8`'s 64-aligned table).
-/// `bzcode07` adds item-relative source positions ([`PositionRow`]). `02`
+/// `bzcode09` adds independent AArch64 relocation sites; `07` added item-relative source positions ([`PositionRow`]). `02`
 /// and `03` are blaze-tier's own forms (record/form.rs), so this form skips them and a record
 /// of one form is never read as another's. A record of an older form of this one is refused
 /// naming its form ([`DecodeError::Older`]) and rebuilt, never read (rule 26).
-pub const MAGIC: [u8; 8] = *b"bzcode07";
+pub const MAGIC: [u8; 8] = *b"bzcode09";
+/// The same columns followed by a machine CFI payload, whose length replaces the last head word.
+pub const CFI_MAGIC: [u8; 8] = *b"bzcode10";
 
 /// The forms before [`MAGIC`] that were this record's: refused by name, never read.
-const OLDER: [[u8; 8]; 3] = [*b"bzcode04", *b"bzcode05", *b"bzcode06"];
+const OLDER: [[u8; 8]; 4] = [*b"bzcode04", *b"bzcode05", *b"bzcode06", *b"bzcode07"];
 
 /// The least alignment, as log2, of a record's code: 16 bytes, what every placement gives
 /// (image.rs `lay_out`, blaze-launch-rt run_mode.rs) and what a 16-aligned data row of the code
@@ -126,10 +131,31 @@ pub enum SiteKind {
     /// `adrp xN, r@PAGE` at `at`, `add xN, xN, r@PAGEOFF` at `at + 4`: the address of byte
     /// `addend` of this record's relro part. Its target is [`NO_TARGET`].
     Relro = 2,
+    /// One ADRP of an own-code or own-relro address, independent of its users.
+    Page21 = 3,
+    /// One ADD-immediate of an own address's low twelve bits.
+    AddLo12 = 4,
+    /// One unsigned-offset load/store, in units of the indicated byte width.
+    LdstLo12_1 = 5,
+    LdstLo12_2 = 6,
+    LdstLo12_4 = 7,
+    LdstLo12_8 = 8,
+    LdstLo12_16 = 9,
+    /// One B or BL to own code. Placement preserves the instruction's link bit.
+    Branch26 = 10,
+    /// One ADRP of a target's import word (not of the target's address).
+    GotPage21 = 11,
+    /// One LDR64 of a target's import word's low twelve bits.
+    GotLo12 = 12,
 }
 
 impl SiteKind {
-    const ALL: [SiteKind; 3] = [SiteKind::Load, SiteKind::Call, SiteKind::Relro];
+    const ALL: [SiteKind; 13] = [Self::Load, Self::Call, Self::Relro, Self::Page21, Self::AddLo12, Self::LdstLo12_1, Self::LdstLo12_2, Self::LdstLo12_4, Self::LdstLo12_8, Self::LdstLo12_16, Self::Branch26, Self::GotPage21, Self::GotLo12];
+
+    /// A single instruction addressing this record's code or relro, not an import.
+    pub fn own(self) -> bool {
+        matches!(self, Self::Page21 | Self::AddLo12 | Self::LdstLo12_1 | Self::LdstLo12_2 | Self::LdstLo12_4 | Self::LdstLo12_8 | Self::LdstLo12_16 | Self::Branch26)
+    }
 
     fn from_byte(byte: u8) -> Option<SiteKind> {
         SiteKind::ALL.get(usize::from(byte)).copied()
@@ -140,6 +166,7 @@ impl SiteKind {
         match self {
             SiteKind::Load | SiteKind::Relro => 8,
             SiteKind::Call => 12,
+            _ => 4,
         }
     }
 }
@@ -150,9 +177,11 @@ pub struct Site {
     /// The first instruction's offset from the code's first byte (4-aligned).
     pub at: u32,
     pub kind: SiteKind,
-    /// The target's index in the record's targets, or [`NO_TARGET`] for [`SiteKind::Relro`].
+    /// The target's index for imports, [`NO_TARGET`] for [`SiteKind::Relro`], or
+    /// [`OWN_CODE`]/[`OWN_RELRO`] for a single own-address instruction.
     pub target: u32,
-    /// For [`SiteKind::Relro`], the relro byte addressed; 0 otherwise.
+    /// The byte within an own-address site's code/relro part (also for `Relro`); zero for
+    /// import sites. Signed external pointer addends live in [`Word`].
     pub addend: u32,
 }
 
@@ -410,6 +439,7 @@ const MOST_REG: u8 = 30;
 /// Why a record was not sealed: the first broken rule, naming the offset it is about.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RecordError {
+    Unwind(UnwindError),
     /// A site or word at `at` names a target index the record does not have.
     NoSuchTarget { at: u32, target: u32 },
     /// A site at `at` covering `len` bytes is not inside the code (`code` bytes).
@@ -420,6 +450,8 @@ pub enum RecordError {
     SitesOverlap { at: u32 },
     /// A relro site at `at` addresses relro byte `addend`, past the relro part's `relro` bytes.
     RelroOutside { at: u32, addend: u32, relro: u32 },
+    /// Import slots name one exact pointer; their instructions cannot encode an addend.
+    ImportAddend { at: u32, addend: u32 },
     /// A word at `at` is not inside the relro part (`relro` bytes).
     WordOutside { at: u32, relro: u32 },
     /// A word at `at` is not 8-aligned.
@@ -455,11 +487,13 @@ pub enum RecordError {
 impl fmt::Display for RecordError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            RecordError::Unwind(error) => fmt::Display::fmt(&error, f),
             RecordError::NoSuchTarget { at, target } => write!(f, "a code record's reference at {at} names target {target}, which the record does not list (run.md, \"The code record\")"),
             RecordError::SiteOutside { at, len, code } => write!(f, "a code record's site at {at} covers {len} bytes past its {code} bytes of code"),
             RecordError::SiteMisaligned { at } => write!(f, "a code record's site at {at} is not on an instruction (4-aligned)"),
             RecordError::SitesOverlap { at } => write!(f, "a code record's site at {at} overlaps the site before it"),
             RecordError::RelroOutside { at, addend, relro } => write!(f, "a code record's site at {at} addresses relro byte {addend}, past its {relro} relro bytes"),
+            RecordError::ImportAddend { at, addend } => write!(f, "a code record's import site at {at} has unsupported addend {addend}"),
             RecordError::WordOutside { at, relro } => write!(f, "a code record's relro word at {at} is past its {relro} relro bytes"),
             RecordError::WordMisaligned { at } => write!(f, "a code record's relro word at {at} is not 8-aligned"),
             RecordError::WordsOverlap { at } => write!(f, "a code record has two relro words at {at}"),
@@ -497,6 +531,8 @@ pub struct CodeRecord<'a> {
     pub words: AVec<'a, Word>,
     pub positions: AVec<'a, PositionRow>,
     pub frame: u32,
+    /// The machine unwind payload, empty for the compact frame form.
+    pub machine_cfi: AVec<'a, u8>,
     /// log2 of the alignment the code's first byte is placed at: the most its data rows ask
     /// (each row's offset in `code` is a multiple of its own alignment), at least
     /// [`LEAST_CODE_ALIGN`], at most [`MOST_PART_ALIGN`]. Every placement honours it
@@ -524,6 +560,7 @@ impl<'a> CodeRecord<'a> {
             words: Vec::new_in(alloc),
             positions: Vec::new_in(alloc),
             frame: 0,
+            machine_cfi: Vec::new_in(alloc),
             code_align: LEAST_CODE_ALIGN,
             relro_align: LEAST_RELRO_ALIGN,
             pads: Vec::new_in(alloc),
@@ -553,7 +590,7 @@ impl<'a> CodeRecord<'a> {
     /// sites and words sorted by offset, pads by start, names by symbol; every rule of the form
     /// checked once here, so a [`Sealed`] needs no check again (rule 74).
     pub fn seal(self) -> Result<Sealed<'a>, RecordError> {
-        let CodeRecord { code, relro, targets, mut sites, mut words, mut positions, frame, code_align, relro_align, mut pads, mut traps, names, text, alloc } = self;
+        let CodeRecord { code, relro, targets, mut sites, mut words, mut positions, frame, machine_cfi, code_align, relro_align, mut pads, mut traps, names, text, alloc } = self;
         if !(LEAST_CODE_ALIGN..=MOST_PART_ALIGN).contains(&code_align) {
             return Err(RecordError::Align { part: "code", align: code_align });
         }
@@ -581,6 +618,9 @@ impl<'a> CodeRecord<'a> {
         let code_len = code.len() as u32;
         let relro_len = relro.len() as u32;
         for site in sites.iter_mut() {
+            if site.kind != SiteKind::Relro && !site.kind.own() && site.addend != 0 {
+                return Err(RecordError::ImportAddend { at: site.at, addend: site.addend });
+            }
             match site.kind {
                 SiteKind::Relro => {
                     if site.target != NO_TARGET {
@@ -590,7 +630,17 @@ impl<'a> CodeRecord<'a> {
                         return Err(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: relro_len });
                     }
                 }
-                SiteKind::Load | SiteKind::Call => match renumber.get(site.target as usize) {
+                kind if kind.own() => {
+                    let len = match site.target {
+                        OWN_CODE => code_len,
+                        OWN_RELRO if kind != SiteKind::Branch26 => relro_len,
+                        _ => return Err(RecordError::NoSuchTarget { at: site.at, target: site.target }),
+                    };
+                    if site.addend >= len {
+                        return Err(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: len });
+                    }
+                }
+                _ => match renumber.get(blaze_int::idx(site.target)) {
                     Some(&new) => site.target = new,
                     None => return Err(RecordError::NoSuchTarget { at: site.at, target: site.target }),
                 },
@@ -702,6 +752,11 @@ impl<'a> CodeRecord<'a> {
             }
         }
         fits(packed.len(), "names' text")?;
+        if !machine_cfi.is_empty() {
+            let cfi = Cfi::read(&machine_cfi, code.len() as u32).map_err(|error| RecordError::Unwind(UnwindError::Cfi(error)))?;
+            let frame = Frame::of_word(frame).map_err(RecordError::Unwind)?;
+            unwind::check(frame, Some(cfi), pads.len(), code.len() as u64, |i| pads[i]).map_err(RecordError::Unwind)?;
+        }
         Ok(Sealed(CodeRecord {
             code,
             relro,
@@ -710,6 +765,7 @@ impl<'a> CodeRecord<'a> {
             words,
             positions,
             frame,
+            machine_cfi,
             code_align,
             relro_align,
             pads,
@@ -764,14 +820,15 @@ impl<'a> Sealed<'a> {
     pub fn encode(&self, out: &mut AVec<'_, u8>) {
         let r = &self.0;
         let start = out.len();
-        out.extend_from_slice(&MAGIC);
+        let magic = if r.machine_cfi.is_empty() { MAGIC } else { CFI_MAGIC };
+        out.extend_from_slice(&magic);
         put32(out, r.frame);
         out.extend_from_slice(&[r.code_align, r.relro_align, 0, 0]);
         let subjects = r.traps.iter().filter(|t| t.subject.is_some()).count();
         for count in [r.code.len(), r.relro.len(), r.targets.len(), r.sites.len(), r.words.len(), r.pads.len(), r.names.len(), r.text.len(), r.traps.len(), subjects, r.positions.len()] {
             put32(out, count as u32);
         }
-        put32(out, 0);
+        put32(out, r.machine_cfi.len() as u32);
         out.extend_from_slice(&r.code);
         pad8(out, start);
         out.extend_from_slice(&r.relro);
@@ -840,6 +897,8 @@ impl<'a> Sealed<'a> {
             out.push(row.field as u8);
             out.extend_from_slice(&[0; 6]);
         }
+        out.extend_from_slice(&r.machine_cfi);
+        pad8(out, start);
     }
 }
 
@@ -865,6 +924,7 @@ const POSITION_ROW: usize = 32;
 /// Why bytes are not a code record.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DecodeError {
+    Unwind(UnwindError),
     /// The bytes do not start with [`MAGIC`].
     Magic,
     /// The head's counts need `need` bytes; there are `have`.
@@ -883,6 +943,8 @@ pub enum DecodeError {
     PositionByte { row: u32, what: &'static str, byte: u8 },
     /// The decoded position would violate the same slot contract as builder input.
     Position(RecordError),
+    /// A decoded relocation violates the same bounds and target contract as a sealed site.
+    Site(RecordError),
     /// The word after the header counts is reserved and must be zero.
     Reserved { value: u32 },
     /// The bytes are a record of an older form of this one (`form` its eight-byte head, e.g.
@@ -896,10 +958,11 @@ pub enum DecodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode07` head"),
+            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode09` or `bzcode10` head"),
+            DecodeError::Unwind(error) => fmt::Display::fmt(&error, f),
             DecodeError::Older { form } => write!(
                 f,
-                "the bytes are a code record of the older form `{}`, which held no source-position table: rebuilt, never read (rule 26)",
+                "the bytes are a code record of the older form `{}`: rebuilt, never read (rule 26)",
                 core::str::from_utf8(&form).unwrap_or("bzcode0?")
             ),
             DecodeError::Align { part, align } => write!(
@@ -910,7 +973,7 @@ impl fmt::Display for DecodeError {
             DecodeError::Held { row } => write!(f, "a code record's trap row {row} has a malformed held value (an unknown tag or a register past x30)"),
             DecodeError::Subject { row } => write!(f, "a code record's subject row {row} is not the subject of one of its trap rows"),
             DecodeError::PositionByte { row, what, byte } => write!(f, "a code record's source-position row {row} has invalid {what} byte {byte}"),
-            DecodeError::Position(error) => fmt::Display::fmt(&error, f),
+            DecodeError::Position(error) | DecodeError::Site(error) => fmt::Display::fmt(&error, f),
             DecodeError::Reserved { value } => write!(f, "a code record's reserved word after the header counts is {value}, expected zero"),
             DecodeError::Length { need, have } => write!(f, "a code record's head counts {need} bytes; it has {have}"),
             DecodeError::Space { row, byte } => write!(f, "a code record's target {row} has the unknown space {byte}"),
@@ -934,10 +997,13 @@ impl core::error::Error for DecodeError {}
 /// its trap row, `count: u32`, `item: u128`, eight `u64` discriminants), by `at`; names
 /// (symbol 32, text `at: u32`, `len: u32`); the padded text; source positions (`item: u128`,
 /// `site: u32`, `at: u32`, part and field tags, six zero bytes), ordered by (part, at).
+/// In `bzcode10` the last head word gives the machine CFI length and the positions are
+/// followed by that payload, padded to eight bytes.
 #[derive(Clone, Copy)]
 pub struct CodeView<'b> {
     bytes: &'b [u8],
     frame: u32,
+    cfi: Option<Cfi<'b>>,
     code_align: u8,
     relro_align: u8,
     code: &'b [u8],
@@ -1003,7 +1069,8 @@ impl<'b> CodeView<'b> {
         if bytes.len() < MAGIC.len() {
             return Err(DecodeError::Length { need: MAGIC.len(), have: bytes.len() });
         }
-        if bytes[..8] != MAGIC {
+        let machine = bytes[..8] == CFI_MAGIC;
+        if !machine && bytes[..8] != MAGIC {
             let mut form = [0u8; 8];
             form.copy_from_slice(&bytes[..8]);
             return Err(match OLDER.contains(&form) {
@@ -1015,7 +1082,7 @@ impl<'b> CodeView<'b> {
             return Err(DecodeError::Length { need: HEAD, have: bytes.len() });
         }
         let reserved = get32(bytes, 60);
-        if reserved != 0 {
+        if !machine && reserved != 0 {
             return Err(DecodeError::Reserved { value: reserved });
         }
         let frame = get32(bytes, 8);
@@ -1043,7 +1110,8 @@ impl<'b> CodeView<'b> {
             count(9) * SUBJECT_ROW,
             count(10) * POSITION_ROW,
         ];
-        let need = HEAD + lens.iter().sum::<usize>();
+        let cfi_len = reserved as usize;
+        let need = HEAD + lens.iter().sum::<usize>() + up8(cfi_len);
         if need != bytes.len() {
             return Err(DecodeError::Length { need, have: bytes.len() });
         }
@@ -1059,6 +1127,17 @@ impl<'b> CodeView<'b> {
         let names = part(bytes, &mut at, lens[6], lens[6]);
         let text = part(bytes, &mut at, lens[7], count(7));
         let (positions, _) = part(bytes, &mut at, lens[10], lens[10]).as_chunks::<POSITION_ROW>();
+        let code_len = get32(bytes, 16);
+        let cfi = if machine {
+            let end = at + cfi_len;
+            if bytes[end..].iter().any(|&byte| byte != 0) {
+                return Err(DecodeError::Unwind(UnwindError::Cfi(CfiError::Padding)));
+            }
+            let cfi = Cfi::read(&bytes[at..end], code_len).map_err(|error| DecodeError::Unwind(UnwindError::Cfi(error)))?;
+            Some(cfi)
+        } else {
+            None
+        };
         let mut previous = None;
         for (i, bytes) in positions.iter().enumerate() {
             let position = decode_position(bytes, i)?;
@@ -1100,7 +1179,38 @@ impl<'b> CodeView<'b> {
                 return Err(DecodeError::Kind { row: row as u32, byte });
             }
         }
-        let view = CodeView { bytes, frame, code_align, relro_align, code, relro, targets, sites, words, pads, traps, subjects, positions, names, text };
+        let view = CodeView { bytes, frame, cfi, code_align, relro_align, code, relro, targets, sites, words, pads, traps, subjects, positions, names, text };
+        if let Some(cfi) = cfi {
+            let frame = Frame::of_word(frame).map_err(DecodeError::Unwind)?;
+            unwind::check(frame, Some(cfi), view.pads(), u64::from(code_len), |i| view.pad(i)).map_err(DecodeError::Unwind)?;
+        }
+        let relro_len = get32(bytes, 20);
+        let mut end = 0u64;
+        for i in 0..view.sites() {
+            let site = view.site(i);
+            if site.kind == SiteKind::Relro && site.target != NO_TARGET {
+                return Err(DecodeError::Site(RecordError::NoSuchTarget { at: site.at, target: site.target }));
+            }
+            if site.kind != SiteKind::Relro && !site.kind.own() && site.addend != 0 {
+                return Err(DecodeError::Site(RecordError::ImportAddend { at: site.at, addend: site.addend }));
+            }
+            if site.at % 4 != 0 { return Err(DecodeError::Site(RecordError::SiteMisaligned { at: site.at })); }
+            if u64::from(site.at) < end { return Err(DecodeError::Site(RecordError::SitesOverlap { at: site.at })); }
+            end = u64::from(site.at) + u64::from(site.kind.len());
+            if end > u64::from(code_len) { return Err(DecodeError::Site(RecordError::SiteOutside { at: site.at, len: site.kind.len(), code: code_len })); }
+            let own = if site.kind == SiteKind::Relro { Some(relro_len) } else if site.kind.own() {
+                match site.target {
+                    OWN_CODE => Some(code_len),
+                    OWN_RELRO if site.kind != SiteKind::Branch26 => Some(relro_len),
+                    _ => return Err(DecodeError::Site(RecordError::NoSuchTarget { at: site.at, target: site.target })),
+                }
+            } else { None };
+            if let Some(len) = own {
+                if site.addend >= len { return Err(DecodeError::Site(RecordError::RelroOutside { at: site.at, addend: site.addend, relro: len })); }
+            } else if blaze_int::idx(site.target) >= view.targets() {
+                return Err(DecodeError::Site(RecordError::NoSuchTarget { at: site.at, target: site.target }));
+            }
+        }
         check_position_references(
             positions,
             |row| (row[24], get32(row, 20)),
@@ -1128,6 +1238,10 @@ impl<'b> CodeView<'b> {
 
     pub fn frame(&self) -> u32 {
         self.frame
+    }
+
+    pub fn cfi(&self) -> Option<Cfi<'b>> {
+        self.cfi
     }
 
     pub fn code(&self) -> &'b [u8] {

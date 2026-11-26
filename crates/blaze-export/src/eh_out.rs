@@ -43,8 +43,8 @@
 //!   `stepWithCompactEncodingFrame`: `savedRegisterLoc = fp - 8`, x19 there, x20 at `fp - 16`),
 //!   which is blaze's one frame form (blaze-code unwind.rs, "The frame word"; unwind-P8a-4): the
 //!   frame word's pair bits ARE the encoding's `UNWIND_ARM64_FRAME_*_PAIR` bits.
-//! - A function whose rows never land carries no LSDA, as blaze-code eh.rs `entry` decides
-//!   (`Unwind::lands`): an unwind through any of its calls goes on to the caller.
+//! - Compact frames whose rows never land carry no LSDA. A machine frame carries the
+//!   original LSDA presence, even if every listed call continues into the caller.
 //!
 //! The section sizes do not depend on addresses (every pointer has a fixed width), so
 //! [`eh_room`] measures them before layout by writing them for the functions laid end to end,
@@ -52,9 +52,10 @@
 //! (`Laid::tables_room`); [`eh_sections`] refuses, in every build, tables that end past it
 //! (`ROOM_SLACK` says why the measure is an upper bound).
 
-use blaze_code::eh::{self, CFA_DEF_CFA, CFA_NOP, CODE_ALIGN, DATA_ALIGN};
+use blaze_code::eh::{self, CFA_NOP};
 use blaze_code::record::Symbol;
-use blaze_code::unwind::{self, Frame, Unwind, reg};
+use blaze_code::unwind::cfi::Cfi;
+use blaze_code::unwind::{self, Frame, Unwind};
 use blaze_own::{AVec, Alloc, Vec};
 
 use blaze_native::image::{Image, Region as NativeRegion};
@@ -225,9 +226,9 @@ fn finish(f: &mut AVec<'_, u8>, start: usize) -> Result<(), ExportError> {
 }
 
 /// Appends a CIE: id 0, version 1, the augmentation (`zPLR` with a personality, else `zR`),
-/// code factor 4, data factor -8, return address `x30`, the augmentation data, and the frame
-/// address `sp + 0` at a function's entry.
-fn cie(f: &mut AVec<'_, u8>, personality: Option<u64>, patches: &mut AVec<'_, (usize, PatchTo)>) -> Result<(), ExportError> {
+/// the frame's alignment factors, return address `x30`, the augmentation data, and the
+/// frame rules at a function's entry.
+fn cie(f: &mut AVec<'_, u8>, personality: Option<u64>, cfi: Option<Cfi<'_>>, patches: &mut AVec<'_, (usize, PatchTo)>) -> Result<(), ExportError> {
     let start = f.len();
     f.extend_from_slice(&[0; 8]);
     f.push(1);
@@ -235,9 +236,7 @@ fn cie(f: &mut AVec<'_, u8>, personality: Option<u64>, patches: &mut AVec<'_, (u
         Some(_) => f.extend_from_slice(b"zPLR\0"),
         None => f.extend_from_slice(b"zR\0"),
     }
-    eh::uleb(f, CODE_ALIGN);
-    eh::sleb(f, DATA_ALIGN);
-    eh::uleb(f, u64::from(reg::LR));
+    eh::cie_factors(cfi, f);
     match personality {
         Some(routine) => {
             // P: its encoding and the pointer; L: the FDEs' LSDA encoding; R: their pc encoding.
@@ -253,10 +252,12 @@ fn cie(f: &mut AVec<'_, u8>, personality: Option<u64>, patches: &mut AVec<'_, (u
             f.push(PCREL_SDATA4);
         }
     }
-    f.push(CFA_DEF_CFA);
-    eh::uleb(f, u64::from(reg::SP));
-    eh::uleb(f, 0);
+    eh::cie_program(cfi, f);
     finish(f, start)
+}
+
+fn cie_key(cfi: Cfi<'_>) -> (u8, i8, bool, &[u8]) {
+    (cfi.code_align(), cfi.data_align(), cfi.has_lsda(), cfi.initial())
 }
 
 /// The tables for `covered` (sorted by address), the personality routine at `personality_at`,
@@ -274,7 +275,7 @@ fn tables<'a>(
     let mut given: AVec<'_, Given> = Vec::with_capacity_in(covered.len(), alloc);
     let mut landing = 0u32;
     for c in covered {
-        let lsda = match c.unwind.frame().is_some() && c.unwind.lands() {
+        let lsda = match c.unwind.has_lsda() {
             false => None,
             true => {
                 if personality_at.is_none() {
@@ -294,24 +295,39 @@ fn tables<'a>(
     let mut f: AVec<'a, u8> = Vec::new_in(alloc);
     let mut patches: AVec<'_, (usize, PatchTo)> = Vec::new_in(alloc);
     let plain_cie = f.len();
-    cie(&mut f, None, &mut patches)?;
-    let landing_cie = match (landing, personality_at) {
-        (0, _) | (_, None) => plain_cie,
-        (_, Some(routine)) => {
+    cie(&mut f, None, None, &mut patches)?;
+    let compact_lands = covered.iter().any(|c| c.unwind.cfi().is_none() && c.unwind.has_lsda());
+    let landing_cie = match (compact_lands, personality_at) {
+        (true, Some(routine)) => {
             let offset = f.len();
-            cie(&mut f, Some(routine), &mut patches)?;
+            cie(&mut f, Some(routine), None, &mut patches)?;
             offset
         }
+        _ => plain_cie,
     };
+    let mut machine_cies = Vec::new_in(alloc);
+    machine_cies.extend(covered.iter().filter_map(|c| c.unwind.cfi()).map(|cfi| (cfi, 0usize)));
+    machine_cies.sort_unstable_by(|a, b| cie_key(a.0).cmp(&cie_key(b.0)));
+    machine_cies.dedup_by(|a, b| cie_key(a.0) == cie_key(b.0));
+    for (cfi, offset) in machine_cies.iter_mut() {
+        *offset = f.len();
+        let personality = if cfi.has_lsda() { personality_at } else { None };
+        cie(&mut f, personality, Some(*cfi), &mut patches)?;
+    }
     let mut functions = 0u32;
     for (k, c) in covered.iter().enumerate() {
-        let Some(frame) = c.unwind.frame() else {
+        if !c.unwind.has_entry() {
             continue;
-        };
+        }
         let start = f.len();
         f.extend_from_slice(&[0; 4]);
-        let cie_at = match given[k].lsda {
-            Some(_) => landing_cie,
+        let cie_at = match c.unwind.cfi() {
+            Some(cfi) => {
+                let i = machine_cies.binary_search_by(|row| cie_key(row.0).cmp(&cie_key(cfi)))
+                    .expect("each machine frame has its CIE");
+                machine_cies[i].1
+            }
+            None if given[k].lsda.is_some() => landing_cie,
             None => plain_cie,
         };
         let back = u32_of((f.len() - cie_at) as u64, "an FDE's CIE pointer")?;
@@ -327,7 +343,7 @@ fn tables<'a>(
             }
             None => eh::uleb(&mut f, 0),
         }
-        eh::frame_program(frame, &mut f);
+        eh::unwind_program(&c.unwind, &mut f);
         finish(&mut f, start)?;
         given[k].fde = Some(u32_of(start as u64, "an FDE's offset in eh_frame")?);
         functions += 1;
