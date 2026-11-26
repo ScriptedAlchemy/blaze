@@ -7454,21 +7454,26 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             if R::RELATES {
                 self.call_through_value(e, &vs, tp, ty)?;
             }
-            self.push_place(tp, ty);
-            return Ok(());
+        } else {
+            let callee = match by_type {
+                Some(c) => Some(c),
+                None => self.callee_of(e),
+            };
+            // THE SEAM (rule 78, D156): the call's regions related by the rule `R`
+            // (one_call.rs; production's is `one_call::Production`).
+            let site = one_call::CallSite { e, vs: &vs, ins: &ins, tp, ty, out, callee };
+            self.call_by_rule(&site)?;
+            // The call an `.await` awaits: its awaited value's positions, made at the call where
+            // the arguments are live (await_call.rs `awaited_shadow`).
+            if self.awaiting.last().is_some_and(|&(op, _)| op == e) {
+                self.awaited_shadow(&site, t)?;
+            }
         }
-        let callee = match by_type {
-            Some(c) => Some(c),
-            None => self.callee_of(e),
-        };
-        // THE SEAM (rule 78, D156): the call's regions related by the rule `R`
-        // (one_call.rs; production's is `one_call::Production`).
-        let site = one_call::CallSite { e, vs: &vs, ins: &ins, tp, ty, out, callee };
-        self.call_by_rule(&site)?;
-        // The call an `.await` awaits: its awaited value's positions, made at the call where
-        // the arguments are live (await_call.rs `awaited_shadow`).
-        if self.awaiting.last().is_some_and(|&(op, _)| op == e) {
-            self.awaited_shadow(&site, t)?;
+        // A call returning `!` checks its operands and requirements at the call, but has no
+        // successor carrying its moves into a branch join. The raw type precedes NeverToAny.
+        if matches!(self.node(ty.ty, e)?, PNode::Never) {
+            self.b.stmt(StmtKind::Unreachable, self.span(e));
+            self.fresh();
         }
         self.push_place(tp, ty);
         Ok(())

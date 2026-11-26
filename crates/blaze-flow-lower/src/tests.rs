@@ -313,6 +313,47 @@ fn moved_once() {
     assert!(got.is_empty(), "{got:?}\n{text}");
 }
 
+/// A move in one branch reaches the join only when the branch can return.
+#[test]
+fn a_diverging_call_keeps_its_branch_out_of_the_join() {
+    for diverges in [false, true] {
+        let mut fx = Fx::new();
+        let structure = fx.strukt("S", 0, &[]);
+        let value = fx.adt(structure, &[]);
+        let flag = fx.ty(PNode::Bool);
+        let unit = fx.unit();
+        let result = if diverges { fx.never() } else { unit };
+        let stop = fx.func("stop", 0, &[], result, vec![]);
+        let owner = fx.func("f", 0, &[value, flag], unit, vec![]);
+        fx.finish();
+
+        let mut heads = Decls::new();
+        heads.func(stop, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: result, slots: &[] });
+        heads.func(owner, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[value, flag], output: unit, slots: &[] });
+
+        let mut b = Bb::new();
+        let s = b.param("s");
+        let test = b.param("test");
+        let before = b.bind("before");
+        let first = b.local(s);
+        let take = b.let_(before, None, first);
+        let stop = b.path(&["stop"]);
+        let call = b.call(stop, &[]);
+        let call = b.semi(call);
+        let then = b.block(&[take, call], None);
+        let cond = b.local(test);
+        let branch = b.bool();
+        b.exprs[branch.ix()] = blaze_typeck::Expr::If { cond, then, else_: None };
+        let branch = b.semi(branch);
+        let after = b.bind("after");
+        let second = b.local(s);
+        let take_again = b.let_(after, None, second);
+        let root = b.block(&[branch, take_again], None);
+        let (got, text) = findings(&fx, &b, owner, root, &heads, Plant::None);
+        assert_eq!(got.iter().any(|line| line.contains("UseOfMoved")), !diverges, "{got:?}\n{text}");
+    }
+}
+
 /// Polonius: "It is an error to invalidate a loan that is live at a given point."
 /// `fn f(s: S) { let r = &s; h(s); g(r); }`: moving `s` writes it deeply while the loan, through
 /// `r`, is live until `g(r)`. Control: an assignment that relates no origins (`Plant::NoRelate`)
