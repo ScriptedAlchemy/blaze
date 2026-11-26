@@ -1394,3 +1394,51 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::front2::tables::head_tests::{a, cells, world_of};
+    use crate::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
+    use crate::front2::tables::view::{Tables, TablesOpts};
+    use blaze_scope::names_cells::NameCell;
+
+    #[test]
+    fn an_absent_member_is_observed_before_and_after_importing_its_trait() {
+        let (records, sized, frame) = world_of("#![no_std]\npub trait Score { fn score(&self) -> u8; }");
+        let trait_ = cells(records).into_iter().find(|&want| matches!(want, Want::Members(_)) && records.name_of(want.key()) == Some("Score"))
+            .expect("the fixture's Score trait");
+        let lib = trait_.key();
+        let owner = checker_of(lib);
+        let module = records.home_of(lib).expect("Score's module");
+        let index = Index::from_source(records, &[]).expect("the fixture index");
+        let blocks = super::super::block_traits::BlockTraits::module(a());
+        let spell = Spelling::fixed();
+        let store = Store::new(sized, frame, a());
+        let keys = Keys::new_in(a());
+
+        let observes_members = |store: &Store<'_>, keys: &Keys| {
+            let recorder = Recorder::new(RecorderOpts { alloc: a() });
+            let names = Tables::new(TablesOpts { records, impls: None, lang_crates: &[], reads: &recorder });
+            let world = BodyWorld {
+                names, keys, index: &index, store, buckets: None, owner, module,
+                params: &[], self_: &SelfTy::None, spell: &spell, traits: &[], blocks: &blocks,
+                path_marks: &[], path_ns: &[], fills: RefCell::new(Vec::new_in(Global)),
+                gaps: RefCell::new(Vec::new_in(Global)), reveal: super::super::opaque_auto::Reveal::InBody,
+            };
+            assert!(matches!(world.assoc_item_once(owner, Name::of("peek")), Ok(None)));
+            let seen = recorder.keys().expect("the member probe's observations")
+                .contains(&TableRead::Names(NameCell::Members { owner: lib }));
+            seen
+        };
+
+        assert!(observes_members(&store, &keys), "a cold probe observes the member list");
+        let frozen = crate::front2::tables::head::freeze(
+            records, sized, super::super::receiver::Pointers::NOT_LOOKED_UP, trait_, frame, a(), a(),
+        ).expect("freeze Score's head");
+        let frozen = crate::front2::tables::head::FrozenHead::read(&frozen.bytes).expect("read Score's head");
+        crate::front2::tables::head::file_frozen(records, trait_, frozen, &store, &keys, a()).expect("file Score's head");
+        assert!(store.made(trait_), "Score's head is resident");
+        assert!(observes_members(&store, &keys), "a probe using the imported head observes the same member list");
+    }
+}
