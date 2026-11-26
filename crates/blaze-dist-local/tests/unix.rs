@@ -203,18 +203,27 @@ fn submit(client: &mut Client, deadline: u64, alloc: WireAlloc) -> Binding {
 }
 
 fn read(stream: &mut UnixStream, alloc: WireAlloc) -> ServerFrame {
-    decode(&read_body(stream, alloc), &Limits::DOCUMENTED, alloc).unwrap()
+    read_reply(stream, alloc, "server reply")
+}
+
+fn read_reply(stream: &mut UnixStream, alloc: WireAlloc, reply_to: &str) -> ServerFrame {
+    let body = read_body_for(stream, alloc, reply_to);
+    decode(&body, &Limits::DOCUMENTED, alloc).unwrap_or_else(|error| panic!("{reply_to}: decoding reply: {error:?}"))
 }
 
 fn read_body(stream: &mut UnixStream, alloc: WireAlloc) -> WireVec<u8> {
+    read_body_for(stream, alloc, "server reply")
+}
+
+fn read_body_for(stream: &mut UnixStream, alloc: WireAlloc, reply_to: &str) -> WireVec<u8> {
     let mut h = [0u8; 4];
-    stream.read_exact(&mut h).unwrap();
+    stream.read_exact(&mut h).unwrap_or_else(|error| panic!("{reply_to}: reading reply header: {error:?}"));
     let n = u32::from_be_bytes(h);
     assert!(n < 1 << 20);
     let len = usize::try_from(n).unwrap();
     let mut body = Vec::with_capacity_in(len, alloc);
     body.resize(len, 0);
-    stream.read_exact(&mut body).unwrap();
+    stream.read_exact(&mut body).unwrap_or_else(|error| panic!("{reply_to}: reading reply body: {error:?}"));
     body
 }
 
@@ -273,23 +282,23 @@ fn fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries() {
     for byte in bytes {
         stream.write_all(&[byte]).unwrap();
     }
-    assert!(matches!(read(&mut stream, alloc), ServerFrame::Welcome(_)));
+    assert!(matches!(read_reply(&mut stream, alloc, "fragmented Hello"), ServerFrame::Welcome(_)));
     let mut bad = raw(&f);
     bad.write_all(&[0, 16, 0, 1]).unwrap(); // oversize before any allocation/body.
-    assert!(matches!(read(&mut bad, alloc), ServerFrame::Error(_)));
+    assert!(matches!(read_reply(&mut bad, alloc, "oversize frame header"), ServerFrame::Error(_)));
     let mut bad = raw(&f);
     bad.write_all(&frame(&[0xff], alloc)).unwrap();
-    assert!(matches!(read(&mut bad, alloc), ServerFrame::Error(_)));
+    assert!(matches!(read_reply(&mut bad, alloc, "malformed CBOR"), ServerFrame::Error(_)));
     let mut bad = raw(&f);
     bad.write_all(&[0, 0, 0, 0]).unwrap();
-    assert!(matches!(read(&mut bad, alloc), ServerFrame::Error(_)));
+    assert!(matches!(read_reply(&mut bad, alloc, "zero-length frame header"), ServerFrame::Error(_)));
     let mut coalesced = raw(&f);
     let h = hello([2; 32]);
     let mut bytes = frame(&encode(&ClientFrame::Hello(h.clone()), alloc), alloc);
     bytes.extend_from_slice(&frame(&encode(&ClientFrame::Hello(h), alloc), alloc));
     coalesced.write_all(&bytes).unwrap();
-    assert!(matches!(read(&mut coalesced, alloc), ServerFrame::Welcome(_)));
-    assert!(matches!(read(&mut coalesced, alloc), ServerFrame::Error(_)));
+    assert!(matches!(read_reply(&mut coalesced, alloc, "first coalesced Hello"), ServerFrame::Welcome(_)));
+    assert!(matches!(read_reply(&mut coalesced, alloc, "second coalesced Hello"), ServerFrame::Error(_)));
 }
 
 #[test]
@@ -300,7 +309,7 @@ fn versions_content_session_and_terminal_bindings_fail_closed() {
     let mut h = hello([3; 32]);
     h.codec += 1;
     stream.write_all(&frame(&encode(&ClientFrame::Hello(h), alloc), alloc)).unwrap();
-    assert!(matches!(read(&mut stream, alloc), ServerFrame::Error(_)));
+    assert!(matches!(read_reply(&mut stream, alloc, "Hello with unsupported codec"), ServerFrame::Error(_)));
     let mut c = f.client();
     let mut s = submission(&job(1000), need(), alloc);
     s.content = blaze_wire::JobContent([0; 32]);
@@ -2313,6 +2322,7 @@ fn the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls(
             ..Default::default()
         };
         let leave = AtomicBool::new(false);
+        let finished = AtomicBool::new(false);
         let clock_sys = SystemClock;
         scope(alloc, |s| {
             let mut client = f.client();
@@ -2329,9 +2339,10 @@ fn the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls(
             let clock = f.clock.clone();
             let (socket, executor, config, leave) =
                 (f.path.as_str(), helper.as_str(), &config, &leave);
+            let finished = &finished;
             let worker = s
                 .spawn(move || {
-                    run_holder_until(
+                    let result = run_holder_until(
                         &mut client,
                         socket,
                         &mut holder,
@@ -2341,12 +2352,17 @@ fn the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls(
                         || clock.now_ms(),
                         &mut Compiler(alloc),
                         leave,
-                    )
+                    );
+                    finished.store(true, Ordering::Release);
+                    result
                 })
                 .unwrap();
             let deadline_ns = clock_sys.monotonic_nanos().unwrap().saturating_add(2_000_000_000);
             let ready_file = directory.join("ready.json");
             while !path_is_file(ready_file.as_str()) {
+                if finished.load(Ordering::Acquire) {
+                    panic!("the Holder exited before capturing its result: {:?}", worker.join());
+                }
                 assert!(
                     clock_sys.monotonic_nanos().unwrap() < deadline_ns,
                     "the real Holder never produced its gated result"

@@ -163,7 +163,7 @@ mod tests {
         let directory = TempDir::new("blaze-sock", alloc).unwrap();
         let absent = directory.join("absent.sock");
         let error = connect(absent.as_str()).unwrap_err();
-        assert!(error.is_not_found());
+        assert!(error.is_not_found(), "expected a missing socket: {error:?}");
         assert!(format_in!(alloc, "{error}").contains("absent.sock"));
         let mut long = String::with_capacity_in(256, alloc);
         for _ in 0..256 {
