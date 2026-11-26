@@ -23,6 +23,7 @@ CASES = [
     },
     {
         "name": "attribute-impl-in-function",
+        "proc_macros": ["pm"],
         "fixes": ["cdb01e00b"],
         "files": {
             "Cargo.toml": '[workspace]\nmembers = ["pm", "app"]\nresolver = "2"\n',
@@ -228,6 +229,7 @@ fn main() {
 CASES.append(
     {
         "name": "a-required-feature-of-a-dependency",
+        "build_scripts": ["app"],
         "fixes": ["c69fe89a6"],
         "files": {
             "Cargo.toml": '[workspace]\nmembers = ["dep", "hostdep", "app"]\ndefault-members = ["app"]\nresolver = "2"\n',
@@ -292,6 +294,7 @@ CASES.append(
 CASES.append(
     {
         "name": "a-script-searches-where-its-build-dependencys-script-said",
+        "build_scripts": ["dep", "app"],
         "fixes": ["c502dffd6"],
         "files": {
             "Cargo.toml": '[workspace]\nmembers = ["dep", "app"]\nresolver = "2"\n',
@@ -335,6 +338,7 @@ CASES.append(
         # Only each request receives these overrides. Changing and removing them must
         # invalidate both the compiled option_env! and the build script's captured output.
         "name": "caller-environment-changes-and-becomes-unset",
+        "build_scripts": ["caller_environment_changes_and_becomes_unset"],
         "fixes": ["80a8430b4", "a47282674"],
         "files": {
             MAIN: '''fn main() {
@@ -426,6 +430,8 @@ fn main() {
 # before changing only the second archive's name; restoring it checks invalidation.
 CASES.append({
     "name": "packages-own-same-named-native-archives",
+    "build_scripts": ["package_a", "package_b"],
+    "clang": True,
     "fixes": [],
     "files": {
         "Cargo.toml": '''[package]
