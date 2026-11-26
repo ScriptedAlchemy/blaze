@@ -89,7 +89,7 @@ fn bodies_take_fundamental_and_field_lifetimes_from_the_frozen_adt() {
     assert_eq!(wrong.diagnostics.len(), 1, "{:?}", wrong.diagnostics);
     let outlives = &wrong.diagnostics[0];
     assert!(outlives.contains("b/src/lib.rs") && outlives.contains("[borrows]")
-        && outlives.contains("a lifetime must outlive another"), "{outlives}");
+        && outlives.contains("signature lifetime 2 must outlive signature lifetime 1"), "{outlives}");
     assert_eq!(wrong.heads_lowered, 0);
     println!("bodies: heads lowered from text 0");
 }

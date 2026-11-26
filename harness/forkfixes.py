@@ -10,7 +10,9 @@ One JSON object, inline, a file, or `-`:
              omitted: `$HOME/.blaze/v2/toolchain` of the harness process
     only     case names to run (empty: all 23)
     timeout  seconds bounding each source command (1800 by default)
-    source   a checkout whose HEAD is recorded as provenance (optional)
+    source   the compiler source checkout (defaults to this checkout)
+    module_builder  the D52 proc_macro_modules executable for fixtures with macros or scripts
+    clang_shelf  pinned C toolchains directory for the archive fixture (defaults to shelf/clang)
     workers  worker count passed explicitly to check/run/test/export (optional)
     stall_bound  accepted for compatibility with the legacy harness input; the v2
              checkout daemon has no such tuning and the value is reported as ignored
@@ -22,16 +24,16 @@ cached-replay oracle from `blaze export --stats` (a cdylib through explicit `--l
 exported programs. Required-feature absence is read from `blaze check --view json`'s
 target-not-built notes. No legacy
 `build`, `serve`, `status --json`, `--message-format` or `blaze-test-result` interface
-is used. Unsupported evidence is never treated as a pass. A case failure does not stop
-independent later cases.
+is used. Independent semantic failures are collected. A timeout or an ownership failure stops the run.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import signal
@@ -46,7 +48,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools/typed-input/
 from cases import CASES  # noqa: E402
 from typed_input import parse  # noqa: E402
 
-MAIN = "src/main.rs"
+RESOURCE_ENV = ("BLAZE_LIBRARY", "BLAZE_CORES", "BLAZE_DAEMON_MEMORY_GB", "BLAZE_HUGE_PAGES",
+                "BLAZE_TESTS", "BLAZE_STORE_MAX_BYTES", "BLAZE_STORE_MAX_GB")
+LOCKS = Path(__file__).resolve().parent / "forkfixes/locks"
 
 
 class Failed(ValueError):
@@ -67,6 +71,17 @@ class Input:
     source: str | None = None
     workers: int | None = None
     stall_bound: int | None = None
+    module_builder: str | None = None
+    clang_shelf: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("timeout", "workers", "stall_bound"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise Failed(f"{name} must be a positive integer")
+        unknown = sorted(set(self.only) - {case["name"] for case in CASES})
+        if unknown:
+            raise Failed(f"unknown case names in only: {', '.join(unknown)}")
 
 
 def digest(path: Path) -> str:
@@ -80,17 +95,11 @@ def require(condition: bool, message: str) -> None:
 
 
 def validate(given: Input, harness_home: str | None) -> Input:
-    if type(given.timeout) is not int or given.timeout <= 0:
-        raise Failed("timeout must be a positive integer")
-    if given.workers is not None and (type(given.workers) is not int or given.workers <= 0):
-        raise Failed("workers must be a positive integer")
-    if given.stall_bound is not None and type(given.stall_bound) is not int:
-        raise Failed("stall_bound must be an integer when given")
     blaze = Path(given.blaze)
     if blaze.is_symlink() or not blaze.is_file() or not os.access(blaze, os.X_OK):
         raise Failed(f"blaze {blaze} is not a regular executable")
     scratch = Path(given.scratch)
-    if scratch.is_symlink() or (scratch.exists() and any(scratch.iterdir())):
+    if scratch.is_symlink() or (scratch.exists() and (not scratch.is_dir() or any(scratch.iterdir()))):
         raise Failed(f"scratch {scratch} must be new or empty; earlier evidence is never erased")
     shelf = given.shelf
     if not shelf:
@@ -100,42 +109,52 @@ def validate(given: Input, harness_home: str | None) -> Input:
     shelf_path = Path(shelf)
     if not shelf_path.is_dir() or not any(shelf_path.iterdir()):
         raise Failed(f"shelf {shelf_path} is not a nonempty toolchain shelf")
-    if any(path.is_symlink() for path in shelf_path.rglob("*")):
-        raise Failed(f"shelf {shelf_path} contains a symlink; copy the canonical shelf")
-    unknown = sorted(set(given.only) - {case["name"] for case in CASES})
-    if unknown:
-        raise Failed(f"unknown case names in only: {', '.join(unknown)}")
-    return Input(str(blaze.absolute()), str(scratch.absolute()), str(shelf_path.resolve()),
-                 given.only, given.timeout, given.source, given.workers, given.stall_bound)
+    for entry in shelf_path.iterdir():
+        if entry.is_symlink() or (entry.is_dir() and entry.name not in ("clang", "sysroot") and any(p.is_symlink() for p in entry.rglob("*"))):
+            raise Failed(f"shelf {shelf_path} contains a symlink outside the pinned C toolchain")
+    builder = Path(given.module_builder).resolve() if given.module_builder else None
+    if builder and (not builder.is_file() or not os.access(builder, os.X_OK)):
+        raise Failed(f"D52 module builder {builder} is not executable")
+    return replace(given, blaze=str(blaze.absolute()), scratch=str(scratch.absolute()),
+                   shelf=str(shelf_path.resolve()), module_builder=str(builder) if builder else None)
 
 
 def binary_digests(blaze: Path) -> dict[str, str]:
     result = {"blaze": digest(blaze)}
-    for name in ("blaze-launcher", "blaze-fact-shim"):
+    for name in ("blaze-launcher", "blaze-fact-shim", "blaze-engine"):
         path = blaze.with_name(name)
-        if path.is_file() and not path.is_symlink():
+        if path.is_file():
             result[name] = digest(path)
     return result
 
 
 def provenance(given: Input) -> dict:
     root = Path(__file__).resolve().parents[1]
-    files = {}
-    for name in ("harness/forkfixes.py", "harness/forkfixes/cases.py",
-                 ".github/scripts/forkfixes_acceptance.py"):
-        path = root / name
-        if path.is_file():
-            files[name] = digest(path)
-    answer = {"binaries": binary_digests(Path(given.blaze)), "harness": files,
-              "shelf": shelf_provenance(Path(given.shelf))}
-    if given.source:
-        try:
-            head = subprocess.run(["git", "-C", given.source, "rev-parse", "HEAD"],
-                                  capture_output=True, text=True, timeout=10, check=False)
-            answer["source_head"] = head.stdout.strip() if head.returncode == 0 else f"unavailable: {head.stderr.strip()}"
-        except (OSError, subprocess.SubprocessError) as error:
-            answer["source_head"] = f"unavailable: {error}"
-    return answer
+    source = Path(given.source or root).resolve(strict=True)
+
+    def git(*args: str) -> bytes:
+        return subprocess.check_output(["git", "-C", str(source), *args], timeout=30)
+
+    # HEAD and the tracked patch do not cover untracked Rust files. Scratch was empty at
+    # entry and owns its outputs, even when it is beneath the source checkout.
+    untracked = {}
+    for name in git("ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
+        if name:
+            path = source / os.fsdecode(name)
+            if not path.is_relative_to(Path(given.scratch).resolve()):
+                untracked[os.fsdecode(name)] = digest(path) if path.is_file() else os.readlink(path)
+    harness = [Path(__file__).resolve(), root / "harness/forkfixes/cases.py",
+               *sorted(LOCKS.glob("*.lock")),
+               root / ".github/scripts/forkfixes_acceptance.py",
+               *sorted((root / "tools/typed-input/src").rglob("*.py"))]
+    return {"source": str(source), "source_head": git("rev-parse", "HEAD").decode().strip(),
+            "git_tree": git("rev-parse", "HEAD^{tree}").decode().strip(),
+            "patch_sha256": hashlib.sha256(git("diff", "--no-ext-diff", "--binary", "HEAD")).hexdigest(),
+            "untracked_sha256": tree_identity(untracked), "binaries": binary_digests(Path(given.blaze)),
+            "module_builder_sha256": digest(Path(given.module_builder)) if given.module_builder else None,
+            "harness": {str(path.relative_to(root)): digest(path) for path in harness},
+            "resources": {name: os.environ[name] for name in RESOURCE_ENV if name in os.environ},
+            "workers": given.workers, "shelf": shelf_provenance(Path(given.shelf))}
 
 
 def shelf_provenance(shelf: Path) -> dict:
@@ -159,9 +178,10 @@ def environment(home: Path) -> dict[str, str]:
         "HOME": str(home),
         "TMPDIR": str(home / "tmp"),
         "RUST_BACKTRACE": "0",
+        "BLAZE_LOCK": "write",
         "PYTHONDONTWRITEBYTECODE": "1",
     })
-    for key in ("BLAZE_CORES", "BLAZE_TESTS", "BLAZE_STORE_MAX_BYTES", "BLAZE_STORE_MAX_GB"):
+    for key in RESOURCE_ENV:
         if key in os.environ:
             env[key] = os.environ[key]
     return env
@@ -186,16 +206,59 @@ def copy_shelf(shelf: Path, home: Path) -> None:
     """Place the immutable shelf in a fresh HOME, hard-linking its read-only packs when possible."""
     destination = home / ".blaze/v2/toolchain"
     destination.mkdir(parents=True)
-    for source in sorted(shelf.rglob("*")):
-        target = destination / source.relative_to(shelf)
+    for source in sorted(shelf.iterdir()):
+        if source.name in ("clang", "sysroot"):
+            continue
+        target = destination / source.name
         if source.is_dir():
-            target.mkdir()
+            shutil.copytree(source, target, copy_function=link_or_copy)
         elif source.is_file():
-            try:
-                os.link(source, target)
-            except OSError:
-                shutil.copy2(source, target)
+            link_or_copy(source, target)
     (home / "tmp").mkdir()
+
+
+def link_or_copy(source: Path, target: Path) -> None:
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+
+
+def copy_pinned_directory(source: Path, target: Path) -> None:
+    require(source.is_dir() and not source.is_symlink(), f"unpacked pinned C toolchain is missing at {source}")
+    real = source.resolve()
+    for path in source.rglob("*"):
+        if path.is_symlink() and (path.readlink().is_absolute() or not path.resolve(strict=True).is_relative_to(real)):
+            raise CaseFailed(f"C toolchain link escapes its pinned directory: {path}")
+    shutil.copytree(source, target, symlinks=True, copy_function=link_or_copy)
+
+
+def copy_clang(given: Input, home: Path) -> dict:
+    """Copy the host's unpacked pin, preserving its internal compiler and linker links."""
+    shelf = Path(given.clang_shelf) if given.clang_shelf else Path(given.shelf) / "clang"
+    source = Path(given.source or Path(__file__).resolve().parents[1])
+    pins = json.loads((source / "pins/clang.json").read_text())
+    arch = platform.machine().replace("arm64", "aarch64")
+    system = {"darwin": "apple-darwin", "linux": "unknown-linux-gnu"}.get(sys.platform, sys.platform)
+    host = f"{arch}-{system}"
+    require(host in pins["targets"], f"pins/clang.json has no C toolchain for {host}")
+    archive = shelf / pins["targets"][host]["sha256"]
+    destination = home / ".blaze/v2/toolchain"
+    copy_pinned_directory(archive, destination / "clang" / archive.name)
+    members = pins["shelf_programs"][host]
+    verified = {}
+    for name in members["names"].split():
+        row = members[name]
+        relative = Path(row["member"])
+        member = destination / "clang" / archive.name / relative.relative_to(relative.parts[0])
+        require(member.is_file() and digest(member) == row["sha256"], f"{member} differs from pins/clang.json")
+        verified[name] = row["sha256"]
+    sysroot = pins["sysroots"][host]
+    if sysroot != "macos-sdk":
+        require(isinstance(sysroot, str) and re.fullmatch(r"[0-9a-f]{64}", sysroot) is not None,
+                f"pins/clang.json has no pinned sysroot for {host}")
+        copy_pinned_directory(shelf.parent / "sysroot" / sysroot, destination / "sysroot" / sysroot)
+    return {"host": host, "archive": archive.name, "members": verified, "sysroot": sysroot}
 
 
 def write_files(root: Path, files: dict[str, str]) -> dict[str, str]:
@@ -210,6 +273,8 @@ def write_files(root: Path, files: dict[str, str]) -> dict[str, str]:
 
 def initial_files(case: dict) -> dict[str, str]:
     files = dict(case["files"])
+    if "proc_macros" in case or "build_scripts" in case:
+        files["Cargo.lock"] = (LOCKS / (case["name"] + ".lock")).read_text()
     if "Cargo.toml" not in files:
         package = case["name"].replace("-", "_")
         files["Cargo.toml"] = (f'[package]\nname = "{package}"\nversion = "0.1.0"\n'
@@ -275,13 +340,9 @@ def choose_target(root: Path, case: dict, step: dict) -> tuple[str, str]:
             raise CaseFailed(f"fixture {case['name']} has no program key and {len(binaries)} binary targets")
         return binaries[0]
     exact = [(package, name) for package, name in binaries if name == requested]
-    if exact:
-        return exact[0]
-    # A simple fixture's generated package has underscores while its retained program key may
-    # be the user-facing binary name; if it is the sole binary, that binary is the target.
-    if len(binaries) == 1:
-        return binaries[0]
-    raise CaseFailed(f"no binary target {requested!r} in fixture {case['name']}")
+    if len(exact) != 1:
+        raise CaseFailed(f"fixture {case['name']} has {len(exact)} targets named {requested!r}, expected one")
+    return exact[0]
 
 
 def target_args(root: Path, case: dict, step: dict) -> list[str]:
@@ -302,40 +363,52 @@ def worker_args(given: Input) -> list[str]:
     return ["--workers", str(given.workers)] if given.workers is not None else []
 
 
-def run_command(argv: list[str], cwd: Path, env: dict[str, str], timeout: int,
-                evidence: Path, label: str) -> dict:
-    """Run one bounded command in its own process group and preserve its exact output."""
-    child = subprocess.Popen([str(part) for part in argv], cwd=cwd, env=env,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, text=True, errors="replace",
-                             start_new_session=True)
-    expired = False
-    stdout = stderr = ""
-    try:
-        stdout, stderr = child.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        expired = True
+def save(path: Path, value: object) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def terminate(process: subprocess.Popen) -> None:
+    """Signal the entire owned session, including descendants after the leader exits."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
-            os.killpg(child.pid, signal.SIGTERM)
+            os.killpg(process.pid, sig)
         except ProcessLookupError:
             pass
         try:
-            stdout, stderr = child.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
-            stdout, stderr = child.communicate(timeout=10)
-    finally:
-        if child.returncode is None:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            child.wait(timeout=10)
-    record = {"label": label, "argv": [str(part) for part in argv], "cwd": str(cwd),
-              "returncode": child.returncode, "timed_out": expired,
-              "stdout": stdout, "stderr": stderr}
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as error:
+            if sig == signal.SIGKILL:
+                raise Failed(f"owned process group {process.pid} did not exit after SIGKILL") from error
+
+
+def run_command(argv: list[str], cwd: Path, env: dict[str, str], timeout: int,
+                evidence: Path, label: str) -> dict:
+    """Keep full output on disk, including when a process is killed or cannot be reaped."""
     evidence.parent.mkdir(parents=True, exist_ok=True)
-    evidence.write_text(json.dumps(record, indent=2) + "\n")
+    started = time.monotonic()
+    record = {"label": label, "argv": [str(part) for part in argv], "cwd": str(cwd),
+              "timeout": timeout, "returncode": None, "timed_out": False}
+    stdout, stderr = evidence.with_suffix(".stdout"), evidence.with_suffix(".stderr")
+    try:
+        with stdout.open("wb") as out, stderr.open("wb") as err:
+            child = subprocess.Popen(record["argv"], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                     stdout=out, stderr=err, start_new_session=True)
+            try:
+                child.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                record["timed_out"] = True
+                terminate(child)
+            except BaseException:
+                terminate(child)
+                raise
+            record["returncode"] = child.returncode
+    finally:
+        record["elapsed_seconds"] = time.monotonic() - started
+        record["stdout"] = stdout.read_text(errors="replace") if stdout.exists() else ""
+        record["stderr"] = stderr.read_text(errors="replace") if stderr.exists() else ""
+        save(evidence, record)
     return record
 
 
@@ -348,7 +421,11 @@ class CommandLog:
                  label: str) -> dict:
         self.count += 1
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", label)
-        return run_command(argv, cwd, env, timeout, self.directory / f"{self.count:03d}-{safe}.json", label)
+        evidence = self.directory / f"{self.count:03d}-{safe}.json"
+        record = run_command(argv, cwd, env, timeout, evidence, label)
+        if record["timed_out"]:
+            raise Failed(f"{label} timed out after {timeout}s; see {evidence}")
+        return record
 
 
 def daemon_status_pid(stdout: str) -> int | None:
@@ -373,71 +450,58 @@ class CheckoutDaemon:
         self.output = log.directory / "daemon.log"
         self.output.parent.mkdir(parents=True, exist_ok=True)
 
-    def status(self) -> tuple[int, str, str]:
-        try:
-            result = subprocess.run([str(self.blaze), "daemon", "--status"], cwd=self.root,
-                                    env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
-                                    text=True, timeout=10, check=False)
-            return result.returncode, result.stdout, result.stderr
-        except (OSError, subprocess.SubprocessError) as error:
-            return 127, "", str(error)
+    def status(self, timeout: float = 10) -> int | None:
+        record = self.log([self.blaze, "daemon", "--status"], self.root, self.env, timeout, "daemon-status")
+        if record["returncode"] != 0:
+            return None
+        return daemon_status_pid(record["stdout"])
 
     def start(self) -> None:
-        stream = self.output.open("ab")
-        self.process = subprocess.Popen([str(self.blaze), "daemon"], cwd=self.root,
-                                        env=self.env, stdin=subprocess.DEVNULL,
-                                        stdout=stream, stderr=subprocess.STDOUT,
-                                        start_new_session=True)
+        with self.output.open("ab") as stream:
+            self.process = subprocess.Popen([str(self.blaze), "daemon"], cwd=self.root,
+                                            env=self.env, stdin=subprocess.DEVNULL,
+                                            stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
         deadline = time.monotonic() + 30
-        attempts = []
-        while time.monotonic() < deadline:
-            code, stdout, stderr = self.status()
-            attempts.append({"returncode": code, "stdout": stdout, "stderr": stderr})
+        while (remaining := deadline - time.monotonic()) > 0:
             if self.process.poll() is not None:
-                break
-            if code == 0 and daemon_status_pid(stdout) == self.process.pid:
-                (self.log.directory / "daemon-start.json").write_text(json.dumps(attempts, indent=2) + "\n")
+                raise Failed(f"checkout daemon for {self.root} exited {self.process.returncode} during startup")
+            pid = self.status(min(10, remaining))
+            if pid == self.process.pid:
                 return
-            time.sleep(0.25)
-        detail = f"checkout daemon did not become ready for {self.root}; "
-        if self.process.poll() is not None:
-            detail += f"it exited {self.process.returncode}"
-        else:
-            detail += "status never reported its pid"
-        (self.log.directory / "daemon-start.json").write_text(json.dumps(attempts, indent=2) + "\n")
-        raise CaseFailed(detail)
+            if pid is not None:
+                raise Failed(f"checkout daemon for {self.root} reports pid {pid}, expected {self.process.pid}")
+            time.sleep(min(0.25, remaining))
+        raise Failed(f"checkout daemon for {self.root} did not report its pid within 30 s")
 
     def check_alive(self) -> None:
         if self.process is None or self.process.poll() is not None:
-            raise CaseFailed("the owned checkout daemon exited during the case")
-        code, stdout, stderr = self.status()
-        if code != 0 or daemon_status_pid(stdout) != self.process.pid:
-            raise CaseFailed(f"checkout daemon status did not report the owned pid {self.process.pid}: "
-                             f"exit {code}, stdout {stdout.strip()!r}, stderr {stderr.strip()!r}")
+            raise Failed(f"owned checkout daemon for {self.root} exited during the case")
+        if self.status() != self.process.pid:
+            raise Failed(f"checkout daemon status for {self.root} did not report owned pid {self.process.pid}")
 
     def stop(self) -> None:
-        if self.process is None:
+        process = self.process
+        if process is None:
             return
-        errors = []
-        if self.process.poll() is None:
-            record = self.log([str(self.blaze), "daemon", "--stop"], self.root, self.env, 20, "daemon-stop")
-            if record["timed_out"] or record["returncode"] != 0:
-                errors.append(f"daemon --stop returned {record['returncode']} timed_out={record['timed_out']}")
+        try:
+            if process.poll() is not None:
+                raise Failed(f"owned daemon exited {process.returncode} before daemon --stop")
+            # A stale or foreign socket must never receive our stop request.
+            self.check_alive()
+            record = self.log([self.blaze, "daemon", "--stop"], self.root, self.env, 20, "daemon-stop")
+            if record["returncode"] != 0:
+                raise Failed(f"daemon --stop returned {record['returncode']}")
             try:
-                self.process.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                errors.append("checkout daemon did not exit after daemon --stop")
-                try:
-                    os.killpg(self.process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                self.process.wait(timeout=10)
-            if self.process.returncode != 0:
-                errors.append(f"checkout daemon exited {self.process.returncode} despite daemon --stop")
-        if errors:
-            self.process = None
-            raise CaseFailed("; ".join(errors))
-        self.process = None
+                status = process.wait(timeout=20)
+            except subprocess.TimeoutExpired as error:
+                raise Failed("owned daemon did not exit after daemon --stop") from error
+            if status != 0:
+                raise Failed(f"owned daemon exited {status} despite daemon --stop")
+        finally:
+            try:
+                terminate(process)
+            finally:
+                self.process = None
 
 
 def check_rows(record: dict) -> tuple[list[dict], dict]:
@@ -459,7 +523,10 @@ def diagnostic_matches(rows: list[dict], expected: str) -> bool:
         message = row.get("message") if isinstance(row.get("message"), str) else ""
         code = row.get("code") if isinstance(row.get("code"), str) else ""
         if re.fullmatch(r"E\d+", expected):
-            if code == expected or expected in message:
+            if "diagnostic_code" in row:
+                if row["diagnostic_code"] == expected:
+                    return True
+            elif code == expected or (code == "types" and re.search(r"\(" + expected + r" [A-Za-z]+\)$", message)):
                 return True
         elif expected in message or expected in code:
             return True
@@ -605,7 +672,7 @@ def cdylib_packages(root: Path) -> list[str]:
 
 
 def export_and_run(root: Path, case: dict, step: dict, given: Input, env: dict[str, str],
-                   log: CommandLog, state: dict, series: str) -> dict[str, int]:
+                   log: CommandLog, state: dict, series: str) -> None:
     """Export the executable and every cdylib companion, then execute the executable.
 
     The two exports are intentionally independent evidence: a refused library export does not
@@ -623,27 +690,34 @@ def export_and_run(root: Path, case: dict, step: dict, given: Input, env: dict[s
             filtered.append(extra[index])
             index += 1
     output_names = {"initial": "export-output", "replay-unchanged": "export-output",
-                    "replay-new": "replay-output"}
+                    "replay-new": f"replay-output-{state.get('generation', 0)}"}
     if series not in output_names:
         raise CaseFailed(f"unknown export series {series!r}")
     outdir = root / output_names[series]
     if outdir.exists():
-        if series == "replay-unchanged":
-            if not outdir.is_dir():
-                raise CaseFailed(f"unchanged export output {outdir} exists and is not a directory")
-        else:
-            shutil.rmtree(outdir)
-    outdir.mkdir(exist_ok=True)
+        if series != "replay-unchanged" or outdir.is_symlink() or not outdir.is_dir():
+            raise CaseFailed(f"unexpected existing export output {outdir}")
+        # Keep the output path unchanged, but require export to materialize every artifact.
+        shutil.rmtree(outdir)
+    outdir.mkdir()
     errors = []
+    suffix = ".dylib" if sys.platform == "darwin" else ".so"
+
+    def check_stats(name: str, stats: dict | None) -> None:
+        if series != "initial" and (not stats or stats.get("compiled") != 0 or stats.get("cached", 0) <= 0):
+            errors.append(f"{series} {name} must report cached functions and compile none: {stats}")
+
     for library in cdylib_packages(root):
-        artifact = outdir / f"lib{library.replace('-', '_')}.dylib"
-        record, _ = export_one(given, root, env, log, library, None, artifact, [],
+        artifact = outdir / f"lib{library.replace('-', '_')}{suffix}"
+        record, stats = export_one(given, root, env, log, library, None, artifact, [],
                                f"export-cdylib-{library}-{series}", library=True)
         if record["timed_out"] or record["returncode"] != 0:
             errors.append(f"export of cdylib package {library} failed with exit {record['returncode']} "
                           f"timed_out={record['timed_out']}")
-        elif not artifact.is_file():
+        elif not artifact.is_file() or artifact.is_symlink():
             errors.append(f"export of cdylib package {library} succeeded but did not write {artifact.name}")
+        else:
+            check_stats(library, stats)
     executable = outdir / "program"
     record, stats = export_one(given, root, env, log, package, binary, executable, filtered,
                                f"export-program-{series}")
@@ -651,30 +725,24 @@ def export_and_run(root: Path, case: dict, step: dict, given: Input, env: dict[s
         errors.append("program export timed out")
     elif record["returncode"] != 0:
         errors.append(f"program export exited {record['returncode']}")
-    if executable.is_file():
-        if not os.access(executable, os.X_OK):
-            errors.append("exported program is not executable")
-        else:
-            ran = log([executable], root, env, min(60, given.timeout), "run-exported-program")
-            if ran["timed_out"] or ran["returncode"] != 0:
-                errors.append(f"exported program exited {ran['returncode']} timed_out={ran['timed_out']}")
-            elif exact_lines(ran["stdout"]) != step["prints"]:
-                errors.append(f"exported program stdout lines {exact_lines(ran['stdout'])!r} differ from {step['prints']!r}")
     else:
-        errors.append("program export produced no executable")
+        check_stats(package, stats)
+    if executable.is_symlink() or not executable.is_file() or not os.access(executable, os.X_OK):
+        errors.append(f"program export did not produce a regular executable at {executable}")
     hashes = artifact_hashes(outdir)
-    artifact_keys = {"initial": "artifacts", "replay-unchanged": "replay_artifacts_unchanged",
-                     "replay-new": "replay_artifacts_new"}
-    state[artifact_keys[series]] = hashes
-    for library in cdylib_packages(root):
-        name = f"lib{library.replace('-', '_')}.dylib"
-        if name not in hashes:
-            errors.append(f"artifact set lacks companion cdylib {name}")
+    save(log.directory / f"{state.get('generation', 0)}-{series}-artifacts.json", hashes)
+    if series == "initial":
+        state["artifacts"] = hashes
+    else:
+        difference = artifact_identity_diff(state["artifacts"], hashes)
+        if difference:
+            errors.append(f"{series} artifact identity differs from the initial export: {difference}")
     if errors:
         raise CaseFailed("; ".join(errors))
-    if stats is None:
-        raise CaseFailed("successful program export had no parsed stats")
-    return stats
+    ran = log([executable], root, env, min(60, given.timeout), "run-exported-program")
+    require(ran["returncode"] == 0, f"exported program exited {ran['returncode']}")
+    require(exact_lines(ran["stdout"]) == step["prints"],
+            f"exported program stdout lines {exact_lines(ran['stdout'])!r} differ from {step['prints']!r}")
 
 
 def tree_hashes(root: Path) -> dict[str, str]:
@@ -746,6 +814,7 @@ def perform_test(root: Path, case: dict, step: dict, given: Input, env: dict[str
 
 def start_replay_home(given: Input, root: Path, log: CommandLog, state: dict,
                       initial_home: Path, scratch_case: Path, label: str) -> tuple[Path, dict[str, str], CheckoutDaemon]:
+    label = f"{state['generation']}-{label}"
     replay_home = scratch_case / f"{label}-home-files"
     if replay_home.exists():
         raise CaseFailed(f"{label} HOME already exists; evidence is never overwritten")
@@ -778,54 +847,27 @@ def artifact_identity_diff(initial: dict[str, str], replay: dict[str, str]) -> s
     return "; ".join(parts)
 
 
-def perform_replay(root: Path, case: dict, step: dict, given: Input, env: dict[str, str],
-                   log: CommandLog, state: dict, daemon: CheckoutDaemon,
-                   home: Path, scratch_case: Path) -> CheckoutDaemon:
+def perform_replay(root: Path, case: dict, step: dict, given: Input, log: CommandLog,
+                   state: dict, daemon: CheckoutDaemon, scratch_case: Path) -> CheckoutDaemon:
     daemon.stop()
-    initial_home = Path(state["physical_home"])
-    attempts: dict[str, dict] = {}
+    initial_home = state["physical_home"]
+    state["generation"] = state.get("generation", 0) + 1
     errors = []
-    for series, label in (("replay-unchanged", "replay-unchanged"), ("replay-new", "replay-new")):
-        attempt = {"label": label, "stats": None, "daemon": None, "home": None, "error": None}
-        attempts[series] = attempt
+    for series in ("replay-new", "replay-unchanged"):
+        replay_home, replay_env, replay_daemon = start_replay_home(
+            given, root, log, state, initial_home, scratch_case, series)
         try:
-            replay_home, replay_env, replay_daemon = start_replay_home(
-                given, root, log, state, initial_home, scratch_case, label)
-            attempt.update({"home": replay_home, "daemon": replay_daemon})
-            try:
-                attempt["stats"] = export_and_run(root, case, step, given, replay_env, log, state, series)
-            except Exception as error:
-                attempt["error"] = str(error)
-        except Exception as error:
-            attempt["error"] = str(error)
-        if attempt["error"]:
-            errors.append(f"{series}: {attempt['error']}")
-
-    for series, key in (("replay-unchanged", "replay_artifacts_unchanged"),
-                        ("replay-new", "replay_artifacts_new")):
-        stats = attempts[series]["stats"]
-        if stats is not None:
-            if stats.get("cached", 0) <= 0:
-                errors.append(f"{series} reused no compiled functions: {stats}")
-            if stats.get("compiled") != 0:
-                errors.append(f"{series} compiled functions instead of replaying them: {stats}")
-        initial = state.get("artifacts")
-        replayed = state.get(key)
-        if initial is not None and replayed is not None and initial != replayed:
-            errors.append(f"{series} artifact identity differs from the initial export: "
-                          f"{artifact_identity_diff(initial, replayed)}")
-
-    supplemental = attempts["replay-new"]["daemon"]
-    if supplemental is not None:
-        try:
-            supplemental.stop()
+            export_and_run(root, case, step, given, step_environment(replay_env, step), log, state, series)
+            replay_daemon.check_alive()
         except CaseFailed as error:
-            errors.append(f"replay-new daemon cleanup: {error}")
+            errors.append(f"{series}: {error}")
+        if series == "replay-new":
+            replay_daemon.stop()
     if errors:
         raise CaseFailed("; ".join(errors))
-    canonical = attempts["replay-unchanged"]
-    state["physical_home"] = canonical["home"]
-    return canonical["daemon"]
+    state["physical_home"] = replay_home
+    return replay_daemon
+
 
 def step_environment(base: dict[str, str], step: dict) -> dict[str, str]:
     env = dict(base)
@@ -837,24 +879,75 @@ def step_environment(base: dict[str, str], step: dict) -> dict[str, str]:
     return env
 
 
-def perform_step(root: Path, case: dict, step: dict, given: Input, env: dict[str, str],
-                 log: CommandLog, state: dict, daemon: CheckoutDaemon,
-                 home: Path, scratch_case: Path) -> CheckoutDaemon:
+def prepare_modules(root: Path, case: dict, given: Input, log: CommandLog, state: dict) -> None:
+    """Build changed fixture modules into their owning HOME before Blaze sees the edit."""
+    for field, kind in (("proc_macros", "proc-macro"), ("build_scripts", "build-script")):
+        packages = case.get(field)
+        if not packages:
+            continue
+        require(bool(given.module_builder), f"{case['name']} requires the D52 proc_macro_modules executable in module_builder")
+        declared = initial_files(case)
+        # Script closures can include a local dependency's build.rs. This snapshot includes
+        # every declared dependency input; the proc macro fixture's app is only a consumer.
+        if field == "proc_macros":
+            declared = {name: value for name, value in declared.items()
+                        if name in ("Cargo.toml", "Cargo.lock") or Path(name).parts[0] in packages}
+        revision = tree_identity({name: digest(root / name) for name in declared})
+        prepared = state.setdefault("modules", {})
+        if revision in prepared:
+            continue
+        tree = Path(given.source or Path(__file__).resolve().parents[1]).resolve()
+        staging = root.parent / "bootstrap" / kind / revision
+        store = staging / "records"
+        request = {"checkout": str(root), "store": str(store), "work": str(staging / "work"),
+                   "tree": str(tree), "crates": [{"name": name, "version": "0.1.0", "features": []} for name in packages],
+                   "unsandboxed_build_scripts": False, "build_seconds": given.timeout}
+        payload = {"build_scripts": request} if field == "build_scripts" else request
+        env = {"HOME": os.environ["HOME"], "PATH": os.environ["PATH"], "RUST_BACKTRACE": "0"}
+        label = f"bootstrap-{kind}-{revision[:12]}"
+        command = log([given.module_builder, json.dumps(payload)], tree, env, given.timeout, label)
+        require(command["returncode"] == 0, f"{label} exited {command['returncode']}; see {log.directory}")
+        found = {}
+        destination = state["physical_home"] / ".blaze/v2" / kind / "modules"
+        for record in sorted((store / kind / "modules").glob("*")):
+            require(record.is_dir() and not record.is_symlink(), f"invalid D52 module directory {record}")
+            files = list(record.iterdir())
+            require(all(path.is_file() and not path.is_symlink() for path in files), f"invalid D52 record files in {record}")
+            identity = record / "identity"
+            require(identity.is_file() and digest(identity) == record.name, f"invalid D52 identity {identity}")
+            names = re.findall(r"^name (.+)$", identity.read_text(), re.MULTILINE)
+            require(len(names) == 1 and names[0] in packages and names[0] not in found, f"unexpected D52 package in {identity}")
+            wasm = record / "module.wasm"
+            checksum = record / "wasm-sha256"
+            require(wasm.is_file() and checksum.is_file() and checksum.read_text().strip() == digest(wasm), f"invalid D52 module {wasm}")
+            target = destination / record.name
+            if target.exists():
+                require(tree_hashes(target) == tree_hashes(record), f"immutable D52 record differs at {target}")
+            else:
+                shutil.copytree(record, target)
+            found[names[0]] = record.name
+        require(set(found) == set(packages), f"{label} produced {sorted(found)}, expected {sorted(packages)}")
+        prepared[revision] = found
+
+
+def perform_step(root: Path, case: dict, step: dict, given: Input, log: CommandLog,
+                 state: dict, daemon: CheckoutDaemon, scratch_case: Path) -> CheckoutDaemon:
     daemon.check_alive()
     write_files(root, step.get("files", {}))
-    step_env = step_environment(env, step)
+    prepare_modules(root, case, given, log, state)
+    step_env = step_environment(daemon.env, step)
     if "diagnostic" in step:
         perform_diagnostic(given, root, step_env, log, step["diagnostic"])
     if "error" in step:
         perform_error(root, case, step, given, step_env, log)
     if "test" in step:
         perform_test(root, case, step, given, step_env, log)
-    if "prints" in step:
+    if "prints" in step and not step.get("replay"):
         perform_prints(root, case, step, given, step_env, log, state)
     for name in step.get("absent", []):
         perform_absent(given, root, step_env, log, name)
     if step.get("replay"):
-        daemon = perform_replay(root, case, step, given, env, log, state, daemon, home, scratch_case)
+        daemon = perform_replay(root, case, step, given, log, state, daemon, scratch_case)
     daemon.check_alive()
     return daemon
 
@@ -867,10 +960,11 @@ def run_case(case: dict, given: Input, scratch: Path) -> dict:
     log = CommandLog(scratch, name)
     result = {"ok": False, "fixes": case["fixes"], "why": "not completed", "sources": {}, "steps": []}
     state: dict = {"physical_home": home, "home_containers": [], "daemons": []}
-    daemon = None
     try:
         root.mkdir(parents=True)
         copy_shelf(Path(given.shelf), home)
+        if case.get("clang"):
+            result["clang"] = copy_clang(given, home)
         logical, container = logical_home(home)
         state["home_containers"].append(container)
         env = environment(logical)
@@ -880,44 +974,48 @@ def run_case(case: dict, given: Input, scratch: Path) -> dict:
         daemon.start()
         steps = steps_for(case)
         for index, step in enumerate(steps):
-            before = dict(result["sources"])
-            result["sources"].update({path: hashlib.sha256(content.encode()).hexdigest()
-                                      for path, content in step.get("files", {}).items()})
             try:
-                daemon = perform_step(root, case, step, given, env, log, state, daemon, home, case_root)
+                daemon = perform_step(root, case, step, given, log, state, daemon, case_root)
                 result["steps"].append({"index": index, "ok": True})
-            except CaseFailed as error:
+            except (CaseFailed, Failed) as error:
                 result["steps"].append({"index": index, "ok": False, "why": str(error)})
                 raise
             finally:
-                if before != result["sources"]:
-                    state["mutated"] = sorted(set(result["sources"]) - set(before))
+                changed = {path: digest(root / path) for path in step.get("files", {}) if (root / path).is_file()}
+                result["sources"].update(changed)
+                if changed and len(result["steps"]) > index:
+                    result["steps"][index]["sources"] = changed
         result["ok"] = True
         result["why"] = "as stated"
-    except Exception as error:
-        result["ok"] = False
+    except CaseFailed as error:
         result["why"] = str(error)
+    except (Failed, OSError, subprocess.SubprocessError) as error:
+        result["why"] = str(error)
+        result["errors"] = [str(error)]
     finally:
-        for owned in reversed(state.get("daemons", [])):
+        if "modules" in state:
+            result["modules"] = state["modules"]
+        for owned in reversed(state["daemons"]):
             try:
                 owned.stop()
-            except CaseFailed as error:
-                result["ok"] = False
-                result["why"] += f"; cleanup: {error}"
+            except (Failed, OSError, subprocess.SubprocessError) as error:
+                result.setdefault("errors", []).append(f"cleanup: {error}")
         for container in state["home_containers"]:
             try:
                 cleanup_logical_home(container)
             except OSError as error:
-                result["ok"] = False
-                result["why"] += f"; cleanup logical HOME: {error}"
+                result.setdefault("errors", []).append(f"cleanup logical HOME: {error}")
+        if result.get("errors"):
+            if result["ok"]:
+                result["why"] = "; ".join(result["errors"])
+            result["ok"] = False
     return result
 
 
 def main(given: Input) -> int:
+    given = validate(given, os.environ.get("HOME"))
     scratch = Path(given.scratch)
     scratch.mkdir(parents=True, exist_ok=True)
-    before = provenance(given)
-    (scratch / "provenance.json").write_text(json.dumps(before, indent=2) + "\n")
     warnings = []
     if given.stall_bound is not None:
         warnings.append("stall_bound is a legacy harness input: the maintained checkout daemon exposes no such tuning; value ignored")
@@ -925,32 +1023,39 @@ def main(given: Input) -> int:
         "blaze": given.blaze, "scratch": given.scratch, "shelf": given.shelf,
         "only": list(given.only), "timeout": given.timeout, "source": given.source,
         "workers": given.workers, "stall_bound": given.stall_bound,
+        "module_builder": given.module_builder, "clang_shelf": given.clang_shelf,
     }, "warnings": warnings, "errors": [], "complete": False, "cases": {}}
     selected = [case for case in CASES if not given.only or case["name"] in given.only]
-    results = {}
+    results = {case["name"]: {"ok": False, "fixes": case["fixes"], "why": "not run"} for case in selected}
     try:
+        save(scratch / "results.json", results)
+        save(scratch / "run.json", report)
+        before = provenance(given)
+        save(scratch / "provenance.json", before)
         for case in selected:
             started = time.monotonic()
             result = run_case(case, given, scratch)
             result["seconds"] = round(time.monotonic() - started, 3)
             results[case["name"]] = result
             report["cases"][case["name"]] = {"ok": result["ok"], "why": result["why"]}
-            (scratch / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+            save(scratch / "results.json", results)
             print(f"{case['name']}: {'ok' if result['ok'] else 'FAILED'}: {result['why']}", flush=True)
+            if result.get("errors"):
+                report["errors"].extend(result["errors"])
+                break
         after = provenance(given)
-        (scratch / "provenance-after.json").write_text(json.dumps(after, indent=2) + "\n")
+        save(scratch / "provenance-after.json", after)
         if after != before:
-            report["errors"].append("source, harness, shelf or binary provenance changed during the run")
+            report["errors"].append("source, harness, shelf or binary provenance changed during acceptance")
         report["complete"] = not report["errors"]
-    except BaseException as error:
-        report["errors"].append(f"{type(error).__name__}: {error}")
-        raise
+    except (Failed, OSError, subprocess.SubprocessError) as error:
+        report["errors"].append(str(error))
     finally:
-        (scratch / "run.json").write_text(json.dumps(report, indent=2) + "\n")
-        if not (scratch / "results.json").exists():
-            (scratch / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+        save(scratch / "run.json", report)
     failed = sum(1 for result in results.values() if not result["ok"])
-    print(f"fork migration: {len(results) - failed}/{len(results)} passed; evidence in {scratch}", flush=True)
+    for error in report["errors"]:
+        print(f"fork migration: {error}", file=sys.stderr)
+    print(f"fork migration: {len(results) - failed}/{len(results)} cases passed; evidence in {scratch}", flush=True)
     return 1 if failed or report["errors"] else 0
 
 
@@ -958,6 +1063,6 @@ if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     try:
-        sys.exit(main(validate(parse(Input, sys.argv[1], "forkfixes.py"), os.environ.get("HOME"))))
+        sys.exit(main(parse(Input, sys.argv[1], "forkfixes.py")))
     except (OSError, ValueError, TypeError) as error:
         sys.exit(f"forkfixes.py: {error}")

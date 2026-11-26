@@ -325,7 +325,8 @@ pub(crate) fn lower_closure_with<A: Allocator + Copy, F: Facts, R: crate::one_ca
     let b = core::mem::replace(&mut l.b, crate::builder::Builder::new(crate::FlowBuilder::new_in(1, 0, alloc)));
     let flow = b.finish().map_err(|_| Refusal { form: Form::Builder, range })?;
     let params = core::mem::replace(&mut l.param_origs, Vec::new_in(alloc));
-    Ok(ClosureFlow { lowered: Lowered { flow, stats, params, coarse: l.coarse.get() }, externals })
+    let signature_origins = core::mem::replace(&mut l.uni, Vec::new_in(alloc));
+    Ok(ClosureFlow { lowered: Lowered { flow, stats, signature_origins, params, coarse: l.coarse.get() }, externals })
 }
 
 /// The body of an `async fn` (`BodyView::coroutine` is `Some`) as its own flow, its `.await`s
@@ -372,7 +373,8 @@ pub(crate) fn lower_async_fn_with<A: Allocator + Copy, F: Facts, R: crate::one_c
         return Err(Refusal { form: Form::Malformed, range });
     }
     let params = core::mem::replace(&mut l.param_origs, Vec::new_in(alloc));
-    Ok(Lowered { flow, stats, params, coarse: l.coarse.get() })
+    let signature_origins = core::mem::replace(&mut l.uni, Vec::new_in(alloc));
+    Ok(Lowered { flow, stats, signature_origins, params, coarse: l.coarse.get() })
 }
 
 impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, F, A, R> {

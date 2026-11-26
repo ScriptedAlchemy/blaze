@@ -11,7 +11,7 @@
 //! 1 error, 1 fix: blaze check --fix e7k2q
 //! ```
 //!
-//! JSON fields, in this order: `id`, `severity`, `code`, `path`, `line`, `col`, `end_line`,
+//! JSON fields, in this order: `id`, `severity`, `code`, optional `diagnostic_code`, `path`, `line`, `col`, `end_line`,
 //! `end_col`, `message`, `fix` (`null`, or `start_line`, `start_col`, `end_line`, `end_col`,
 //! `replace`, `with`, `reason`). A note is `{"note": ..}`; the closing object's fields are
 //! `errors`, `warnings`, `fixes`, `command`, `not_checked`.
@@ -65,6 +65,8 @@ pub struct Plain<'a> {
     pub severity: Severity,
     /// The rule's name (`syntax`, `unresolved`, `E0425`).
     pub code: &'a str,
+    /// The checker's specific diagnostic when several findings share the rule.
+    pub diagnostic_code: Option<&'a str>,
     /// Where it is: the file as shown, or, for a finding of no file, what it is about.
     pub path: &'a str,
     /// The file's text, for `line:col`; `None` for a finding of no file.
@@ -206,6 +208,10 @@ pub fn json(out: &mut AString<'_>, plain: &Plain<'_>) -> Result<(), PlainError> 
     json_str(out, plain.severity.label());
     out.str(",\"code\":");
     json_str(out, plain.code);
+    if let Some(code) = plain.diagnostic_code {
+        out.str(",\"diagnostic_code\":");
+        json_str(out, code);
+    }
     out.str(",\"path\":");
     json_str(out, plain.path);
     match plain.text {

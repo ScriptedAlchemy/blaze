@@ -869,7 +869,7 @@ fn finding_about<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], file: Option<&str>, s
                 writeln!(line, "{about}: {label}[{}]: {message}", l.code())
                     .map_err(|_| CliError::Text { what: "could not render a fileless finding" })?;
             } else {
-                let plain = Plain { id: l.id.as_str(), severity, code: l.code(), path: about.as_str(), text: None, start: 0, end: 0, message, fix: None };
+                let plain = Plain { id: l.id.as_str(), severity, code: l.code(), diagnostic_code: None, path: about.as_str(), text: None, start: 0, end: 0, message, fix: None };
                 written(&mut line, &plain, shown.view)?;
             }
             Ok(line)
@@ -971,7 +971,8 @@ fn drawing<'a>(
         words::help_words(&mut reason, change.reason, change.args()).map_err(|_| CliError::Text { what: "a fix's arguments do not match its help's words" })?;
     }
     if shown.view != View::Person {
-        let plain = Plain { id, severity, code: name, path, text: Some(text), start, end, message: headline.as_str(), fix: fix.map(|(edit, _)| (edit, reason.as_str())) };
+        let diagnostic_code = matches!((area, rule), (Area::Cli, crate::body_types::TYPES | crate::body_types::BORROWS)).then_some(args[0]);
+        let plain = Plain { id, severity, code: name, diagnostic_code, path, text: Some(text), start, end, message: headline.as_str(), fix: fix.map(|(edit, _)| (edit, reason.as_str())) };
         let mut line = AString::new_in(alloc);
         written(&mut line, &plain, shown.view)?;
         return Ok(line);

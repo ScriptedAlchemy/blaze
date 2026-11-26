@@ -9,7 +9,7 @@
 //!   no `clang.cfg`;
 //! - reads: the package's folder, the script's `OUT_DIR` as its record laid, each dependency's
 //!   laid `OUT_DIR` (`DEP_*_INCLUDE`), the SDK, the shelf: each a tree root named by its
-//!   digest ([`Laid`]); nothing else but macOS's loader reads;
+//!   digest ([`Laid`]); Linux's loader and its runtime are in the verified shelf too;
 //! - writes: one task folder for the object and its depfile (the output root, emptied first);
 //!   no network, no channel;
 //! - environment: `SOURCE_DATE_EPOCH=0` alone (`ClockSpec::Fixed { unix_secs: 0 }`: clang takes
@@ -537,7 +537,28 @@ impl CCompiler for ShelfClang<'_> {
             has_sysroot |= arg.starts_with("-isysroot") || arg.starts_with("--sysroot");
             held.push(self.host_arg(arg, alloc)?);
         }
-        if !has_sysroot {
+        #[cfg(target_os = "linux")]
+        {
+            // The host's GCC installation and C/C++ include directories are not inputs.
+            // Supply every default header directory from the two verified trees instead.
+            let major = blaze_build_script::toolchain::clang_major(blaze_pins::CLANG_JSON)
+                .map_err(|_| refused(alloc, &["pins/clang.json has no clang resource version"]))?;
+            held.push(text(&["-resource-dir"]));
+            held.push(text(&[self.shelf.host, "/lib/clang/", major]));
+            held.push(text(&["--target=aarch64-unknown-linux-gnu"]));
+            held.push(text(&["--sysroot=", self.sdk.host]));
+            held.push(text(&["--gcc-toolchain=", self.shelf.host]));
+            held.push(text(&["-nostdinc"]));
+            for parts in [
+                [self.shelf.host, "/lib/clang/", major, "/include"],
+                [self.sdk.host, "/usr/include/aarch64-linux-gnu", "", ""],
+                [self.sdk.host, "/usr/include", "", ""],
+            ] {
+                held.push(text(&["-isystem"]));
+                held.push(text(&parts));
+            }
+        }
+        if !cfg!(target_os = "linux") && !has_sysroot {
             held.push(text(&["-isysroot"]));
             held.push(text(&[self.sdk.host]));
         }
@@ -568,7 +589,20 @@ impl CCompiler for ShelfClang<'_> {
         // make; the object's path in the archive is its file name alone.
         held.push(text(&[self.task_out, "/", object_name]));
         let mut args: AVec<'a, &str> = Vec::with_capacity_in(held.len(), alloc);
+        // Linux's LLVM archive depends on glibc/libstdc++/libgcc/zlib. Enter through the
+        // pinned loader and its verified runtime closure, not the host's ELF interpreter
+        // and ld.so cache. -fintegrated-cc1 above keeps cc1 in this confined process.
+        #[cfg(target_os = "linux")]
+        let loader = text(&[self.shelf.host, "/runtime/ld-linux-aarch64.so.1"]);
+        #[cfg(target_os = "linux")]
+        let runtime = text(&[self.shelf.host, "/runtime"]);
+        #[cfg(target_os = "linux")]
+        args.extend_from_slice(&["--inhibit-cache", "--library-path", runtime.as_str(), self.clang]);
         args.extend(held.iter().map(|a| a.as_str()));
+        #[cfg(target_os = "linux")]
+        let program = loader.as_str();
+        #[cfg(not(target_os = "linux"))]
+        let program = self.clang;
 
         // The roots: each laid folder a tree root by its digest; the task folder the output.
         let mut roots: AVec<'a, Root<'_>> = Vec::new_in(alloc);
@@ -590,7 +624,7 @@ impl CCompiler for ShelfClang<'_> {
         let env = [("SOURCE_DATE_EPOCH", "0")];
         let report = RelPath::new(DEPFILE, blaze_roots::Limits::SHIPPED.most_path).map_err(|_| refused(alloc, &["the depfile's name"]))?;
         let spec = HermeticSpec::new(HermeticOpts {
-            program: Program::Stored { name: "clang", digest: Digest(self.shelf.digest), path: self.clang },
+            program: Program::Stored { name: "clang", digest: Digest(self.shelf.digest), path: program },
             args: &args,
             env: &env,
             roots,
