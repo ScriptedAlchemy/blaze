@@ -3234,6 +3234,59 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         Ok(())
     }
 
+    /// A checked noncapturing closure-to-fn coercion. A pointer counts every position of its
+    /// signature, while a closure value stores only the signature positions its owner binds.
+    /// Align them through the signature slots. Bound positions are proved in the closure's
+    /// body and instantiated when the pointer is called, so they take no origin from the value.
+    fn relate_closure_pointer(&mut self, src: Place, src_ty: TyD, dst: Place, dst_ty: TyD, e: ExprId) -> Result<(), Refusal> {
+        use closure::to_usize;
+
+        let (s, d) = (self.info(src), self.info(dst));
+        if !R::RELATES || self.plant == Plant::NoRelate || d.len == 0 {
+            return Ok(());
+        }
+        if !s.exact || !d.exact {
+            return self.relate(src, dst, dst_ty, e);
+        }
+        let (None, PNode::Closure { owner, ordinal, .. }) = (src_ty.wrap, self.node(src_ty.ty, e)?) else {
+            return self.refuse(Form::Malformed, e);
+        };
+        if owner != self.body.owner {
+            return self.refuse(Form::TypeNode, e);
+        }
+        let mut slots: Vec<SigSlot, A> = Vec::new_in(self.alloc);
+        self.sig_slots(to_usize(ordinal), e, &mut slots)?;
+        if slots.len() != to_usize(d.len) || slots.iter().filter(|slot| matches!(slot, SigSlot::Owner(_))).count() != to_usize(s.len) {
+            return self.refuse(Form::Malformed, e);
+        }
+        if s.len == 0 && !slots.contains(&SigSlot::Static) {
+            return Ok(());
+        }
+        let mut variances: Vec<Variance, A> = Vec::new_in(self.alloc);
+        self.position_variances(dst_ty, &mut variances, e)?;
+        if variances.len() != slots.len() {
+            return self.refuse(Form::Malformed, e);
+        }
+        for (i, (slot, variance)) in slots.into_iter().zip(variances).enumerate() {
+            let from = match slot {
+                SigSlot::Owner(k) if k < s.len => {
+                    let Some(&origin) = self.origs.get(to_usize(s.start + k)) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    origin
+                }
+                SigSlot::Owner(_) => return self.refuse(Form::Malformed, e),
+                SigSlot::Static => self.universal(Region::Static),
+                SigSlot::Late(_) | SigSlot::InnerBound(..) => continue,
+            };
+            let Some(&into) = self.origs.get(to_usize(d.start) + i) else {
+                return self.refuse(Form::Malformed, e);
+            };
+            self.relate_one(from, into, variance);
+        }
+        Ok(())
+    }
+
     fn operand(&self, v: Val, e: ExprId) -> Result<Operand, Refusal> {
         Ok(match v.at {
             At::Const => Operand::Const,
@@ -5992,6 +6045,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                                 UnsizeDone::Handled => {}
                                 UnsizeDone::Fallback => self.relate(p, tp, out, e)?,
                             }
+                        } else if kind == AdjustKind::ClosureFnPointer {
+                            self.relate_closure_pointer(p, v.ty, tp, out, e)?;
                         } else {
                             self.relate(p, tp, out, e)?;
                         }

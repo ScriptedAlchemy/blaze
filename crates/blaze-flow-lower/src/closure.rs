@@ -2194,7 +2194,7 @@ fn to_u32(n: usize) -> u32 {
 }
 
 #[inline]
-fn to_usize(n: u32) -> usize {
+pub(super) fn to_usize(n: u32) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
 }
 

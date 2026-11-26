@@ -521,26 +521,34 @@ fn closure_fn_ptr_param_call_lowers_cleanly() {
     }
 }
 
-/// `let cb = (|arg| ()) as fn(&u8)` lowers the same coercion as `let cb: fn(&u8) = |arg| ()`.
-/// Without the fix the explicit cast adds an `AggregateHub` between two pointer region slots.
+/// An explicit cast and an ascribed binding use the checked pointer coercion once. With a
+/// reference result, the closure's owner output slot goes to the pointer's output. The pointer's
+/// bound input is a distinct position, so generic value assignment reports `ValueInexact`.
 #[test]
 fn explicit_closure_to_fn_pointer_cast_uses_the_checked_coercion_once() {
     let mut fx = Fx::new();
     let unit = fx.unit();
     let byte = fx.ty(PNode::Uint(UintTy::U8));
     let input = fx.r(Mutbl::Not, byte);
-    let sig = fx.list(&[input, unit]);
-    let pointer = fx.ty(PNode::FnPtr(sig, FnPtrHeader::RUST));
+    let unit_sig = fx.list(&[input, unit]);
+    let unit_pointer = fx.ty(PNode::FnPtr(unit_sig, FnPtrHeader::RUST));
+    let ref_sig = fx.list(&[input, input]);
+    let ref_pointer = fx.ty(PNode::FnPtr(ref_sig, FnPtrHeader::RUST));
     let owner = fx.func("f", 0, &[], unit, no_clauses());
     fx.finish();
 
     let mut lane = Lane::new();
     lane.wide.add(owner, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: unit, slots: &[] });
     let alloc = crate::region_fixture::alloc();
-    for explicit in [false, true] {
+    for (pointer, returns_ref, explicit) in [
+        (unit_pointer, false, false),
+        (unit_pointer, false, true),
+        (ref_pointer, true, false),
+        (ref_pointer, true, true),
+    ] {
         let mut b = Bb::new();
         let arg = b.bind("arg");
-        let result = b.tuple(&[]);
+        let result = if returns_ref { b.local(arg) } else { b.tuple(&[]) };
         let closure = b.closure(&[arg], result);
         let callback = b.bind("cb");
         let binding = if explicit {
@@ -559,7 +567,7 @@ fn explicit_closure_to_fn_pointer_cast_uses_the_checked_coercion_once() {
         let regions = lane.decls().lay(fx.t.view(), &mut checked.types);
         let facts = crate::region_fixture::WithRegions { base: &lane, regions: &regions };
         let lowered = crate::lower(&body, &checked, &facts, alloc).expect("lower the callback binding");
-        assert!(lowered.coarse.is_none(), "explicit cast {explicit}: {:?}", lowered.coarse);
+        assert!(lowered.coarse.is_none(), "explicit cast {explicit}, reference result {returns_ref}: {:?}", lowered.coarse);
         let findings = blaze_flow::check(&lowered.flow, alloc).expect("check the callback binding");
         assert!(findings.moves.is_empty() && findings.borrows.is_empty());
     }
