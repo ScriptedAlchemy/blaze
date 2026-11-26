@@ -1509,3 +1509,37 @@ mod std_readiness_tests {
         assert_eq!(rows.row(2).landing, 0);
     }
 }
+
+/// Sota's trap row must name a register holding the *original* invalid enum
+/// discriminant, including dense switches whose table would otherwise normalize it.
+#[test]
+fn a_switch_default_trap_keeps_the_original_discriminant() {
+    use blaze_code::record::Held;
+    for count in [2, 8] {
+        let mut b = Builder::<Global, Full>::new_in(64, Global);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        let default = b.create_block(BlockKind::Normal);
+        let valid = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let value = b.param(Ty::I64);
+        let cases: std::vec::Vec<_> = (1..=count).map(|n| (n as u128, (valid, &[][..]))).collect();
+        b.switch(value, (default, &[]), &cases);
+        b.begin(default);
+        b.unreachable();
+        b.begin(valid);
+        let answer = b.iconst(Ty::I64, 1);
+        b.ret(&[answer]);
+        let func = b.finish_checked().unwrap();
+        let emitted = Sota::standalone().emit(verify(func.view()).unwrap(), &NoNames, MAC_ARM64, Alloc::global()).unwrap();
+        assert_eq!(emitted.traps.len(), 1);
+        assert_eq!(emitted.traps[0].held, Held::Reg(16));
+        // Valid cases still run; invalid cases are covered by the process-level
+        // run_trapped_enum test, which reads the child's real register snapshot.
+        let (exec, _) = load_exec(emitted);
+        let call: extern "C" fn(u64) -> u64 = unsafe { exec.as_fn() };
+        assert_eq!(call(1), 1);
+        assert_eq!(call(count), 1);
+    }
+}
