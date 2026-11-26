@@ -1385,7 +1385,7 @@ impl TcpListener {
         sys_set_nonblocking(self.fd.fd(), on).map_err(IoError::from_errno)
     }
 
-    /// Accepts one connection with `FD_CLOEXEC`.
+    /// Accepts a blocking stream with `FD_CLOEXEC`, including from a nonblocking listener.
     pub fn accept(&self) -> Result<TcpStream, IoError> {
         #[cfg(target_os = "linux")]
         {
@@ -1408,6 +1408,7 @@ impl TcpListener {
             // SAFETY: `rc >= 0` is a fresh owned descriptor.
             let fd = unsafe { OwnedFd::from_raw(rc) };
             sys_set_close_on_exec(fd.fd(), true).map_err(IoError::from_errno)?;
+            sys_set_nonblocking(fd.fd(), false).map_err(IoError::from_errno)?;
             let _ = setsockopt_int(fd.fd(), SOL_SOCKET, SO_NOSIGPIPE, 1);
             Ok(TcpStream { fd })
         }

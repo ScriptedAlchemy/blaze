@@ -121,7 +121,8 @@ fn coordinate(args: &[String<WireAlloc>], alloc: WireAlloc) -> Result<(), Comman
             ..Default::default()
         },
         alloc,
-    );
+    )
+    .start_on_claim();
     let stop = Arc::new_in(AtomicBool::new(false), alloc);
     let server = Server::bind(
         path,
