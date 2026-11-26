@@ -38,7 +38,7 @@ use blaze_ids::ContentId;
 use blaze_ladder::code_records::{CodeKey, CodeStore};
 
 use super::plain_place::{Facts, StoreAlloc, after_answer, config, open, test_cx};
-use super::roots::{CleanupLine, keep_program, keep_toolchain};
+use super::roots::{CleanupLine, keep_export, keep_program, keep_toolchain, renew_export};
 use crate::code_store::HomeCodeStore;
 use crate::start_list::{self, Certificate, HEAD, ListName, ROW, Today};
 
@@ -187,6 +187,53 @@ fn idle(sim: Sim, n: u64) -> Sim {
     let lent = process(sim, n);
     after_answer(&test_cx(), &lent, 1).expect("an idle commit");
     back(lent)
+}
+
+/// An export has no start list. Its code survives lease expiry and cleanup through the
+/// artifact's root, including when an artifact no-op renewed the root without a new walk.
+fn export_surviving_pointers(rooted: bool) -> usize {
+    let id = ContentId::of("reach test export", b"app");
+    let process_one = process(Sim::new(53, Faults::default()), 1);
+    let mut codes = HomeCodeStore::new(&process_one);
+    for n in A {
+        codes.put(CodeClass::Program, content(n), &entry(n)).expect("an entry put");
+        codes.point(CodeClass::Program, code(n), content(n)).expect("a pointer put");
+    }
+    if rooted {
+        keep_export(&process_one, &id, &codes.reached()).expect("the export root");
+    }
+    drop(codes);
+    after_answer(&test_cx(), &process_one, 1).expect("the export commits");
+    let mut sim = back(process_one);
+    let interval = Duration::from_nanos(ROOT_LIFE_NS) / 2 + MINUTE;
+    sim.advance(interval);
+
+    let no_op = process(sim, 2);
+    renew_export(&no_op, &id);
+    after_answer(&test_cx(), &no_op, 1).expect("the no-op commits");
+    let mut sim = back(no_op);
+    sim.advance(interval);
+    for n in 3..11 {
+        sim = idle(sim, n);
+        sim.advance(MINUTE);
+    }
+
+    let reopened = process(sim, 11);
+    let codes = HomeCodeStore::new(&reopened);
+    A.filter(|&n| {
+        let key = codes.pointed(code(n)).expect("a pointer lookup");
+        key == Some(content(n)) && codes.get(content(n)).expect("an entry lookup") == Some(&entry(n)[..])
+    }).count()
+}
+
+#[test]
+fn export_code_survives_cleanup_and_artifact_no_op() {
+    assert_eq!(export_surviving_pointers(true), A.len());
+}
+
+#[test]
+fn an_export_root_planted_off_loses_its_code() {
+    assert_eq!(export_surviving_pointers(false), 0);
 }
 
 /// Which of the first checkout's own instances still read: by content key or by pointer.

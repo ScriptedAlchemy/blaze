@@ -655,6 +655,11 @@ leaves no hole, so it CLOSES the program before it writes.
    under (certificate, target, tier, profile) holds the file's content id and the report: a repeat with
    nothing changed compares the destination's id and writes nothing.
 
+An export keeps the code entries and pointers reached by its walk under an `expo.<id>`
+root. The id names the package, target, and profile. A successful export replaces the
+root's index, and an artifact no-op renews the root. The store uses the same reach sweep
+and lifetime as program code from `blaze run`.
+
 Floors: nothing changed, 3 ms (certificate, one compare); one body edited: its code, then the layout and the
 write of the whole file (about 25 ms a 50 MB file each for the write and the page hashes): an export is
 written whole by design, and its floor is the file's size, not the program's source.

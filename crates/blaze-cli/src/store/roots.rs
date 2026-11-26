@@ -17,6 +17,7 @@
 //!   records costs a root of one key; renewed by a run of that program from any checkout, let
 //!   go of when no checkout runs it for blaze-cas `ROOT_LIFE_NS`. It names the certificate's
 //!   run tables too (`run_ids`, `run_names`: [`start_list::Today::tables`]).
+//!   An export names its reached code through [`keep_export`] under the same lifetime.
 //! - [`Toolchain`]: the toolchain's records for every project on it, by the root `tool.<id>`
 //!   ([`keep_toolchain`]): std's compiled code (`CodeClass::Toolchain` writes), and from the
 //!   engine's answer std's names records with the expansion records beside them; renewed by
@@ -132,6 +133,11 @@ impl RootName {
         RootName::of(b"code.", &list.id().0)
     }
 
+    /// An export's code root, by package, binary and profile.
+    fn export(id: &blaze_ids::ContentId) -> RootName {
+        RootName::of(b"expo.", &id.0)
+    }
+
     /// The toolchain root of `toolchain`: `tool.` and the 64 hex of its id. Every project on one
     /// toolchain shares it, so std's compiled code made for one is found by the next.
     pub(crate) fn toolchain(toolchain: ToolchainId) -> RootName {
@@ -218,18 +224,28 @@ pub(crate) fn keep_program<D: Driver>(lent: &Lent<D, StoreAlloc>, today: &start_
     if let Some(bytes) = list {
         kept.stale_rows = start_list::rooted_keys(lent, &today.name, bytes, &mut keys).map_err(RootError::List)?;
     }
-    // The index sorts and dedups (blaze-cas `Plain::index`); its cap is the store's refusal.
-    let store = |why| RootError::Store { class: Program::WHAT, root, why };
-    let index = lent.index(&keys).map_err(store)?;
-    let at = lent.root_through(root.as_str(), &[index], ROOT_LIFE_NS).map_err(store)?;
-    Ok((Rooted::new(at), kept))
+    Ok((keep_indexed(lent, root, &keys)?, kept))
+}
+
+/// Keep the code records and pointers reached by this export for the next build.
+pub(crate) fn keep_export<D: Driver>(lent: &Lent<D, StoreAlloc>, id: &blaze_ids::ContentId, walked: &[CasKey]) -> Result<Rooted<Program>, RootError> {
+    keep_indexed(lent, RootName::export(id), walked)
+}
+
+/// An unchanged artifact used the previous export's closure. Renew its index in place.
+pub(crate) fn renew_export<D: Driver>(lent: &Lent<D, StoreAlloc>, id: &blaze_ids::ContentId) {
+    lent.renew_root(RootName::export(id).as_str(), ROOT_LIFE_NS);
 }
 
 /// Pins a test suite's kept incremental state (pointer, state record, head, postings, result
 /// records) under `test.<id>` for [`ROOT_LIFE_NS`].
 pub(crate) fn keep_test_suite<D: Driver>(lent: &Lent<D, StoreAlloc>, suite: &blaze_ids::ContentId, keys: &[CasKey]) -> Result<Rooted<TestSuite>, RootError> {
-    let root = RootName::test_suite(suite);
-    let store = |why| RootError::Store { class: TestSuite::WHAT, root, why };
+    keep_indexed(lent, RootName::test_suite(suite), keys)
+}
+
+fn keep_indexed<C: Class, D: Driver>(lent: &Lent<D, StoreAlloc>, root: RootName, keys: &[CasKey]) -> Result<Rooted<C>, RootError> {
+    let store = |why| RootError::Store { class: C::WHAT, root, why };
+    // The index sorts and deduplicates keys and refuses oversize closures.
     let index = lent.index(keys).map_err(store)?;
     let at = lent.root_through(root.as_str(), &[index], ROOT_LIFE_NS).map_err(store)?;
     Ok(Rooted::new(at))

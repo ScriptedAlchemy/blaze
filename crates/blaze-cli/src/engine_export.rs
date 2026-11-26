@@ -87,6 +87,8 @@ pub enum ExportCliError {
     Store { symbol: [u8; 32], shown: AString<'static> },
     /// A code or datum entry was missing from the store right after stepping.
     MissingEntry { symbol: [u8; 32] },
+    /// Rooting the reached program code for subsequent exports failed.
+    KeepCode(crate::store::roots::RootError),
     /// Decoding a code entry, code record, or datum record failed.
     Decode { symbol: [u8; 32], what: &'static str, shown: AString<'static> },
     /// Resolving an item-relative source position row failed.
@@ -141,6 +143,7 @@ impl fmt::Display for ExportCliError {
             ExportCliError::Special { what, shown } => write!(f, "blaze export: building {what}: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::Store { symbol, shown } => write!(f, "blaze export: reading code entry {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::MissingEntry { symbol } => write!(f, "blaze export: code entry {} missing from store after step (engine_export.rs)", Hex(symbol)),
+            ExportCliError::KeepCode(error) => write!(f, "blaze export: {error}"),
             ExportCliError::Decode { symbol, what, shown } => write!(f, "blaze export: decoding {what} {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::Position { symbol, shown } => write!(f, "blaze export: resolving source position in {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::Materialize { symbol, shown } => write!(f, "blaze export: materializing position-free record {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
@@ -678,6 +681,12 @@ fn export_program<'f>(
     };
     let mut maker = Maker::of_roots(names, maker_entry, &roots, ByKind::new(typed.over(ids)), &builder, heap.alloc());
     let mut codes = HomeCodeStore::new(lent);
+    let export_id = blaze_ids::Hasher::new("blaze export program root 1")
+        .part(picked.package.as_bytes())
+        .part(picked.bin.as_bytes())
+        .part(picked.root.as_bytes())
+        .part(&[u8::from(release)])
+        .finish();
 
     // Optional distributed compilation pass over workspace crates (D11).
     let mut dist_fp: Option<blaze_wire::Digest> = None;
@@ -704,6 +713,7 @@ fn export_program<'f>(
         match outcome {
             crate::engine_dist::DistExportOutcome::NoOp => {
                 end_procs(cx, &maker_procs, standing.err, "export")?;
+                crate::store::roots::renew_export(lent, &export_id);
                 return Ok(ExportSummary {
                     output: output_path,
                     exported: Exported {
@@ -1124,12 +1134,15 @@ fn export_program<'f>(
     let mut exe_bytes: AVec<'_, u8> = Vec::new_in(alloc);
     let exported = blaze_export::export(&program_in, platform, &mut exe_bytes, alloc).map_err(|error| box_err(ExportCliError::Export(error), heap))?;
 
-    // Release immutable borrows of `codes` before persisting toolchain code.
+    // Keep every reached pointer and target across the next command's reach sweep.
     drop(functions);
     drop(data);
     drop(seen_data);
+    let walked = codes.reached();
     let toolchain_made = codes.toolchain_made();
     drop(codes);
+    crate::store::roots::keep_export(lent, &export_id, &walked)
+        .map_err(|why| box_err(ExportCliError::KeepCode(why), heap))?;
     if let Err(why) = crate::store::roots::keep_toolchain(lent, builder.toolchain, &toolchain_made, &[]) {
         standing.err.line(cx, format_args!("blaze export: warning: toolchain code was not kept: {why}")).map_err(CliError::Out)?;
     }
