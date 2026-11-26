@@ -3531,6 +3531,11 @@ fn checking<'f, 's: 'f>(
             let home_dir = Some(opened.home.dir());
             sweep::read_home_listing(cx, home_dir, &stamps, crate::macros::MODULE_LISTING, &mut rows, frame)?;
             sweep::read_home_listing(cx, home_dir, &stamps, crate::scripts::MODULE_LISTING, &mut rows, frame)?;
+            if let (Some(home), Some(lockfile), Some(members)) = (env.home, laid_here.lock.as_ref(), crate::names::member_dirs(Some(&laid_here))) {
+                crate::script_modules::read_checkout_receipts(
+                    cx, root, &stamps, home, lockfile.lock, members, followed_kept.as_ref().map(|followed| &followed.now), &mut rows, frame,
+                )?;
+            }
             phases.mark_cx(cx, "layout", frame);
             let units = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
             if let (Some(lockfile), Some(parts)) = (laid_here.lock.as_ref(), laid_here.parts.take()) {

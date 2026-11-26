@@ -32,7 +32,7 @@
 use super::*;
 
 use blaze_build_script::{
-    module_record::{Digest, Executable, Identity, Source},
+    module_record::{CheckoutRead, Digest, Executable, Identity, Source, checkout_path},
     wasi_std::{self, PERM_ANCHOR, PERM_PATCH, RT_ANCHOR, RT_PATCH, UNIX_PATH_LIST_END, UNIX_PATH_LIST_START, WASI_PATHS_ANCHOR, WASI_PATHS_PATCH, WASI_PATH_LIST_HEADER},
 };
 
@@ -434,6 +434,74 @@ struct BuiltScript {
     fresh: bool,
 }
 
+/// Rustc reports source files. A dependency's build script or procedural macro needs an
+/// explicit output receipt of its own before the local module can use that finer identity.
+fn has_dependency_producer(output: &str, library: &Path, checkout: &Path, member: &Path, closure: &[String]) -> bool {
+    output.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).any(|message| {
+        let text = |field: &str| message.get(field).and_then(serde_json::Value::as_str).unwrap_or("");
+        let manifest = Path::new(text("manifest_path"));
+        if text("reason") != "compiler-artifact" || manifest.starts_with(library) {
+            return false;
+        }
+        let package_id = text("package_id");
+        if package_id.starts_with("path+") && manifest.starts_with(checkout) && !manifest.starts_with(member) {
+            return true;
+        }
+        let (name, version) = artifact_package(package_id);
+        if !closure.iter().any(|row| {
+            let mut fields = row.split(' ');
+            fields.next() == Some(name) && fields.next() == Some(version)
+        }) {
+            return false;
+        }
+        message.get("target").and_then(|target| target.get("kind")).and_then(serde_json::Value::as_array)
+            .is_some_and(|kinds| kinds.iter().any(|kind| matches!(kind.as_str(), Some("custom-build" | "proc-macro"))))
+    })
+}
+
+/// The uplifted Cargo dep-info records the actual path inputs of this root and its local
+/// dependencies. Registry and sysroot bytes already have pinned identities.
+fn checkout_inputs(checkout: &Path, source: &Path, script: &Path, artifact: &Path, supplied: &[&Path], alloc: blaze_own::Alloc<'_>) -> Result<String, Failure> {
+    use std::fmt::Write as _;
+
+    let depfile = artifact.with_extension("d");
+    let refuse = |why: String| Failure::Manifest { path: depfile.clone(), why };
+    let text = read(&depfile)?;
+    let mut listed = blaze_own::AVec::new_in(alloc);
+    blaze_build_script::toolchain::depfile_reads(&text, &mut listed, alloc);
+    if !listed.iter().any(|file| Path::new(file.as_str()) == script) {
+        return Err(refuse(format!("the compile receipt did not name its root source {}", script.display())));
+    }
+    let bad_path = |path: &Path| refuse(format!("the compile receipt cannot name {} relative to the checkout", path.display()));
+    let source_name = checkout_relative(source, checkout).ok_or_else(|| bad_path(source))?;
+    let mut footprint = format!("checkout-package {}\n", if source_name.is_empty() { "." } else { source_name });
+    let mut files = vec![checkout.join("Cargo.toml"), checkout.join("Cargo.lock"), source.join("Cargo.toml")];
+    for path in &listed {
+        let path = Path::new(path.as_str());
+        if path.starts_with(source) {
+            files.push(path.to_owned());
+        } else if !supplied.iter().any(|root| path.starts_with(root)) {
+            return Err(refuse(format!("the compile read {} outside its checkout package and the pinned toolchain inputs", path.display())));
+        }
+    }
+    files.sort_unstable();
+    files.dedup();
+    for file in &files {
+        if std::fs::canonicalize(file).map_err(io(file))? != *file {
+            return Err(refuse(format!("{} is not a plain path under the checkout", file.display())));
+        }
+        let bytes = std::fs::read(file).map_err(io(file))?;
+        let path = checkout_relative(file, checkout).ok_or_else(|| bad_path(file))?;
+        let input = CheckoutRead { path, content: Digest::checkout_file(&bytes) };
+        write!(footprint, "{input}").expect("writing text to a string succeeds");
+    }
+    Ok(footprint)
+}
+
+fn checkout_relative<'p>(path: &'p Path, checkout: &Path) -> Option<&'p str> {
+    path.strip_prefix(checkout).ok()?.to_str().filter(|path| path.is_empty() || checkout_path(path))
+}
+
 impl Plan<'_> {
     /// One package's script: its workspace, its sandboxed offline build, its record.
     fn build_script(
@@ -442,6 +510,7 @@ impl Plan<'_> {
         library: &Path,
         shim_digest: &str,
         patches_digest: &str,
+        workspace_before: &str,
         native: Option<&Native>,
         alloc: blaze_own::Alloc<'_>,
     ) -> Result<BuiltScript, Failure> {
@@ -470,8 +539,6 @@ impl Plan<'_> {
             .ok_or_else(|| no_module("the lock closure digest is not hexadecimal SHA-256".to_owned()))?;
         let feature_names: Vec<_> = features.iter().map(String::as_str).collect();
         let header = Identity { name: &wanted.name, version: &wanted.version, source: source_pin, dependencies, features: &feature_names, toolchain: &self.tool.name };
-        let identity = format!("{header}{runner}builder bootstrap\n");
-        let key = sha256(identity.as_bytes());
         let source = match origin {
             Origin::Registry { .. } => self.work.join("vendor").join(format!("{}-{}", wanted.name, wanted.version)),
             Origin::Path { dir, .. } | Origin::Git { dir, .. } => dir.clone(),
@@ -592,6 +659,7 @@ impl Plan<'_> {
         }
         let what = format!("the build of {} {}'s script", wanted.name, wanted.version);
         let mut ran = run(&argv, &ws, &env, Duration::from_secs(self.args.build_seconds), &what)?;
+        let dependency_producer = has_dependency_producer(&String::from_utf8_lossy(&ran.output), library, &self.args.checkout, &ws.join("script"), &closure);
         let (compiled, readable) = artifacts_of(&String::from_utf8_lossy(&ran.output));
         ran.output = readable.clone().into_bytes();
         let log = self.work.join("logs").join(format!("{}-{}.script.txt", wanted.name, wanted.version));
@@ -608,6 +676,19 @@ impl Plan<'_> {
         };
         let (module_file, digest_file) = (executable.filename(), executable.digest_filename());
         let wasm_path = target.join(artifact);
+        let footprint = match origin {
+            Origin::Path { dir, files, .. } if native.is_none() && !dependency_producer => {
+                let footprint = checkout_inputs(&self.args.checkout, dir, &script, &wasm_path, &[&self.work, library, &self.tool.sysroot], alloc)?;
+                let observed = files_digest(dir)?;
+                if observed != *files || workspace_before != read(&self.args.checkout.join("Cargo.toml"))? || read(&self.args.checkout.join("Cargo.lock"))? != self.lock {
+                    return Err(no_module("the checkout package changed during the bootstrap build".to_owned()));
+                }
+                footprint
+            }
+            _ => String::new(),
+        };
+        let identity = format!("{header}{runner}{footprint}builder bootstrap\n");
+        let key = sha256(identity.as_bytes());
         let wasm = std::fs::read(&wasm_path).map_err(io(&wasm_path))?;
         let wasm_sha256 = sha256(&wasm);
         let record = self.args.store.join("build-script/modules").join(&key);
@@ -653,6 +734,7 @@ pub(super) fn main_with(text: &str, heap: &blaze_own::Heap) -> i32 {
     let tool = toolchain(&tree, &home).unwrap_or_else(|failure| fail(failure));
     let (library, shim_digest, patches_digest) = library(&tool, &tree, &work).unwrap_or_else(|failure| fail(failure));
     let lock = read(&args.checkout.join("Cargo.lock")).unwrap_or_else(|failure| fail(failure));
+    let workspace_manifest = read(&args.checkout.join("Cargo.toml")).unwrap_or_else(|failure| fail(failure));
     let me = std::env::current_exe().unwrap_or_else(|error| fail(Failure::Io { path: PathBuf::from("current_exe"), error })).into_os_string();
     // A workspace or git member's script needs only its build-dependencies: the fetch and the
     // build take its manifest cut to them (the fetch's member manifest wants a `[lib]` table,
@@ -691,7 +773,7 @@ pub(super) fn main_with(text: &str, heap: &blaze_own::Heap) -> i32 {
     let mut failed = 0;
     for (at, wanted) in args.crates.iter().enumerate() {
         let started = Instant::now();
-        match plan.build_script(at, &library, &shim_digest, &patches_digest, native, heap.alloc()) {
+        match plan.build_script(at, &library, &shim_digest, &patches_digest, &workspace_manifest, native, heap.alloc()) {
             Ok(built) => println!(
                 "{} {} [{}]: script module {} wasm-sha256 {} {} bytes{} in {:.1}s",
                 wanted.name,

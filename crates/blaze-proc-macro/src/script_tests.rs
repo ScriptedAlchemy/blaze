@@ -114,6 +114,42 @@ fn exact_script_module_reopens_the_selected_executable_bytes() {
     std::fs::remove_dir_all(store).unwrap();
 }
 
+#[test]
+fn checkout_script_lookup_selects_only_the_current_compiler_reads() {
+    use blaze_build_script::module_record::{CheckoutRead, Digest};
+
+    use crate::module::sha256_hex;
+    use crate::script_unit::{CheckoutModule, checkout_module_of, wasm_runner_lines};
+
+    let store = folder("tracked-module-reads");
+    let [shim, recipe] = wasm_runner_lines();
+    let publish = |compile_input: &[u8], wasm: &[u8]| {
+        let read = CheckoutRead { path: "pkg/build.rs", content: Digest::checkout_file(compile_input) };
+        let identity = format!("blaze build-script module 3\nname shapes\nversion 0.1.0\nfiles {}\nfeatures \n{shim}\n{recipe}\ntoolchain {}\ncheckout-package pkg\n{read}", sha256_hex(compile_input), blaze_pins::TOOLCHAIN);
+        let record = store.join("build-script/modules").join(sha256_hex(identity.as_bytes()));
+        std::fs::create_dir_all(&record).unwrap();
+        std::fs::write(record.join("identity"), identity).unwrap();
+        std::fs::write(record.join("module.wasm"), wasm).unwrap();
+        std::fs::write(record.join("wasm-sha256"), sha256_hex(wasm)).unwrap();
+        record
+    };
+    let old = publish(b"build old archive", b"old wasm");
+    let new = publish(b"build renamed archive", b"new wasm");
+    let select = |directory, source| {
+        checkout_module_of(&store, "shapes", "0.1.0", &[], CheckoutModule {
+            directory,
+            required: &["pkg/build.rs"],
+            agrees: &|read| read.path == "pkg/build.rs" && read.content == Digest::checkout_file(source),
+        }).unwrap()
+    };
+    assert_eq!(select("pkg", b"build old archive"), Some(old.clone()));
+    assert_eq!(select("pkg", b"build renamed archive"), Some(new));
+    assert_eq!(select("pkg", b"build old archive"), Some(old));
+    assert_eq!(select("pkg", b"not built yet"), None);
+    assert_eq!(select("foreign", b"build old archive"), None);
+    std::fs::remove_dir_all(store).unwrap();
+}
+
 fn uleb(mut value: u64, out: &mut Vec<u8>) {
     loop {
         let byte = (value & 0x7f) as u8;

@@ -16,7 +16,7 @@ use blaze_build_script::{
     Outputs, OutputsRef,
     env::{DepMetadata, Given, PackageFacts},
     key::{CMode, RunLimits},
-    module_record::{Digest, Executable, Request, Selected},
+    module_record::{CheckoutRead, Digest, Executable, Request, Selected, checkout_package},
     native::Runner,
     probe::Row,
     toolchain::Mode,
@@ -144,14 +144,25 @@ impl std::error::Error for UnitScriptError {}
 /// identity has a `target` line, D69) is never it: that one holds `script.bin`, not a module.
 /// `Ok(None)`: the store holds no such record (no `modules` folder at all included).
 pub fn module_of(store: &Path, name: &str, version: &str, features: &[&str]) -> Result<Option<PathBuf>, ModuleLookupError> {
-    module_where(store, name, version, features, None)
+    module_where(store, name, version, features, None, None)
 }
 
 /// The native binary record (`<store>/build-script/modules/<key>`, holding `script.bin`) of
 /// `name version` built for `host` with exactly `features` (D69: the interim builder's
 /// `native` mode, whose identity adds `target <host>`).
 pub fn module_of_native(store: &Path, name: &str, version: &str, features: &[&str], host: &str) -> Result<Option<PathBuf>, ModuleLookupError> {
-    module_where(store, name, version, features, Some(host))
+    module_where(store, name, version, features, Some(host), None)
+}
+
+/// A local module is eligible if the files the bootstrap compile observed still agree.
+pub struct CheckoutModule<'a> {
+    pub directory: &'a str,
+    pub required: &'a [&'a str],
+    pub agrees: &'a dyn Fn(CheckoutRead<'_>) -> bool,
+}
+
+pub fn checkout_module_of(store: &Path, name: &str, version: &str, features: &[&str], checkout: CheckoutModule<'_>) -> Result<Option<PathBuf>, ModuleLookupError> {
+    module_where(store, name, version, features, None, Some(checkout))
 }
 
 /// Why the module store could not answer a lookup: each names the path (rule 19), and none is
@@ -223,6 +234,11 @@ fn records(store: &Path) -> Result<Vec<(PathBuf, String)>, ModuleLookupError> {
     Ok(found)
 }
 
+/// The local WASI receipts, to plan reads of their confined paths before the module tasks.
+pub fn checkout_receipts(store: &Path) -> Result<impl Iterator<Item = String>, ModuleLookupError> {
+    Ok(records(store)?.into_iter().filter_map(|(_, identity)| checkout_package(&identity).is_some().then_some(identity)))
+}
+
 /// Every record of the store whose identity names `name` and `version`, whatever its features
 /// and runner: (its folder, its identity's text), sorted by folder. What a refusal of a lookup
 /// shows beside the asked identity (rule 19): which line of the nearest record differs.
@@ -251,13 +267,14 @@ pub fn wasm_runner_lines() -> [String; 2] {
 /// <host>`; for `None`, one with no `target` line and this host's [`wasm_runner_lines`].
 /// Several checkout revisions can name the same WASI executable. They give one answer if
 /// their verified module bytes agree. Different answers are refused.
-fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
+fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>, checkout: Option<CheckoutModule<'_>>) -> Result<Option<PathBuf>, ModuleLookupError> {
     let mut sorted = features.to_vec();
     sorted.sort_unstable();
     let lines = [format!("name {name}"), format!("version {version}"), format!("features {}", sorted.join(","))];
     let target = host.map(|host| format!("target {host}"));
     let wasm = wasm_runner_lines();
-    let mut fits = records(store)?.into_iter().filter(|(_, identity)| {
+    let records = records(store)?;
+    let compatible = |identity: &str| {
         // A stale WASM module may sit beside its rebuild. Only the compatible record answers
         // the ask, and the lookup diagnostic names a missing or differing identity line.
         let runner_fits = match &target {
@@ -265,11 +282,28 @@ fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host
             None => !identity.lines().any(|l| l.starts_with("target ")) && wasm.iter().all(|want| identity.lines().any(|l| l == want)),
         };
         runner_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
+    };
+    let mut fits = records.into_iter().filter(|(_, identity)| {
+        compatible(identity) && checkout.as_ref().is_none_or(|checkout| {
+            let mut reads = CheckoutRead::inputs(identity);
+            let valid = |read: Option<CheckoutRead<'_>>| read.is_some_and(checkout.agrees);
+            let mut toolchain = identity.lines().filter_map(|line| line.strip_prefix("toolchain "));
+            checkout_package(identity) == Some(checkout.directory)
+                && toolchain.next() == Some(blaze_pins::TOOLCHAIN) && toolchain.next().is_none()
+                && reads.next().is_some_and(valid) && reads.all(valid)
+                && checkout.required.iter().all(|required| CheckoutRead::inputs(identity).flatten().any(|read| read.path == *required))
+        })
     });
     let Some((first, identity)) = fits.next() else { return Ok(None) };
+    if checkout.is_some() {
+        verify_module_record_key(&first, &identity)?;
+    }
     let checkout_wasm = |identity: &str| host.is_none() && identity.lines().any(|line| line.starts_with("files "));
     let mut first_bytes = None;
     for (second, other) in fits {
+        if checkout.is_some() {
+            verify_module_record_key(&second, &other)?;
+        }
         if !checkout_wasm(&identity) || !checkout_wasm(&other) {
             return Err(ModuleLookupError::Ambiguous { first, second });
         }
@@ -304,14 +338,19 @@ pub(crate) fn read_verified_module(record: &Path, executable: Executable, expect
 pub fn module_for(store: &Path, request: &Request<'_>) -> Result<Option<Selected>, ModuleLookupError> {
     let mut matching = records(store)?.into_iter().filter(|(_, identity)| request.accepts(identity));
     let Some((folder, identity)) = matching.next() else { return Ok(None) };
-    let expected = crate::module::sha256_hex(identity.as_bytes());
-    if folder.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
-        return Err(ModuleLookupError::RecordKey { folder, expected });
-    }
+    verify_module_record_key(&folder, &identity)?;
     if let Some((second, _)) = matching.next() {
         return Err(ModuleLookupError::Ambiguous { first: folder, second });
     }
     select_record(&folder, request.executable()).map(Some)
+}
+
+fn verify_module_record_key(folder: &Path, identity: &str) -> Result<(), ModuleLookupError> {
+    let expected = crate::module::sha256_hex(identity.as_bytes());
+    if folder.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        return Err(ModuleLookupError::RecordKey { folder: folder.to_owned(), expected });
+    }
+    Ok(())
 }
 
 /// Preserve the identity and named executable digest of a record selected by the module lookup.

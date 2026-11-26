@@ -240,7 +240,7 @@ impl Stamps for FromMeta {
 /// A file's content id: the same domain as `blaze_vfs::FILE_DOMAIN` (one digest of a file in the
 /// tree). blaze-vfs is not a dependency here (std, and much else); the constant belongs in
 /// blaze-ids (a gap for its lane, rule 30).
-pub const FILE_DOMAIN: &str = "blaze v2 vfs file 1";
+pub const FILE_DOMAIN: &str = blaze_build_script::module_record::CHECKOUT_FILE_DOMAIN;
 const LISTING_DOMAIN: &str = "blaze-cli listing 1";
 const BOTH_DOMAIN: &str = "blaze-cli module at both 1";
 const UNITS_SOURCE_DOMAIN: &str = "blaze-cli units source 2";
@@ -430,7 +430,23 @@ pub(crate) fn look(
 ) -> Result<Option<(Option<Stamp>, ContentId)>, CliError> {
     match file_meta(cx, root, path)? {
         None => Ok(None),
-        Some(meta) => Ok(look_at(cx, root, stamps, plant, path, &meta, old, bytes)?),
+        Some(meta) => Ok(look_at(stamps, plant, path, &meta, old, bytes, |path, bytes| root.read_all(cx, path, bytes))?),
+    }
+}
+
+/// Read a module input from the opened checkout, with the same stamp rule as the sweep.
+pub(crate) fn look_confined(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    stamps: &impl Stamps,
+    plant: Plant,
+    path: &str,
+    old: Option<(Stamp, ContentId)>,
+    bytes: &mut Bytes<'_>,
+) -> Result<Option<(Option<Stamp>, ContentId)>, CliError> {
+    match file_meta(cx, root, path)? {
+        None => Ok(None),
+        Some(meta) => Ok(look_at(stamps, plant, path, &meta, old, bytes, |path, bytes| root.read_all_confined(cx, path, bytes))?),
     }
 }
 
@@ -443,14 +459,13 @@ fn file_meta(cx: &Cx, root: &Dir<ReadWrite>, path: &str) -> Result<Option<Meta>,
 
 /// [`look`], its stat `meta` taken.
 fn look_at(
-    cx: &Cx,
-    root: &Dir<ReadWrite>,
     stamps: &impl Stamps,
     plant: Plant,
     path: &str,
     meta: &Meta,
     old: Option<(Stamp, ContentId)>,
     bytes: &mut Bytes<'_>,
+    read: impl FnOnce(&Path, &mut Bytes<'_>) -> Result<usize, bstd::fs::FsError>,
 ) -> Result<Option<(Option<Stamp>, ContentId)>, Unread> {
     let at = Path::new(path)?;
     let seen = stamps.stamp(path, meta);
@@ -464,7 +479,7 @@ fn look_at(
         return Ok(Some((stamp, id)));
     }
     bytes.truncate(0);
-    match root.read_all(cx, &at, bytes) {
+    match read(&at, bytes) {
         Ok(_) => Ok(Some((stamp, ContentId::of(FILE_DOMAIN, bytes.as_slice())))),
         // A symbolic link to a directory: no file.
         Err(error) if error.kind == FsKind::IsADirectory || error.kind == FsKind::NotFound => Ok(None),
@@ -525,7 +540,7 @@ fn slot_now(
     let rs = file_meta(cx, root, slot)?;
     if !module {
         return Ok(match rs {
-            Some(meta) => match look_at(cx, root, stamps, plant, slot, &meta, was(false), bytes)? {
+            Some(meta) => match look_at(stamps, plant, slot, &meta, was(false), bytes, |path, bytes| root.read_all(cx, path, bytes))? {
                 Some((stamp, id)) => (base, stamp, id),
                 None => absent,
             },
@@ -544,8 +559,8 @@ fn slot_now(
     // prove it). Both found is the finding whatever they hold: neither is read.
     let found = match (rs, at_mod) {
         (Some(_), Some(_)) => return Ok((base | BOTH, None, ContentId::of(BOTH_DOMAIN, slot.as_bytes()))),
-        (Some(meta), None) => look_at(cx, root, stamps, plant, slot, &meta, was(false), bytes)?.map(|(stamp, id)| (base, stamp, id)),
-        (None, Some(meta)) => look_at(cx, root, stamps, plant, mod_rs, &meta, was(true), bytes)?.map(|(stamp, id)| (base | AT_MOD_RS, stamp, id)),
+        (Some(meta), None) => look_at(stamps, plant, slot, &meta, was(false), bytes, |path, bytes| root.read_all(cx, path, bytes))?.map(|(stamp, id)| (base, stamp, id)),
+        (None, Some(meta)) => look_at(stamps, plant, mod_rs, &meta, was(true), bytes, |path, bytes| root.read_all(cx, path, bytes))?.map(|(stamp, id)| (base | AT_MOD_RS, stamp, id)),
         (None, None) => None,
     };
     Ok(found.unwrap_or(absent))
@@ -1123,7 +1138,11 @@ impl<S: Stamps> Follow<S> {
                     let reuse = old.stamp.filter(|_| !old.absent()).map(|stamp| (stamp, old.id));
                     // Emptied first: after the look, bytes are there only when it read them.
                     bytes.truncate(0);
-                    match look(&cx, root, &self.stamps, self.plant, path, reuse, &mut bytes)? {
+                    let found = match old.kind {
+                        LeafKind::MacroFile => look_confined(&cx, root, &self.stamps, self.plant, path, reuse, &mut bytes)?,
+                        _ => look(&cx, root, &self.stamps, self.plant, path, reuse, &mut bytes)?,
+                    };
+                    match found {
                         Some((stamp, id)) => {
                             if old.kind == LeafKind::Manifest && !bytes.as_slice().is_empty() {
                                 now.lock_read(path, bytes.as_slice(), frame);

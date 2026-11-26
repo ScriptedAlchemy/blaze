@@ -1618,7 +1618,7 @@ fn make_world<'f>(
     let mut facts = blaze_own::Vec::new_in(frame);
     facts.resize(graph.units.len(), [None; 3]);
     for (at, unit) in script_units(world.crates.iter().map(|krate| krate.origin), |unit| graph.units[unit.index()].build_script) {
-        let module = plan_script_module(graph, unit, Some(at), home, heap);
+        let module = plan_script_module(graph, lock, unit, Some(at), home, heap);
         script_roots.push((at, graph.units[unit.index()].root.as_str()));
         let krate = &world.crates[at];
         if let blaze_world::Script::Read { subject } = krate.script {
@@ -1636,7 +1636,7 @@ fn make_world<'f>(
     for plan in plans.iter().filter(|plan| plan.id.consumer == Consumer::HostDependency) {
         let id = plan.id;
         let unit = &graph.units[id.unit.index()];
-        let module = plan_script_module(graph, id.unit, None, home, heap);
+        let module = plan_script_module(graph, lock, id.unit, None, home, heap);
         let source = run_plan::host_source(graph, lock, paths, id.unit).ok_or_else(|| NamesError::World(std::format!(
             "the build script of {} {} has no host library to serve", unit.name.as_str(), unit.version.as_str()
         )))?;
@@ -1670,6 +1670,7 @@ fn make_world<'f>(
 
 fn plan_script_module(
     graph: &'static blaze_unit_graph::UnitGraph<'static>,
+    lock: &Lock<'_>,
     unit: blaze_unit_graph::UnitId,
     crate_at: Option<usize>,
     home: &str,
@@ -1681,7 +1682,8 @@ fn plan_script_module(
     features.extend(script.features.iter().map(|feature| feature.as_str()));
     let (package, version) = (script.name.as_str(), script.version.as_str());
     let subject = crate::script_modules::subject(ran_as, package, version, &features);
-    crate::script_modules::ScriptModule { subject, crate_at, ran_as, package, version, features }
+    let tracked = ran_as == crate::scripts::RanAs::Wasm && crate::script_modules::tracks_checkout(graph, lock, unit, heap);
+    crate::script_modules::ScriptModule { subject, crate_at, ran_as, package, version, package_id: script.package, root: script.root.as_str(), tracked, features }
 }
 
 /// Each crate (by world index, in order) made from a unit with a build script, with that

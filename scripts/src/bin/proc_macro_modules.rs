@@ -470,6 +470,17 @@ fn closure_lines(lock: &str, name: &str, version: &str) -> Result<Vec<String>, F
     Ok(lines)
 }
 
+/// The package and version in Cargo's `compiler-artifact` package ID.
+fn artifact_package(id: &str) -> (&str, &str) {
+    // `<source>#<name>@<version>`, or `<source>/<name>#<version>` where the
+    // package's folder bears its name.
+    let (source, spec) = id.rsplit_once('#').unwrap_or((id, ""));
+    match spec.split_once('@') {
+        Some(pair) => pair,
+        None => (source.rsplit('/').next().unwrap_or("").split('?').next().unwrap_or(""), spec),
+    }
+}
+
 /// Cargo's `--message-format=json` output split into what the build used and what a person
 /// reads: `name version manifest-dir` for each `compiler-artifact` (fresh ones too, so a
 /// package built for an earlier crate in the shared target folder is still seen), and the
@@ -485,14 +496,7 @@ fn artifacts_of(output: &str) -> (String, String) {
         let text = |key: &str| message.get(key).and_then(serde_json::Value::as_str).unwrap_or("");
         match text("reason") {
             "compiler-artifact" => {
-                // `<source>#<name>@<version>`, or `<source>/<name>#<version>` where the
-                // package's folder bears its name.
-                let id = text("package_id");
-                let (source, spec) = id.rsplit_once('#').unwrap_or((id, ""));
-                let (name, version) = match spec.split_once('@') {
-                    Some(pair) => pair,
-                    None => (source.rsplit('/').next().unwrap_or("").split('?').next().unwrap_or(""), spec),
-                };
+                let (name, version) = artifact_package(text("package_id"));
                 let dir = Path::new(text("manifest_path")).parent().map(|it| it.display().to_string()).unwrap_or_default();
                 compiled.push_str(&format!("{name} {version} {dir}\n"));
             }

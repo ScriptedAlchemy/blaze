@@ -2,7 +2,11 @@
 
 use core::fmt;
 
-/// A SHA-256 written as 64 lower-case hexadecimal digits in the D52 store.
+/// The checkout sweep's file-content identity, shared with the bootstrap read receipt.
+pub const CHECKOUT_FILE_DOMAIN: &str = "blaze v2 vfs file 1";
+
+/// A 32-byte digest written as 64 lower-case hexadecimal digits in the D52 store. Record
+/// keys and executable digests are SHA-256, and checkout file digests use the sweep's domain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Digest([u8; 64]);
 
@@ -15,6 +19,21 @@ impl Digest {
     pub fn text(&self) -> &str {
         // The parser admits only ASCII hexadecimal bytes.
         core::str::from_utf8(&self.0).expect("the digest was checked as ASCII")
+    }
+
+    /// The digest of bytes as the checkout sweep observes them.
+    pub fn checkout_file(bytes: &[u8]) -> Self {
+        Self::from_content(blaze_ids::ContentId::of(CHECKOUT_FILE_DOMAIN, bytes))
+    }
+
+    pub fn from_content(id: blaze_ids::ContentId) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut text = [0; 64];
+        for (byte, pair) in id.0.into_iter().zip(text.chunks_exact_mut(2)) {
+            pair[0] = HEX[usize::from(byte >> 4)];
+            pair[1] = HEX[usize::from(byte & 15)];
+        }
+        Self(text)
     }
 }
 
@@ -37,6 +56,44 @@ impl fmt::Display for Source<'_> {
             Self::Git { commit, path } => write!(out, "git {commit} {path}"),
         }
     }
+}
+
+/// One checkout file the compiler read or whose contents control its isolated resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckoutRead<'s> {
+    pub path: &'s str,
+    pub content: Digest,
+}
+
+/// A confined checkout spelling: the package root is represented by `.`.
+pub fn checkout_path(path: &str) -> bool {
+    path == "." || (!path.is_empty() && !path.contains(['\\', '\n', '\r', '\0']) && path.split('/').all(|part| !matches!(part, "" | "." | "..")))
+}
+
+impl<'s> CheckoutRead<'s> {
+    pub fn inputs(record: &'s str) -> impl Iterator<Item = Option<Self>> + 's {
+        record.lines().filter_map(|line| line.strip_prefix("checkout-read ")).map(|line| {
+            let (digest, path) = line.split_once(' ')?;
+            (checkout_path(path) && path != ".").then_some(Self { path, content: Digest::parse(digest)? })
+        })
+    }
+}
+
+impl fmt::Display for CheckoutRead<'_> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(out, "checkout-read {} {}", self.content.text(), self.path)
+    }
+}
+
+/// Where the checkout placed the package this receipt was made for.
+pub fn checkout_package(record: &str) -> Option<&str> {
+    let path = one(record, "checkout-package").ok()??;
+    checkout_path(path).then_some(path)
+}
+
+/// The package and location a checkout receipt belongs to.
+pub fn checkout_owner(record: &str) -> Option<(&str, &str, &str)> {
+    Some((one(record, "name").ok()??, one(record, "version").ok()??, checkout_package(record)?))
 }
 
 /// The package and its dependencies as they are given to the module compiler.

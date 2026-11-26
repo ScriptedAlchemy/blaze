@@ -22,7 +22,7 @@
 //! Interim (D110): the store is scanned on the filesystem as the runtime scans it; one scan a
 //! lookup, cached by the lookup's record.
 
-use blaze_build_script::module_record::{Executable, Selected};
+use blaze_build_script::module_record::{CheckoutRead, Digest, Executable, Selected, checkout_owner};
 use blaze_drive::{Kind, Name, Task, TaskFailure, Why};
 use blaze_ids::ContentId;
 use bstd::cx::Cx;
@@ -31,6 +31,7 @@ use crate::CliError;
 use crate::work::{Did, Made, held_str};
 
 use crate::scripts::RanAs;
+use crate::sweep::{LeafKind, Plant, Rows, Stamps};
 
 // "2": the subject holds the run's placement (a native script's record is a host binary,
 // `target <host>` in its identity and `bin-sha256` its digest; tempo 2026-11-17: libproc,
@@ -84,7 +85,43 @@ pub(crate) struct ScriptModule {
     pub ran_as: RanAs,
     pub package: &'static str,
     pub version: &'static str,
+    pub package_id: blaze_manifest::lock::LockId,
+    pub root: &'static str,
+    pub tracked: bool,
     pub features: std::vec::Vec<&'static str, std::alloc::Global>,
+}
+
+/// A local root can use a compile-file receipt when its compiled dependencies are archived
+/// libraries with no build script and no procedural macro. Their sources are pinned by the
+/// resolution, and nothing from a dependency's execution becomes a compiler input.
+pub(crate) fn tracks_checkout(
+    graph: &blaze_unit_graph::UnitGraph<'_>,
+    lock: &blaze_manifest::lock::Lock<'_>,
+    script: blaze_unit_graph::UnitId,
+    alloc: blaze_own::Alloc<'_>,
+) -> bool {
+    use blaze_manifest::lock::LockSource;
+    use blaze_unit_graph::UnitKind;
+
+    let root = &graph.units[script.index()];
+    if !matches!(lock.package(root.package).source, LockSource::Path) {
+        return false;
+    }
+    let mut pending = blaze_own::AVec::new_in(alloc);
+    pending.extend(root.deps.iter().map(|dep| dep.unit));
+    let mut seen = blaze_own::AVec::new_in(alloc);
+    seen.resize(graph.units.len(), false);
+    while let Some(id) = pending.pop() {
+        if core::mem::replace(&mut seen[id.index()], true) {
+            continue;
+        }
+        let unit = &graph.units[id.index()];
+        if !matches!(unit.kind, UnitKind::Lib) || unit.build_script.is_some() || !matches!(lock.package(unit.package).source, LockSource::Registry { .. }) {
+            return false;
+        }
+        pending.extend(unit.deps.iter().map(|dep| dep.unit));
+    }
+    true
 }
 
 /// What one lookup is for: the run's placement and the script unit's package, version and
@@ -94,6 +131,65 @@ pub(crate) struct Wanted<'w> {
     pub package: &'w str,
     pub version: &'w str,
     pub features: &'w [&'w str],
+    pub checkout: Option<Checkout<'w>>,
+}
+
+pub(crate) struct Checkout<'a> {
+    pub directory: &'a str,
+    pub required: &'a [&'a str],
+    pub files: &'a [(&'a str, Digest)],
+}
+
+/// Supply the source facts of provisioned local modules. A normal package's source tree is
+/// never walked here. The sweep carries unchanged rows, and a changed row moves the lookup.
+#[expect(clippy::too_many_arguments, reason = "the receipt's store, proved layout, stamps and checkout capability")]
+pub(crate) fn read_checkout_receipts(
+    cx: &Cx,
+    root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+    stamps: &impl Stamps,
+    home: &str,
+    lock: &blaze_manifest::lock::Lock<'_>,
+    members: &[crate::graph::CheckoutDir],
+    prior: Option<&Rows<'_>>,
+    rows: &mut Rows<'_>,
+    frame: &bstd::mem::Frame,
+) -> Result<(), CliError> {
+    let _span = cx.span("build-script modules: track checkout compilation inputs");
+    let store = std::path::Path::new(home).join(crate::scripts::STORE_UNDER_HOME);
+    let identities: blaze_own::Vec<_, &bstd::mem::Frame> = {
+        let mut records = blaze_own::Vec::new_in(frame);
+        records.extend(blaze_proc_macro::script_unit::checkout_receipts(&store).map_err(CliError::BuildScriptModule)?);
+        records
+    };
+    let mut paths = blaze_own::Vec::new_in(frame);
+    for identity in &identities {
+        let Some((name, version, directory)) = checkout_owner(identity) else { continue };
+        let directory = if directory == "." { "" } else { directory };
+        if !lock.named(name).any(|id| {
+            lock.package(id).version.to_string() == version && members.iter().any(|member| member.id == id && member.dir.as_str() == directory)
+        }) {
+            continue;
+        }
+        paths.extend(CheckoutRead::inputs(identity).flatten().map(|read| read.path));
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    let mut bytes = bstd::mem::Bytes::new_in(frame, "a build-script module's source file");
+    for path in &paths {
+        if rows.of(LeafKind::MacroFile).any(|leaf| rows.path(leaf) == *path) {
+            continue;
+        }
+        let old = prior.and_then(|prior| prior.of(LeafKind::MacroFile).find(|leaf| prior.path(leaf) == *path));
+        let found = match old {
+            Some(leaf) => (!leaf.absent()).then_some((leaf.stamp, leaf.id)),
+            None => crate::sweep::look_confined(cx, root, stamps, Plant::None, path, None, &mut bytes)?,
+        };
+        match found {
+            Some((stamp, id)) => rows.push(LeafKind::MacroFile, 0, path, stamp, id),
+            None => rows.push(LeafKind::MacroFile, crate::sweep::ABSENT, path, None, ContentId([0; 32])),
+        }
+    }
+    Ok(())
 }
 
 /// One build-script module lookup: the record `<home>/.blaze/v2/build-script/modules/<key>`
@@ -109,10 +205,22 @@ pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Ta
         return Ok(Did::Hole(refused("no home: the module store is under it"), "the build-script module store is under the home, and HOME is not set"));
     };
     let store = std::path::Path::new(home).join(".blaze/v2");
-    let Wanted { ran_as, package, version, features } = wanted;
+    let Wanted { ran_as, package, version, features, checkout } = wanted;
+    let tracked = checkout.is_some();
     let host = crate::graph::TRIPLE;
     let (found, executable) = match ran_as {
-        RanAs::Wasm => (blaze_proc_macro::script_unit::module_of(&store, package, version, features), Executable::Wasm),
+        RanAs::Wasm => {
+            let found = match checkout {
+                Some(checkout) => blaze_proc_macro::script_unit::checkout_module_of(&store, package, version, features, blaze_proc_macro::script_unit::CheckoutModule {
+                    directory: checkout.directory,
+                    required: checkout.required,
+                    agrees: &|read| checkout.files.binary_search_by_key(&read.path, |(path, _)| *path)
+                        .is_ok_and(|index| checkout.files[index].1 == read.content),
+                }),
+                None => blaze_proc_macro::script_unit::module_of(&store, package, version, features),
+            };
+            (found, Executable::Wasm)
+        }
         RanAs::Native => (blaze_proc_macro::script_unit::module_of_native(&store, package, version, features, host), Executable::Native),
     };
     let unread = |error: &blaze_proc_macro::script_unit::ModuleLookupError| {
@@ -145,9 +253,10 @@ pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Ta
             RanAs::Wasm => "build it with `toolrun.sh proc_macro_modules` in build-script mode",
             RanAs::Native => "build it with `toolrun.sh proc_macro_modules` in build-script mode with `native` (D112)",
         };
+        let scope = if tracked { " matching the checkout's compiler source inputs" } else { "" };
         let words = bstd::mem::format_in!(
             held,
-            "the build script of {package} {version}: no build-script module of {package} {version} with features [{}] in {}: asked for the identity lines {};{beside} {how}",
+            "the build script of {package} {version}: no build-script module of {package} {version} with features [{}]{scope} in {}: asked for the identity lines {};{beside} {how}",
             features.join(","),
             store.join("build-script/modules").display(),
             asked.iter().map(|line| std::format!("`{line}`")).collect::<std::vec::Vec<_>>().join(" "),

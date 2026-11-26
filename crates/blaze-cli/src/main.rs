@@ -192,6 +192,7 @@ pub enum CliError {
     /// A member proc-macro crate's files could not be read whole for its module key
     /// (macro_files.rs), named by path.
     MacroFiles(macro_files::MacroFilesError),
+    BuildScriptModule(blaze_proc_macro::script_unit::ModuleLookupError),
     /// The checkout's leaf table is not one.
     Leaves(WireError),
     /// A file the outline cannot read: not UTF-8, or past 4 GiB.
@@ -322,6 +323,7 @@ impl fmt::Display for CliError {
             CliError::Out(error) => write!(f, "{error}"),
             CliError::Changed { paths } => write!(f, "changed while the command ran; run again (nothing of these was kept):\n{paths}"),
             CliError::MacroFiles(error) => write!(f, "{error}"),
+            CliError::BuildScriptModule(error) => write!(f, "{error}"),
             CliError::Leaves(error) => write!(f, "the checkout's leaf table (in a pointer of .blaze/v2/at), of this build's form, is malformed: {error}"),
             CliError::Text { what } => write!(f, "{what}"),
             CliError::Program(error) => write!(f, "the program: {error}"),
