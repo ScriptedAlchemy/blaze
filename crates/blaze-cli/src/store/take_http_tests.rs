@@ -125,7 +125,7 @@ fn over_http(world: &super::tests::World, cx: &Cx, lent: &CommandLent, lies: boo
     let hex = TOOLCHAIN.hex();
     let key = Signer::from_seed(&SEED).public().to_string();
     let base = format!("http://{}:{}/o/", AT.0, AT.1);
-    let named = NamedOrigin::published(cx, &fs, Some(&net), &base, Some(key.as_str()), set_name(&hex), lent).expect("the published origin over http");
+    let named = NamedOrigin::published(cx, &fs, Some(&net), &base, Some(key.as_str()), Default::default(), set_name(&hex), lent).expect("the published origin over http");
     let OriginAt::Http(at) = &named.at else { panic!("an http:// origin was not read over HTTP") };
     // The join: the base, then the set's folder; each object's name is added per ask.
     assert_eq!(at.base.as_str(), format!("http://{}:{}/o/public/{}/{TARGET}", AT.0, AT.1, hex.as_str()), "the origin's base joined to the set's folder");
@@ -151,7 +151,7 @@ fn a_set_taken_over_http_is_byte_equal_to_the_set_taken_from_the_folder() {
         let fs = world.io.need_fs().expect("files");
         let hex = TOOLCHAIN.hex();
         let key = Signer::from_seed(&SEED).public().to_string();
-        let named = NamedOrigin::published(&cx, &fs, None, "o", Some(key.as_str()), set_name(&hex), &lent_b).expect("the published folder origin");
+        let named = NamedOrigin::published(&cx, &fs, None, "o", Some(key.as_str()), Default::default(), set_name(&hex), &lent_b).expect("the published folder origin");
         let clock = world.io.need_clock().expect("a clock");
         super::take(&cx, &named, set_id(), &lent_b, TOOLCHAIN, &clock, TakePlant::NONE).expect("B takes from the folder")
     };

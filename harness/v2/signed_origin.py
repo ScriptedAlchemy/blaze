@@ -1,0 +1,285 @@
+"""Exercise the signed toolchain origin through the release CLI on Linux.
+
+Pass one JSON object with `blaze` (an installed release CLI built with `publish` and
+`fetch`), `shelf` (its installed toolchain directory), and `scratch` (a new evidence
+directory). `alternate_blaze` optionally measures an installed developer build with
+the same shelf pin and target. It measures its own cold baseline and checks that even
+the trusted builder leaves its local records out of publication. `timeout` bounds each
+Blaze command (seconds, default 300).
+"""
+
+import contextlib
+import hashlib
+import http.server
+import json
+import os
+import re
+import secrets
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+from collections.abc import Generator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TypedDict
+
+from typed_input import fail, parse
+
+
+@dataclass(frozen=True)
+class Input:
+    blaze: str
+    shelf: str
+    scratch: str
+    alternate_blaze: str | None = None
+    timeout: int = 300
+
+
+class RangeRead(TypedDict):
+    path: str
+    first: int
+    bytes: int
+
+
+class TakenSet(TypedDict):
+    entered: int
+    records: int
+    bytes: int
+    reads: list[RangeRead]
+
+
+def require(condition: bool, why: str) -> None:
+    if not condition:
+        raise ValueError(why)
+
+
+def digest(path: Path) -> str:
+    with path.open("rb") as file:
+        return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def certificate(directory: Path) -> tuple[ssl.SSLContext, Path, Path]:
+    def openssl(*args: str) -> None:
+        subprocess.run(["openssl", *args], cwd=directory, capture_output=True, check=True, timeout=20)
+
+    for name in ("origin", "unrelated"):
+        openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                "-subj", f"/CN=Blaze signed-origin fixture {name}",
+                "-addext", "basicConstraints=critical,CA:TRUE",
+                "-keyout", f"{name}.key", "-out", f"{name}.pem")
+    openssl("req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=127.0.0.1",
+            "-keyout", "server.key", "-out", "server.csr")
+    (directory / "server.ext").write_text(
+        "subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n"
+    )
+    openssl("x509", "-req", "-days", "1", "-in", "server.csr", "-CA", "origin.pem", "-CAkey", "origin.key",
+            "-CAcreateserial", "-extfile", "server.ext", "-out", "server.pem")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(directory / "server.pem", directory / "server.key")
+    return context, directory / "origin.pem", directory / "unrelated.pem"
+
+
+@contextlib.contextmanager
+def serve(directory: Path, tls: ssl.SSLContext) -> Generator[tuple[str, list[RangeRead], list[str]]]:
+    objects = {"/" + path.relative_to(directory).as_posix(): path
+               for path in directory.rglob("*") if path.is_file()}
+    reads: list[RangeRead] = []
+    refused_tls: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def do_GET(self):
+            file = objects.get(self.path)
+            if file is None:
+                self.send_error(404)
+                return
+            asked = re.fullmatch(r"bytes=(\d+)-(\d+)", self.headers.get("Range", ""))
+            if asked is None:
+                self.send_error(400, "expected a closed byte range")
+                return
+            start, last = map(int, asked.groups())
+            size = file.stat().st_size
+            if start >= size or start > last:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            last = min(last, size - 1)
+            count = last - start + 1
+            reads.append({"path": self.path, "first": start, "bytes": count})
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{last}/{size}")
+            self.send_header("Content-Length", str(count))
+            self.end_headers()
+            with file.open("rb") as stream:
+                stream.seek(start)
+                while count:
+                    chunk = stream.read(min(count, 1 << 16))
+                    if not chunk:
+                        raise OSError(f"published object changed while serving {self.path}")
+                    self.wfile.write(chunk)
+                    count -= len(chunk)
+
+    class Server(http.server.ThreadingHTTPServer):
+        def get_request(self):
+            sock, peer = super().get_request()
+            sock.settimeout(5)
+            try:
+                return tls.wrap_socket(sock, server_side=True), peer
+            except OSError as error:
+                sock.close()
+                refused_tls.append(str(error))
+                raise
+
+    with Server(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1})
+        thread.start()
+        try:
+            yield f"https://127.0.0.1:{server.server_port}", reads, refused_tls
+        finally:
+            server.shutdown()
+            thread.join(timeout=6)
+            require(not thread.is_alive(), "the disposable origin did not stop")
+
+
+def fixture(scratch: Path, shelf: Path, name: str) -> tuple[Path, Path]:
+    root = scratch / name
+    checkout = root / "project"
+    home = root / "home"
+    (checkout / "src").mkdir(parents=True)
+    (checkout / "Cargo.toml").write_text(
+        '[package]\nname = "signed-origin-probe"\nversion = "0.1.0"\nedition = "2024"\n'
+    )
+    (checkout / "src/main.rs").write_text('fn main() { println!("signed origin: {}", 2 + 4); }\n')
+    shutil.copytree(shelf, home / ".blaze/v2/toolchain")
+    return checkout, home
+
+
+def entered(stderr: str, which: str) -> int:
+    line = re.search(r"(?m)^blaze: (\d+) of \d+ task\(s\) entered,", stderr)
+    if line is None:
+        raise ValueError(f"{which}: no --stats entered-task count")
+    return int(line[1])
+
+
+def run(given: Input) -> None:
+    require(sys.platform == "linux", "the fixture gives Linux a disposable TLS root via SSL_CERT_FILE")
+    require(type(given.timeout) is int and given.timeout > 0, "timeout must be a positive integer")
+    blaze, shelf, scratch = (Path(path).resolve() for path in (given.blaze, given.shelf, given.scratch))
+    alternate = Path(given.alternate_blaze).resolve() if given.alternate_blaze else None
+    binaries = {str(blaze): digest(blaze)}
+    if alternate is not None:
+        binaries[str(alternate)] = digest(alternate)
+        require(binaries[str(alternate)] != binaries[str(blaze)], "alternate_blaze must name a different binary")
+    require(shelf.is_dir() and any(shelf.iterdir()), f"{shelf}: empty toolchain shelf")
+    scratch.mkdir()
+    origin = scratch / "origin"
+    origin.mkdir()
+
+    def command(which: str, binary: Path, checkout: Path, home: Path, *args: str, ca: Path | None = None):
+        env = {"HOME": str(home), "PATH": os.defpath, "LANG": "C.UTF-8", "RUST_BACKTRACE": "0",
+               "BLAZE_NO_DAEMON": "1", "BLAZE_NO_LAN_PEER": "1"}
+        if ca is not None:
+            env["SSL_CERT_FILE"] = str(ca)
+        with (scratch / f"{which}.stdout").open("w+") as stdout, (scratch / f"{which}.stderr").open("w+") as stderr:
+            result = subprocess.run([binary, *args], cwd=checkout, env=env, stdout=stdout, stderr=stderr,
+                                    check=False, timeout=given.timeout)
+            stdout.seek(0)
+            stderr.seek(0)
+            return result.returncode, stdout.read(), stderr.read()
+
+    def check(which: str, binary: Path, *args: str, ca: Path | None = None):
+        checkout, home = fixture(scratch, shelf, which)
+        result = command(which, binary, checkout, home, "check", "--stats", "--color", "never", *args, ca=ca)
+        return checkout, home, result
+
+    with tempfile.TemporaryDirectory(dir=scratch, prefix="private-") as private:
+        directory = Path(private)
+        signer = directory / "seed"
+        signer.touch(mode=0o600)
+        signer.write_text(secrets.token_hex(32))
+        checkout, home, (status, _, cold_log) = check("cold", blaze)
+        require(status == 0, "the publisher's cold check failed")
+        cold = entered(cold_log, "cold")
+        status, publication, _ = command("publish", blaze, checkout, home, "store", "publish", str(origin), "--signer", str(signer))
+        made = re.search(r"published: set [0-9a-f]+ generation 1: ([1-9]\d*) records, ([1-9]\d*) objects written .* signed by ([0-9a-f]{64})", publication)
+        if status != 0 or made is None:
+            raise ValueError("the trusted builder did not publish a nonempty signed set")
+        key = made[3]
+        tls, ca, unrelated = certificate(directory)
+
+        with serve(origin, tls) as (url, reads, refused_tls):
+            def origin_args(public_key: str) -> tuple[str, ...]:
+                return "--origin", url, "--origin-key", public_key
+
+            _, _, (status, _, stderr) = check("untrusted-tls", blaze, *origin_args(key), ca=unrelated)
+            unknown_ca = any("unknown ca" in why.lower() or "certificate unknown" in why.lower() for why in refused_tls)
+            require(status != 0 and "the published set of --origin was not taken" in stderr and unknown_ca and not reads,
+                    "the client did not stop at the unrelated TLS root")
+            _, _, (status, _, stderr) = check("untrusted-signer", blaze, *origin_args("00" * 32), ca=ca)
+            require(status != 0 and "a key this blaze was not given for the namespace" in stderr
+                    and bool(reads) and all(row["path"].endswith("/prefix") for row in reads),
+                    "the client did not refuse the foreign signer before reading payloads")
+
+            def taken(which: str, binary: Path) -> tuple[Path, Path, TakenSet]:
+                start = len(reads)
+                checkout, home, (status, _, stderr) = check(which, binary, *origin_args(key), ca=ca)
+                require(status == 0, f"{which}: HTTPS check failed")
+                adopted = re.search(r"generation 1: ([1-9]\d*) records, ([1-9]\d*) bytes taken", stderr)
+                if adopted is None:
+                    raise ValueError(f"{which}: the command did not report taking a nonempty signed set")
+                asked = reads[start:]
+                require(any(row["path"].endswith("/prefix") for row in asked)
+                        and any(row["path"].rsplit("/", 1)[1].startswith(("seg-", "segz-")) for row in asked),
+                        f"{which}: the HTTPS origin did not supply the signed prefix and segment bytes")
+                return checkout, home, {"entered": entered(stderr, which), "records": int(adopted[1]),
+                                        "bytes": int(adopted[2]), "reads": asked}
+
+            checkout, home, https = taken("https", blaze)
+            require(https["entered"] < cold, f"the same compiler entered {https['entered']} tasks with HTTPS and {cold} cold")
+            status, stdout, _ = command("run", blaze, checkout, home, "run", *origin_args(key), ca=ca)
+            require(status == 0 and stdout == "signed origin: 6\n", "the HTTPS consumer did not run the expected program")
+            comparison = None
+            if alternate is not None:
+                alt_checkout, alt_home, (status, _, stderr) = check("alternate-cold", alternate)
+                require(status == 0, "the alternate reader's cold check failed")
+                alternate_cold = entered(stderr, "alternate-cold")
+                private_origin = scratch / "from-developer-home"
+                private_origin.mkdir()
+                status, private_publication, _ = command("publish-developer-home", blaze, alt_checkout, alt_home,
+                                                          "store", "publish", str(private_origin), "--signer", str(signer))
+                excluded = re.search(r"generation 1: 0 records, \d+ objects written .*; ([1-9]\d*) left out \(local\)", private_publication)
+                if status != 0 or excluded is None:
+                    raise ValueError("the trusted publisher did not exclude the developer home’s local records")
+                _, _, alternate_https = taken("alternate-https", alternate)
+                comparison = {
+                    "https": alternate_https,
+                    "cold_entered": alternate_cold,
+                    "reuse_observed": alternate_https["entered"] < alternate_cold,
+                    "local_records_excluded": int(excluded[1]),
+                }
+
+    require(all(digest(Path(path)) == sha for path, sha in binaries.items()), "a CLI changed during acceptance")
+    (scratch / "result.json").write_text(json.dumps({
+        "binaries_sha256": binaries, "signer": key, "published_records": int(made[1]),
+        "cold_entered": cold, "same_binary_https": https, "alternate": comparison,
+        "tls_refusals": refused_tls, "https_reads": reads,
+    }, indent=2) + "\n")
+    print(f"signed_origin.py: published, verified over HTTPS and ran; {cold} → {https['entered']} tasks entered; evidence {scratch}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        fail("signed_origin.py", "expected one JSON input")
+    try:
+        run(parse(Input, sys.argv[1], "signed_origin.py"))
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        fail("signed_origin.py", str(error))

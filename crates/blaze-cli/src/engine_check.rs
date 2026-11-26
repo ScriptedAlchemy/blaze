@@ -652,10 +652,12 @@ fn edge_at<'l, R>(
     then: impl for<'f> FnOnce(Edge<'f>, &mut Phases) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
     let var = |name: &str| -> Option<&str> { env?.get(&VarName::new(name).ok()?).ok().flatten() };
+    let cert_file = var("SSL_CERT_FILE");
+    let cert_dir = var("SSL_CERT_DIR");
     // The named origin, opened as `check-old` opens it (main.rs): a miss is read from it.
     // Declared before `shown`: the request's options and what it prints share one lifetime
     // (`checking` takes `&mut Shown<'f>`), so the origin must outlive the printer's state.
-    let origin = crate::store::NamedOrigin::of(cx, fs, net, flags.origin, flags.origin_key)?;
+    let origin = crate::store::NamedOrigin::of(cx, fs, net, flags.origin, flags.origin_key, tls_places(cert_file, cert_dir))?;
     // The open checkout's parts, each a phase (rule 17): its 22 ms on tempo (score-c1725wave42)
     // was one phase until 2026-11-20. Its floor is a few opens: one manifest read and the
     // pointer. `locate` reads one manifest where the start folder's has `[workspace]`, else the
@@ -725,8 +727,8 @@ fn edge_at<'l, R>(
         caller_env: crate::caller_env::project(&flags.build_env, env, frame)?,
         checkout: served.root_text().unwrap_or(checkout_at),
         served,
-        cert_file: var("SSL_CERT_FILE"),
-        cert_dir: var("SSL_CERT_DIR"),
+        cert_file,
+        cert_dir,
         rustflags: blaze_manifest::rustflags::RustflagsEnv {
             encoded: var("CARGO_ENCODED_RUSTFLAGS"),
             plain: var("RUSTFLAGS"),
@@ -2320,6 +2322,13 @@ pub(crate) fn stats_line<'f>(checked: &Checked, in_main_ns: u64, frame: &'f Fram
     )
 }
 
+fn tls_places<'a>(cert_file: Option<&'a str>, cert_dir: Option<&'a str>) -> blaze_core::trust::Places<'a> {
+    blaze_core::trust::Places {
+        cert_file: cert_file.map(std::ffi::OsStr::new),
+        cert_dir: cert_dir.map(std::ffi::OsStr::new),
+    }
+}
+
 /// Where the command runs and what the fetches and scripts read, each given by the edge (rule
 /// 75; main.rs `request`'s first argument). Copied, never re-read: `--fix`'s two checks take one.
 #[derive(Clone, Copy)]
@@ -2770,7 +2779,8 @@ fn checking<'f, 's: 'f>(
     let mut phase_mem = made_boxed(heap, crate::engine_phase_mem::PhaseLedger::new);
     // The one store, opened as `check` opens it (main.rs), committed after the answer.
     let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, place.max_store_bytes, root, place.checkout, phases.clock(), err, heap)?;
-    crate::store::take::before_first_phase(cx, args, fs, net, &opened, toolchain, phases, err)?;
+    let tls = tls_places(place.cert_file, place.cert_dir);
+    crate::store::take::before_first_phase(cx, args, fs, net, &opened, toolchain, tls, phases, err)?;
     let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, origin, phases.clock().clone(), err, erased.handle())?;
     phases.mark_cx(cx, "store open", frame);
     // 0. The stored answer (engine_answer.rs): its pointer, then the sweep of what it read.

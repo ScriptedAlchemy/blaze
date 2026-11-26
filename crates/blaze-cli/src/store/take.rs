@@ -277,6 +277,7 @@ pub(crate) fn before_first_phase(
     net: Option<&bstd::net::Net>,
     opened: &Opened,
     toolchain: ToolchainId,
+    tls: blaze_core::trust::Places<'_>,
     phases: &mut crate::phases::Phases,
     err: &Out,
 ) -> Result<(), CliError> {
@@ -292,7 +293,7 @@ pub(crate) fn before_first_phase(
     let hex = toolchain.hex();
     let set = SetName::new(hex.as_str(), crate::graph::TRIPLE).map_err(TakeError::Set)?;
     let id = set.id();
-    let named = NamedOrigin::published(cx, fs, net, origin, flags.origin_key, set, &opened.lent)?;
+    let named = NamedOrigin::published(cx, fs, net, origin, flags.origin_key, tls, set, &opened.lent)?;
     let clock = phases.clock().clone();
     let lan_peer = match (&named.at, net) {
         (OriginAt::Http(_), Some(net)) if !cx.is_simulated() => Some(LanSegzPeer {

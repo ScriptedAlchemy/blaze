@@ -78,6 +78,7 @@ harness/v2/ran.py
 harness/v2/ready_check.py
 harness/v2/real_smoke.py
 harness/v2/report.py
+harness/v2/signed_origin.py
 harness/v2/test_distributed.py
 harness/v2/test_exec_observer.py
 harness/v2/test_real_smoke.py

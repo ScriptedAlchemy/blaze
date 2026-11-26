@@ -1393,14 +1393,14 @@ impl HeadCheck for OneKey {
 impl NamedOrigin {
     /// The origin the arguments name (main.rs reads them): `--origin` and `--origin-key`
     /// together or neither.
-    pub fn of(cx: &Cx, fs: &Fs, net: Option<&Net>, folder: Option<&str>, key: Option<&str>) -> Result<Option<NamedOrigin>, CliError> {
+    pub fn of(cx: &Cx, fs: &Fs, net: Option<&Net>, folder: Option<&str>, key: Option<&str>, tls: blaze_core::trust::Places<'_>) -> Result<Option<NamedOrigin>, CliError> {
         match (folder, key) {
             (None, None) => Ok(None),
             (Some(folder), Some(key)) => {
                 let key = PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?;
                 let at = if folder.starts_with("https://") || folder.starts_with("http://") {
                     let net = net.ok_or(CliError::Usage("--origin http(s)://: this host offers no network"))?;
-                    OriginAt::Http(HttpAt::of(folder, net)?)
+                    OriginAt::Http(HttpAt::of(folder, net, tls)?)
                 } else {
                     OriginAt::Folder(fs.open_dir(cx, &Path::new(folder)?)?)
                 };
@@ -1416,7 +1416,8 @@ impl NamedOrigin {
     /// signed over the set's id by a key trusted for the origin (blaze-remote trust.rs
     /// `trusted_for`: the compiled-in published keys, or `key`, the `--origin-key` named for it),
     /// at a generation no lower than the floor `lent` holds for it.
-    pub fn published<D: Driver>(cx: &Cx, fs: &Fs, net: Option<&Net>, origin: &str, key: Option<&str>, set: blaze_remote::published::set::SetName<'_>, lent: &Lent<D, StoreAlloc>) -> Result<NamedOrigin, CliError> {
+    #[expect(clippy::too_many_arguments, reason = "the origin's edge takes the network, TLS roots, signing key and local rollback floor")]
+    pub fn published<D: Driver>(cx: &Cx, fs: &Fs, net: Option<&Net>, origin: &str, key: Option<&str>, tls: blaze_core::trust::Places<'_>, set: blaze_remote::published::set::SetName<'_>, lent: &Lent<D, StoreAlloc>) -> Result<NamedOrigin, CliError> {
         let named = match key {
             Some(key) => Some(PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?),
             None => None,
@@ -1426,7 +1427,7 @@ impl NamedOrigin {
             let [public, toolchain, target] = set.dir();
             // Each part a checked set name (`[0-9a-z._-]`): nothing joined here leaves the base.
             let joined = bstd::mem::format_in!(cx.frame(), "{}/{}/{}/{}", origin.trim_end_matches('/'), public, toolchain, target);
-            OriginAt::Http(HttpAt::of(joined.as_str(), net)?)
+            OriginAt::Http(HttpAt::of(joined.as_str(), net, tls)?)
         } else {
             let mut dir = fs.open_dir(cx, &Path::new(origin)?)?;
             for part in set.dir() {
@@ -1505,9 +1506,9 @@ fn own_msg(display: impl core::fmt::Display) -> blaze_own::String<blaze_mem::Kep
 impl HttpAt {
     /// The origin at `base` (`http://host:port[/prefix]` or `https://host[:port][/prefix]`),
     /// the network narrowed to its address. For `https://` (R2/S3/static HTTPS origins), builds a
-    /// pooled keep-alive `blaze-http` client with verified system TLS roots (no fallback on TLS
-    /// setup or handshake failure, rule 3).
-    fn of(base: &str, net: &Net) -> Result<HttpAt, CliError> {
+    /// pooled keep-alive `blaze-http` client with verified TLS roots from the command's
+    /// settings or the platform trust store.
+    fn of(base: &str, net: &Net, tls: blaze_core::trust::Places<'_>) -> Result<HttpAt, CliError> {
         let trimmed = base.trim_end_matches('/');
         let is_https = trimmed.starts_with("https://");
         let parsed = Url::parse(trimmed).map_err(|_| CliError::Usage("--origin http(s)://: not a URL"))?;
@@ -1516,6 +1517,7 @@ impl HttpAt {
         let net = net.connect_only(&Addr::Tcp(origin.at().clone()));
         #[cfg(not(feature = "fetch"))]
         {
+            let _ = tls;
             if is_https {
                 return Err(CliError::Usage("--origin https:// requires blaze built with the `fetch` (HTTPS/TLS) feature"));
             }
@@ -1524,8 +1526,7 @@ impl HttpAt {
         #[cfg(feature = "fetch")]
         {
             let pooled = if is_https {
-                let places = blaze_http::roots::Places { cert_file: None, cert_dir: None };
-                let tls = blaze_http::roots::system(places).map_err(|e| CliError::Remote(RemoteError::Tls(own_msg(e))))?;
+                let tls = blaze_http::roots::system(tls).map_err(|e| CliError::Remote(RemoteError::Tls(own_msg(e))))?;
                 let proxies = blaze_http::proxy_env::from_env().map_err(|e| CliError::Remote(RemoteError::Proxy(own_msg(e))))?;
                 let config = blaze_http::Config {
                     idle_most: ORIGIN_IN_FLIGHT,
