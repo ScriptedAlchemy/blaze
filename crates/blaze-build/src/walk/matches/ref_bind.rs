@@ -1,6 +1,13 @@
-//! `let` with a `ref` binding over a place: the initializer is built as a PLACE and the pattern
-//! is bound where that place is, by the irrefutable binder's own projection
-//! (matches/irrefutable.rs `bind_pattern_at`, the one home of it), never a copy.
+//! `let` with a `ref` / `ref mut` binding:
+//! - Over a PLACE (`let ref s = *r;`, `let (ref a, k) = *p;`): the initializer is built as a
+//!   PLACE and the pattern is bound where that place is, by the irrefutable binder's own
+//!   projection (matches/irrefutable.rs `bind_pattern_at`, the one home of it), never a copy.
+//! - Over a VALUE (`let ref x = { ExternWeak::new(...) };`, `let ref mut x = 7;`,
+//!   `let ref g = G { x: 5 };`): the initializer is evaluated as a VALUE, stored into a temporary
+//!   slot whose lifetime is extended to the enclosing block when its type needs drop (the
+//!   Reference, "Temporary lifetime extension": an extending pattern with a `ref` or `ref mut`
+//!   binding extends the initializer's temporary scope to the enclosing block as `Held::Temp`),
+//!   and the pattern is bound at that slot by `bind_pattern_at`.
 //!
 //! The rules, from the Reference:
 //! - "Place Expressions and Value Expressions": "The following contexts are place expression
@@ -10,23 +17,21 @@
 //!   in a value expression context, or is bound by value in a pattern, it denotes the value
 //!   held in that memory location".
 //! - "Identifier patterns": "`ref` ... binds to a reference to the matched place".
+//! - "Temporary lifetime extension": "If the pattern in a `let` statement is an extending
+//!   pattern then the temporary scope of the initializer expression is extended."
 //! - [expr.move.movable-place]: "Only the following place expressions may be moved out of:
 //!   Variables ... Temporary values. Fields of a place expression which can be moved out of and
 //!   don't implement `Drop`. The result of dereferencing an expression with type `Box<T>`"; a
 //!   value context reading a non-`Copy` place behind `&` is E0507 and never reaches the builder.
 //!
 //! So `let ref s = *r;` and `let (ref a, k) = *p;` (`p: &(G, i32)`) read nothing but `k`: `s`
-//! and `a` hold the addresses of the places, and nothing moves. Before this, `*r` was evaluated
-//! (`Task::Deref`, a load: refused for a type that needs drop) and walk.rs `plain_binding`
-//! refused the `ref`. The match side (`match *self { V(ref x) => .. }`) is matches.rs
-//! `bind_with` on the place walk.rs `Expr::Match` pushes (walk/moves.rs `scrutinee_in_place`).
+//! and `a` hold the addresses of the places, and nothing moves. The match side
+//! (`match *self { V(ref x) => .. }`) is matches.rs `bind_with` on the place walk.rs
+//! `Expr::Match` pushes (walk/moves.rs `scrutinee_in_place`).
 //!
-//! Taken here: a pattern with an explicit `ref`/`ref mut` binding, over an initializer that is
-//! a place expression with no adjustment of its own. Every other by-value binding in it reads a
-//! `Copy` part; a by-value binding of a part that needs drop would move out of the place (a
-//! partial move of a local, or E0507 behind a reference) and is refused by name. A `ref` over a
-//! VALUE initializer (`let ref x = f();`, whose temporary the `let` extends) stays the old
-//! route's, refused there by name.
+//! Every other by-value binding alongside a `ref` binding reads a `Copy` part; a by-value
+//! binding of a part that needs drop would move out of the place (a partial move of a local,
+//! E0507 behind a reference, or partial drop of an extended temporary) and is refused by name.
 
 use core::alloc::Allocator;
 
@@ -38,8 +43,9 @@ use super::At;
 use crate::BuildError;
 
 impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
-    /// Whether `pat` contains an explicit `ref` or `ref mut` binding anywhere inside it.
-    pub(in crate::walk) fn pat_has_ref(&self, pat: PatId) -> Result<bool, BuildError> {
+    /// Whether `pat` contains an explicit `ref` or `ref mut` binding anywhere in its irrefutable
+    /// structure.
+    pub(in crate::walk) fn pat_has_ref_bind(&self, pat: PatId) -> Result<bool, BuildError> {
         let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(pat);
         while let Some(p) = todo.pop() {
@@ -73,11 +79,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if !self.adjust_rows(init).is_empty() || !self.is_place_expr(init)? {
             return Ok(false);
         }
-        self.pat_has_ref(pat)
+        self.pat_has_ref_bind(pat)
     }
 
-    /// Refuses a by-value binding of a part that needs drop inside a `let` whose pattern borrows
-    /// its initializer by `ref` (would require partial-move tracking out of the borrowed place).
+    /// Refuses any by-value binding of a part that needs drop in a `let` that borrows its
+    /// initializer by `ref`. (A `ref` binding's own `local_ty` is `&T`/`&mut T`, which never
+    /// needs drop.)
     fn refuse_drop_by_value_in_ref_let(&mut self, pat: PatId) -> Result<(), BuildError> {
         let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
         todo.push(pat);
@@ -130,6 +137,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// its temporary lifetime to the enclosing block if it needs drop (the Reference, "Temporary
     /// lifetime extension"), and binds `pat` at that place.
     pub(in crate::walk) fn bind_let_value_ref(&mut self, pat: PatId, init: ExprId, v: V) -> Result<(), BuildError> {
+        self.refuse_refutable(pat)?;
         self.refuse_drop_by_value_in_ref_let(pat)?;
         let t = self.adjusted_ty(init)?;
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(init, error))?;
@@ -145,7 +153,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 at
             }
         };
-        if self.needs_drop(g).map_err(|error| Self::pat_ty_err(pat, error))? {
+        if self.live && self.needs_drop(g).map_err(|error| Self::pat_ty_err(pat, error))? {
             let Repr::Agg(l) = repr else { return Err(malformed("a value that needs drop not held as an aggregate")) };
             self.hold_extended_let_temp(init, at, l)?;
         }

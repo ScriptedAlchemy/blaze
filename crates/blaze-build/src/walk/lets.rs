@@ -32,9 +32,9 @@ use core::alloc::Allocator;
 use blaze_code::record::TrapKind;
 use blaze_lir::Block;
 use blaze_own::Vec;
-use blaze_typeck::{BinOp, Expr, ExprId, Stmt, StmtId};
+use blaze_typeck::{BinOp, Expr, ExprId, PNode, Stmt, StmtId};
 
-use super::{Held, Task, Walk, malformed, unsupported};
+use super::{Held, Repr, Task, V, Walk, malformed, unsupported};
 use crate::BuildError;
 
 pub(super) mod scope;
@@ -68,8 +68,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // The condition's region (lets/scope.rs): its bindings and, in edition 2024, its
         // scrutinee temporaries; dropped after the consequent (the region's `ScopeEnd`, then
         // the temporary scope's end), or by each failed link before the `else` block.
+        let repr = self.expr_repr(e)?;
+        let res = self.join_slot(repr);
         let temps = self.if_let_open(e, cond, links.len())?;
-        self.work.push(Task::IfThen { expr: e, else_, else_block, join });
+        self.work.push(Task::IfThen { expr: e, else_, else_block, join, res });
         if temps {
             self.work.push(Task::TempScopeEnd(cond));
         }
@@ -146,6 +148,14 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             Expr::Local(p) if self.local_drops(p) && self.adjust_rows(init).is_empty() => {
                 self.work.push(Task::Place(s));
             }
+            // An unsized scrutinee (`if let [a, b, c, d] = *chunk`, `let [head, ..] = *s else { .. }`):
+            // an unsized value is never copied, so its place (`V::Unsized`) is what is tested
+            // (mirrors walk.rs `Expr::Match`).
+            _ if self.is_place_expr(init)?
+                && matches!(self.node_at(init, self.adjusted_ty(init)?)?, PNode::Slice(_) | PNode::Str) =>
+            {
+                self.work.push(Task::Place(init));
+            }
             // A place behind a pointer that needs drop (`if let Reach::Hosted = self.reach`):
             // matched in place, nothing moved (walk/moves.rs `scrutinee_in_place`).
             _ if self.scrutinee_in_place(init)? => self.work.push(Task::Place(init)),
@@ -162,7 +172,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     pub(super) fn let_link(&mut self, l: ExprId, fail: Block) -> Result<(), BuildError> {
         let Expr::Let { pat, init } = self.expr(l)? else { return Err(malformed("a `let` link's task on another expression")) };
         let s = self.pop()?;
-        let srepr = self.adjusted_repr(init)?;
+        let srepr = if matches!(s, V::Unsized(..)) { Repr::None } else { self.adjusted_repr(init)? };
         // Owned as a `match`'s scrutinee (`owned_place`, as `let_else_test`): a place is tested
         // where it is (a local by its own scope, a place behind a pointer by no one here); a
         // temporary that needs drop joins the condition's region (`hold_temp`, anchored by
@@ -172,8 +182,16 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // `scan_flags` gave them, walk/moves.rs `scan_local_scrutinee`), as a `match` arm does.
         let m = self.matches.len() as u32;
         let at = self.owned_place(m, init, init, s, srepr)?;
+        // A non-dropping temporary slot made for the scrutinee (not held in `scope_pats` and not
+        // a local): must end on the miss path and (unless `pat` borrows from it via `ref`) after
+        // bindings on the match path so it cannot falsely stay live across a later `.await`.
+        let scrut_slot = self.whole_slot(at.at).filter(|&slot| self.is_temp_slot(slot) && !self.slot_held(slot) && !self.slot_is_local(slot));
         // A failed test drops what the region holds at this link, then goes to the `else`.
-        let (to, undo) = self.link_fail(fail)?;
+        let (to, undo) = match self.link_fail(fail)? {
+            (to, true) => (to, true),
+            (_, false) if scrut_slot.is_some() => (self.create(), true),
+            (to, false) => (to, false),
+        };
         let pass = self.create();
         // Set before the tests: an or-alternative binds (and moves) on its own pass.
         self.move_arm(m, pat, false);
@@ -183,13 +201,21 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         self.move_arm_end();
         if undo {
-            self.link_fail_end(to, fail)?;
+            self.link_fail_end(to, fail, scrut_slot)?;
         }
         self.begin(pass);
         self.move_arm(m, pat, false);
         let bound = self.bind_tested(pat, at);
         self.move_arm_end();
-        bound
+        bound?;
+        if let Some(slot) = scrut_slot {
+            if self.pat_has_ref(pat)? {
+                self.hold_copy_temp(init, at.at)?;
+            } else {
+                self.end_temp_slot(slot);
+            }
+        }
+        Ok(())
     }
 
     /// `Task::CondLink`: a `bool` link's value on top; false to `fail`, through a block that
@@ -201,7 +227,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let (to, undo) = self.link_fail(fail)?;
         self.br(c, (next, &[]), (to, &[]));
         if undo {
-            self.link_fail_end(to, fail)?;
+            self.link_fail_end(to, fail, None)?;
         }
         self.begin(next);
         Ok(())
@@ -226,13 +252,14 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(malformed("a drop scope left open inside a `let`-`else` initializer"));
         }
         let v = self.pop()?;
-        let srepr = self.adjusted_repr(init)?;
+        let srepr = if matches!(v, V::Unsized(..)) { Repr::None } else { self.adjusted_repr(init)? };
         // The scrutinee is owned like a match's (`owned_place`): a temporary that needs drop
         // joins the statement's temporaries with a word, and a binding by value moves its part
         // out of it. A local scrutinee keeps the place it has; a binding by value moves its
         // part out by the local's field flags (walk/moves.rs `scan_local_scrutinee`).
         let m = self.matches.len() as u32;
         let at = self.owned_place(m, init, init, v, srepr)?;
+        let scrut_slot = self.whole_slot(at.at).filter(|&slot| self.is_temp_slot(slot) && !self.slot_held(slot) && !self.slot_is_local(slot));
         let pass = self.create();
         let fail = self.create();
         // Set before the tests: an or-alternative binds (and moves) on its own pass.
@@ -247,6 +274,13 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let bound = self.bind_tested(pat, at);
         self.move_arm_end();
         bound?;
+        if let Some(slot) = scrut_slot {
+            if self.pat_has_ref(pat)? {
+                self.hold_copy_temp(init, at.at)?;
+            } else {
+                self.end_temp_slot(slot);
+            }
+        }
         let cont = self.create();
         self.jump(cont, &[]);
         // The pattern failed: the statement's temporaries (the initializer's borrowed ones and
@@ -274,6 +308,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     return Err(unsupported(init, "an extended temporary in a `let`-`else` initializer"));
                 }
             }
+        }
+        self.end_scope_slots_peek(mark, usize::MAX);
+        if let Some(slot) = scrut_slot {
+            self.end_temp_slot(slot);
         }
         let from = self.let_else_held.len() as u32;
         self.let_else_held.extend_from_slice(&self.scope_pats[mark..]);

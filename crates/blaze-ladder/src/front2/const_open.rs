@@ -63,8 +63,9 @@ use super::source::NamesSource;
 use super::types::{Env, Heads, SelfTy, Why};
 
 /// The most constants one evaluation may have evaluated FIRST (`Consts::value_at`'s work
-/// list: each is a constant a head named while a body of the evaluation was checked).
-pub(super) const MOST_FIRSTS: u32 = 64;
+/// list: each is a constant a head named while a body of the evaluation was checked, e.g.
+/// explicit enum discriminants such as `nix::errno::consts::Errno`).
+pub(super) const MOST_FIRSTS: u32 = 1024;
 
 /// The constant that must have a value before the evaluation that failed with `e` can go on:
 /// a head made while one of its bodies was checked names it (`[u8; size_of::<Self>()]` on a
@@ -78,6 +79,7 @@ pub(super) fn needed_first(e: &ConstFail) -> Option<LibKey> {
         ConstFail::Check { error: CheckFail::Const { key, error, .. }, .. } if matches!(**error, ConstFail::Nested { .. }) => Some(*key),
         ConstFail::Body { error: BodyError::Convert { why: Some(Why::NeedConst(c, _)), .. }, .. } => Some(*c),
         ConstFail::Body { error: BodyError::Head { error: HeadError::Item(_, Why::NeedConst(c, _)), .. }, .. } => Some(*c),
+        ConstFail::Body { error: BodyError::Const { item, error }, .. } if matches!(**error, ConstFail::Nested { .. }) => Some(*item),
         _ => None,
     }
 }
@@ -132,10 +134,14 @@ fn names_param(text: &str, params: &[(Name, u32)]) -> bool {
 /// (a parameter named; `Self` in a trait, where it is a parameter; a `Self` with generic
 /// arguments, whose identity is not one key), which the caller refuses by name.
 pub(super) fn ground_self(tys: PTys<'_>, env: &Env<'_>, text: &str) -> Option<(PTy, PNode)> {
-    if !super::anon::mentions(text, &[]) || names_param(text, env.params) {
+    ground_self_in(tys, env.self_, env.params, text)
+}
+
+pub(super) fn ground_self_in(tys: PTys<'_>, self_: SelfTy, params: &[(Name, u32)], text: &str) -> Option<(PTy, PNode)> {
+    if !super::anon::mentions(text, &[]) || names_param(text, params) {
         return None;
     }
-    let SelfTy::Ty(t, _) = env.self_ else { return None };
+    let SelfTy::Ty(t, _) = self_ else { return None };
     let node = tys.get(t).copied()?;
     match node {
         PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str => Some((t, node)),

@@ -55,6 +55,8 @@ struct BodyBuf {
     /// inside `unsafe`, so its intrinsic calls and `asm!`s need no block (the unsafety check's
     /// own tests are blaze-ladder's tests/front2_unsafety.rs).
     unsafe_blocks: Vec<ExprId, Global>,
+    /// The body's Rust edition (`BodyView::edition`, default 2024).
+    edition: Edition,
 }
 
 impl BodyBuf {
@@ -84,6 +86,7 @@ impl BodyBuf {
             asm_text: "",
             call_arg_ints: Vec::new_in(Global),
             unsafe_blocks: Vec::new_in(Global),
+            edition: Edition::E2024,
         }
     }
 
@@ -211,7 +214,7 @@ impl BodyBuf {
     fn view(&self, owner: ItemKey, root: ExprId) -> BodyView<'_> {
         BodyView {
             owner,
-            edition: Edition::E2024,
+            edition: self.edition,
             params: &self.params,
             root,
             exprs: &self.exprs,
@@ -247,7 +250,7 @@ impl BodyBuf {
             expr_editions: &[],
             pat_editions: &[],
             record_expr_schemas: &[],
-            closure_static_params: &[],
+            closure_param_regions: &[],
         }
     }
 }
@@ -1580,9 +1583,10 @@ fn a_struct_is_returned_through_the_result_pointer() {
     let mk = build_instance(&w, &callee, ItemKey(3), root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(mk.func.view());
     assert_eq!(own_sig(&mk), (vec_of(&[Ty::PTR, Ty::I32, Ty::I8]), vec_of(&[])), "{text}");
-    // The result pointer is the entry's first parameter, `v0`; both fields are stored through it.
-    let through = text.lines().filter(|l| l.contains("store") && l.contains("v0")).count();
-    assert_eq!(through, 2, "{text}");
+    // The result pointer is the entry's first parameter, `v0`; the struct is copied through it
+    // as one disjoint `memcpy` (not field-by-field stores).
+    let through = text.lines().filter(|l| l.contains("memcpy v0,")).count();
+    assert_eq!(through, 1, "{text}");
 
     w.func(1, "main", &[], I32);
     let mut b = BodyBuf::new();
@@ -2181,6 +2185,11 @@ fn an_enum_is_built_copied_and_matched() {
         Some(take),
     );
     let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    // Copying `let f = e` emits a single bulk `memcpy` (not a per-variant switch tree): only
+    // the two source `match` expressions (`match k` and `match f`) emit `switch`.
+    let text = blaze_lir::print(built.func.view());
+    assert_eq!(text.lines().filter(|l| l.trim_start().starts_with("switch ")).count(), 2, "{text}");
+    assert!(text.contains("memcpy "), "{text}");
     assert_eq!(one(&built, &[Val::Int(0)]), 1);
     assert_eq!(one(&built, &[Val::Int(1)]), 42);
     assert_eq!(one(&built, &[Val::Int(2)]), 109);
@@ -2777,7 +2786,7 @@ impl Tables<'_> {
             for &(offset, to) in table.relocs.iter() {
                 words[offset as usize / 8] = match to {
                     VtableTarget::Fn(i) if Some(i.item) == glue => fn_addr(i.item, Some(i.args)),
-                    VtableTarget::Fn(i) => {
+                    VtableTarget::Fn(i) | VtableTarget::ByValueShim(i) => {
                         let &(_, _, f) = self
                             .impls
                             .iter()
@@ -2795,19 +2804,45 @@ impl Tables<'_> {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+type PlacedFns<A> = blaze_own::Vec<(ItemKey, Option<List>, blaze_inproc::exec::Executable), A>;
+
 /// [`run_native_with`], placing the vtables each fn names from `tables`.
 #[cfg(target_arch = "aarch64")]
-fn run_native_vt(host: &[(ItemKey, u64)], fns: &[(ItemKey, Option<List>, &Built<Global>)], mut tables: Option<&mut Tables<'_>>) -> u64 {
+fn run_native_vt(host: &[(ItemKey, u64)], fns: &[(ItemKey, Option<List>, &Built<Global>)], tables: Option<&mut Tables<'_>>) -> u64 {
+    let placed = place_native_vt(host, fns, tables, Global);
+    let (_, _, entry) = placed.last().expect("one fn to run");
+    // SAFETY: the entry is an emitted function of no parameters returning one integer in x0;
+    // every callee it names is mapped and held in `placed` until it returns.
+    let f: extern "C" fn() -> u64 = unsafe { entry.as_fn() };
+    f()
+}
+
+/// Emits and maps each built fn without calling it yet (so callers that `fork()` before calling
+/// the entry perform zero heap allocations in the child).
+#[cfg(target_arch = "aarch64")]
+fn place_native_with<A: core::alloc::Allocator + Copy>(host: &[(ItemKey, u64)], fns: &[(ItemKey, Option<List>, &Built<A>)], alloc: A) -> PlacedFns<A> {
+    place_native_vt(host, fns, None, alloc)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn place_native_vt<A: core::alloc::Allocator + Copy>(
+    host: &[(ItemKey, u64)],
+    fns: &[(ItemKey, Option<List>, &Built<A>)],
+    mut tables: Option<&mut Tables<'_>>,
+    alloc: A,
+) -> PlacedFns<A> {
     use blaze_emit::RelocTo;
     use blaze_inproc::exec::Executable;
-    let mut placed: Vec<(ItemKey, Option<List>, Executable), Global> = Vec::new_in(Global);
+    let mut placed: PlacedFns<A> = PlacedFns::new_in(alloc);
     for &(key, key_args, built) in fns {
-        let mut vias = Vec::new_in(Global);
+        let mut vias = Vec::new_in(alloc);
         vias.resize(built.refs.len(), blaze_emit::Via::Address);
-        let mut code = blaze_emit::Code::new_in(Global);
-        let isa = blaze_emit::Isa { lse: true, os: blaze_emit::Os::MacOs };
+        let mut code = blaze_emit::Code::new_in(alloc);
+        let os = if cfg!(target_os = "macos") { blaze_emit::Os::MacOs } else { blaze_emit::Os::Linux };
+        let isa = blaze_emit::Isa { lse: true, os };
         blaze_emit::emit(built.func.verified(), &vias, isa, &mut code).unwrap_or_else(|e| panic!("{e}"));
-        let mut table_at: Vec<(u32, u64), Global> = Vec::new_in(Global);
+        let mut table_at: Vec<(u32, u64), A> = Vec::new_in(alloc);
         for r in code.relocs.iter() {
             if let RelocTo::Vtable(p) = r.to {
                 let fn_addr = |item: ItemKey, args: Option<List>| -> u64 {
@@ -2855,11 +2890,7 @@ fn run_native_vt(host: &[(ItemKey, u64)], fns: &[(ItemKey, Option<List>, &Built<
         .expect("the code maps");
         placed.push((key, key_args, exec));
     }
-    let (_, _, entry) = placed.last().expect("one fn to run");
-    // SAFETY: the entry is an emitted function of no parameters returning one integer in x0;
-    // every callee it names is mapped and held in `placed` until it returns.
-    let f: extern "C" fn() -> u64 = unsafe { entry.as_fn() };
-    f()
+    placed
 }
 
 /// lib.rs, "Adjustments": `&[u8; 3]` to `&[u8]` (s1-layout's `let wide: &[u8] = &bytes;`), and

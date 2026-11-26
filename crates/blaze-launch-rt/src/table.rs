@@ -16,7 +16,7 @@ use core::cell::Cell;
 use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::ops::Range;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use blaze_launch::{Frame, FrameKind, Slot, Thread};
@@ -89,6 +89,14 @@ pub struct Shared {
     /// The process the launcher was made in: a forked child of it has these words and no
     /// control thread.
     pid: u32,
+    /// Pending lazy native library initializers published by the control thread and run once
+    /// by the waking mutator thread in [`resolve`] before entering the newly bound foreign code.
+    native_inits_base: AtomicU64,
+    native_inits_at: AtomicU64,
+    native_inits_count: AtomicU32,
+    /// Arguments captured before any guest or control thread runs. Lazy constructors see
+    /// the same process-lived arrays that the entry receives.
+    pub(crate) native_args: Option<crate::native_lib::ProcessArgs>,
 }
 
 thread_local! {
@@ -122,7 +130,22 @@ impl Shared {
             bell: AtomicU64::new(0),
             waiters,
             pid: std::process::id(),
+            native_inits_base: AtomicU64::new(0),
+            native_inits_at: AtomicU64::new(0),
+            native_inits_count: AtomicU32::new(0),
+            native_args: None,
         }
+    }
+
+    /// Publishes a lazily loaded native library's initializer list so the waking mutator thread
+    /// runs it once before executing the newly bound foreign function.
+    pub(crate) fn publish_lazy_inits(&self, loaded: crate::native_lib::Loaded) {
+        if loaded.inits == 0 {
+            return;
+        }
+        self.native_inits_base.store(loaded.base, Ordering::Relaxed);
+        self.native_inits_at.store(loaded.inits_at, Ordering::Relaxed);
+        self.native_inits_count.store(loaded.inits, Ordering::Release);
     }
 
     /// The address of `slot`'s word, which is the slot's for the life of the process: what
@@ -415,6 +438,27 @@ pub(crate) extern "C" fn resolve(stub: usize, context: *const c_void) -> *const 
     shared.waiters.release(row);
     match answer {
         Answer::Bound => {
+            // If the control thread lazily loaded the program's native library while answering
+            // this stub, run its C initializers once here on the mutator thread before entering
+            // the newly bound function (the control thread is free to serve any Rust word stubs
+            // the initializers call).
+            if shared.native_inits_count.load(Ordering::Acquire) != 0 {
+                let inits = shared.native_inits_count.swap(0, Ordering::AcqRel);
+                if inits > 0 {
+                    let loaded = crate::native_lib::Loaded {
+                        record: blaze_launch::wire::RecordId([0; 32]),
+                        base: shared.native_inits_base.load(Ordering::Relaxed),
+                        inits_at: shared.native_inits_at.load(Ordering::Relaxed),
+                        inits,
+                    };
+                    let Some(args) = &shared.native_args else {
+                        stop(slot, "a lazily loaded native library has no process arguments");
+                    };
+                    if crate::native_lib::run_inits(loaded, args).is_err() {
+                        stop(slot, "a lazily loaded native library initializer failed");
+                    }
+                }
+            }
             // The resolver's exit is a safepoint (launcher.md, section 1): a thread that
             // began as a mutator reports its stack here while a batch waits.
             if thread.0 != 0 && shared.waiting.load(Ordering::Relaxed) != 0 {

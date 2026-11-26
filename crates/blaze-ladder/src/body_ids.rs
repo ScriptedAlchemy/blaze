@@ -230,7 +230,7 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     };
     let head = key_at(0)?;
-    if head != blaze_build::REIFY_SHIM_ITEM {
+    if head != blaze_build::REIFY_SHIM_ITEM && head != blaze_build::VTABLE_SHIM_ITEM && head != blaze_build::TEST_REPORT_SHIM_ITEM {
         each(head);
     }
     // The item's key (16) and the count of arguments (4); at no argument, nothing more.
@@ -436,6 +436,12 @@ pub trait Make {
     fn verify(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, Self::Error> {
         let _ = (tabled, name, entry);
         Ok(None)
+    }
+    /// Keyed verification hook receiving `(key, under)` (instance key and content key of the
+    /// stored entry) so a suite-level or certificate-checked verifier can memoize `Verdict::Holds`
+    /// within a single checked snapshot without re-evaluating read lists. Defaults to [`Make::verify`].
+    fn verify_keyed(&mut self, _key: CodeKey, _under: CodeKey, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, Self::Error> {
+        self.verify(tabled, name, entry)
     }
 }
 
@@ -1286,7 +1292,7 @@ impl<'a> Walk<'a> {
             let rows = form.reads(bytes).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
             let holds = match rows {
                 0 => true,
-                rows => match verify.verify(tabled, name.as_slice(), bytes).map_err(|why| WalkError::Verify { tabled, why })? {
+                rows => match verify.verify_keyed(key, under, tabled, name.as_slice(), bytes).map_err(|why| WalkError::Verify { tabled, why })? {
                     None => return Err(WalkError::Unverified { tabled, rows }),
                     Some(Verdict::Holds) => {
                         self.verified += 1;

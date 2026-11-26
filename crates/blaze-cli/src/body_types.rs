@@ -20,6 +20,7 @@ use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadOnly, ReadWrite};
 use bstd::mem::Frame;
 use bstd::path::Path;
+use bstd::sync::Once;
 use std::alloc::Global;
 
 use crate::CliError;
@@ -134,52 +135,404 @@ impl Kept {
         self.lazy_trees = Some((graph, trees));
         trees
     }
+
+    /// Seeds `Kept` with an existing command-scoped [`SyncLazyTrees`] (such as the one
+    /// `NamesWorld` created during the `Names` stage) so `Heads` and `Bodies` reuse its
+    /// already-mapped/decompressed packs and cached checkout files instead of duplicating work.
+    pub(crate) fn share_lazy_trees(
+        &mut self,
+        graph: ContentId,
+        packs: &'static SyncLazyTrees<'static>,
+        list: &CrateList<'static>,
+        heap: &'static blaze_own::Heap,
+    ) {
+        if packs.trees_len() != list.trees() {
+            return;
+        }
+        if let Some((out, Ok(_))) = self.lazy_trees
+            && out == graph
+        {
+            return;
+        }
+        if let Ok(corrected) = corrected_of(list, heap) {
+            self.lazy_trees = Some((graph, Ok((packs, corrected))));
+        }
+    }
 }
 
-/// Thread-safe, lock-free on-demand pack opener: each tree `k` (1-based) is mapped and verified
-/// on first read and published via `PublishOnce`.
+/// Number of hash buckets in [`CheckoutCache`]: power of two, lazily allocated on the first
+/// checkout read. Unbounded via per-bucket chains, keeping chains short even on large monorepos.
+const CHECKOUT_BUCKETS: usize = 2048;
+
+/// Deterministic hash of a checkout-relative path for [`CheckoutCache`] (rule 25, rule 75).
+fn checkout_hash(inner: &str) -> u64 {
+    core::hash::BuildHasher::hash_one(&blaze_hash::FixedState, inner)
+}
+
+/// Result of reading one checkout file (`/0/<inner>`) once per [`SyncLazyTrees`] lifetime
+/// (rule 74: one `read_all`, one UTF-8 check, and one `FILE_DOMAIN` BLAKE3 digest).
+pub(crate) enum CachedCheckout {
+    /// Valid UTF-8 text and its precomputed `crate::sweep::FILE_DOMAIN` digest.
+    Utf8 {
+        text: blaze_own::String<blaze_own::SharedAlloc<'static>>,
+        digest: ContentId,
+    },
+    /// Readable non-UTF-8 bytes (served to `read_data` / `include_bytes!`, and reported as
+    /// `Found::Unknown` with the exact `Utf8Error` to `source`).
+    NonUtf8 {
+        bytes: Vec<u8, blaze_own::SharedAlloc<'static>>,
+        utf8_error: core::str::Utf8Error,
+    },
+    /// Invalid path, `NotFound`, `IsADirectory`, or `NotADirectory`.
+    Absent,
+    /// Unreadable due to a filesystem error (permission denied, I/O error, etc.).
+    FsError(bstd::fs::FsError),
+}
+
+impl CachedCheckout {
+    fn load(cx: &Cx, root: &Dir<ReadWrite>, inner: &str, alloc: blaze_own::SharedAlloc<'static>) -> CachedCheckout {
+        if inner.split('/').any(|part| part == ".." || part == ".") {
+            return CachedCheckout::Absent;
+        }
+        let Ok(at) = Path::new(inner) else {
+            return CachedCheckout::Absent;
+        };
+        let mut raw = bstd::mem::Bytes::new_in(cx.frame(), "checkout file cache");
+        if let Err(error) = root.read_all(cx, &at, &mut raw) {
+            return match error.kind {
+                bstd::fs::FsKind::NotFound | bstd::fs::FsKind::IsADirectory | bstd::fs::FsKind::NotADirectory => CachedCheckout::Absent,
+                _ => CachedCheckout::FsError(error),
+            };
+        }
+        let slice = raw.as_slice();
+        let entry = match core::str::from_utf8(slice) {
+            Ok(text_str) => {
+                let digest = ContentId::of(crate::sweep::FILE_DOMAIN, slice);
+                let text = blaze_own::String::from_str_in(text_str, alloc);
+                CachedCheckout::Utf8 { text, digest }
+            }
+            Err(utf8_error) => {
+                let mut bytes = Vec::with_capacity_in(slice.len(), alloc);
+                bytes.extend_from_slice(slice);
+                CachedCheckout::NonUtf8 { bytes, utf8_error }
+            }
+        };
+        drop(raw);
+        entry
+    }
+
+    pub(crate) fn as_str(&self) -> Option<&str> {
+        match self {
+            CachedCheckout::Utf8 { text, .. } => Some(text.as_str()),
+            CachedCheckout::NonUtf8 { .. } | CachedCheckout::Absent | CachedCheckout::FsError(_) => None,
+        }
+    }
+
+    pub(crate) fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            CachedCheckout::Utf8 { text, .. } => Some(text.as_bytes()),
+            CachedCheckout::NonUtf8 { bytes, .. } => Some(bytes.as_slice()),
+            CachedCheckout::Absent | CachedCheckout::FsError(_) => None,
+        }
+    }
+
+    pub(crate) fn digest(&self) -> Option<ContentId> {
+        match self {
+            CachedCheckout::Utf8 { digest, .. } => Some(*digest),
+            CachedCheckout::NonUtf8 { .. } | CachedCheckout::Absent | CachedCheckout::FsError(_) => None,
+        }
+    }
+
+    pub(crate) fn as_source<'a>(&'a self, path: &'a str) -> blaze_scope::resolve::Found<&'a str, blaze_scope::resolve::Unread<'a>> {
+        match self {
+            CachedCheckout::Utf8 { text, .. } => blaze_scope::resolve::Found::Known(text.as_str()),
+            CachedCheckout::NonUtf8 { utf8_error, .. } => {
+                blaze_scope::resolve::Found::Unknown(blaze_scope::resolve::Unread { path, why: utf8_error })
+            }
+            CachedCheckout::Absent => blaze_scope::resolve::Found::Absent,
+            CachedCheckout::FsError(why) => {
+                blaze_scope::resolve::Found::Unknown(blaze_scope::resolve::Unread { path, why })
+            }
+        }
+    }
+}
+
+type CheckoutBucketSlot = Once<blaze_own::Box<CheckoutNode, blaze_own::SharedAlloc<'static>>>;
+
+struct CheckoutNode {
+    hash: u64,
+    path: blaze_own::String<blaze_own::SharedAlloc<'static>>,
+    value: Once<CachedCheckout>,
+    next: CheckoutBucketSlot,
+}
+
+/// Command-scoped, thread-safe, lock-free-on-read cache of checkout files (`/0/<inner>`).
+/// Allocated lazily on `SharedAlloc<'static>` and freed iteratively when [`SyncLazyTrees`] drops.
+struct CheckoutCache {
+    buckets: Once<Vec<CheckoutBucketSlot, blaze_own::SharedAlloc<'static>>>,
+}
+
+impl CheckoutCache {
+    fn new() -> CheckoutCache {
+        CheckoutCache { buckets: Once::new("checkout cache") }
+    }
+
+    fn bucket_index(hash: u64) -> usize {
+        const CHECKOUT_BUCKET_MASK: u64 = 2047;
+        const _: () = assert!((CHECKOUT_BUCKETS - 1) == 2047);
+        usize::try_from(hash & CHECKOUT_BUCKET_MASK).unwrap_or(0)
+    }
+
+    fn get_node(&self, inner: &str) -> Option<&CheckoutNode> {
+        let table = self.buckets.get()?;
+        let hash = checkout_hash(inner);
+        let mut slot = table.get(Self::bucket_index(hash))?;
+        while let Some(node) = slot.get() {
+            if node.hash == hash && node.path.as_str() == inner {
+                return Some(node);
+            }
+            slot = &node.next;
+        }
+        None
+    }
+
+    fn get_digest(&self, inner: &str) -> Option<ContentId> {
+        self.get_node(inner)?.value.get()?.digest()
+    }
+
+    fn cached_path(&self, inner: &str) -> Option<&str> {
+        self.get_node(inner).map(|node| node.path.as_str())
+    }
+
+    fn get_or_load(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        inner: &str,
+        alloc: blaze_own::SharedAlloc<'static>,
+    ) -> Result<(&str, &CachedCheckout), bstd::sync::OnceError<core::convert::Infallible>> {
+        let table = self.buckets.get_or_make(cx, |_| {
+            let mut v = Vec::with_capacity_in(CHECKOUT_BUCKETS, alloc);
+            v.resize_with(CHECKOUT_BUCKETS, || Once::new("checkout cache bucket"));
+            Ok::<_, core::convert::Infallible>(v)
+        })?;
+        let hash = checkout_hash(inner);
+        let Some(mut slot) = table.get(Self::bucket_index(hash)) else {
+            unreachable!("checkout bucket table always has CHECKOUT_BUCKETS entries");
+        };
+        loop {
+            let node = match slot.get() {
+                Some(node) => node,
+                None => slot.get_or_make(cx, |_| {
+                    Ok::<_, core::convert::Infallible>(blaze_own::Box::new_in(
+                        CheckoutNode {
+                            hash,
+                            path: blaze_own::String::from_str_in(inner, alloc),
+                            value: Once::new("checkout file"),
+                            next: Once::new("checkout cache bucket"),
+                        },
+                        alloc,
+                    ))
+                })?,
+            };
+            if node.hash == hash && node.path.as_str() == inner {
+                let entry = node.value.get_or_make(cx, |cx| {
+                    Ok::<_, core::convert::Infallible>(CachedCheckout::load(cx, root, inner, alloc))
+                })?;
+                return Ok((node.path.as_str(), entry));
+            }
+            slot = &node.next;
+        }
+    }
+}
+
+impl Drop for CheckoutCache {
+    fn drop(&mut self) {
+        let buckets = core::mem::replace(&mut self.buckets, Once::new("checkout cache"));
+        let Some(mut table) = buckets.into_inner() else {
+            return;
+        };
+        for bucket in table.drain(..) {
+            let mut cur = bucket.into_inner();
+            while let Some(node) = cur {
+                let CheckoutNode { next, .. } = blaze_own::Box::into_inner(node);
+                cur = next.into_inner();
+            }
+        }
+    }
+}
+
+/// One pack entry materialized once on demand across all workers and stretches (rule 74:
+/// decompress and check UTF-8 at most once per unique file in a pack).
+enum CachedPackEntry {
+    BorrowedStr(&'static str),
+    BorrowedBytes(&'static [u8]),
+    OwnedStr(blaze_own::String<blaze_own::SharedAlloc<'static>>),
+    OwnedBytes(Vec<u8, blaze_own::SharedAlloc<'static>>),
+    Failed,
+}
+
+impl CachedPackEntry {
+    fn of(entry: blaze_fetch::pack::FileEntry<'static>, alloc: blaze_own::SharedAlloc<'static>) -> CachedPackEntry {
+        match entry.read_in(alloc) {
+            Ok(blaze_fetch::pack::FileBytes::Borrowed(bytes)) => match core::str::from_utf8(bytes) {
+                Ok(text) => CachedPackEntry::BorrowedStr(text),
+                Err(_) => CachedPackEntry::BorrowedBytes(bytes),
+            },
+            Ok(blaze_fetch::pack::FileBytes::Owned(bytes)) => match blaze_own::String::from_utf8(bytes) {
+                Ok(text) => CachedPackEntry::OwnedStr(text),
+                Err(error) => CachedPackEntry::OwnedBytes(error.into_bytes()),
+            },
+            Err(_) => CachedPackEntry::Failed,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            CachedPackEntry::BorrowedStr(s) => Some(s),
+            CachedPackEntry::OwnedStr(s) => Some(s.as_str()),
+            CachedPackEntry::BorrowedBytes(_) | CachedPackEntry::OwnedBytes(_) | CachedPackEntry::Failed => None,
+        }
+    }
+
+    fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            CachedPackEntry::BorrowedStr(s) => Some(s.as_bytes()),
+            CachedPackEntry::BorrowedBytes(b) => Some(b),
+            CachedPackEntry::OwnedStr(s) => Some(s.as_bytes()),
+            CachedPackEntry::OwnedBytes(b) => Some(b.as_slice()),
+            CachedPackEntry::Failed => None,
+        }
+    }
+}
+
+/// One opened pack and its per-entry lazy cache of decompressed file bytes/UTF-8 text.
+struct CachedPack {
+    view: PackView<'static>,
+    entries: Vec<Once<CachedPackEntry>, blaze_own::SharedAlloc<'static>>,
+}
+
+impl CachedPack {
+    fn new(view: PackView<'static>, alloc: blaze_own::SharedAlloc<'static>) -> CachedPack {
+        let mut entries = Vec::with_capacity_in(view.len(), alloc);
+        entries.resize_with(view.len(), || Once::new("pack file entry"));
+        CachedPack { view, entries }
+    }
+
+    fn get_or_load(
+        &self,
+        cx: &Cx,
+        path: &str,
+        alloc: blaze_own::SharedAlloc<'static>,
+    ) -> Result<Option<&CachedPackEntry>, blaze_fetch::PackRefused> {
+        let Some(at) = self.view.find_index(path) else {
+            if let Some(sub) = self.view.submodule_covering(path) {
+                let commit = sub.submodule_commit().unwrap_or([0u8; 20]);
+                return Err(blaze_fetch::PackRefused::Submodule {
+                    path: blaze_fetch::unpack::Cut::of(path.as_bytes()),
+                    submodule: blaze_fetch::unpack::Cut::of(sub.path.as_bytes()),
+                    commit,
+                });
+            }
+            return Ok(None);
+        };
+        let entry = self.view.entry(at);
+        if entry.mode == blaze_fetch::Mode::Submodule {
+            let commit = entry.submodule_commit().unwrap_or([0u8; 20]);
+            return Err(blaze_fetch::PackRefused::Submodule {
+                path: blaze_fetch::unpack::Cut::of(path.as_bytes()),
+                submodule: blaze_fetch::unpack::Cut::of(entry.path.as_bytes()),
+                commit,
+            });
+        }
+        let Some(slot) = self.entries.get(at) else {
+            return Ok(None);
+        };
+        Ok(slot.get_or_make(cx, |_| Ok::<_, core::convert::Infallible>(CachedPackEntry::of(entry, alloc))).ok())
+    }
+}
+
+/// Thread-safe, on-demand pack opener, per-entry decompressed pack file cache, and command-scoped
+/// checkout file cache: each tree `k` (1-based) is mapped and verified once, each compressed pack
+/// file is decompressed and UTF-8 checked at most once, and each checkout file (`/0/<inner>`) is
+/// read from disk, UTF-8 checked, and BLAKE3-hashed (`FILE_DOMAIN`) at most once across all
+/// workers, jobs, and stretches.
 pub(crate) struct SyncLazyTrees<'f> {
     home: Option<&'f str>,
     heap: &'static blaze_own::Heap,
     list: CrateList<'static>,
-    slots: &'f [bstd::sync::PublishOnce<Result<PackView<'static>, &'static str>>],
+    slots: Vec<Once<Result<CachedPack, &'static str>>, blaze_own::SharedAlloc<'static>>,
     refused: bstd::sync::PublishOnce<&'static str>,
+    checkout: CheckoutCache,
 }
 
 impl<'f> SyncLazyTrees<'f> {
     pub(crate) fn new(home: Option<&str>, heap: &'static blaze_own::Heap, list: CrateList<'static>, frame: &'f Frame) -> SyncLazyTrees<'f> {
-        let mut slots: Vec<bstd::sync::PublishOnce<Result<PackView<'static>, &'static str>>, &'f Frame> = Vec::with_capacity_in(list.trees(), frame);
-        slots.extend((0..list.trees()).map(|_| bstd::sync::PublishOnce::new()));
+        let mut slots: Vec<Once<Result<CachedPack, &'static str>>, blaze_own::SharedAlloc<'static>> = Vec::with_capacity_in(list.trees(), heap.shared());
+        slots.resize_with(list.trees(), || Once::new("source pack"));
         let home = home.map(|h| crate::work::held_str(h, frame));
         SyncLazyTrees {
             home,
             heap,
             list,
-            slots: slots.into_bump_slice(),
+            slots,
             refused: bstd::sync::PublishOnce::new(),
+            checkout: CheckoutCache::new(),
         }
     }
 
     pub(crate) fn new_in_heap(home: Option<&str>, heap: &'static blaze_own::Heap, list: CrateList<'static>) -> Result<&'static SyncLazyTrees<'static>, &'static str> {
         let g = heap.alloc();
-        let mut slots: AVec<'static, bstd::sync::PublishOnce<Result<PackView<'static>, &'static str>>> = AVec::new_in(g);
+        let mut slots: Vec<Once<Result<CachedPack, &'static str>>, blaze_own::SharedAlloc<'static>> = Vec::new_in(heap.shared());
         if slots.try_reserve_exact(list.trees()).is_err() {
             return Err(TREES_REFUSED);
         }
-        slots.extend((0..list.trees()).map(|_| bstd::sync::PublishOnce::new()));
+        slots.resize_with(list.trees(), || Once::new("source pack"));
         let home: Option<&'static str> = home.map(|h| &*blaze_own::Box::leak_static(blaze_own::AString::from_str_in(h, g).into_boxed_str()));
         let lazy = SyncLazyTrees {
             home,
             heap,
             list,
-            slots: slots.leak_static(),
+            slots,
             refused: bstd::sync::PublishOnce::new(),
+            checkout: CheckoutCache::new(),
         };
         Ok(blaze_own::Box::leak_static(blaze_own::Box::new_in(lazy, g)))
     }
 
     pub(crate) fn trees_len(&self) -> usize {
         self.slots.len()
+    }
+
+    fn open_cached(
+        &self,
+        cx: &Cx,
+        fs: &bstd::fs::Fs,
+        dirs: Option<&SyncPackDirs>,
+        scratch: &Frame,
+        k: usize,
+    ) -> Option<(&CachedPack, bool)> {
+        let slot = self.slots.get(k.checked_sub(1)?)?;
+        let mut newly_opened = false;
+        let got = slot.get_or_make(cx, |cx| {
+            newly_opened = true;
+            let from = PackHome { home: self.home, fs, heap: self.heap };
+            let opened = match dirs {
+                Some(shared) => open_tree_shared(cx, from, &self.list, k, shared, scratch).map_err(|r| r.0),
+                None => {
+                    let mut local = PackDirs::default();
+                    open_tree(cx, from, &self.list, k, &mut local, scratch)
+                }
+            };
+            Ok::<_, core::convert::Infallible>(opened.map(|view| CachedPack::new(view, self.heap.shared())))
+        }).ok()?;
+        match got {
+            Ok(pack) => Some((pack, newly_opened)),
+            Err(why) => {
+                let _ = self.refused.set(*why);
+                None
+            }
+        }
     }
 
     pub(crate) fn open_tree_with(
@@ -190,34 +543,75 @@ impl<'f> SyncLazyTrees<'f> {
         scratch: &Frame,
         k: usize,
     ) -> Option<(PackView<'static>, bool)> {
-        let slot = self.slots.get(k.checked_sub(1)?)?;
-        let (got, newly_opened) = match slot.get() {
-            Some(got) => (*got, false),
-            None => {
-                let from = PackHome { home: self.home, fs, heap: self.heap };
-                let opened = match dirs {
-                    Some(shared) => open_tree_shared(cx, from, &self.list, k, shared, scratch).map_err(|r| r.0),
-                    None => {
-                        let mut local = PackDirs::default();
-                        open_tree(cx, from, &self.list, k, &mut local, scratch)
-                    }
-                };
-                let newly_opened = slot.set(opened).is_ok();
-                (*slot.get()?, newly_opened)
-            }
-        };
-        match got {
-            Ok(view) => Some((view, newly_opened)),
+        let (pack, newly_opened) = self.open_cached(cx, fs, dirs, scratch, k)?;
+        Some((pack.view, newly_opened))
+    }
+
+    pub(crate) fn tree(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
+        let (pack, _) = self.open_cached(cx, fs, None, scratch, k)?;
+        Some(pack.view)
+    }
+
+    fn record_pack_refusal(&self, why: &blaze_fetch::PackRefused) {
+        if self.refused.get().is_some() {
+            return;
+        }
+        let mut msg = blaze_own::AString::new_in(self.heap.alloc());
+        blaze_text::Writes::show(&mut msg, why);
+        let leaked: &'static str = blaze_own::Box::leak_static(msg.into_boxed_str());
+        let _ = self.refused.set(leaked);
+    }
+
+    /// Reads file `path` of pack `k` as UTF-8 text, decompressing and verifying UTF-8 at most
+    /// once across all workers and stretches (zero bytes allocated in `scratch`).
+    pub(crate) fn read_str(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize, path: &str) -> Option<&str> {
+        let (pack, _) = self.open_cached(cx, fs, None, scratch, k)?;
+        match pack.get_or_load(cx, path, self.heap.shared()) {
+            Ok(Some(entry)) => entry.as_str(),
+            Ok(None) => None,
             Err(why) => {
-                let _ = self.refused.set(why);
+                self.record_pack_refusal(&why);
                 None
             }
         }
     }
 
-    pub(crate) fn tree(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
-        let (view, _) = self.open_tree_with(cx, fs, None, scratch, k)?;
-        Some(view)
+    /// Reads file `path` of pack `k` as raw bytes, decompressing at most once across all workers
+    /// and stretches (zero bytes allocated in `scratch`).
+    pub(crate) fn read_slice(&self, cx: &Cx, fs: &bstd::fs::Fs, scratch: &Frame, k: usize, path: &str) -> Option<&[u8]> {
+        let (pack, _) = self.open_cached(cx, fs, None, scratch, k)?;
+        match pack.get_or_load(cx, path, self.heap.shared()) {
+            Ok(Some(entry)) => entry.as_bytes(),
+            Ok(None) => None,
+            Err(why) => {
+                self.record_pack_refusal(&why);
+                None
+            }
+        }
+    }
+
+    /// Reads checkout file `inner` (`/0/<inner>`) from `root` at most once per `SyncLazyTrees`
+    /// lifetime (rule 74): one `read_all`, one UTF-8 check, and one `FILE_DOMAIN` BLAKE3 digest.
+    /// Returns `(cached_path, entry)` borrowed from `&self` (zero bytes in any stretch `Frame`).
+    pub(crate) fn read_checkout(
+        &self,
+        cx: &Cx,
+        root: &Dir<ReadWrite>,
+        inner: &str,
+    ) -> Result<(&str, &CachedCheckout), bstd::sync::OnceError<core::convert::Infallible>> {
+        self.checkout.get_or_load(cx, root, inner, self.heap.shared())
+    }
+
+    /// Returns the precomputed `crate::sweep::FILE_DOMAIN` digest for an already-cached UTF-8
+    /// checkout file `inner`, with zero locks, zero allocation, and zero BLAKE3 recomputation.
+    pub(crate) fn checkout_digest(&self, inner: &str) -> Option<ContentId> {
+        self.checkout.get_digest(inner)
+    }
+
+    /// Returns the cached path slice for an already-cached checkout file `inner`, avoiding
+    /// re-copying the path into a job's stretch `Frame`.
+    pub(crate) fn cached_checkout_path(&self, inner: &str) -> Option<&str> {
+        self.checkout.cached_path(inner)
     }
 
     pub(crate) fn refused(&self) -> Option<&'static str> {
@@ -354,17 +748,27 @@ fn open_row_shared(cx: &Cx, from: PackHome<'_>, row: TreeRow, k: usize, dirs: &S
     let hex = crate::fetch::key_hex(&ContentId(name));
     let hex = core::str::from_utf8(&hex).map_err(|_| PackRefusal("a pack's name is not hex (fetch.rs `key_hex`)"))?;
     let at = bstd::mem::format_in!(scratch, "tree {k} of the crate list, `<home>/{folder}/{hex}`");
+    let dir_owned;
     let dir = match slot.get() {
         Some(dir) => dir,
         None => {
             let opened = open_home_pack_dir(cx, from, folder, at.as_str(), scratch)?;
-            // If another thread raced and published first, `opened` drops here and closes its driver.
-            let _ = slot.set(opened);
-            let Some(dir) = slot.get() else {
-                let kept = |words: &str| -> PackRefusal { PackRefusal(blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, from.heap.alloc()).into_boxed_str())) };
-                return Err(kept(bstd::mem::format_in!(scratch, "{at}: its folder was not opened").as_str()));
-            };
-            dir
+            // If another thread raced and is still in `WRITING`, `slot.set` returns `Err(mine)`
+            // while `slot.get()` is briefly `None`; borrow `dir_owned` for this call so it never
+            // fails spuriously, then drop it cleanly on return.
+            match slot.set(opened) {
+                Ok(()) => match slot.get() {
+                    Some(dir) => dir,
+                    None => {
+                        let kept = |words: &str| -> PackRefusal { PackRefusal(blaze_own::Box::leak_static(blaze_own::AString::from_str_in(words, from.heap.alloc()).into_boxed_str())) };
+                        return Err(kept(bstd::mem::format_in!(scratch, "{at}: its folder was not opened").as_str()));
+                    }
+                },
+                Err(mine) => {
+                    dir_owned = mine;
+                    slot.get().unwrap_or(&dir_owned)
+                }
+            }
         }
     };
     map_pack_in_dir(cx, dir, row, hex, at.as_str(), from.heap, scratch)
@@ -416,13 +820,13 @@ impl<'n> SharedTrees<'n> {
         SharedTrees { packs, fs, dirs, seen }
     }
 
-    pub(crate) fn tree(&self, cx: &Cx, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
-        match self.packs.open_tree_with(cx, self.fs, Some(self.dirs), scratch, k) {
-            Some((view, newly_opened)) => {
+    fn open_cached(&self, cx: &Cx, scratch: &Frame, k: usize) -> Option<&'static CachedPack> {
+        match self.packs.open_cached(cx, self.fs, Some(self.dirs), scratch, k) {
+            Some((pack, newly_opened)) => {
                 if newly_opened {
                     self.seen.opened.set(self.seen.opened.get() + 1);
                 }
-                Some(view)
+                Some(pack)
             }
             None => {
                 if let Some(why) = self.packs.refused()
@@ -430,6 +834,38 @@ impl<'n> SharedTrees<'n> {
                 {
                     self.seen.refused.set(Some(why));
                 }
+                None
+            }
+        }
+    }
+
+    pub(crate) fn tree(&self, cx: &Cx, scratch: &Frame, k: usize) -> Option<PackView<'static>> {
+        self.open_cached(cx, scratch, k).map(|pack| pack.view)
+    }
+
+    /// Reads file `path` of immutable pack `k` as UTF-8 text from the command-wide cache
+    /// (zero bytes allocated in `scratch`, zero repeat Zstd decode across workers/suites).
+    pub(crate) fn read_str(&self, cx: &Cx, scratch: &Frame, k: usize, path: &str) -> Option<&'static str> {
+        let pack = self.open_cached(cx, scratch, k)?;
+        match pack.get_or_load(cx, path, self.packs.heap.shared()) {
+            Ok(Some(entry)) => entry.as_str(),
+            Ok(None) => None,
+            Err(why) => {
+                self.packs.record_pack_refusal(&why);
+                None
+            }
+        }
+    }
+
+    /// Reads file `path` of immutable pack `k` as raw bytes from the command-wide cache
+    /// (zero bytes allocated in `scratch`, zero repeat Zstd decode across workers/suites).
+    pub(crate) fn read_slice(&self, cx: &Cx, scratch: &Frame, k: usize, path: &str) -> Option<&'static [u8]> {
+        let pack = self.open_cached(cx, scratch, k)?;
+        match pack.get_or_load(cx, path, self.packs.heap.shared()) {
+            Ok(Some(entry)) => entry.as_bytes(),
+            Ok(None) => None,
+            Err(why) => {
+                self.packs.record_pack_refusal(&why);
                 None
             }
         }
@@ -667,9 +1103,133 @@ mod shared_pack_tests {
 
         for _ in 0..64 {
             let view = open_row_shared(&cx, from, row, 1, &dirs, &frame).unwrap_or_else(|e| panic!("open pack: {}", e.0));
-            let file = view.find("src/lib.rs").expect("src/lib.rs");
-            assert_eq!(file.bytes, b"pub fn ok() {}\n");
+            let file = view.read("src/lib.rs", &frame).expect("read").expect("src/lib.rs");
+            assert_eq!(file.bytes.as_slice(), b"pub fn ok() {}\n");
         }
         assert_eq!(dirs.opened_count(), 1, "64 suite opens must share one sources Dir, never open 64 drivers");
+    }
+
+    #[test]
+    fn cached_pack_fails_closed_on_submodule_paths() {
+        let io = Io::simulated(SimWorld::new(93, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root cx");
+        let heap = blaze_own::testing::heap();
+        let limits = PackLimits { most_files: 8, most_bytes: 1 << 16, most_path: 128 };
+        let sub_oid = [0x33u8; 20];
+        let mut builder = Builder::new(PackKind::Git, [0x42; 32], limits, 0, heap.alloc()).expect("builder");
+        builder.file("src/lib.rs", Mode::File, b"pub fn ok() {}\n").expect("file");
+        builder.file("v8", Mode::Submodule, &sub_oid).expect("submodule");
+        let pack_bytes = builder.finish().expect("pack bytes");
+        let leaked: &'static [u8] = blaze_own::Box::leak_static(pack_bytes.into_boxed_slice());
+        let view = PackView::open_verified(leaked).expect("valid pack");
+        let cached = CachedPack::new(view, heap.shared());
+
+        let ok = cached.get_or_load(&cx, "src/lib.rs", heap.shared()).expect("normal file").expect("present");
+        assert_eq!(ok.as_str(), Some("pub fn ok() {}\n"));
+        assert!(cached.get_or_load(&cx, "v8_extra/foo.rs", heap.shared()).expect("non-submodule miss").is_none());
+
+        for bad in ["v8", "v8/src/lib.rs"] {
+            let Err(err) = cached.get_or_load(&cx, bad, heap.shared()) else {
+                panic!("submodule path `{bad}` must fail closed");
+            };
+            assert_eq!(
+                err,
+                blaze_fetch::PackRefused::Submodule {
+                    path: blaze_fetch::unpack::Cut::of(bad.as_bytes()),
+                    submodule: blaze_fetch::unpack::Cut::of(b"v8"),
+                    commit: sub_oid,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn checkout_cache_reads_once_caches_digest_and_catches_stale_on_fresh_cache() {
+        let io = Io::simulated(SimWorld::new(97, Limits::USUAL));
+        let Ok(cx) = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME) else {
+            panic!("root cx");
+        };
+        let Ok(fs) = io.need_fs() else {
+            panic!("fs");
+        };
+        let Ok(ws_path) = Path::new("ws") else {
+            panic!("ws path");
+        };
+        let Ok(root) = fs.open_dir(&cx, &ws_path) else {
+            panic!("open ws");
+        };
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+
+        let Ok(lib_path) = Path::new("src/lib.rs") else {
+            panic!("lib path");
+        };
+        let Ok(bin_path) = Path::new("src/data.bin") else {
+            panic!("bin path");
+        };
+        let first_text: &[u8] = b"pub fn one() -> u32 { 1 }\n";
+        let second_text: &[u8] = b"pub fn one() -> u32 { 2 }\n";
+        let raw_bin: &[u8] = &[0xff, 0xfe, 0x00, 0x41];
+        if let Err(err) = root.publish(&cx, &lib_path, Content::bytes(first_text), Durable::No) {
+            panic!("publish lib.rs: {err}");
+        }
+        if let Err(err) = root.publish(&cx, &bin_path, Content::bytes(raw_bin), Durable::No) {
+            panic!("publish data.bin: {err}");
+        }
+
+        let cache = CheckoutCache::new();
+        assert_eq!(cache.get_digest("src/lib.rs"), None);
+        let Ok((path, entry)) = cache.get_or_load(&cx, &root, "src/lib.rs", alloc) else {
+            panic!("load lib.rs");
+        };
+        assert_eq!(path, "src/lib.rs");
+        assert_eq!(entry.as_str(), Some("pub fn one() -> u32 { 1 }\n"));
+        assert_eq!(entry.as_bytes(), Some(first_text));
+        let expected_first = ContentId::of(crate::sweep::FILE_DOMAIN, first_text);
+        assert_eq!(entry.digest(), Some(expected_first));
+        assert_eq!(cache.get_digest("src/lib.rs"), Some(expected_first));
+        assert_eq!(cache.cached_path("src/lib.rs"), Some("src/lib.rs"));
+
+        // Mutate file on disk: same command's cache must serve the first snapshot without re-reading.
+        if let Err(err) = root.publish(&cx, &lib_path, Content::bytes(second_text), Durable::No) {
+            panic!("republish lib.rs: {err}");
+        }
+        let Ok((_, again)) = cache.get_or_load(&cx, &root, "src/lib.rs", alloc) else {
+            panic!("reload lib.rs");
+        };
+        assert_eq!(again.as_str(), Some("pub fn one() -> u32 { 1 }\n"));
+        assert_eq!(cache.get_digest("src/lib.rs"), Some(expected_first));
+
+        // Non-UTF-8 binary file: readable as bytes, None as str/digest, Unknown(Utf8Error) as source.
+        let Ok((bpath, bentry)) = cache.get_or_load(&cx, &root, "src/data.bin", alloc) else {
+            panic!("load data.bin");
+        };
+        assert_eq!(bpath, "src/data.bin");
+        assert_eq!(bentry.as_str(), None);
+        assert_eq!(bentry.as_bytes(), Some(raw_bin));
+        assert_eq!(bentry.digest(), None);
+        assert!(matches!(bentry.as_source(bpath), blaze_scope::resolve::Found::Unknown(_)));
+
+        // Absent and dot-segment paths map to Absent.
+        let Ok((_, missing)) = cache.get_or_load(&cx, &root, "src/missing.rs", alloc) else {
+            panic!("load missing.rs");
+        };
+        assert!(matches!(missing.as_source("src/missing.rs"), blaze_scope::resolve::Found::Absent));
+        assert_eq!(missing.as_bytes(), None);
+        let Ok((_, dotdot)) = cache.get_or_load(&cx, &root, "../escape.rs", alloc) else {
+            panic!("load escape.rs");
+        };
+        assert!(matches!(dotdot.as_source("../escape.rs"), blaze_scope::resolve::Found::Absent));
+
+        // Drop cleans up without panic; a fresh cache for a new command observes the mutated file.
+        drop(cache);
+        let fresh = CheckoutCache::new();
+        let Ok((_, fresh_entry)) = fresh.get_or_load(&cx, &root, "src/lib.rs", alloc) else {
+            panic!("fresh load lib.rs");
+        };
+        let expected_second = ContentId::of(crate::sweep::FILE_DOMAIN, second_text);
+        assert_eq!(fresh_entry.as_str(), Some("pub fn one() -> u32 { 2 }\n"));
+        assert_eq!(fresh_entry.digest(), Some(expected_second));
+        assert_eq!(fresh.get_digest("src/lib.rs"), Some(expected_second));
     }
 }

@@ -28,7 +28,7 @@ use super::{Machine, Mode, Need, NeedKind, R, Repr, Stop, Val, Work, int_info, m
 use crate::error::Refusal;
 use crate::layout::{self, Layout};
 use crate::lit;
-use crate::record::{ConstFn, RecordKey};
+use crate::record::{ConstFn, ConstVtable, RecordKey};
 use crate::soft::Format;
 use crate::{ConstWorld, FnKind, FnTraitMethod, Intrinsic, Typed};
 
@@ -158,6 +158,10 @@ pub(super) enum Op {
     Unsize { dst: Reg, src: Reg, n: u32 },
     /// A pointer to an array made a slice's pointer and length (`Code::u64s[k]`).
     UnsizeWide { dst: Reg, src: Reg, k: u32 },
+    /// A thin pointer unsized to a trait object (`Code::vtables[k]`).
+    UnsizeDyn { dst: Reg, src: Reg, k: u32 },
+    /// A trait-object wide pointer upcast to a supertrait (`Code::dyn_upcasts[k]`).
+    UnsizeDynUpcast { dst: Reg, src: Reg, k: u32 },
     /// A fn pointer to `Code::fns[k]`.
     FnPtr { dst: Reg, k: u32 },
     Unary { dst: Reg, src: Reg, op: UnOp, num: Num },
@@ -327,6 +331,10 @@ pub(super) struct Code<A: Allocator + Clone> {
     pub(super) consts: Vec<(ItemKey, List, RecordKey), A>,
     /// The fn pointers it makes: each one's key and the instance it was made from.
     pub(super) fns: Vec<ConstFn, A>,
+    /// The trait-object vtables it names (`Op::UnsizeDyn`).
+    pub(super) vtables: Vec<ConstVtable, A>,
+    /// The target `(principal, args)` of trait-object upcasts (`Op::UnsizeDynUpcast`).
+    pub(super) dyn_upcasts: Vec<(ItemKey, List), A>,
     pub(super) calls: Vec<Call, A>,
     /// Argument registers of calls and their types.
     pub(super) regs_of: Vec<(Reg, PTy), A>,
@@ -396,7 +404,7 @@ impl EnumFacts {
 
 /// The compiled bodies of a unit, separated from `Work` so `Machine` can borrow `&mut Work`
 /// and `&mut CodeTable` simultaneously with zero moves.
-pub(super) struct CodeTable<A: Allocator + Clone> {
+pub(super) struct CodeTable<A: Allocator + Copy> {
     pub(super) list: Vec<Code<A>, A>,
     pub(super) by: HashMap<(ItemKey, List), u32, A>,
     pub(super) alloc: A,
@@ -407,14 +415,14 @@ pub(super) struct CodeTable<A: Allocator + Clone> {
 /// The code of a unit's bodies, by item and ground arguments: compiled once, run by every
 /// evaluation in the unit. It lives as long as the unit's ground table and layouts, whose ids
 /// it holds.
-pub struct Codes<A: Allocator + Clone> {
+pub struct Codes<A: Allocator + Copy> {
     pub(super) table: CodeTable<A>,
     /// The machine's working vectors, kept for the next evaluation of the unit and borrowed
     /// in place (`&mut Work`) with zero struct moves.
     pub(super) work: Work<A>,
 }
 
-impl<A: Allocator + Clone> Codes<A> {
+impl<A: Allocator + Copy> Codes<A> {
     pub fn new_in(alloc: A) -> Codes<A> {
         Codes {
             table: CodeTable {
@@ -688,9 +696,9 @@ impl Refusal<'_> {
     }
 }
 
-impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
+impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Machine<'w, 'l, 'g, 't, 'wk, 'a, W, L, K> {
     /// The code of `item` at ground arguments `args`: the unit's, or compiled now.
-    pub(super) fn code<A: Allocator + Clone>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List) -> R<'a, u32> {
+    pub(super) fn code<A: Allocator + Copy>(&mut self, codes: &mut CodeTable<A>, item: ItemKey, args: List, param_tys: &[PTy]) -> R<'a, u32> {
         let old = codes.by.get(&(item, args)).copied();
         if let Some(i) = old {
             let c = &codes.list[i as usize];
@@ -732,6 +740,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 statics: Vec::new_in(codes.alloc.clone()),
                 consts: Vec::new_in(codes.alloc.clone()),
                 fns: Vec::new_in(codes.alloc.clone()),
+                vtables: Vec::new_in(codes.alloc),
+                dyn_upcasts: Vec::new_in(codes.alloc),
                 calls: Vec::new_in(codes.alloc.clone()),
                 regs_of: Vec::new_in(codes.alloc.clone()),
                 builds: Vec::new_in(codes.alloc.clone()),
@@ -764,7 +774,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 restart: None,
             };
             cc.homes.resize(typed.body.pats.len(), Home::None);
-            self.body(&mut cc, &mut code)?;
+            self.body(&mut cc, &mut code, param_tys)?;
             let restart = cc.restart;
             drop(cc);
             match restart {
@@ -798,29 +808,51 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
         })
     }
 
+    /// When `cand` peels through one or more `PNode::Ref` layers down to `peeled`, returns `cand`
+    /// (the unpeeled type for default-binding-mode patterns like `fn f(Label(a, b): &Label)` or
+    /// `let Label(a, b) = &label;`, where `typeck` records `pat_ty` at the peeled type);
+    /// otherwise returns `peeled`.
+    fn unpeeled_ref_ty(&self, cand: PTy, peeled: PTy) -> R<'a, PTy> {
+        let mut cur = cand;
+        for _ in 0..64 {
+            if cur == peeled {
+                return Ok(cand);
+            }
+            match self.node(cur)? {
+                PNode::Ref(_, inner) => cur = inner,
+                _ => break,
+            }
+        }
+        Ok(peeled)
+    }
+
     /// Compiles the whole body: the parameters' bindings, then its expression, then `Ret`.
-    fn body<A: Allocator + Clone>(&mut self, cc: &mut Cc<'w, '_>, code: &mut Code<A>) -> R<'a, ()> {
+    fn body<A: Allocator + Clone>(&mut self, cc: &mut Cc<'w, '_>, code: &mut Code<A>, param_tys: &[PTy]) -> R<'a, ()> {
         let typed = cc.typed;
         let body = typed.body;
         // The arguments arrive in registers 0..n.
         for _ in body.params.iter() {
             self.reg(cc, Kind::V);
         }
-        for (i, &pat) in body.params.iter().enumerate() {
-            let i = i as u32;
-            let t = match self.cg(cc, *typed.pat_ty.get(pat.ix()).ok_or(malformed("a pattern with no type"))?) {
+        for (ix, &pat) in body.params.iter().enumerate() {
+            let i = ix as u32;
+            let t_pat = match self.cg(cc, *typed.pat_ty.get(pat.ix()).ok_or(malformed("a pattern with no type"))?) {
                 Ok(t) => t,
                 Err(s) => {
                     self.late(code, cc, s);
                     continue;
                 }
             };
+            let t = match param_tys.get(ix).copied() {
+                Some(arg_ty) => self.unpeeled_ref_ty(arg_ty, t_pat)?,
+                None => t_pat,
+            };
             if let Pat::Bind { ann: blaze_typeck::BindAnn { by_ref: None, .. }, sub: None, .. } = body.pats[pat.ix()]
                 && self.union_pat_c(cc, pat).is_none()
             {
                 if self.reg_home(cc, pat, t)? {
                     cc.homes[pat.ix()] = Home::Reg(i);
-                    cc.kinds[i as usize] = Kind::Local(pat);
+                    cc.kinds[ix] = Kind::Local(pat);
                     continue;
                 }
             }
@@ -941,6 +973,181 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             }
         };
         self.emit(code, cc, op)
+    }
+
+    /// Principal trait and its arguments after `Self` of ground trait object `t`, `None` for
+    /// auto-trait-only objects (`dyn Send`).
+    fn principal_c(&self, t: PTy) -> R<'a, Option<(ItemKey, List)>> {
+        let view = self.ground.view();
+        let PNode::Dynamic(l) = view.node(t).map_err(|_| malformed("a type past the ground table"))? else {
+            return Err(malformed("a trait object's principal asked of another type"));
+        };
+        let preds = view.list(l).map_err(|_| malformed("a trait object's predicates past the ground table"))?;
+        let Some(&first) = preds.first() else {
+            return Err(unsupported("a trait object with no predicates"));
+        };
+        Ok(match view.node(first).map_err(|_| malformed("a type past the ground table"))? {
+            PNode::ExTrait(k, args) => Some((k, args)),
+            _ => None,
+        })
+    }
+
+    /// Walks pointees `f` and `g` through matching struct tails (the Reference, "Unsized
+    /// coercions": a struct whose last field involves `T`), returning the pair whose metadata
+    /// the unsized wide pointer carries.
+    fn unsize_tails_c(&mut self, mut f: PTy, mut g: PTy) -> R<'a, (PTy, PTy)> {
+        const UNSIZE_DEPTH: u32 = 16;
+        for _ in 0..UNSIZE_DEPTH {
+            if f == g {
+                return Ok((f, g));
+            }
+            let (k, nfields) = match (self.node(f)?, self.node(g)?) {
+                (PNode::Adt(k, _), PNode::Adt(k2, _)) if k == k2 => {
+                    let adt = self.world.adt(k).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                    if adt.kind != AdtKind::Struct || adt.variants.len() != 1 {
+                        return Err(unsupported("an unsizing of a pointee that is an enum or a union"));
+                    }
+                    let len = adt.variants[0].fields.len;
+                    if len == 0 {
+                        return Err(unsupported("an unsizing of a pointee struct without fields"));
+                    }
+                    (k, len)
+                }
+                _ => return Ok((f, g)),
+            };
+            let _ = k;
+            let last = nfields - 1;
+            f = self.field_ty(f, 0, last)?;
+            g = self.field_ty(g, 0, last)?;
+        }
+        Err(unsupported("an unsizing whose pointee passes through more struct tails than the bound"))
+    }
+
+    /// Unsizing coercion from ground type `ty` to `next` (array-to-slice, concrete-to-`dyn`,
+    /// `dyn` upcast, pointee struct-tail unsizing, and nested `CoerceUnsized` structs such as
+    /// `NonNull<T>` or `Pin<&T>`), peeled iteratively up to `UNSIZE_DEPTH` wrappers.
+    fn unsize_c<A: Allocator + Clone>(&mut self, cc: &mut Cc<'w, '_>, code: &mut Code<A>, mut out: Reg, mut ty: PTy, mut next: PTy) -> R<'a, Reg> {
+        const UNSIZE_DEPTH: u32 = 16;
+        enum Wrap<'a> {
+            Pat(PTy),
+            Adt { next: PTy, coerced_fi: u32, coerced_ty: PTy, parts: Vec<(u32, Reg, PTy), Alloc<'a>> },
+        }
+        let mut wraps: Vec<Wrap<'a>, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut cur = None;
+        for _ in 0..UNSIZE_DEPTH {
+            if ty == next {
+                cur = Some(out);
+                break;
+            }
+            match (self.node(ty)?, self.node(next)?) {
+                (PNode::Ref(_, f) | PNode::Ptr(_, f), PNode::Ref(_, g) | PNode::Ptr(_, g)) => {
+                    let (from, to) = self.unsize_tails_c(f, g)?;
+                    let leaf = match (self.node(from)?, self.node(to)?) {
+                        (PNode::Array(_, n), PNode::Slice(_)) => {
+                            let src = self.as_value(cc, code, out, ty)?;
+                            let n = self.len(n)?;
+                            let dst = self.reg(cc, Kind::V);
+                            self.emit_unsize(code, cc, dst, src, n);
+                            dst
+                        }
+                        (PNode::Dynamic(_), PNode::Dynamic(_)) => {
+                            let src = self.as_value(cc, code, out, ty)?;
+                            let Some((principal, args)) = self.principal_c(to)? else {
+                                return Err(unsupported("an unsizing to a trait object of auto traits alone (no principal trait)"));
+                            };
+                            let k = u32::try_from(code.dyn_upcasts.len()).map_err(|_| malformed("more trait-object upcasts than fit u32"))?;
+                            code.dyn_upcasts.push((principal, args));
+                            let dst = self.reg(cc, Kind::V);
+                            self.emit(code, cc, Op::UnsizeDynUpcast { dst, src, k });
+                            dst
+                        }
+                        (_, PNode::Dynamic(_)) => {
+                            let src = self.as_value(cc, code, out, ty)?;
+                            let Some((principal, args)) = self.principal_c(to)? else {
+                                return Err(unsupported("an unsizing to a trait object of auto traits alone (no principal trait)"));
+                            };
+                            let key = self.vtable_key_of(from, principal, args)?;
+                            let k = u32::try_from(code.vtables.len()).map_err(|_| malformed("more trait-object vtables than fit u32"))?;
+                            code.vtables.push(ConstVtable { key, vtable: blaze_build::vtable::VtableRef { concrete: from, principal, args } });
+                            let dst = self.reg(cc, Kind::V);
+                            self.emit(code, cc, Op::UnsizeDyn { dst, src, k });
+                            dst
+                        }
+                        _ if from == to => self.as_value(cc, code, out, ty)?,
+                        _ => return Err(unsupported("an unsizing coercion other than to a slice or a trait object")),
+                    };
+                    cur = Some(leaf);
+                    break;
+                }
+                (PNode::Pat(bs, ps), PNode::Pat(bt, pt)) => {
+                    let view = self.ground.view();
+                    let lps = view.list(ps).map_err(|_| malformed("a pattern type's ranges past the ground table"))?;
+                    let lpt = view.list(pt).map_err(|_| malformed("a pattern type's ranges past the ground table"))?;
+                    if lps != lpt {
+                        return Err(unsupported("an unsizing between two pattern types of different patterns"));
+                    }
+                    out = self.as_place(cc, code, out, ty)?;
+                    wraps.push(Wrap::Pat(bt));
+                    ty = bs;
+                    next = bt;
+                }
+                (PNode::Adt(k, _), PNode::Adt(k2, _)) if k == k2 => {
+                    let adt = self.world.adt(k).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: k }))?;
+                    if adt.kind != AdtKind::Struct || adt.variants.len() != 1 {
+                        return Err(unsupported("an unsizing coercion through an enum or a union"));
+                    }
+                    let nfields = self.variant_fields(ty, 0)?;
+                    let src_pl = self.as_place(cc, code, out, ty)?;
+                    let cap = usize::try_from(nfields).unwrap_or(0);
+                    let mut parts: Vec<(u32, Reg, PTy), Alloc<'a>> = Vec::with_capacity_in(cap, self.alloc);
+                    let mut next_step: Option<(u32, Reg, PTy, PTy)> = None;
+                    for fi in 0..nfields {
+                        let fty_s = self.field_ty(ty, 0, fi)?;
+                        let fty_t = self.field_ty(next, 0, fi)?;
+                        if fty_s == fty_t {
+                            if self.size_align(fty_s)?.0 == 0 {
+                                continue;
+                            }
+                            let soff = self.field_offset(ty, 0, fi)?;
+                            let fpl = self.reg(cc, Kind::P);
+                            self.emit_field(code, cc, fpl, src_pl, soff, false);
+                            parts.push((fi, fpl, fty_t));
+                        } else if self.size_align(fty_s)?.0 == 0 && self.size_align(fty_t)?.0 == 0 {
+                            continue;
+                        } else {
+                            if next_step.is_some() {
+                                return Err(unsupported("an unsizing coercion through a struct where more than one field differs"));
+                            }
+                            let soff = self.field_offset(ty, 0, fi)?;
+                            let fpl = self.reg(cc, Kind::P);
+                            self.emit_field(code, cc, fpl, src_pl, soff, false);
+                            next_step = Some((fi, fpl, fty_s, fty_t));
+                        }
+                    }
+                    let Some((coerced_fi, fpl, fty_s, fty_t)) = next_step else {
+                        return Err(unsupported("an unsizing coercion through a struct where no field holding bytes differs"));
+                    };
+                    wraps.push(Wrap::Adt { next, coerced_fi, coerced_ty: fty_t, parts });
+                    out = fpl;
+                    ty = fty_s;
+                    next = fty_t;
+                }
+                _ => return Err(unsupported("an unsizing coercion of a value that is not a pointer or a struct holding one")),
+            }
+        }
+        let Some(mut cur) = cur else {
+            return Err(unsupported("an unsizing coercion through more nested structs than the bound"));
+        };
+        while let Some(wrap) = wraps.pop() {
+            cur = match wrap {
+                Wrap::Pat(bt) => self.as_place(cc, code, cur, bt)?,
+                Wrap::Adt { next, coerced_fi, coerced_ty, mut parts } => {
+                    parts.push((coerced_fi, cur, coerced_ty));
+                    self.build(cc, code, next, 0, &parts, false)?
+                }
+            };
+        }
+        Ok(cur)
     }
 
     /// Fn item type `ty`'s value as a fn pointer: the one reification, for the checker's
@@ -1893,11 +2100,13 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 cc.rs.push(t.dst);
             }
             C::Let { s, e } => {
-                let Stmt::Let { pat, else_, .. } = body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past the body"))? else {
+                let Stmt::Let { pat, init: Some(init_expr), else_, .. } = body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past the body"))? else {
                     return Err(malformed("a let task"));
                 };
                 let init = self.pop_r(cc)?;
-                let t = self.cg(cc, *typed.pat_ty.get(pat.ix()).ok_or(malformed("a pattern with no type"))?)?;
+                let t_pat = self.cg(cc, *typed.pat_ty.get(pat.ix()).ok_or(malformed("a pattern with no type"))?)?;
+                let init_ty = self.final_ty_c(cc, init_expr)?;
+                let t = self.unpeeled_ref_ty(init_ty, t_pat)?;
                 if cc.kinds[init as usize] != Kind::P {
                     // A plain binding kept in a register.
                     let Home::Reg(r) = self.home(cc, &mut code.slots, pat)? else { return Err(malformed("a value for a binding in memory")) };
@@ -2217,6 +2426,11 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 cc.tasks.push(C::Field(e));
                 cc.tasks.push(C::Eval(base, Mode::Place));
             }
+            // `*x` overloaded: the dereference is `x`'s own last adjustment (rules/op.rs), so
+            // `*x`'s place is `x`'s adjusted place, never dereferenced a second time.
+            Expr::Unary { op: UnOp::Deref, operand } if self.deref_on_operand(cc, operand) => {
+                cc.tasks.push(C::Eval(operand, Mode::Place));
+            }
             Expr::Unary { op: UnOp::Deref, operand } => {
                 cc.tasks.push(C::Deref(e));
                 cc.tasks.push(C::Eval(operand, Mode::Value));
@@ -2229,17 +2443,35 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 cc.rs.push(r);
             }
             Expr::Unary { operand, .. } => {
-                cc.tasks.push(C::Unary(e));
+                if rows(typed.callees.0, e).next().is_some() {
+                    cc.tasks.push(C::Call(e));
+                } else {
+                    cc.tasks.push(C::Unary(e));
+                }
                 cc.tasks.push(C::Eval(operand, Mode::Value));
             }
             Expr::Binary { op: BinOp::And | BinOp::Or, lhs, .. } => {
                 cc.tasks.push(C::Logic(e));
                 cc.tasks.push(C::Eval(lhs, Mode::Value));
             }
-            Expr::Binary { lhs, rhs, .. } => {
-                cc.tasks.push(C::Binary(e));
-                cc.tasks.push(C::Eval(rhs, Mode::Value));
-                cc.tasks.push(C::Eval(lhs, Mode::Value));
+            Expr::Binary { op, lhs, rhs } => {
+                if rows(typed.callees.0, e).next().is_some() {
+                    cc.tasks.push(C::Call(e));
+                    if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+                        // [expr.cmp.place]: comparison operators implicitly borrow both operands.
+                        cc.tasks.push(C::Ref(e));
+                        cc.tasks.push(C::Eval(rhs, Mode::Place));
+                        cc.tasks.push(C::Ref(e));
+                        cc.tasks.push(C::Eval(lhs, Mode::Place));
+                    } else {
+                        cc.tasks.push(C::Eval(rhs, Mode::Value));
+                        cc.tasks.push(C::Eval(lhs, Mode::Value));
+                    }
+                } else {
+                    cc.tasks.push(C::Binary(e));
+                    cc.tasks.push(C::Eval(rhs, Mode::Value));
+                    cc.tasks.push(C::Eval(lhs, Mode::Value));
+                }
             }
             Expr::Assign { lhs, rhs } => {
                 // The right operand first, then the place (the Reference, "Assignment expressions").
@@ -2250,12 +2482,20 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                 cc.tasks.push(C::Eval(rhs, Mode::Value));
             }
             Expr::AssignOp { lhs, rhs, .. } => {
-                // Both primitive: the modifying operand first (the Reference, "Compound assignment").
-                cc.tasks.push(C::AssignOp(e));
-                if self.reg_local(cc, lhs).is_none() {
+                if rows(typed.callees.0, e).next().is_some() {
+                    // [expr.compound-assign.trait]: `a += b` is `AddAssign::add_assign(&mut a, b)`.
+                    cc.tasks.push(C::Call(e));
+                    cc.tasks.push(C::Eval(rhs, Mode::Value));
+                    cc.tasks.push(C::Ref(e));
                     cc.tasks.push(C::Eval(lhs, Mode::Place));
+                } else {
+                    // Both primitive: the modifying operand first (the Reference, "Compound assignment").
+                    cc.tasks.push(C::AssignOp(e));
+                    if self.reg_local(cc, lhs).is_none() {
+                        cc.tasks.push(C::Eval(lhs, Mode::Place));
+                    }
+                    cc.tasks.push(C::Eval(rhs, Mode::Value));
                 }
-                cc.tasks.push(C::Eval(rhs, Mode::Value));
             }
             Expr::Ref { operand, .. } => {
                 cc.tasks.push(C::Ref(e));
@@ -2323,6 +2563,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             Expr::Underscore => return Err(unsupported("`_` (`_ = e`) in a constant")),
             // The Reference, inline-assembly: "asm! ... cannot be used in const contexts".
             Expr::Asm { .. } => return Err(unsupported("inline assembly in a constant")),
+            Expr::Become { .. } => return Err(unsupported("`become` in a constant")),
             Expr::RawRef { operand, .. } => {
                 cc.tasks.push(C::RawRef(e));
                 cc.tasks.push(C::Eval(operand, Mode::Place));
@@ -2347,8 +2588,8 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     /// (`repr(C)`, `packed` and `align` included); core's `mem::offset_of!`: "Expands to the
     /// offset in bytes of a field from the beginning of the given type", nested fields allowed
     /// (`a.0.b`). A tuple's or tuple struct's step is named by its digits (`Name::of_index`), a
-    /// struct's or union's by its field name. A step through an enum variant (unstable
-    /// `offset_of_enum`) is refused by name.
+    /// struct's or union's by its field name, and an enum variant (`offset_of_enum`) by the
+    /// variant's name followed by its field name or tuple index.
     fn offset_of(&mut self, cc: &mut Cc<'w, '_>, ty: PTy, fields: List) -> R<'a, u64> {
         let body = cc.typed.body;
         let steps = body.segments.get(fields.range()).ok_or(malformed("an `offset_of!` path past the body's segments"))?;
@@ -2365,34 +2606,142 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
             _ => unsupported("an `offset_of!` type with no ground form at the instance (an alias, an opaque type, a closure)"),
         })?;
         let mut total: u64 = 0;
+        // The variant the step before named, when traversing an enum (`offset_of_enum`), matching
+        // `blaze-typeck` `rules/field.rs` `expr_offset_of`.
+        let mut variant: Option<u32> = None;
         for step in steps {
-            let index = match self.node(t)? {
-                PNode::Tuple(l) => {
+            let (vi, index) = match self.node(t)? {
+                PNode::Tuple(l) if variant.is_none() => {
                     let n = self.ground.view().list(l).map_err(|_| malformed("a tuple's list past the ground table"))?.len() as u32;
-                    (0..n).find(|&i| blaze_typeck::Name::of_index(i) == step.name)
+                    (0, (0..n).find(|&i| blaze_typeck::Name::of_index(i) == step.name))
                 }
-                PNode::Record(schema, _) => self
-                    .ground
-                    .view()
-                    .record_field_index(schema, step.name)
-                    .or_else(|| cc.typed.types.record_field_index(schema, step.name)),
+                PNode::Record(schema, _) if variant.is_none() => (
+                    0,
+                    self.ground
+                        .view()
+                        .record_field_index(schema, step.name)
+                        .or_else(|| cc.typed.types.record_field_index(schema, step.name)),
+                ),
                 PNode::Adt(key, _) => {
                     let adt = self.world.adt(key).ok_or(Stop::Refused(Refusal::Missing { what: "ADT definition", item: key }))?;
-                    if adt.kind == AdtKind::Enum {
-                        return Err(unsupported("`offset_of!` through an enum variant (`offset_of_enum`)"));
+                    if adt.kind == AdtKind::Enum && variant.is_none() {
+                        let vi = adt
+                            .variants
+                            .iter()
+                            .position(|v| v.name == step.name)
+                            .ok_or(malformed("an `offset_of!` step naming a variant its enum lacks"))?;
+                        variant = Some(u32::try_from(vi).map_err(|_| malformed("an `offset_of!` variant past `u32`"))?);
+                        continue;
                     }
-                    let v = adt.variants.first().ok_or(malformed("a struct with no variant"))?;
+                    let vi = variant.take().unwrap_or(0);
+                    let vi_usize = usize::try_from(vi).map_err(|_| malformed("an `offset_of!` variant past `usize`"))?;
+                    let v = adt.variants.get(vi_usize).ok_or(malformed("an `offset_of!` variant past its ADT"))?;
                     let own = adt.fields.get(v.fields.range()).ok_or(malformed("a variant's fields past its ADT"))?;
-                    own.iter().position(|f| f.name == step.name).map(|i| i as u32)
+                    (vi, own.iter().position(|f| f.name == step.name).and_then(|i| u32::try_from(i).ok()))
                 }
                 _ => return Err(unsupported("`offset_of!` through a field of a type with no fields")),
             };
             let index = index.ok_or(malformed("an `offset_of!` step naming a field its container lacks"))?;
-            let off = self.field_offset(t, 0, index)?;
+            let off = self.field_offset(t, vi, index)?;
             total = total.checked_add(off).ok_or(malformed("an `offset_of!` past `u64`"))?;
-            t = self.field_ty(t, 0, index)?;
+            t = self.field_ty(t, vi, index)?;
+        }
+        if variant.is_some() {
+            return Err(malformed("an `offset_of!` ending on an enum variant with no field"));
         }
         Ok(total)
+    }
+
+    /// Whether `operand`'s last adjustment is an overloaded dereference: the checker records
+    /// overloaded `*x` on `x` itself (rules/op.rs `expr_unary`), so `x`'s adjusted place IS `*x`.
+    fn deref_on_operand(&self, cc: &Cc<'w, '_>, operand: ExprId) -> bool {
+        rows(cc.typed.adjusts.0, operand)
+            .last()
+            .and_then(|i| cc.typed.adjusts.1.get(i))
+            .is_some_and(|k| matches!(k, AdjustKind::Deref { overloaded: Some(_) }))
+    }
+
+    /// An overloaded dereference adjustment (`*x` or autoderef through `Deref::deref` /
+    /// `DerefMut::deref_mut`): borrows `out` (of ground type `ty`) as `&Self` / `&mut Self`,
+    /// resolves the trait method at `[Self]` and calls it, then dereferences the returned
+    /// `&Target` / `&mut Target` into a place of type `next`.
+    fn overloaded_deref<A: Allocator + Clone>(
+        &mut self,
+        cc: &mut Cc<'w, '_>,
+        code: &mut Code<A>,
+        out: Reg,
+        ty: PTy,
+        next: PTy,
+        mutbl: Mutbl,
+    ) -> R<'a, Reg> {
+        let method = match self.world.deref_method(mutbl) {
+            FnTraitMethod::Found(item) => item,
+            FnTraitMethod::Absent => {
+                return Err(unsupported(
+                    "an overloaded `Deref` in a constant in a world that names no `Deref::deref` (ConstWorld::deref_method)",
+                ));
+            }
+            FnTraitMethod::Pending { trait_ } => {
+                return Err(Stop::Refused(Refusal::Missing {
+                    what: "the trait members for `Deref` (ConstWorld::deref_method)",
+                    item: trait_,
+                }));
+            }
+        };
+        let self_args = self.ground.intern_list(&[ty]).map_err(|_| malformed("the ground table is full"))?;
+        let (item, args) = self.resolve(method, self_args)?;
+        enum DerefCall {
+            Const,
+            Panic,
+            Intrinsic(Intrinsic),
+        }
+        let call_kind = match self.world.fn_kind(item) {
+            FnKind::Const => DerefCall::Const,
+            FnKind::Panic => DerefCall::Panic,
+            FnKind::Intrinsic(i) => DerefCall::Intrinsic(i),
+            FnKind::NotConst => return Err(Stop::Refused(Refusal::NotConstFn { item })),
+            FnKind::UnknownIntrinsic => return Err(Stop::Refused(Refusal::UnknownIntrinsic { item })),
+            FnKind::Missing(fact) => return Err(Stop::Refused(Refusal::FnFact { item, fact })),
+            FnKind::Ctor { .. } => return Err(malformed("a `Deref` impl that is a constructor")),
+        };
+        let self_ref_ty = self.ground.intern(PNode::Ref(mutbl, ty)).map_err(|_| malformed("the ground table is full"))?;
+        let ret_ref_ty = self.ground.intern(PNode::Ref(mutbl, next)).map_err(|_| malformed("the ground table is full"))?;
+        let place = self.as_place(cc, code, out, ty)?;
+        let unsized_ = matches!(self.node(ty)?, PNode::Str | PNode::Slice(_));
+        let thin = !layout::is_unsized(self.world, self.ground, ty, self.alloc)?;
+        let meta = if thin {
+            Meta::Drop
+        } else if unsized_ {
+            Meta::Need
+        } else {
+            Meta::Keep
+        };
+        let self_ref = self.reg(cc, Kind::V);
+        self.emit(code, cc, Op::Borrow { dst: self_ref, src: place, meta });
+        let regs = self.arg_regs(cc, code, &[(self_ref, self_ref_ty)])?;
+        let k = u32::try_from(code.calls.len()).map_err(|_| malformed("too many calls in a constant"))?;
+        let ret_ref = match call_kind {
+            DerefCall::Const => {
+                code.calls.push(Call { item, args, regs, link: Cell::new(u32::MAX), intrinsic: None, ret: ret_ref_ty });
+                let dst = self.reg(cc, Kind::V);
+                self.emit(code, cc, Op::Call { dst, k });
+                dst
+            }
+            DerefCall::Panic => {
+                code.calls.push(Call { item, args, regs, link: Cell::new(u32::MAX), intrinsic: None, ret: ret_ref_ty });
+                self.emit(code, cc, Op::Panic { k });
+                self.reg(cc, Kind::V)
+            }
+            DerefCall::Intrinsic(i) => {
+                code.calls.push(Call { item, args, regs, link: Cell::new(u32::MAX), intrinsic: Some(i), ret: ret_ref_ty });
+                let dst = self.reg(cc, Kind::V);
+                self.emit(code, cc, Op::Intrinsic { dst, k });
+                dst
+            }
+        };
+        let dst = self.reg(cc, Kind::P);
+        self.emit(code, cc, Op::Deref { dst, src: ret_ref });
+        Ok(dst)
     }
 
     /// Whether pattern `top` binds anything by reference (`ref`, `ref mut`).
@@ -2423,7 +2772,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     self.emit(code, cc, Op::Deref { dst, src });
                     dst
                 }
-                AdjustKind::Deref { overloaded: Some(_) } => return Err(unsupported("an overloaded `Deref` in a constant (a const trait)")),
+                AdjustKind::Deref { overloaded: Some(mutbl) } => self.overloaded_deref(cc, code, out, ty, next, mutbl)?,
                 AdjustKind::Borrow { .. } => {
                     let src = self.as_place(cc, code, out, ty)?;
                     let unsized_ = matches!(self.node(ty)?, PNode::Str | PNode::Slice(_));
@@ -2485,19 +2834,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
                     self.emit(code, cc, Op::FnPtr { dst, k: code.fns.len() as u32 - 1 });
                     dst
                 }
-                AdjustKind::Unsize => {
-                    let src = self.as_value(cc, code, out, ty)?;
-                    let n = match self.node(ty)? {
-                        PNode::Ref(_, a) | PNode::Ptr(_, a) => match self.node(a)? {
-                            PNode::Array(_, n) => self.len(n)?,
-                            _ => return Err(unsupported("an unsizing coercion other than an array to a slice")),
-                        },
-                        _ => return Err(unsupported("an unsizing coercion of a value that is not a pointer")),
-                    };
-                    let dst = self.reg(cc, Kind::V);
-                    self.emit_unsize(code, cc, dst, src, n);
-                    dst
-                }
+                AdjustKind::Unsize => self.unsize_c(cc, code, out, ty, next)?,
                 AdjustKind::UnionInject { variant } => {
                     let PNode::Union(ul) = self.node(next)? else {
                         return Err(malformed("a union injection to a type that is not a structural union"));
@@ -2571,21 +2908,59 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Ma
     fn call_c<A: Allocator + Clone>(&mut self, cc: &mut Cc<'w, '_>, code: &mut Code<A>, e: ExprId) -> R<'a, ()> {
         let typed = cc.typed;
         let body = typed.body;
-        let (arg_exprs, receiver) = match self.expr_c(cc, e)? {
-            Expr::Call { args, .. } => (args, None),
-            Expr::MethodCall { receiver, args, .. } => (args, Some(receiver)),
-            _ => return Err(malformed("a call task")),
-        };
         let mut exprs: Vec<ExprId, Alloc<'a>> = Vec::new_in(self.alloc);
-        exprs.extend(receiver);
-        exprs.extend_from_slice(body.expr_lists.get(arg_exprs.range()).ok_or(malformed("a list past `expr_lists`"))?);
-        let at = cc.rs.len().checked_sub(exprs.len()).ok_or(malformed("the value stack ran out"))?;
         let mut vals: Vec<(Reg, PTy), Alloc<'a>> = Vec::new_in(self.alloc);
-        for (k, &x) in exprs.iter().enumerate() {
-            let t = self.final_ty_c(cc, x)?;
-            vals.push((cc.rs[at + k], t));
+        match self.expr_c(cc, e)? {
+            Expr::Call { args, .. } => {
+                exprs.extend_from_slice(body.expr_lists.get(args.range()).ok_or(malformed("a list past `expr_lists`"))?);
+                let at = cc.rs.len().checked_sub(exprs.len()).ok_or(malformed("the value stack ran out"))?;
+                for (k, &x) in exprs.iter().enumerate() {
+                    let r = *cc.rs.get(at + k).ok_or(malformed("the value stack ran out"))?;
+                    vals.push((r, self.final_ty_c(cc, x)?));
+                }
+                cc.rs.truncate(at);
+            }
+            Expr::MethodCall { receiver, args, .. } => {
+                exprs.push(receiver);
+                exprs.extend_from_slice(body.expr_lists.get(args.range()).ok_or(malformed("a list past `expr_lists`"))?);
+                let at = cc.rs.len().checked_sub(exprs.len()).ok_or(malformed("the value stack ran out"))?;
+                for (k, &x) in exprs.iter().enumerate() {
+                    let r = *cc.rs.get(at + k).ok_or(malformed("the value stack ran out"))?;
+                    vals.push((r, self.final_ty_c(cc, x)?));
+                }
+                cc.rs.truncate(at);
+            }
+            Expr::Unary { operand, .. } => {
+                exprs.push(operand);
+                let r = cc.rs.pop().ok_or(malformed("the value stack ran out"))?;
+                vals.push((r, self.final_ty_c(cc, operand)?));
+            }
+            Expr::Binary { op, lhs, rhs } => {
+                exprs.push(lhs);
+                exprs.push(rhs);
+                let rr = cc.rs.pop().ok_or(malformed("the value stack ran out"))?;
+                let lr = cc.rs.pop().ok_or(malformed("the value stack ran out"))?;
+                let (mut lt, mut rt) = (self.final_ty_c(cc, lhs)?, self.final_ty_c(cc, rhs)?);
+                if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+                    lt = self.ground.intern(PNode::Ref(Mutbl::Not, lt)).map_err(|_| malformed("the ground table is full"))?;
+                    rt = self.ground.intern(PNode::Ref(Mutbl::Not, rt)).map_err(|_| malformed("the ground table is full"))?;
+                }
+                vals.push((lr, lt));
+                vals.push((rr, rt));
+            }
+            Expr::AssignOp { lhs, rhs, .. } => {
+                exprs.push(lhs);
+                exprs.push(rhs);
+                let rr = cc.rs.pop().ok_or(malformed("the value stack ran out"))?;
+                let lr = cc.rs.pop().ok_or(malformed("the value stack ran out"))?;
+                let lt = self.final_ty_c(cc, lhs)?;
+                let lt = self.ground.intern(PNode::Ref(Mutbl::Mut, lt)).map_err(|_| malformed("the ground table is full"))?;
+                let rt = self.final_ty_c(cc, rhs)?;
+                vals.push((lr, lt));
+                vals.push((rr, rt));
+            }
+            _ => return Err(malformed("a call task")),
         }
-        cc.rs.truncate(at);
         let row = rows(typed.callees.0, e).next();
         let (item, args) = match row {
             Some(i) => {
@@ -3132,6 +3507,8 @@ fn shape<'a>(task: C, typed: &Typed<'_>) -> R<'a, (u32, bool)> {
         C::Call(e) => match expr(e)? {
             Expr::Call { args, .. } => (args.len, true),
             Expr::MethodCall { args, .. } => (args.len + 1, true),
+            Expr::Unary { .. } => (1, true),
+            Expr::Binary { .. } | Expr::AssignOp { .. } => (2, true),
             _ => (0, true),
         },
         // The place is on the stack unless the left side is a register local; the compile of

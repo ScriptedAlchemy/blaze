@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-371 invariants, 45 refinements, 12 reference models.
-By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
+371 invariants, 47 refinements, 13 reference models.
+By level: 297 tested, 105 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -198,6 +198,11 @@ By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
 - **`execution_bindings_retain_cleanup_without_sliding_replay_or_expiry`** *simulated* (`crates/blaze-dist-local/src/coordinator/lifetime_tests.rs`): verified work retains its bounded cleanup lifetime across coalesced deadline changes; replay keeps the exact request and response identity, refused limits publish no transition prefix, and neither reconnect nor a new lifetime revives expiry.
   Controls: `a_missing_verified_execution_binding`, `a_sliding_session_ceiling`, `a_lost_reply_with_changed_replay_identity`, `different_bytes_reusing_a_replay_identity`.
 
+### blaze-ecs
+
+- **`property_world_matches_reference_model_and_bijection`** *tested* (`crates/blaze-ecs/src/tests.rs`): any sequence of spawns, despawns, component sets/removals, exclusive `ChildOf` reparenting, and `IsA` inheritance links preserves exact entity liveness, direct and inherited component values, `ChildOf` exclusivity, and table-row bijection against the reference model.
+  Controls: `stale_entity_row_update`.
+
 ### blaze-emit
 
 - **`homes_never_share_a_register_where_both_are_live`** *tested* (`crates/blaze-emit/src/compose/analysis_tests.rs`): no two values live at one point share a register across loops, back edges, and irreducibility. No two values live at one point share a register; the loop maps, back edges, irreducibility and classes hold (the module's list), on 512 drawn functions. Expected: passes.
@@ -213,12 +218,17 @@ By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
 - **`the_index_reads_each_file_once_cold_and_downloads_nothing_warm`** *tested* (`crates/blaze-fetch/src/tests/index.rs`): the sparse-index machine reads each crate index once cold, sends cached validators when warm, and downloads nothing when unchanged. A clean machine passes 300 cases; a failure prints the oracle's words and the tape, e.g. "asked again: se/rd/serde asked 2 times, not 1".
   Controls: `a_request_sent_without_its_validator`.
 - **`a_fetch_stores_only_verified_records_and_ends_whatever_the_origin_does`** *tested* (`crates/blaze-fetch/src/tests/sim.rs`): a fetch stores only checksum- and path-verified records within allocation bounds, never trusts an unverified commit or wire size, and terminates under any origin fault or crash.
-  Controls: `a_pack_stored_before_its_checksum`, `an_entry_outside_its_folder`, `a_commit_taken_from_the_server`, `a_size_from_the_wire_allocated_unchecked`.
+  Controls: `a_pack_stored_before_its_checksum`, `an_entry_outside_its_folder`, `a_commit_taken_from_the_server`, `a_size_from_the_wire_allocated_unchecked`, `a_dropped_submodule`.
 
 ### blaze-file-items
 
 - **`resplit_equals_split_after_random_edits`** *tested* (`crates/blaze-file-items/src/split/tests.rs`): a resplit after any edit is the split of the new text, digests and all.
   Controls: `a_suffix_kept_unsynced`.
+
+### blaze-git
+
+- **`worktree_and_index_counts_match_oracle`** *tested* (`crates/blaze-git/src/tests.rs`): racy edits, deletions, staged changes, and conflicts are counted identically to the reference construction across random working-tree states.
+  Controls: `skip_merge_second_parent`, `skip_racy_hash_check`, `skip_conflict_count`, `skip_staged_diff`, `ignore_negation`.
 
 ### blaze-graph
 
@@ -606,8 +616,6 @@ By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
   Controls: `pointer_loop_miss`.
 - **`property_dotenv_round_trip`** *tested* (`crates/blaze-std/src/dotenv.rs`): dotenv formatting and parsing round-trip arbitrary keys and escaped values without loss.
   Controls: `skipped_escapes`.
-- **`property_world_matches_reference_model_and_bijection`** *tested* (`crates/blaze-std/src/ecs/tests.rs`): any sequence of spawns, despawns, component sets/removals, exclusive `ChildOf` reparenting, and `IsA` inheritance links preserves exact entity liveness, direct and inherited component values, `ChildOf` exclusivity, and table-row bijection against the reference model.
-  Controls: `stale_entity_row_update`.
 - **`property_hex_round_trip`** *tested* (`crates/blaze-std/src/hex.rs`): hex encoding and decoding round-trip arbitrary byte slices exactly.
   Controls: `swapped_nibbles`.
 - **`property_escape_round_trip_and_sanitizer_never_leaks_xss`** *tested* (`crates/blaze-std/src/html.rs`): HTML entity escaping round-trips arbitrary UTF-8 and `sanitize_html_in` never emits `<script`, `onerror=`, or `javascript:`.
@@ -736,8 +744,6 @@ By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
   Controls: `unquoted_keyword_strings`.
 - **`property_zip_round_trip_and_hostile_bytes_never_panic`** *tested* (`crates/blaze-std/src/zip.rs`): Store and Deflate ZIP archives round-trip with verified CRC-32 and hostile archive bytes never panic.
   Controls: `skipped_crc_verification`.
-- **`property_zstd_round_trip_and_hostile_bytes_never_panic`** *tested* (`crates/blaze-std/src/zstd/tests.rs`): RFC 8878 Zstandard compression and decompression round-trip across arbitrary inputs and hostile bytes never panic.
-  Controls: `skipped_checksum`.
 
 ### blaze-surface
 
@@ -768,6 +774,11 @@ By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
   Controls: `an_answer_with_no_flush`, `an_ask_joined_to_an_earlier_flush`, `an_overflow_taken_as_whole`, `a_place_of_a_dead_instance_accepted`, `names_dropped_without_forgetting_their_places`.
 - **`a_slow_page_never_grows_the_viewer`** *tested* (`crates/blaze-watch/src/sim/viewer.rs`): the viewer bounds slow-page queues, checks origin and pairing keys before routing or toggling, and expires idle viewers without holding resources forever.
   Controls: `a_page_queue_past_its_bound`, `a_route_before_the_origin_check`, `a_toggle_before_the_key_check`, `a_page_that_holds_the_viewer_forever`.
+
+### blaze-zstd
+
+- **`property_zstd_round_trip_and_hostile_bytes_never_panic`** *tested* (`crates/blaze-zstd/src/tests.rs`): RFC 8878 Zstandard compression and decompression round-trip across arbitrary inputs and hostile bytes never panic.
+  Controls: `skipped_checksum`.
 
 ### const-ast
 
@@ -893,8 +904,6 @@ By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
   Controls: `a_held_key_taken_for_the_askers_own`, `a_carried_changed_arena`, `a_carried_dependent`, `a_hit_that_does_not_replay`, `a_check_on_a_hit`, `a_member_run_twice`, `a_reader_that_looks_up_a_dead_id`.
 - **`a_reader_of_a_carried_table_looks_up_only_live_ids`** *simulated* (`crates/blaze-memo/tests/sim.rs`): a carried-table reader looks up only generations its snapshot holds, answers that snapshot's values, removes superseded ids and never refuses a live id.
   Controls: `a_held_key_taken_for_the_askers_own`, `a_carried_changed_arena`, `a_carried_dependent`, `a_hit_that_does_not_replay`, `a_check_on_a_hit`, `a_member_run_twice`, `a_reader_that_looks_up_a_dead_id`.
-- **`every_name_an_expansion_binds_is_in_its_summary`** *tested* (`crates/blaze-names-source/tests/writes_sound.rs`): every name an expansion binds in its calling module (items and `use` bindings) is listed in its `writes` summary.
-  Controls: `a_summary_that_forgets_use`.
 - **`a_reader_that_closes_early_ends_the_command_quietly`** *tested* (`crates/blaze-report/tests/closed_pipe.rs`): a command that writes through `blaze_report::out` to a pipe whose reader closed ends with status 141 and says nothing on stderr.
   Controls: `a_print_that_panics_on_a_closed_pipe`.
 - **`the_region_fits_and_leaves_nothing_behind`** *tested* (`crates/blaze-screen/tests/properties.rs`): on a terminal of any size the live region fits (never taller than the terminal less a row, never wider than it less a column), every frame leaves exactly the lines that stay and the region with no stale row, a resize in the middle included, and the last frame leaves the lines that stay alone, the cursor shown and the progress report cleared.
@@ -937,6 +946,11 @@ By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
 
 - **`open_refuses_every_buffer_an_unchecked_read_would_misread`** *tested* (`crates/blaze-format-core/src/verified_tests.rs`): `Verified::open` refuses every buffer the byte-by-byte reference reader refuses (including out-of-bounds references and invalid UTF-8), and every unchecked read agrees with the reference.
   Controls: `a_reference_past_its_field`, `text_that_is_not_utf8`.
+
+### blaze-git
+
+- **`ahead_behind_matches_reference_model`** *tested* (`crates/blaze-git/src/tests.rs`): ahead/behind computed by [`StatusMachine`] (both via `CGPH` commit-graph and via loose objects) equals [`ref_ahead_behind`] on every random DAG including merges.
+  Controls: `skip_merge_second_parent`, `skip_racy_hash_check`, `skip_conflict_count`, `skip_staged_diff`, `ignore_negation`.
 
 ### blaze-ids
 
@@ -992,11 +1006,6 @@ By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
 - **`case`** *tested* (`crates/blaze-memchr/src/tests.rs`): each search on the vector `L` equals its byte-at-a-time model.
   Controls: `a_word_mask_that_drops_the_last_lane`, `a_native_mask_that_drops_the_last_lane`.
 
-### blaze-names-demand
-
-- **`demand_answers_equal_the_whole_world`** *simulated* (`crates/blaze-names-demand/src/sim_tests.rs`): for random generated module worlds and asks, demand-driven name resolution equals whole-world resolution.
-  Controls: `a_glob_that_beats_an_explicit_binding`, `an_expansion_ignored`, `a_fixpoint_cut_early`.
-
 ### blaze-own
 
 - **`vec_matches_std`** *tested* (`crates/blaze-own/src/tests.rs`): blaze-own collections match std collections under random operation sequences, free every allocation with its matching layout, and run every drop on truncate, retain, clone, growth, and merge.
@@ -1022,6 +1031,13 @@ By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
   Controls: `an_offer_over_the_total`.
 - **`affected_is_exactly_the_tests_that_entered_a_changed_body`** *tested* (`crates/blaze-run/src/sim/suite.rs`): `Tests::affected` equals a naive scan of each test's latest entered-body record without keeping stale postings from earlier records.
   Controls: `postings_kept_from_an_old_record`.
+
+### blaze-sh
+
+- **`pmap_refines_btreemap_across_forks`** *tested* (`crates/blaze-sh/src/persist_tests.rs`): persistent `PMap` with O(1) CoW forks matches `BTreeMap` across every branch.
+  Controls: `pmap_fork_leak`, `pvec_fork_leak`.
+- **`pvec_refines_vec_across_forks`** *tested* (`crates/blaze-sh/src/persist_tests.rs`): persistent `PVec` with O(1) CoW forks matches `Vec` across every branch.
+  Controls: `pmap_fork_leak`, `pvec_fork_leak`.
 
 ### blaze-sim
 
@@ -1089,6 +1105,10 @@ By level: 294 tested, 106 simulated, 1 model-checked, 15 proved.
 
 - **`Serial`** (`crates/blaze-engine/src/code_pool_sim.rs`): give each child's first demand of a key its next slot, execute only that key synchronously and remember its result. Exit withdraws unanswered receipts. The order is each child's own (D194): a child's replies keep its demand order, and no child's reply waits on another's.
 
+### blaze-git
+
+- **`ref_ahead_behind`** (`crates/blaze-git/src/tests.rs`): pure sequential symmetric difference on an in-memory DAG.
+
 ### blaze-memchr
 
 - **`naive_find`** (`crates/blaze-memchr/src/tests.rs`): the first byte of `haystack` in `needles`, one byte at a time.
@@ -1114,7 +1134,7 @@ Every promise of a doc comment or an effect attribute and how it is held
 `Evidence:` or `Unverified:`, an effect attribute, a `# Safety` obligation, a proved contract.
 A checked attribute and an obligation are counted, not listed.
 
-4207 claims. By level: 31 none, 4 unverified, 387 obligation, 3745 checked, 0 tested, 2 simulated, 0 model-checked, 38 proved.
+4256 claims. By level: 31 none, 4 unverified, 388 obligation, 3791 checked, 2 tested, 2 simulated, 0 model-checked, 38 proved.
 
 ### Totals
 
@@ -1136,13 +1156,13 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-inproc | 0 | 0 | 2 | 0 | 0 | 0 | 0 | 0 |
 | blaze-int | 0 | 0 | 0 | 17 | 0 | 0 | 0 | 0 |
 | blaze-kit | 5 | 0 | 7 | 0 | 0 | 0 | 0 | 0 |
-| blaze-ladder | 1 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
+| blaze-ladder | 1 | 0 | 4 | 0 | 0 | 0 | 0 | 0 |
 | blaze-launch-rt | 0 | 0 | 24 | 0 | 0 | 0 | 0 | 0 |
 | blaze-lex | 0 | 0 | 2 | 0 | 0 | 0 | 0 | 0 |
 | blaze-malloc | 0 | 0 | 27 | 0 | 0 | 0 | 0 | 0 |
 | blaze-mem | 0 | 0 | 26 | 0 | 0 | 0 | 0 | 0 |
 | blaze-memo | 0 | 0 | 10 | 0 | 0 | 0 | 0 | 0 |
-| blaze-own | 21 | 0 | 47 | 8 | 0 | 0 | 0 | 0 |
+| blaze-own | 21 | 0 | 47 | 8 | 2 | 0 | 0 | 0 |
 | blaze-pg | 0 | 0 | 0 | 188 | 0 | 0 | 0 | 0 |
 | blaze-profile | 0 | 0 | 9 | 0 | 0 | 0 | 0 | 0 |
 | blaze-queue | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
@@ -1157,7 +1177,7 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-std | 0 | 0 | 19 | 1271 | 0 | 0 | 0 | 0 |
 | blaze-store-check | 0 | 0 | 8 | 0 | 0 | 0 | 0 | 0 |
 | blaze-surface | 0 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
-| blaze-sys | 0 | 4 | 86 | 1513 | 0 | 0 | 0 | 0 |
+| blaze-sys | 0 | 4 | 86 | 1559 | 0 | 0 | 0 | 0 |
 | blaze-text | 0 | 0 | 5 | 0 | 0 | 0 | 0 | 0 |
 | blaze-trace | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
 | blaze-url | 0 | 0 | 0 | 58 | 0 | 0 | 0 | 0 |
@@ -1214,6 +1234,8 @@ A checked attribute and an obligation are counted, not listed.
 - **`blaze-own::arc::Weak#1`** *none* none (`crates/blaze-own/src/arc.rs:77`): `ptr` points to a block as `Arc`'s whose `weak` count includes this reference, so the block, though maybe not the value, is live.
 - **`blaze-own::boxed::Box#1`** *none* none (`crates/blaze-own/src/boxed.rs:41`): `ptr` points to a live `T`. When `Layout::for_value` of it has a size, the block is one `alloc` returned for that layout; when the size is 0 nothing is allocated and `ptr` is dangling and aligned.
 - **`blaze-own::btree::Leaf#1`** *none* none (`crates/blaze-own/src/btree.rs:86`): `keys[..len]` and `vals[..len]` are written, the keys strictly increasing; `parent` is the internal node whose edge `parent_idx` this is, `None` for the root.
+- **`blaze-own::csr::Csr#1`** *tested* evidenced (`crates/blaze-own/src/csr.rs:34`): `offsets` starts with `0` (`offsets.len() == self.len() + 1`). Evidence: `tests::csr_empty_push_slice_row_iter_and_clear`, `tests::csr_push_row_rolls_back_and_drops_on_iterator_panic`.
+- **`blaze-own::csr::Csr#2`** *tested* evidenced (`crates/blaze-own/src/csr.rs:37`): `offsets` is monotonically non-decreasing, and its last element equals `values.len()`. Evidence: `tests::csr_empty_push_slice_row_iter_and_clear`, `tests::csr_push_row_rolls_back_and_drops_on_iterator_panic`.
 - **`blaze-own::deque::Drain#1`** *none* none (`crates/blaze-own/src/deque.rs:499`): The ring's length is `start` and its head unchanged; indices `front..back` hold the values not yet given out, `end..len` the values after the range.
 - **`blaze-own::deque::VecDeque#1`** *none* none (`crates/blaze-own/src/deque.rs:35`): `head < capacity` (or 0 when nothing is allocated); the `len` values are in the slots `head, head + 1, ..` taken modulo the capacity; `len <= capacity`.
 - **`blaze-own::raw::RawBuf#1`** *none* none (`crates/blaze-own/src/raw.rs:19`): `T` sized 0: `cap` is `usize::MAX` and nothing is ever allocated; `ptr` is dangling, aligned.

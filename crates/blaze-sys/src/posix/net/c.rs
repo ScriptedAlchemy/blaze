@@ -39,6 +39,9 @@ unsafe extern "C" {
     /// `int shutdown(int socket, int how)` (sys/socket.h).
     /// replaces libc::shutdown (macOS)
     pub fn shutdown(socket: c_int, how: c_int) -> c_int;
+    /// `int accept(int socket, struct sockaddr *address, socklen_t *address_len)` (sys/socket.h).
+    /// replaces libc::accept (macOS)
+    pub fn accept(socket: c_int, address: *mut sockaddr, len: *mut socklen_t) -> c_int;
     /// `int getsockname(int socket, struct sockaddr *address, socklen_t *address_len)`
     /// (sys/socket.h).
     /// replaces libc::getsockname (macOS)

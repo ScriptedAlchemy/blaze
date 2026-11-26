@@ -199,23 +199,22 @@ fn static_attrs_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -
     let krate = r.names.crate_of(f.lib).ok_or_else(|| refuse(format!("no crate holds {:x}", f.lib)))?;
     let atoms = r.names.cfg_atoms(krate).ok_or_else(|| refuse(format!("crate {krate}'s cfg was not answered by the names source")))?;
     let edition = r.names.edition_of(krate).ok_or_else(|| refuse(format!("crate {krate}'s edition was not answered by the names source")))?;
-    let sig = blaze_lower::lower_signature(f.text, edition, &mut CrateCfg(atoms), r.store.tys.alloc())
+    let sig = blaze_lower::lower_signature(f.text, edition, &mut CrateCfg(atoms), r.store.work_alloc())
         .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
     let v = sig.view();
     let mut thread_local = false;
     let mut extern_weak = false;
+    let text = |r| v.text_at(r).map_err(|e| refuse(format!("{e:?}")));
     for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {
         let a = v.attr(n).map_err(|e| refuse(format!("{e:?}")))?;
-        match v.text_at(a.path).map_err(|e| refuse(format!("{e:?}")))?.trim() {
-            "thread_local" => thread_local = true,
-            "linkage" => {
-                let args = v.text_at(a.args).map_or("", str::trim);
-                let val = args.strip_prefix('=').unwrap_or(args).trim();
-                if val == "\"extern_weak\"" {
-                    extern_weak = true;
-                }
+        let path = text(a.path)?.trim();
+        if path == "thread_local" {
+            thread_local = true;
+        } else if path == "linkage" {
+            let val = text(a.args)?.trim().trim_start_matches('=').trim().trim_matches('"');
+            if val == "extern_weak" {
+                extern_weak = true;
             }
-            _ => {}
         }
     }
     Ok((thread_local, extern_weak))

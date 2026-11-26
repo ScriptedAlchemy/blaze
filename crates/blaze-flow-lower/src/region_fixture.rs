@@ -393,7 +393,7 @@ impl Arity for Decls {
 /// both live as long as the views handed out (`RegionFacts::clauses` returns a slice of views).
 fn leak(item: ItemKey, head: HeadRegions<Alloc<'static>>) -> (ItemKey, &'static HeadRegions<Alloc<'static>>, &'static [ClauseView<'static>]) {
     let head: &'static HeadRegions<Alloc<'static>> = Box::leak(Box::new(head));
-    let views: vec::Vec<ClauseView<'static>> = head.clauses.iter().map(ClauseView::of).collect();
+    let views: vec::Vec<ClauseView<'static>> = head.clauses.iter().map(|c| ClauseView::of_in(c, &head.outlives)).collect();
     (item, head, Box::leak(views.into_boxed_slice()))
 }
 
@@ -572,6 +572,12 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     }
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
         self.base.is_zero_slot_builtin_assoc(trait_, name)
+    }
+    fn drop_lifetimes(&self, adt: ItemKey) -> Option<&[bool]> {
+        self.base.drop_lifetimes(adt)
+    }
+    fn alias_copy(&self, alias: PTy) -> bool {
+        self.base.alias_copy(alias)
     }
     fn ties(&self, item: ItemKey) -> Option<Ties<'_>> {
         self.base.ties(item)

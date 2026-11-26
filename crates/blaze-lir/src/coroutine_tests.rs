@@ -23,7 +23,7 @@
 //! (Destructors) "When control flow leaves a drop scope all variables associated to that
 //! scope are dropped": the cancel path is the builder's, and the pass must run exactly it.
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 
 use blaze_sim::{Broke, Config, Tape, check, control};
 
@@ -121,7 +121,7 @@ impl World {
                 bytes[8 * i + j] = Byte::Int((upvar >> (8 * j)) as u8);
             }
         }
-        World { regions: vec![Region { bytes, live: true }], trace: Vec::new(), fuel: FUEL }
+        World { regions: vec![Region { bytes, live: true }], trace: Default::default(), fuel: FUEL }
     }
 
     fn frame(&mut self, view: View<'_>) -> Frame {
@@ -222,11 +222,11 @@ fn mask(value: u64, ty: Ty) -> u64 {
 
 /// The target's parameters take its arguments, all read before any is written.
 fn enter(frame: &mut Frame, view: View<'_>, to: Target<'_>) -> Result<Block, Fault> {
-    let mut args = Vec::new();
+    let mut args = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
     for value in to.args.iter() {
         args.push(get(frame, value)?);
     }
-    for (param, arg) in view.params(to.block).zip(args) {
+    for (param, &arg) in view.params(to.block).zip(args.iter()) {
         frame.values[param] = Some(arg);
     }
     Ok(to.block)
@@ -249,6 +249,12 @@ fn run(world: &mut World, view: View<'_>, frame: &mut Frame, mut block: Block) -
                 Op::Iconst => {
                     let word = o.imm();
                     Some(Val::Int(if ty.bits(64) > 32 { word as i32 as i64 as u64 } else { u64::from(word) }))
+                }
+                Op::IconstWide => {
+                    let words = o.constant();
+                    let lo = u64::from(words.first().copied().unwrap_or(0));
+                    let hi = u64::from(words.get(1).copied().unwrap_or(0));
+                    Some(Val::Int(lo | (hi << 32)))
                 }
                 Op::Uninit => Some(Val::Undef),
                 Op::Add | Op::Sub => {
@@ -416,7 +422,7 @@ fn direct(view: View<'_>, shape: Shape, upvars: [u64; 2], cancel: Option<u32>) -
 
 /// The pass's outputs, driven as a state machine: `poll` until it is not Pending, or `drop`
 /// where `cancel` says; a state that returned is dropped too, which must do nothing.
-fn machine(split: &Split<Global>, upvars: [u64; 2], cancel: Option<u32>, most_polls: u64) -> Result<Vec<Event>, Fault> {
+fn machine<A: Allocator>(split: &Split<A>, upvars: [u64; 2], cancel: Option<u32>, most_polls: u64) -> Result<Vec<Event>, Fault> {
     let (poll, glue) = (split.poll.view(), split.drop.view());
     let layout = &split.layout;
     let mut world = World::new(layout.size as usize, upvars);
@@ -490,7 +496,7 @@ fn machine(split: &Split<Global>, upvars: [u64; 2], cancel: Option<u32>, most_po
 }
 
 /// Whether the body and its split agree on every schedule.
-fn agree(view: View<'_>, shape: Shape, split: &Split<Global>, upvars: [u64; 2]) -> Result<(), Broke> {
+fn agree<A: Allocator>(view: View<'_>, shape: Shape, split: &Split<A>, upvars: [u64; 2]) -> Result<(), Broke> {
     let texts = || format!("{}\npoll:\n{}\ndrop:\n{}", print(view), print(split.poll.view()), print(split.drop.view()));
     for (name, func) in [("poll", &split.poll), ("drop", &split.drop)] {
         verify(func.view()).map_err(|e| Broke::Oracle(format!("the {name} is not LIR: {e}\n{}", texts())))?;
@@ -500,12 +506,15 @@ fn agree(view: View<'_>, shape: Shape, split: &Split<Global>, upvars: [u64; 2]) 
     }
     let full = direct(view, shape, upvars, None).map_err(|f| Broke::Harness(format!("the direct run: {f}\n{}", texts())))?;
     let yields = full.iter().filter(|event| matches!(event, Event::Out(values) if values.first() == Some(&PENDING))).count() as u32;
-    let mut schedules = vec![None];
-    schedules.extend((0..=yields.min(4)).map(Some));
+    let mut schedules = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+    schedules.push(None);
+    for k in 0..=yields.min(4) {
+        schedules.push(Some(k));
+    }
     if yields > 4 {
         schedules.push(Some(yields));
     }
-    for cancel in schedules {
+    for &cancel in schedules.iter() {
         let want = direct(view, shape, upvars, cancel)
             .map_err(|f| Broke::Harness(format!("the direct run: {f} (cancel {cancel:?})\n{}", texts())))?;
         let got = machine(split, upvars, cancel, u64::from(yields) + 2)
@@ -766,7 +775,7 @@ struct Made {
 }
 
 /// `(state: ptr, cx: i64) -> (i64, i64)`: the returns are `Poll`'s tag and its value.
-fn own_sig(b: &mut Builder<Global, Full>) {
+fn own_sig<A: Allocator + Clone>(b: &mut Builder<A, Full>) {
     let sig = b.sig(
         Conv::C,
         Variadic::No,

@@ -1487,7 +1487,94 @@ fn the_native_library_is_the_first_frame() {
     std::println!("native: the library told first, its words slots 0 and 1; told late refused");
 }
 
-/// The toy's maker as a code worker keeps it: made for one entry and start (test_drive.rs
+/// Asserts that `Needs::arm_lazy_native` sends NO `Down::Native` for pure records, sends
+/// `Down::Native` BEFORE `Down::Publish` on the first foreign publication while reusing any
+/// already-declared word slot (and assigning fresh slots to remaining words in word order), and
+/// sends `Down::Native` at most once even if multiple foreign publications follow.
+#[test]
+fn lazy_native_sends_before_first_foreign_record_and_reuses_declared_slots() {
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let word_a = Symbol([1; 32]);
+    let word_b = Symbol([2; 32]);
+    let foreign_1 = Symbol([3; 32]);
+    let foreign_2 = Symbol([4; 32]);
+    let words = [word_a, word_b];
+    let library = RecordId([5; 32]);
+
+    struct LazyModel {
+        foreign_1: Symbol,
+        foreign_2: Symbol,
+    }
+    impl Resolve for LazyModel {
+        fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
+            Ok(Resolved::Record {
+                key: CodeKey(blaze_ids::ContentId(symbol.0)),
+                record: RecordId(symbol.0),
+                declares: &[],
+                data: &[],
+                named: &[],
+                sent: Sent::NONE,
+            })
+        }
+
+        fn publication_with_native(
+            &mut self,
+            symbol: &Symbol,
+            _values: &mut AVec<'_, u8>,
+            needs_native: &mut bool,
+        ) -> Result<Resolved<'_>, ParentError> {
+            if *symbol == self.foreign_1 || *symbol == self.foreign_2 {
+                *needs_native = true;
+            }
+            self.resolve(symbol)
+        }
+    }
+
+    let mut needs = Needs::new(alloc);
+    needs.arm_lazy_native(library, &words);
+    let mut out = wire_out(alloc);
+    needs.name_personality(Some(CodeSymbol([9; 32])), &mut out).expect("personality");
+
+    let mut model = LazyModel { foreign_1, foreign_2 };
+    // 1. Pure call to `word_a` (also exported to C): assigns slot 1 and must NOT send `Native`.
+    out.clear();
+    assert!(needs.answer(Needed::Symbol(word_a), &mut model, &mut out).expect("pure answer"));
+    let pure_frames = frames(&out);
+    assert!(
+        !pure_frames.iter().any(|f| f.starts_with("Native ")),
+        "pure record must not trigger Down::Native: {pure_frames:?}"
+    );
+
+    // 2. First foreign call: must emit `Native 5 2` BEFORE `Declare`/`Publish`, reusing slot 1
+    //    for `word_a` and assigning slot 2 for `word_b`, then slot 3 for `foreign_1`.
+    out.clear();
+    assert!(needs.answer(Needed::Symbol(foreign_1), &mut model, &mut out).expect("foreign 1"));
+    let foreign_frames = frames(&out);
+    assert_eq!(foreign_frames.first().map(|s| s.as_str()), Some("Native 5 2"), "Native must precede foreign Publish: {foreign_frames:?}");
+    let (_, first) = Down::decode(split(&out).expect("frame").expect("one").0).expect("down");
+    let Down::Native { words: told, .. } = first else { panic!("first frame must be Native") };
+    let pairs: AVec<'_, (Symbol, u32)> = {
+        let mut p = AVec::new_in(alloc);
+        for it in told.iter() {
+            p.push((it.symbol, it.slot.0));
+        }
+        p
+    };
+    assert_eq!(pairs.as_slice(), &[(word_a, 1), (word_b, 2)], "word_a reuses slot 1; word_b gets slot 2");
+
+    // 3. Second foreign call: Native already sent, must NOT send a second Native frame.
+    out.clear();
+    assert!(needs.answer(Needed::Symbol(foreign_2), &mut model, &mut out).expect("foreign 2"));
+    let second_frames = frames(&out);
+    assert!(
+        !second_frames.iter().any(|f| f.starts_with("Native ")),
+        "Native must be sent at most once: {second_frames:?}"
+    );
+}
+
+/// The toy's maker as a code worker keeps it: made for one start class (test_drive.rs
 /// `MadeFor`).
 struct ToyKept<'t> {
     maker: ToyMaker<'t>,
@@ -1496,8 +1583,17 @@ struct ToyKept<'t> {
 }
 
 impl crate::test_drive::MadeFor for ToyKept<'_> {
-    fn made_for(&self) -> (Option<ItemKey>, blaze_ladder::run::special::MakerStart) {
-        (self.entry, self.start)
+    fn made_for(&self) -> blaze_ladder::run::special::MakerKind {
+        blaze_ladder::run::special::MakerKind::of(self.entry, self.start)
+    }
+
+    fn set_direct_entry(&mut self, entry: Option<ItemKey>, start: blaze_ladder::run::special::MakerStart) -> bool {
+        if !matches!((self.start, start), (blaze_ladder::run::special::MakerStart::Direct(_), blaze_ladder::run::special::MakerStart::Direct(_))) {
+            return false;
+        }
+        self.entry = entry;
+        self.start = start;
+        true
     }
 }
 
@@ -1506,6 +1602,7 @@ impl crate::test_drive::MadeFor for ToyKept<'_> {
 /// `Makers`. `panics`: how many makes left panic before they make (rule 20's plant).
 struct ToyMakers<'t> {
     calls: &'t Cell<usize>,
+    created: Cell<usize>,
     kept: crate::test_drive::Makers<ToyKept<'t>>,
     panics: usize,
     forgot: usize,
@@ -1518,7 +1615,11 @@ impl crate::test_drive::KeptMakers for ToyMakers<'_> {
             panic!("a planted panic in a toy make");
         }
         let calls = self.calls;
-        let kept = self.kept.of(job, || Ok(ToyKept { maker: ToyMaker { calls, typed: true }, entry: job.entry, start: job.start }))?;
+        let created = &self.created;
+        let kept = self.kept.of(job, || {
+            created.set(created.get() + 1);
+            Ok(ToyKept { maker: ToyMaker { calls, typed: true }, entry: job.entry, start: job.start })
+        })?;
         job.order.make(&mut kept.maker, &job.proof, job.name.as_slice(), entry)
     }
 
@@ -1534,12 +1635,12 @@ impl crate::test_drive::KeptMakers for ToyMakers<'_> {
 }
 
 fn toy_makers(calls: &Cell<usize>, plant: crate::test_drive::MakersPlant, panics: usize) -> ToyMakers<'_> {
-    ToyMakers { calls, kept: crate::test_drive::Makers::new(blaze_own::testing::heap().alloc(), plant), panics, forgot: 0 }
+    ToyMakers { calls, created: Cell::new(0), kept: crate::test_drive::Makers::new(blaze_own::testing::heap().alloc(), plant), panics, forgot: 0 }
 }
 
-/// A make of the toy's fn `item` for a test whose roots start at `entry`, as the relay hands it
-/// to a worker (test_drive.rs `Job`).
-fn toy_job(item: u128, entry: u128) -> crate::test_drive::Job<'static> {
+/// A make of the toy's fn `item` for a test whose roots start at `entry` with `start`, as the
+/// relay hands it to a worker (test_drive.rs `Job`).
+fn toy_job_start(item: u128, entry: u128, start: blaze_ladder::run::special::MakerStart) -> crate::test_drive::Job<'static> {
     let heap = blaze_own::testing::heap();
     let mut name = blaze_engine::SVec::with_capacity_in(20, heap.shared());
     name.extend_from_slice(&name_of(item));
@@ -1549,8 +1650,14 @@ fn toy_job(item: u128, entry: u128) -> crate::test_drive::Job<'static> {
         name,
         proof: Checked::Clean.runs(ItemKey(item)).expect("a clean body runs"),
         entry: Some(ItemKey(entry)),
-        start: blaze_ladder::run::special::MakerStart::ByRule,
+        start,
+        enclosers: crate::test_drive::suite_cache::LocalEnclosers::default(),
     }
+}
+
+/// A make of the toy's fn `item` for a `ByRule` run starting at `entry`.
+fn toy_job(item: u128, entry: u128) -> crate::test_drive::Job<'static> {
+    toy_job_start(item, entry, blaze_ladder::run::special::MakerStart::ByRule)
 }
 
 /// `symbol` resolved under `Codes::Pooled` through the real relay and the real pool's channels
@@ -1589,6 +1696,7 @@ fn resolve_pooled(
             proof: ask.proof,
             entry: Some(ItemKey(MAIN)),
             start: blaze_ladder::run::special::MakerStart::ByRule,
+            enclosers: crate::test_drive::suite_cache::LocalEnclosers::default(),
         };
         code.ask(child, ask.key, job).expect("the relay takes the ask");
         assert!(lane.step(cx, clock, makers, &mut scratch, heap).expect("the worker's turn"), "the relay handed the worker no make");
@@ -1665,35 +1773,90 @@ fn pooled_codes_equal_serial() {
 }
 
 /// THE SEAM TEST's control (rule 78, a planted bug): a worker whose makers are found by suite
-/// alone (`MakersPlant::BySuiteAlone`) hands a make of a test starting at `a` the maker made for
-/// `main`'s; `Makers::of` refuses it by name, typed, and never makes with it. Asserts the clean
-/// makers make both, and the planted ones refuse the second with the words of `ANOTHER_START`.
+/// alone (`MakersPlant::BySuiteAlone`) hands a make of another start class (another `ByRule`
+/// entry, or `Direct` vs `ByRule`) the kept maker of the first; `Makers::of` refuses it by
+/// name, typed, and never makes with it. Asserts the clean makers make both, and the planted
+/// ones refuse the second with the words of `ANOTHER_START`.
 /// Prints "seam control: a maker of another start refused".
 #[test]
 fn a_maker_of_another_start_is_refused() {
+    use blaze_ladder::run::special::MakerStart;
     use crate::test_drive::{MakersPlant, make_one};
 
     let heap = blaze_own::testing::heap();
     let mut scratch: AVec<'static, u8> = blaze_own::Vec::new_in(heap.alloc());
-    for plant in [MakersPlant::None, MakersPlant::BySuiteAlone] {
-        let calls = Cell::new(0);
-        let mut makers = toy_makers(&calls, plant, 0);
-        make_one(&mut makers, &toy_job(MAIN, MAIN), &mut scratch, heap.shared()).expect("main's make");
-        let second = make_one(&mut makers, &toy_job(A, A), &mut scratch, heap.shared());
-        match plant {
-            MakersPlant::None => {
-                second.expect("a make of another test's roots gets a maker of its own");
-                assert_eq!(calls.get(), 2, "the clean makers did not make both");
-            }
-            MakersPlant::BySuiteAlone => {
-                let why = second.expect_err("the planted makers handed a maker of another start, and it was used");
-                assert!(why.walk.as_str().contains("another entry or start"), "the refusal does not name the start: {why}");
-                assert!(why.whole, "the refusal's words were cut");
-                assert_eq!(calls.get(), 1, "the maker of another start made the instance");
+    let direct_a = MakerStart::Direct(blaze_id::ItemKey(blaze_ids::ContentId::of("direct test", b"a")));
+    for second_job in [toy_job(A, A), toy_job_start(A, A, direct_a)] {
+        for plant in [MakersPlant::None, MakersPlant::BySuiteAlone] {
+            let calls = Cell::new(0);
+            let mut makers = toy_makers(&calls, plant, 0);
+            make_one(&mut makers, &toy_job(MAIN, MAIN), &mut scratch, heap.shared()).expect("main's make");
+            let second = make_one(&mut makers, &second_job, &mut scratch, heap.shared());
+            match plant {
+                MakersPlant::None => {
+                    second.expect("a make of another start class gets a maker of its own");
+                    assert_eq!(calls.get(), 2, "the clean makers did not make both");
+                    assert_eq!(makers.created.get(), 2, "distinct start classes must not share one maker");
+                }
+                MakersPlant::BySuiteAlone => {
+                    let why = second.expect_err("the planted makers handed a maker of another start, and it was used");
+                    assert!(why.walk.as_str().contains("another entry or start"), "the refusal does not name the start: {why}");
+                    assert!(why.whole, "the refusal's words were cut");
+                    assert_eq!(calls.get(), 1, "the maker of another start made the instance");
+                }
             }
         }
     }
     std::println!("seam control: a maker of another start refused");
+}
+
+/// All `MakerStart::Direct(_)` tests in one suite share ONE persistent maker per worker
+/// (retargeted cleanly via `set_direct_entry`), never allocating one maker per test and never
+/// evicting at `MOST_MAKERS`; a `ByRule` job in the same suite gets its own maker.
+#[test]
+fn direct_tests_in_one_suite_share_one_persistent_maker() {
+    use blaze_ladder::run::special::MakerStart;
+    use crate::test_drive::{MakersPlant, make_one};
+
+    let heap = blaze_own::testing::heap();
+    let mut scratch: AVec<'static, u8> = blaze_own::Vec::new_in(heap.alloc());
+    let calls = Cell::new(0);
+    let mut makers = toy_makers(&calls, MakersPlant::None, 0);
+    for i in 1u128..=100u128 {
+        let start = MakerStart::Direct(blaze_id::ItemKey(blaze_ids::ContentId::of("direct test", &i.to_be_bytes())));
+        let job = toy_job_start(A, i, start);
+        make_one(&mut makers, &job, &mut scratch, heap.shared()).expect("direct test make");
+        let kept = makers.kept.kept(&job).expect("shared direct maker is kept");
+        assert_eq!(kept.entry, Some(ItemKey(i)), "shared direct maker retargeted its entry");
+        assert_eq!(kept.start, start, "shared direct maker retargeted its start");
+    }
+    assert_eq!(calls.get(), 100, "every direct test made its instance");
+    assert_eq!(makers.created.get(), 1, "all 100 direct tests in one suite must reuse ONE persistent maker");
+
+    // A `ByRule` job in the same suite must NOT reuse the `Direct` maker.
+    make_one(&mut makers, &toy_job(MAIN, MAIN), &mut scratch, heap.shared()).expect("by-rule make");
+    assert_eq!(makers.created.get(), 2, "ByRule in the same suite must get its own maker");
+
+    // LRU eviction: fill the worker's `MOST_MAKERS = 4` table (suite 0 Direct + suite 0 ByRule +
+    // suite 1 Direct + suite 2 Direct), touch suite 0 Direct so suite 0 ByRule is the LRU entry,
+    // then add suite 3 Direct and confirm suite 0 ByRule is evicted while suite 0 Direct stays hot.
+    let s0 = MakerStart::Direct(blaze_id::ItemKey(blaze_ids::ContentId::of("direct test", &1u128.to_be_bytes())));
+    let hot_s0 = toy_job_start(A, 1, s0);
+    for suite_id in 1u32..=2u32 {
+        let mut job = toy_job_start(A, 100 + u128::from(suite_id), s0);
+        job.suite = crate::test_loop::SuiteId(suite_id);
+        make_one(&mut makers, &job, &mut scratch, heap.shared()).expect("fill worker makers");
+    }
+    assert_eq!(makers.created.get(), 4, "4 distinct (suite, kind) makers created");
+    make_one(&mut makers, &hot_s0, &mut scratch, heap.shared()).expect("touch suite 0 direct maker");
+    assert_eq!(makers.created.get(), 4, "touching suite 0 reuses its direct maker");
+
+    let mut suite3 = toy_job_start(A, 103, s0);
+    suite3.suite = crate::test_loop::SuiteId(3);
+    make_one(&mut makers, &suite3, &mut scratch, heap.shared()).expect("suite 3 direct make");
+    assert_eq!(makers.created.get(), 5, "suite 3 gets its own direct maker");
+    assert!(makers.kept.kept(&hot_s0).is_some(), "hot suite 0 direct maker stays resident across boundary");
+    assert!(makers.kept.kept(&toy_job(MAIN, MAIN)).is_none(), "cold LRU ByRule maker was evicted");
 }
 
 /// Rule 20 on a code worker: a make that panics fails alone, typed, naming that it panicked;
@@ -1714,4 +1877,269 @@ fn a_panicking_make_fails_alone_and_the_next_one_makes() {
     assert!(!made.is_empty(), "the make after the panic made nothing");
     assert_eq!(calls.get(), 1, "the panicked make reached the maker");
     std::println!("code worker: a panicked make failed alone");
+}
+
+/// Bounded worker `Frame` reclamation: across many suites exceeding a tight `Frame` reserve,
+/// `drive_with_frame` reclaims the frame on soft budget / LRU eviction / `forget` without ever
+/// exhausting the reserve; retries a warm-frame OOM panic once on a freshly reset empty frame;
+/// isolates a deterministic cold-frame panic without infinite retry; and isolates a panic inside
+/// `KeptMakers::shown` (rule 20: never crashes the worker task).
+#[test]
+fn worker_frame_reclaims_across_many_suites_and_recovers_from_oom_and_shown_panics() {
+    use crate::test_drive::{KeptMakers, MakerFactory, Makers, MakersPlant, drive_with_frame, make_one_or_retry};
+    use crate::test_loop::SuiteId;
+
+    struct DummyMaker(blaze_ladder::run::special::MakerKind);
+    impl crate::test_drive::MadeFor for DummyMaker {
+        fn made_for(&self) -> blaze_ladder::run::special::MakerKind {
+            self.0
+        }
+        fn set_direct_entry(&mut self, _: Option<ItemKey>, _: blaze_ladder::run::special::MakerStart) -> bool {
+            true
+        }
+    }
+
+    struct BoundedSuiteMakers<'f> {
+        frame: &'f bstd::mem::Frame,
+        makers: Makers<DummyMaker>,
+        reset_needed: bool,
+        reset_at: usize,
+        evict_reset_at: usize,
+        alloc_bytes: &'f dyn Fn(u32) -> usize,
+        panic_suite: Option<u32>,
+        panic_shown_suite: Option<u32>,
+        rebuilds: &'f Cell<usize>,
+    }
+
+    impl KeptMakers for BoundedSuiteMakers<'_> {
+        fn make(&mut self, job: &crate::test_drive::Job<'static>, entry: &mut AVec<'_, u8>) -> Result<(), crate::test_drive::Unmade> {
+            let suite = job.suite.0;
+            if self.panic_suite == Some(suite) {
+                panic!("deterministic cold-frame panic on suite {suite}");
+            }
+            if self.panic_shown_suite == Some(suite) {
+                let tabled = job.order.tabled;
+                return Err(blaze_ladder::body_ids::WalkError::Make {
+                    tabled,
+                    why: blaze_ladder::run::RunError::OneBody { key: tabled, why: "refusal triggering shown panic" },
+                });
+            }
+            let bytes = (self.alloc_bytes)(suite);
+            let _ = self.makers.of(job, || Ok(DummyMaker(blaze_ladder::run::special::MakerKind::of(job.entry, job.start))))?;
+            // Allocate into the worker's bounded frame just as `names_in` + `Front2` do.
+            let slice = self.frame.alloc_uninit_slice::<u8>(bytes);
+            assert_eq!(slice.len(), bytes);
+            entry.extend_from_slice(&suite.to_le_bytes());
+            Ok(())
+        }
+
+        fn forget(&mut self, suite: SuiteId) {
+            self.makers.forget(suite);
+            self.reset_needed = true;
+        }
+
+        fn shown(&mut self, job: &crate::test_drive::Job<'static>, _refusal: &mut CodeRefusal) {
+            if self.panic_shown_suite == Some(job.suite.0) {
+                panic!("simulated Unserved OOM panic inside shown()");
+            }
+        }
+
+        fn needs_reset(&self) -> bool {
+            let used = self.frame.used();
+            self.reset_needed || used >= self.reset_at || (self.makers.evicted() && used >= self.evict_reset_at)
+        }
+
+        fn is_warm(&self) -> bool {
+            self.frame.used() > 0
+        }
+    }
+
+    struct Factory<'a> {
+        alloc_bytes: &'a dyn Fn(u32) -> usize,
+        reset_at: usize,
+        evict_reset_at: usize,
+        panic_suite: Option<u32>,
+        panic_shown_suite: Option<u32>,
+        rebuilds: &'a Cell<usize>,
+        heap: &'static blaze_own::Heap,
+    }
+
+    impl<'a> MakerFactory for Factory<'a> {
+        type Makers<'f> = BoundedSuiteMakers<'f>
+        where
+            Self: 'f;
+
+        fn build<'f>(&'f self, frame: &'f bstd::mem::Frame) -> BoundedSuiteMakers<'f> {
+            self.rebuilds.set(self.rebuilds.get() + 1);
+            BoundedSuiteMakers {
+                frame,
+                makers: Makers::new(self.heap.alloc(), MakersPlant::None),
+                reset_needed: false,
+                reset_at: self.reset_at,
+                evict_reset_at: self.evict_reset_at,
+                alloc_bytes: self.alloc_bytes,
+                panic_suite: self.panic_suite,
+                panic_shown_suite: self.panic_shown_suite,
+                rebuilds: self.rebuilds,
+            }
+        }
+    }
+
+    let heap = blaze_own::testing::heap();
+
+    // 1. 20 suites * 256 KiB = 5 MiB total through a 2 MiB bounded Frame: reclaims cleanly without OOM.
+    let mut frame = bstd::mem::Frame::with_reserve(2 << 20, bstd::mem::Tag::Other).expect("2 MiB bounded frame");
+    let rebuilds = Cell::new(0usize);
+    let alloc_256k = |_suite: u32| 256 << 10;
+    let factory = Factory {
+        alloc_bytes: &alloc_256k,
+        reset_at: 1 << 20,
+        evict_reset_at: 512 << 10,
+        panic_suite: None,
+        panic_shown_suite: None,
+        rebuilds: &rebuilds,
+        heap,
+    };
+    let mut suite_iter = (0u32..20).map(|s| {
+        let mut job = toy_job(MAIN, MAIN);
+        job.suite = SuiteId(s);
+        job
+    });
+    let mut results = std::vec::Vec::new();
+    drive_with_frame(
+        &mut frame,
+        0,
+        &factory,
+        || Ok(suite_iter.next()),
+        |res| {
+            results.push(res);
+            Ok(())
+        },
+        |job, makers, scratch, allow_retry| make_one_or_retry(makers, job, scratch, heap.shared(), allow_retry),
+        heap,
+    )
+    .expect("20 suites through 2 MiB bounded frame must succeed without OOM");
+    assert_eq!(results.len(), 20);
+    assert!(results.iter().all(|r| r.is_ok()), "every suite must succeed after frame reclamation");
+    assert!(rebuilds.get() >= 4, "frame must have reset multiple times across 5 MiB of allocations (rebuilds={})", rebuilds.get());
+
+    // 2. Warm-frame OOM recovery + cold-frame deterministic panic + shown() panic isolation.
+    let mut frame2 = bstd::mem::Frame::with_reserve(2 << 20, bstd::mem::Tag::Other).expect("2 MiB bounded frame");
+    let rebuilds2 = Cell::new(0usize);
+    // Suite 0 takes 1 MiB (warms frame below 1.8 MiB soft cap); suite 1 takes 1.4 MiB (exceeds
+    // remaining 1 MiB -> panics on warm frame -> resets -> retries once on empty 2 MiB frame -> succeeds!);
+    // suite 2 panics deterministically even on a fresh frame -> fails alone as PANICKED;
+    // suite 3 returns Err and panics inside shown() -> isolated refusal, triggers reset;
+    // suite 4 succeeds cleanly afterward.
+    let alloc_mixed = |suite: u32| if suite == 1 { 1400 << 10 } else { 1024 << 10 };
+    let factory2 = Factory {
+        alloc_bytes: &alloc_mixed,
+        reset_at: 1800 << 10,
+        evict_reset_at: 1800 << 10,
+        panic_suite: Some(2),
+        panic_shown_suite: Some(3),
+        rebuilds: &rebuilds2,
+        heap,
+    };
+    let mut mixed_iter = (0u32..5).map(|s| {
+        let mut job = toy_job(MAIN, MAIN);
+        job.suite = SuiteId(s);
+        job
+    });
+    let mut mixed_results = std::vec::Vec::new();
+    drive_with_frame(
+        &mut frame2,
+        0,
+        &factory2,
+        || Ok(mixed_iter.next()),
+        |res| {
+            mixed_results.push(res);
+            Ok(())
+        },
+        |job, makers, scratch, allow_retry| make_one_or_retry(makers, job, scratch, heap.shared(), allow_retry),
+        heap,
+    )
+    .expect("worker loop must survive warm-frame OOM, cold panic, and shown() panic");
+    assert_eq!(mixed_results.len(), 5);
+    assert!(mixed_results[0].is_ok(), "suite 0 warms frame");
+    assert!(mixed_results[1].is_ok(), "suite 1 recovers from warm-frame OOM via single retry on fresh frame");
+    let err2 = mixed_results[2].as_ref().expect_err("suite 2 deterministic panic fails alone");
+    assert!(err2.walk.as_str().contains("panicked on its code worker"), "suite 2 refusal names panic: {err2}");
+    let err3 = mixed_results[3].as_ref().expect_err("suite 3 refusal survives shown() panic");
+    assert!(err3.walk.as_str().contains("refusal triggering shown panic"), "suite 3 preserves refusal: {err3}");
+    assert!(mixed_results[4].is_ok(), "suite 4 succeeds on clean frame after shown() panic reset");
+}
+
+#[test]
+fn publish_precomputed_emits_bytes_declare_data_publish_and_answers_later_needs_without_resolving() {
+    let frame = bstd::mem::Frame::with_reserve(1 << 18, bstd::mem::Tag::Other).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let mut needs = Needs::new(alloc);
+    let mut out = wire_out(alloc);
+
+    let fn_sym = Symbol([0x11; 32]);
+    let callee_sym = Symbol([0x22; 32]);
+    let static_sym = Symbol([0x33; 32]);
+    let fn_bytes = b"fn-code-record";
+    let datum_bytes = b"static-datum";
+    let fn_rec = RecordId(blaze_blake3::hash(fn_bytes));
+    let datum_rec = RecordId(blaze_blake3::hash(datum_bytes));
+    let datum = Datum { symbol: static_sym, record: datum_rec };
+
+    assert!(!needs.is_settled(&fn_sym));
+    let first = needs
+        .publish_precomputed(
+            fn_sym,
+            fn_rec,
+            &[callee_sym],
+            &[datum],
+            &[static_sym],
+            &[],
+            &[(fn_rec, fn_bytes), (datum_rec, datum_bytes)],
+            &mut out,
+        )
+        .expect("precomputed publish");
+    assert!(first);
+    assert!(needs.is_settled(&fn_sym));
+
+    // Second precomputed publish of the same symbol is an idempotent no-op.
+    let len_after_first = out.len();
+    let second = needs
+        .publish_precomputed(fn_sym, fn_rec, &[callee_sym], &[datum], &[static_sym], &[], &[], &mut out)
+        .expect("idempotent second publish");
+    assert!(!second);
+    assert_eq!(out.len(), len_after_first);
+
+    // Wire order: Bytes before Declare, Declare before Data, Data before Publish.
+    let mut seen: AVec<'_, &str> = AVec::new_in(alloc);
+    let mut rest = out.as_slice();
+    while let Some((item, len)) = split(rest).expect("whole frame") {
+        let (_, down) = Down::decode(item).expect("valid down frame");
+        let kind = match down {
+            Down::Bytes { .. } => "Bytes",
+            Down::Declare { .. } => "Declare",
+            Down::Data { .. } => "Data",
+            Down::Publish { .. } => "Publish",
+            _ => "Other",
+        };
+        seen.push(kind);
+        rest = &rest[len..];
+    }
+    assert_eq!(seen.as_slice(), ["Bytes", "Bytes", "Declare", "Data", "Publish"]);
+
+    // Subsequent `Up::Need` for the pre-published symbol answers directly without calling `Resolve`.
+    struct NeverResolve;
+    impl Resolve for NeverResolve {
+        fn resolve(&mut self, _symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
+            panic!("pre-published symbol must not hit the resolver");
+        }
+        fn publication(&mut self, _symbol: &Symbol, _values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
+            panic!("pre-published symbol must not hit the resolver");
+        }
+    }
+    let mut reply = wire_out(alloc);
+    needs.serve(&mut NeverResolve, &need(Needed::Symbol(fn_sym)), &mut reply).expect("answered from cache");
+    let (item, _) = split(&reply).expect("whole frame").expect("one reply");
+    assert!(matches!(Down::decode(item).expect("valid"), (_, Down::Publish { record, .. }) if record == fn_rec));
 }

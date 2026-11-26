@@ -6,8 +6,10 @@ use std::alloc::Allocator;
 use std::{
     alloc::Global,
     collections::BTreeMap,
+    io::Error as IoError,
     ops::Range,
     path::{Path, PathBuf},
+    process,
     time::Duration,
 };
 
@@ -21,7 +23,7 @@ use blaze_keyed::{
 };
 
 use super::{
-    core::{Batch, Committed, Found, GcPlan, Got, LentRecord, Liveness, Plain, PlainConfig, Probe, Probes, PutError, Renewed, Report, Scrubbed, Sliced, TAGS},
+    core::{Batch, CommitDurability, Committed, Found, GcPlan, Got, LentRecord, Liveness, PidCheck, PidLiveness, Plain, PlainConfig, Probe, Probes, PutError, Renewed, Report, Scrubbed, Sliced, TAGS},
     format::{self, Segment},
     settings::Settings,
 };
@@ -193,6 +195,10 @@ pub struct Driven<D: Driver, A: Allocator + Clone> {
     /// The test's power cut ([`Driven::cut`]).
     #[cfg(test)]
     cut: Option<Cut>,
+    /// Test-only knob to suppress automatic tiered merging on commit when a test intentionally
+    /// constructs many unmerged segments (e.g. `bloom_tests` exercising 120-segment skipping).
+    #[cfg(test)]
+    auto_merge: bool,
 }
 
 /// Where a test's power cut falls ([`Driven::cut`]): every run from then on stops, as if the
@@ -242,6 +248,7 @@ impl<A: Allocator + Clone> Driven<Native, A> {
             lock_step: crate::plain::LockStep::Backoff,
         };
         let mut it = Driven::with(driver, root, cfg, alloc)?;
+        it.set_pid(process::id());
         it.open_files()?;
         Ok(it)
     }
@@ -307,7 +314,15 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         self.cut = at;
     }
 
-    fn bare(driver: D, root: &Path, core: Plain<A>) -> Driven<D, A> {
+    /// Suppresses automatic tiered merging on commit for tests that deliberately construct many
+    /// unmerged segments to measure multi-segment probing / Bloom skipping.
+    #[cfg(test)]
+    pub(crate) fn disable_auto_merge(&mut self) {
+        self.auto_merge = false;
+    }
+
+    fn bare(driver: D, root: &Path, mut core: Plain<A>) -> Driven<D, A> {
+        core.set_stream_commits(true);
         Driven {
             driver,
             root: root.to_owned(),
@@ -318,6 +333,8 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             files: BTreeMap::new(),
             #[cfg(test)]
             cut: None,
+            #[cfg(test)]
+            auto_merge: true,
         }
     }
 
@@ -395,6 +412,10 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
 
     /// Runs until nothing is in flight, the store's completions to it, the driver's own kept.
     fn run(&mut self, what: &'static str) -> Result<(), StoreError> {
+        self.run_with(what, &[], &[])
+    }
+
+    fn run_with(&mut self, what: &'static str, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<(), StoreError> {
         let _span = blaze_trace::info_span!("plain.wait", what).entered();
         let mut since = self.driver.now();
         #[cfg(test)]
@@ -431,7 +452,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
                         }
                     }
                     if self.core.owns(completion.tag) {
-                        self.core.complete(completion, wall, &mut self.effects);
+                        self.core.complete_with(completion, wall, batches, records, &mut self.effects);
                     } else {
                         self.own.push(completion);
                     }
@@ -654,17 +675,60 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         self.commit_records(batches, &[])
     }
 
+    /// Maps and verifies ONLY the unmapped/parked local segments whose Bloom filter matches at
+    /// least one key being committed in `batches`, `records`, or `self.core.held` (plus any
+    /// segment lacking a valid Bloom filter), leaving non-matching prior-boot segments unmapped
+    /// and unhashed during foreground commits ([`Plain::map_for_commit`]).
+    fn map_for_commit(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<(), StoreError> {
+        if self.core.whole() && self.core.broken().is_none() && self.core.ready() {
+            return Ok(());
+        }
+        let lost = self.core.report().lost.len();
+        let now = self.driver.wall_ns();
+        if self.core.map_for_commit(batches, records, now, &mut self.effects)? && !self.effects.is_empty() {
+            self.run("mapping commit-matching segments")?;
+        }
+        self.hand_losses(lost);
+        Ok(())
+    }
+
     /// [`Driven::commit_with`] with `records` lent where they lie (core.rs
     /// [`Plain::commit_records`]): a `Lent`'s shared arena, copied once, by the layout.
     pub fn commit_records(&mut self, batches: &[&Batch], records: &[LentRecord<'_>]) -> Result<Committed<A>, StoreError> {
-        // After the answer: what is left unmapped is mapped, so the layout refuses two values
-        // under one key against every row. A commit with nothing to lay out maps nothing.
-        if self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) || !records.is_empty() {
+        // After the answer: only map/verify segments that can conflict with the batch being
+        // committed (Bloom-filtered), unless a `Liveness::Reached` root-set or emergency
+        // auto-tier-merge requires a whole store.
+        let writing = self.core.holds_uncommitted() || batches.iter().any(|it| !it.is_empty()) || !records.is_empty();
+        let mut auto_folded = false;
+        if self.core.needs_whole_for_commit() {
             self.map_all()?;
+        }
+        if writing {
+            #[cfg(test)]
+            let allow_auto = self.auto_merge;
+            #[cfg(not(test))]
+            let allow_auto = true;
+            // Routine tiered merging (`Plain::AUTO_TIER_MERGE_BG` = 24) runs asynchronously in
+            // detached `blaze gc --background`. Foreground commits only fold a synchronous slice
+            // at the emergency safety ceiling (`Plain::AUTO_TIER_MERGE_FG` = 128) so interactive
+            // `blaze check`/`test` commits never stall on multi-hundred-MB tier merges.
+            if allow_auto && !self.core.slice_parked() && self.core.needs_auto_tier_merge() {
+                self.map_all()?;
+                let now = self.driver.wall_ns();
+                if self.core.fold_tiered_slice(now, &mut self.effects)? {
+                    self.run("auto-merging tiers on commit")?;
+                }
+                auto_folded = self.core.slice_parked();
+            } else {
+                self.map_for_commit(batches, records)?;
+            }
         }
         let now = self.driver.wall_ns();
         self.core.commit_records(batches, records, now, &mut self.effects)?;
-        self.run("committing")?;
+        self.run_with("committing", batches, records)?;
+        if auto_folded {
+            let _ = self.core.take_sliced();
+        }
         match self.core.take_committed() {
             Some(outcome) => outcome,
             None => Err(StoreError::Unfinished { what: "a commit" }),
@@ -691,7 +755,7 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
             self.run("compacting")?;
             let sliced = self.core.take_sliced().ok_or(StoreError::Unfinished { what: "a compaction slice" })?;
             out.push(sliced);
-            if !sliced.more || sliced.aborted || (sliced.segments == 0 && sliced.evicted_roots == 0 && sliced.removed == 0) {
+            if !sliced.more || sliced.aborted || (sliced.segments == 0 && sliced.evicted_roots == 0 && sliced.removed == 0 && sliced.orphans == 0) {
                 break;
             }
         }
@@ -757,6 +821,11 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
         self.root_through_owned(name, indexes, life_ns, &|_| false)
     }
 
+    /// [`Plain::hint_replaced_indexes`].
+    pub fn hint_replaced_indexes(&mut self, indexes: &[Key]) {
+        self.core.hint_replaced_indexes(indexes);
+    }
+
     /// O(1) lease renewal for an already-live root `name` ([`Plain::renew_root`]): checks the
     /// manifest's root entry against the driver's wall clock without probing or hashing held keys.
     pub fn renew_root(&mut self, name: &str, life_ns: u64) -> Renewed {
@@ -784,6 +853,21 @@ impl<D: Driver, A: Allocator + Clone> Driven<D, A> {
     pub fn rearm_lease(&mut self) {
         let now_ns = self.driver.wall_ns();
         self.core.rearm_lease(now_ns)
+    }
+
+    /// [`Plain::set_commit_durability`].
+    pub fn set_commit_durability(&mut self, durability: CommitDurability) {
+        self.core.set_commit_durability(durability)
+    }
+
+    /// [`Plain::set_pid`].
+    pub fn set_pid(&mut self, pid: u32) {
+        self.core.set_pid(pid)
+    }
+
+    /// [`Plain::reclaim_dead_leases`].
+    pub fn reclaim_dead_leases(&mut self, check: &dyn PidCheck) -> u32 {
+        self.core.reclaim_dead_leases(check)
     }
 
     /// Reads at most [`format::HEAD_LEN`] + 1 bytes of `head` through the driver (zero segment
@@ -1064,6 +1148,40 @@ impl<D: Driver> Drop for ExclusiveLock<D> {
         while self.driver.in_flight() > 0 && !deadline.passed(self.driver.now()) {
             self.driver.poll(&mut done, deadline);
             done.clear();
+        }
+    }
+}
+
+/// Native Unix [`PidCheck`] via `kill(pid, 0)` (outside `#![blaze::sans_io]`, rules 14, 75).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct OsPidCheck;
+
+impl PidCheck for OsPidCheck {
+    fn check_pid(&self, pid: u32) -> PidLiveness {
+        #[cfg(unix)]
+        {
+            let Ok(pid_i32) = libc::pid_t::try_from(pid) else {
+                return PidLiveness::Unknown;
+            };
+            if pid_i32 <= 0 {
+                return PidLiveness::Dead;
+            }
+            // SAFETY: signal 0 performs only a kernel existence/permission check on positive
+            // `pid_i32` without delivering a signal or touching user memory.
+            let rc = unsafe { libc::kill(pid_i32, 0) };
+            if rc == 0 {
+                return PidLiveness::Alive;
+            }
+            match IoError::last_os_error().raw_os_error() {
+                Some(libc::EPERM) => PidLiveness::Alive,
+                Some(libc::ESRCH) => PidLiveness::Dead,
+                _ => PidLiveness::Unknown,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            PidLiveness::Unknown
         }
     }
 }

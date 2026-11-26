@@ -23,14 +23,15 @@
 //!   call and key) or a damaged row is answered none and filed in [`StoreLoad::unserved`].
 
 use core::cell::RefCell;
+use std::sync::OnceLock;
 
 use blaze_drive::{Input, Key, Name};
 use blaze_core::SharedSet;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_ladder::front2::source::{Load, LoadedExpansion};
-use blaze_own::{AVec, Alloc, Bump, Vec};
-use blaze_scope::items_record::{CurrentFile, ItemsRecord, ItemsRecordError};
-use blaze_scope::names_record::{NamesRecordError, Verified};
+use blaze_own::{AVec, Alloc, Bump, SharedAlloc, Vec};
+use blaze_scope::items_record::{CurrentFile, ItemsRecordError, VerifiedItems};
+use blaze_scope::names_record::{NamesRecordError, Verified, VerifiedModules};
 use blaze_scope::package_path::PackagePath;
 use blaze_scope::resolve::SourceTexts;
 use bstd::cx::Cx;
@@ -55,7 +56,10 @@ pub(crate) struct CrateRecords<'n> {
     /// opens it from here, in O(1), with no check again.
     pub names_proof: Verified<'n>,
     pub items: &'n [u8],
-    /// The items section's edition, read by its one open at the load ([`checked_records`]):
+    /// The items section's one form and UTF-8 check this process (rule 74): every later job or
+    /// stretch opens `ItemsRecord` from here in O(1), with no re-check of columns or strings.
+    pub items_proof: VerifiedItems<'n>,
+    /// The items section's edition, read by its one check at the load ([`checked_records`]):
     /// what a reader that needs only the edition takes, never opening the section again (a
     /// proc-macro caller's edition, run_names.rs; before 2026-11-18 every names-records build
     /// opened every crate's items section for it, re-checking its strings).
@@ -127,15 +131,40 @@ pub(crate) fn checked_records<'n>(
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "names" });
     }
-    // The section's one open this command: its key checked, its edition kept beside it. Every
-    // later reader of its rows opens it once per job, in the job's names records
-    // (front2 source.rs `Records::items_record`).
-    let opened = ItemsRecord::open(items, alloc).map_err(|error| LoadError::Items { name, error })?;
-    let (found, edition) = (opened.key(), opened.edition());
+    // The section's one form + UTF-8 check this command (rule 74): its key checked, its proof
+    // and edition kept beside it so every job and stretch opens `ItemsRecord` in O(1).
+    let _ = alloc;
+    let items_proof = VerifiedItems::check(items).map_err(|error| LoadError::Items { name, error })?;
+    let (found, edition) = (items_proof.key(), items_proof.edition());
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "items" });
     }
-    Ok(CrateRecords { key, file_slots: &[], names, names_proof, items, edition, expansions })
+    Ok(CrateRecords { key, file_slots: &[], names, names_proof, items, items_proof, edition, expansions })
+}
+
+/// O(1) lazy-validated variant of [`checked_records`] for in-place local CAS records
+/// (`engine_records::InPlace`): verifies headers, alignment, all section bounds, column headers,
+/// crate keys, edition, `CrateRoot`, and expansion directory upfront, deferring module scope
+/// `ScopeView::read`, variant UTF-8, and `ItemsRecord` string UTF-8 checks until accessed.
+pub(crate) fn checked_records_lazy<'n>(
+    name: Name,
+    key: CrateItemKey,
+    names: &'n [u8],
+    items: &'n [u8],
+    expansions: &'n [u8],
+) -> Result<CrateRecords<'n>, LoadError> {
+    let expansions = ExpansionTexts::open(expansions).map_err(|error| LoadError::Expansions { name, error })?;
+    let names_proof = Verified::check_header(names).map_err(|error| LoadError::Names { name, error })?;
+    let found = names_proof.key();
+    if found != key {
+        return Err(LoadError::OtherCrate { name, asked: key, found, which: "names" });
+    }
+    let items_proof = VerifiedItems::check_header(items).map_err(|error| LoadError::Items { name, error })?;
+    let (found, edition) = (items_proof.key(), items_proof.edition());
+    if found != key {
+        return Err(LoadError::OtherCrate { name, asked: key, found, which: "items" });
+    }
+    Ok(CrateRecords { key, file_slots: &[], names, names_proof, items, items_proof, edition, expansions })
 }
 
 /// The crate `key`'s sections from the record `input` names, read from `store` by its key
@@ -187,10 +216,37 @@ pub(crate) struct Unopened {
 /// [`ByNeedCounts::opened`] over that, 1.0 by construction (a slot opens once). Before, every
 /// crate of every opened scope was opened at the setup (tempo, one edited body: 773 records,
 /// 823 MB checked).
+/// One immutable pack file's encoded `FileItems` buffer (16-aligned slice `bytes[offset..offset + len]`)
+/// and its surface digest, cached once per file slot across all workers of a request.
+struct CachedPackFileItems {
+    edition: u8,
+    surface: ContentId,
+    /// Backing allocation sized `len + 15` (never reallocated), storing the 16-aligned `FileItems` bytes at `offset`.
+    buf: Vec<u8, SharedAlloc<'static>>,
+    offset: usize,
+    len: usize,
+}
+
+impl CachedPackFileItems {
+    fn aligned_bytes(&self) -> Option<&[u8]> {
+        let end = self.offset.checked_add(self.len)?;
+        self.buf.get(self.offset..end)
+    }
+}
+
+struct OpenedCrate<'r> {
+    records: CrateRecords<'r>,
+    /// Shared lock-free per-module verification bitmap for lazy `names_proof`, populated once per
+    /// accessed module across all workers of the request.
+    module_cache: VerifiedModules<'r, SharedAlloc<'static>>,
+    /// Per-file `FileItems` cache for immutable pack crates (indexed by `file_index`).
+    pack_files: blaze_own::Vec<OnceLock<CachedPackFileItems>, blaze_own::SharedAlloc<'static>>,
+}
+
 pub(crate) struct ScopeRecords<'r> {
     snapshot: &'r StoreSnapshot,
     heap: &'static blaze_own::Heap,
-    slots: blaze_own::Vec<std::sync::OnceLock<Result<CrateRecords<'r>, &'static str>>, blaze_own::SharedAlloc<'static>>,
+    slots: blaze_own::Vec<OnceLock<Result<OpenedCrate<'r>, &'static str>>, blaze_own::SharedAlloc<'static>>,
     asks: core::sync::atomic::AtomicU64,
     opened: core::sync::atomic::AtomicU64,
     bytes: core::sync::atomic::AtomicU64,
@@ -207,8 +263,79 @@ pub(crate) struct ByNeedCounts {
 impl<'r> ScopeRecords<'r> {
     /// No crate opened yet, for a crate list of `crates` crates, over the committed `snapshot`.
     pub(crate) fn new(snapshot: &'r StoreSnapshot, crates: usize, heap: &'static blaze_own::Heap) -> ScopeRecords<'r> {
-        let slots = blaze_own::Vec::from_iter_in((0..crates).map(|_| std::sync::OnceLock::new()), heap.shared());
-        ScopeRecords { snapshot, heap, slots, asks: core::sync::atomic::AtomicU64::new(0), opened: core::sync::atomic::AtomicU64::new(0), bytes: core::sync::atomic::AtomicU64::new(0) }
+        let slots = blaze_own::Vec::from_iter_in((0..crates).map(|_| OnceLock::new()), heap.shared());
+        ScopeRecords {
+            snapshot,
+            heap,
+            slots,
+            asks: core::sync::atomic::AtomicU64::new(0),
+            opened: core::sync::atomic::AtomicU64::new(0),
+            bytes: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Build or fetch cached `CurrentFile` for an immutable pack (non-checkout) file at `(world_at, file)`.
+    pub(crate) fn cached_pack_file_items<'s>(
+        &'s self,
+        world_at: usize,
+        file: u32,
+        edition: blaze_surface::Edition,
+        text: &'s str,
+    ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
+        let opened = self.slots.get(world_at)?.get()?.as_ref().ok()?;
+        let cell = opened.pack_files.get(usize::try_from(file).ok()?)?;
+        if let Some(entry) = cell.get() {
+            if entry.edition != edition.byte() {
+                return None;
+            }
+            let bytes = entry.aligned_bytes()?;
+            let view = match blaze_surface::FileItemsView::read(bytes) {
+                Ok(v) => v,
+                Err(why) => return Some(Err(ItemsRecordError::FileItemsRead { file, why })),
+            };
+            return Some(Ok(CurrentFile { text, surface: entry.surface, view }));
+        }
+        let (surface, buf, offset, len) = match blaze_mem::frame::task(blaze_mem::Tag::Parse, |scratch| {
+            let erased = blaze_own::Erased::new(scratch);
+            let alloc = erased.handle();
+            let outline = blaze_file_items::outline(text, edition, alloc);
+            let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+            let encoded = match outline.to_file_items(text, digest, alloc) {
+                Ok(e) => e,
+                Err(why) => return Err(ItemsRecordError::FileItemsBuild { file, why }),
+            };
+            let surface = outline.surface();
+            let len = encoded.len();
+            let mut buf = Vec::with_capacity_in(len.saturating_add(15), self.heap.shared());
+            buf.resize(len.saturating_add(15), 0);
+            let offset = (16 - (buf.as_ptr().addr() & 15)) & 15;
+            let Some(dst) = offset.checked_add(len).and_then(|end| buf.get_mut(offset..end)) else {
+                return Ok(None);
+            };
+            dst.copy_from_slice(&encoded);
+            Ok(Some((surface, buf, offset, len)))
+        }) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(why) => return Some(Err(why)),
+        };
+        let Some(check_slice) = offset.checked_add(len).and_then(|end| buf.get(offset..end)) else {
+            return None;
+        };
+        if let Err(why) = blaze_surface::FileItemsView::read(check_slice) {
+            return Some(Err(ItemsRecordError::FileItemsRead { file, why }));
+        }
+        let _ = cell.set(CachedPackFileItems { edition: edition.byte(), surface, buf, offset, len });
+        let entry = cell.get()?;
+        if entry.edition != edition.byte() {
+            return None;
+        }
+        let bytes = entry.aligned_bytes()?;
+        let view = match blaze_surface::FileItemsView::read(bytes) {
+            Ok(v) => v,
+            Err(why) => return Some(Err(ItemsRecordError::FileItemsRead { file, why })),
+        };
+        Some(Ok(CurrentFile { text, surface: entry.surface, view }))
     }
 
     /// What it did so far.
@@ -219,19 +346,29 @@ impl<'r> ScopeRecords<'r> {
 
     /// Crate `one`'s records: opened at the first ask, the same after; `Err`: the words of why
     /// its record did not open, the same for every ask.
-    fn records(&self, one: &Unopened) -> Result<CrateRecords<'r>, &'static str> {
+    fn records<'s>(&'s self, one: &Unopened) -> Result<CrateRecords<'s>, &'static str> {
         use core::sync::atomic::Ordering::Relaxed;
         self.asks.fetch_add(1, Relaxed);
         let Some(slot) = self.slots.get(one.world_at) else {
             return Err("its place is past the request's crate list (front_load.rs `ScopeRecords`)");
         };
-        *slot.get_or_init(|| {
+        let opened = slot.get_or_init(|| {
             let mut counts = crate::engine_records::ReadCounts::default();
             let read = self.read(one, &mut counts);
             self.opened.fetch_add(counts.records, Relaxed);
             self.bytes.fetch_add(counts.bytes, Relaxed);
-            read.map_err(|why| crate::engine_head_notes::leak(self.heap.alloc(), format_args!("{why}")))
-        })
+            read.map(|records| {
+                let module_cache = records.names_proof.new_module_cache(self.heap.shared());
+                let nfiles = records.items_proof.files();
+                let pack_files = blaze_own::Vec::from_iter_in((0..nfiles).map(|_| OnceLock::new()), self.heap.shared());
+                OpenedCrate { records, module_cache, pack_files }
+            })
+            .map_err(|why| crate::engine_head_notes::leak(self.heap.alloc(), format_args!("{why}")))
+        });
+        opened
+            .as_ref()
+            .map(|o| CrateRecords { names_proof: o.records.names_proof.bind_cache(&o.module_cache), ..o.records })
+            .map_err(|&e| e)
     }
 
     /// The one read of crate `one`'s record: from the snapshot by its key, in place, opened.
@@ -281,11 +418,33 @@ impl core::fmt::Display for ByNeedError {
 /// cells).
 pub(crate) trait OpenByNeed: Sync {
     fn open<'s>(&'s self, one: &Unopened) -> Result<CrateRecords<'s>, &'static str>;
+
+    /// Cached `FileItems` view for immutable pack (non-checkout) files, keyed by
+    /// `(world_at, file_index)`. Returns `None` if no shared cache slot is available.
+    fn pack_file_items<'s>(
+        &'s self,
+        _world_at: usize,
+        _file: u32,
+        _edition: blaze_surface::Edition,
+        _text: &'s str,
+    ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
+        None
+    }
 }
 
 impl OpenByNeed for ScopeRecords<'_> {
     fn open<'s>(&'s self, one: &Unopened) -> Result<CrateRecords<'s>, &'static str> {
         self.records(one)
+    }
+
+    fn pack_file_items<'s>(
+        &'s self,
+        world_at: usize,
+        file: u32,
+        edition: blaze_surface::Edition,
+        text: &'s str,
+    ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
+        self.cached_pack_file_items(world_at, file, edition, text)
     }
 }
 
@@ -333,6 +492,36 @@ impl<'n> CratesFrom<'n> {
     }
 }
 
+/// Optional lookup of precomputed checkout file digests (`crate::sweep::FILE_DOMAIN`),
+/// implemented by [`crate::job_texts::JobTexts`] when backed by [`crate::body_types::SyncLazyTrees`].
+pub(crate) trait DigestLookup {
+    fn checkout_digest(&self, inner: &str) -> Option<ContentId>;
+}
+
+impl DigestLookup for crate::job_texts::JobTexts<'_> {
+    fn checkout_digest(&self, inner: &str) -> Option<ContentId> {
+        crate::job_texts::JobTexts::checkout_digest(self, inner)
+    }
+}
+
+/// Source texts accepted by [`StoreLoad::from_crates`]: either a plain `&dyn SourceTexts` or a
+/// [`crate::job_texts::JobTexts`] that also exposes cached `FILE_DOMAIN` checkout digests.
+pub(crate) trait StoreTexts<'n> {
+    fn split(self) -> (&'n dyn SourceTexts<'n>, Option<&'n dyn DigestLookup>);
+}
+
+impl<'a: 'n, 'n> StoreTexts<'n> for &'a (dyn SourceTexts<'n> + 'n) {
+    fn split(self) -> (&'n dyn SourceTexts<'n>, Option<&'n dyn DigestLookup>) {
+        (self, None)
+    }
+}
+
+impl<'a: 'n, 'n> StoreTexts<'n> for &'a crate::job_texts::JobTexts<'n> {
+    fn split(self) -> (&'n dyn SourceTexts<'n>, Option<&'n dyn DigestLookup>) {
+        (self, Some(self))
+    }
+}
+
 /// front2's [`Load`] over crates read from the store: `crates`' crate `i` is the reader's crate
 /// `i` (the program's own at 0, as `Records::new`'s keys), `texts` the world's trees.
 pub(crate) struct StoreLoad<'n> {
@@ -346,6 +535,7 @@ pub(crate) struct StoreLoad<'n> {
     /// `CrateInput::shown_from`): a record's package path is joined onto it to read (D96).
     packages: &'n [&'n str],
     texts: &'n dyn SourceTexts<'n>,
+    digests: Option<&'n dyn DigestLookup>,
     snapshot: Option<&'n StoreSnapshot>,
     expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
     outlines: Option<&'n [crate::engine_tasks::Outlined<'n>]>,
@@ -354,6 +544,7 @@ pub(crate) struct StoreLoad<'n> {
     /// damaged row); `None`: the crate made no text for the call.
     unserved: RefCell<AVec<'n, Unserved>>,
     alloc: Alloc<'n>,
+    bump: Bump<'n>,
 }
 
 /// One expansion a question asked that was not served ([`StoreLoad::unserved`]).
@@ -383,12 +574,13 @@ impl core::fmt::Display for ExpansionReadError {
 
 impl<'n> StoreLoad<'n> {
     #[cfg(test)]
-    pub(crate) fn new(crates: &'n [CrateRecords<'n>], packages: &'n [&'n str], texts: &'n dyn SourceTexts<'n>, alloc: Alloc<'n>) -> StoreLoad<'n> {
-        Self::from_parts(crates, packages, texts, None, None, None, alloc)
+    pub(crate) fn new(crates: &'n [CrateRecords<'n>], packages: &'n [&'n str], texts: &'n dyn SourceTexts<'n>, bump: Bump<'n>, alloc: Alloc<'n>) -> StoreLoad<'n> {
+        Self::from_parts(crates, packages, texts, None, None, None, bump, alloc)
     }
 
     /// Both (the merge of two lanes, 2026-11-18): the snapshot for lazy expansion texts and
     /// the outlines for current file ranges. The engine's Bodies path passes both.
+    #[expect(clippy::too_many_arguments, reason = "test and driver loader inputs, each one handle")]
     pub(crate) fn from_parts(
         crates: &'n [CrateRecords<'n>],
         packages: &'n [&'n str],
@@ -396,22 +588,42 @@ impl<'n> StoreLoad<'n> {
         snapshot: Option<&'n StoreSnapshot>,
         expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
         outlines: Option<&'n [crate::engine_tasks::Outlined<'n>]>,
+        bump: Bump<'n>,
         alloc: Alloc<'n>,
     ) -> Self {
-        Self::from_crates(CratesFrom::Opened(crates), packages, texts, snapshot, expansion_keys, outlines, alloc)
+        Self::from_crates(CratesFrom::Opened(crates), packages, texts, snapshot, expansion_keys, outlines, bump, alloc)
     }
 
     /// [`StoreLoad::from_parts`] over either source of crates ([`CratesFrom`]).
+    #[expect(clippy::too_many_arguments, reason = "loader inputs, each one handle")]
     pub(crate) fn from_crates(
         crates: CratesFrom<'n>,
         packages: &'n [&'n str],
-        texts: &'n dyn SourceTexts<'n>,
+        texts: impl StoreTexts<'n>,
         snapshot: Option<&'n StoreSnapshot>,
         expansion_keys: Option<&'n SharedSet<Key, blaze_own::SharedAlloc<'static>>>,
         outlines: Option<&'n [crate::engine_tasks::Outlined<'n>]>,
+        bump: Bump<'n>,
         alloc: Alloc<'n>,
     ) -> Self {
-        StoreLoad { crates, refused: core::cell::Cell::new(None), packages, texts, snapshot, expansion_keys, outlines, unserved: RefCell::new(AVec::new_in(alloc)), alloc }
+        let (texts, digests) = texts.split();
+        let crates = match crates {
+            CratesFrom::ByNeed { mut own, rest, records } => {
+                if own.names_proof.needs_module_cache() {
+                    own.names_proof = own.names_proof.bind_bump_cache(bump);
+                }
+                CratesFrom::ByNeed { own, rest, records }
+            }
+            CratesFrom::Opened(list) if list.iter().any(|one| one.names_proof.needs_module_cache()) => {
+                let mut bound = Vec::with_capacity_in(list.len(), bump);
+                for &one in list.iter() {
+                    bound.push(CrateRecords { names_proof: one.names_proof.bind_bump_cache(bump), ..one });
+                }
+                CratesFrom::Opened(bound.into_bump_slice())
+            }
+            CratesFrom::Opened(list) => CratesFrom::Opened(list),
+        };
+        StoreLoad { crates, refused: core::cell::Cell::new(None), packages, texts, digests, snapshot, expansion_keys, outlines, unserved: RefCell::new(AVec::new_in(alloc)), alloc, bump }
     }
 
     /// The crates' keys in reader order: `Records::new`'s `keys`.
@@ -470,7 +682,7 @@ impl<'n> StoreLoad<'n> {
         }
         let bytes = snapshot.expansion_get(key).map_err(|error| ExpansionReadError::Snapshot { call, key, error })?
             .ok_or(ExpansionReadError::Record(ExpansionRecordsError::Missing { call, key: entry.record }))?;
-        let record = ExpansionRecord::open(bytes).map_err(ExpansionReadError::Record)?;
+        let record = ExpansionRecord::open_in(bytes, self.bump).map_err(ExpansionReadError::Record)?;
         let text = entry.text(&record).map_err(ExpansionReadError::Record)?;
         Ok(Some(LoadedExpansion { text, origins: Some((entry.call_part, record.column)) }))
     }
@@ -481,8 +693,16 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         self.records_of(krate).map(|c| c.names)
     }
 
+    fn names_verified(&self, krate: usize) -> Option<Verified<'n>> {
+        self.records_of(krate).map(|c| c.names_proof)
+    }
+
     fn items(&self, krate: usize) -> Option<&'n [u8]> {
         self.records_of(krate).map(|c| c.items)
+    }
+
+    fn items_verified(&self, krate: usize) -> Option<VerifiedItems<'n>> {
+        self.records_of(krate).map(|c| c.items_proof)
     }
 
     fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'n str> {
@@ -497,6 +717,13 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         // The outline planner covers checkout sources. The packed libraries and the
         // text-only driver supply immutable texts from which the view is made once.
         let (Some(outlines), Some(real)) = (self.outlines, full.strip_prefix("/0/")) else {
+            if !full.starts_with("/0/")
+                && let CratesFrom::ByNeed { rest, records, .. } = self.crates
+                && let Some(one) = krate.checked_sub(1).and_then(|i| rest.get(i))
+                && let Some(res) = records.pack_file_items(one.world_at, index, edition, text)
+            {
+                return res.map(Some);
+            }
             return CurrentFile::from_text(index, text, edition, bump).map(Some);
         };
         // A physical x/mod.rs can be a literal file or the module slot x.rs.
@@ -520,7 +747,7 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         if found != expected { return Err(stale(expected, found)); }
         let payload = record.payload_bytes().map_err(|_| ItemsRecordError::FileItemsUnavailable { file: index, what: "the planned outline payload is unavailable" })?;
         let view = blaze_surface::FileItemsView::read(payload).map_err(|why| ItemsRecordError::FileItemsRead { file: index, why })?;
-        let digest = ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes());
+        let digest = self.digests.and_then(|d| d.checkout_digest(real)).unwrap_or_else(|| ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()));
         if view.file() != digest { return Err(stale(view.file(), digest)); }
         Ok(Some(CurrentFile { text, surface, view }))
     }
@@ -680,7 +907,7 @@ mod tests {
         // The load and the log go in the frame, as the command places them (run_names.rs
         // `names_records_with_snapshot`): the reader takes both for the one lifetime it lives
         // for, which a stack value that is dropped cannot give.
-        let load: &StoreLoad<'_> = frame.alloc(StoreLoad::from_parts(&read, &packages, &Files, Some(&snapshot), None, None, g));
+        let load: &StoreLoad<'_> = frame.alloc(StoreLoad::from_parts(&read, &packages, &Files, Some(&snapshot), None, None, bump, g));
         let crate_names: std::vec::Vec<_> = names.crates().iter().map(|c| c.name).collect();
         let log: &Log<'_> = frame.alloc(Log::new(&crate_names, g));
         let records = frame.alloc(Records::new(load.keys(&frame), load, log, &frame, g));
@@ -883,7 +1110,7 @@ mod tests {
             .collect();
         let read: &'static [CrateRecords<'static>] = std::vec::Vec::leak(read);
         let packages: &'static [&'static str] = std::vec::Vec::leak(order.iter().map(|_| "/").collect());
-        let load: &'static StoreLoad<'static> = std::boxed::Box::leak(std::boxed::Box::new(StoreLoad::new(read, packages, &PreludeFiles, g)));
+        let load: &'static StoreLoad<'static> = std::boxed::Box::leak(std::boxed::Box::new(StoreLoad::new(read, packages, &PreludeFiles, b, g)));
         let crate_names: &'static [&'static str] = std::vec::Vec::leak(order.iter().map(|at| &*std::string::String::from(names.crates()[*at].name).leak()).collect());
         let log: &'static Log<'static> = std::boxed::Box::leak(std::boxed::Box::new(Log::new(crate_names, g)));
         let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::new(bstd::mem::Tag::Other).expect("a frame")));

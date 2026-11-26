@@ -4,16 +4,28 @@
 use blaze_own::Vec;
 use core::alloc::Allocator;
 
-use blaze_body::{Block as BodyBlock, BlockKind as BodyKind, Local, LocalKind, Place, Proj, StmtKind, Value as BodyValue};
+use blaze_body::{Block as BodyBlock, BlockKind as BodyKind, Local, LocalKind, Operand, Place, Proj, StmtKind, Value as BodyValue};
+use blaze_build::cabi::{self, CAbiError, Class};
 use blaze_build::drop_facts::needs_drop;
-use blaze_build::layout::{LayoutError, LayoutId, Variants};
-use blaze_build::{Panic, abi};
-use blaze_lir::builder::Variadic;
-use blaze_lir::func::{BlockKind, Conv, SlotKind};
-use blaze_lir::{Flags, Ty, Value};
-use blaze_typeck::{LangItem, PTy};
+use blaze_build::intrinsics::{lir, resize_in};
+use blaze_build::layout::{LayoutCx, LayoutError, LayoutId, Prim, Variants};
+use blaze_build::{Abi, Instance, Panic, abi};
+use blaze_lir::builder::{MemAttrs, Param, Variadic};
+use blaze_lir::func::{BlockKind, Conv, Ext, SlotKind};
+use blaze_lir::{Flags, Op, Ty, Value};
+use blaze_typeck::{AdtKind, LangItem, PNode, PTy};
 
-use crate::{BuildError, Cx, Held, Pass, V};
+use crate::{BuildError, Cx, Held, Pass, Track, V};
+
+/// Integer width for C ABI `Pass::Words` power-of-two chunk loads/stores: log2 in 0..=3 -> 1, 2, 4, 8 bytes.
+fn word_width(log: u32) -> Ty {
+    match log {
+        0 => Ty::I8,
+        1 => Ty::I16,
+        2 => Ty::I32,
+        _ => Ty::I64,
+    }
+}
 
 impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// Whether the projection nearest local of place `p` is a dereference: then a use of `p` is
@@ -45,20 +57,94 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         Ok(())
     }
 
+    /// Marks `p`'s local when `p` indexes or subslices the local's own bytes (even on reads,
+    /// because `Proj::Index`, `ConstIndex`, and `Subslice` compute addresses in memory).
+    fn mark_read_place(&self, p: Place, taken: &mut [bool]) -> Result<(), BuildError> {
+        if matches!(self.first_proj(p)?, Some(Proj::Index(_) | Proj::ConstIndex { .. } | Proj::Subslice { .. })) {
+            let local = self.v.place(p).local.index();
+            *taken.get_mut(local).ok_or(self.malformed("a place of a local past the frame"))? = true;
+        }
+        Ok(())
+    }
+
+    fn mark_operand(&self, o: Operand, taken: &mut [bool]) -> Result<(), BuildError> {
+        if let Operand::Copy(p) | Operand::Move(p) = o {
+            self.mark_read_place(p, taken)?;
+        }
+        Ok(())
+    }
+
     /// The address-taken locals, by one pass over the rows: a borrow or raw borrow of a place
-    /// of the local's own bytes, a projection written through, a drop.
-    fn address_taken(&self) -> Result<Vec<bool, A>, BuildError> {
+    /// of the local's own bytes, a projection written through, a drop, or an indexed/subsliced
+    /// local.
+    pub(crate) fn address_taken(&self) -> Result<Vec<bool, A>, BuildError> {
         let mut taken = Vec::new_in(self.alloc);
         taken.resize(self.v.locals() as usize, false);
         for s in 0..self.v.stmts() {
             match self.v.stmt(blaze_body::Stmt(s)).kind {
                 StmtKind::Assign { dest, value } => {
                     self.mark(dest, false, &mut taken)?;
-                    if let BodyValue::Borrow { place, .. } | BodyValue::RawAddr { place, .. } = value {
-                        self.mark(place, true, &mut taken)?;
+                    match value {
+                        BodyValue::Borrow { place, .. } | BodyValue::RawAddr { place, .. } => {
+                            self.mark(place, true, &mut taken)?;
+                        }
+                        BodyValue::Use(o) | BodyValue::Unary { operand: o, .. } | BodyValue::Cast { operand: o, .. } | BodyValue::Repeat { operand: o, .. } => {
+                            self.mark_operand(o, &mut taken)?;
+                        }
+                        BodyValue::Binary { lhs, rhs, .. } | BodyValue::CheckedBinary { lhs, rhs, .. } => {
+                            self.mark_operand(lhs, &mut taken)?;
+                            self.mark_operand(rhs, &mut taken)?;
+                        }
+                        BodyValue::Aggregate { operands, .. } => {
+                            for o in self.v.ops(operands) {
+                                self.mark_operand(o, &mut taken)?;
+                            }
+                        }
+                        BodyValue::Len(place) | BodyValue::Discriminant(place) => {
+                            self.mark_read_place(place, &mut taken)?;
+                        }
+                        BodyValue::SizeOf(_) | BodyValue::AlignOf(_) | BodyValue::ThreadLocalAddr(_) => {}
                     }
                 }
-                StmtKind::Call { dest: Some(dest), .. } => self.mark(dest, false, &mut taken)?,
+                StmtKind::Call { callee, args, dest, .. } => {
+                    if let Some(dest) = dest {
+                        self.mark(dest, false, &mut taken)?;
+                    }
+                    if let blaze_body::Callee::Value(o) = self.v.callee(callee) {
+                        self.mark_operand(o, &mut taken)?;
+                    }
+                    for o in self.v.ops(args) {
+                        self.mark_operand(o, &mut taken)?;
+                    }
+                }
+                StmtKind::TailCall { callee, args } => {
+                    if let blaze_body::Callee::Value(o) = self.v.callee(callee) {
+                        self.mark_operand(o, &mut taken)?;
+                    }
+                    for o in self.v.ops(args) {
+                        self.mark_operand(o, &mut taken)?;
+                    }
+                }
+                StmtKind::InlineAsm { asm, operands, .. } => {
+                    for o in self.v.ops(operands) {
+                        self.mark_operand(o, &mut taken)?;
+                    }
+                    if asm < self.v.asms() {
+                        let row = self.v.asm(asm);
+                        for oi in row.ops.start..row.ops.end {
+                            if let Some(p) = self.v.asm_op(oi).out_place {
+                                self.mark(p, false, &mut taken)?;
+                            }
+                        }
+                    }
+                }
+                StmtKind::Switch { on, .. } => self.mark_operand(on, &mut taken)?,
+                StmtKind::Assert { cond, msg, .. } => {
+                    self.mark_operand(cond, &mut taken)?;
+                    for o in self.v.ops(msg) {
+                        self.mark_operand(o, &mut taken)?;
+                    }
+                }
                 StmtKind::Drop { place, .. } => self.mark(place, true, &mut taken)?,
                 // The tag is written in memory, by the layout's one encoding.
                 StmtKind::SetDiscriminant { place, .. } => self.mark(place, true, &mut taken)?,
@@ -68,8 +154,8 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         Ok(taken)
     }
 
-    /// How a value of layout `lay` is held when its address is never taken.
-    fn value_held(&self, lay: LayoutId) -> Result<Option<Held>, BuildError> {
+    /// How a value of layout `lay` and ground type `g` is held when its address is never taken.
+    fn value_held(&self, lay: LayoutId, g: PTy) -> Result<Option<Held>, BuildError> {
         let l = *self.layouts.get(lay);
         if l.tail != blaze_build::layout::Tail::Sized {
             return Err(self.unsupported("a local of an unsized type"));
@@ -77,14 +163,19 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         if let Variants::Multiple { .. } = l.variants {
             return Ok(None);
         }
+        if let PNode::Adt(key, _) = self.node(g)?
+            && self.adts.adt(key).is_some_and(|adt| adt.kind == AdtKind::Union)
+        {
+            return Ok(None);
+        }
         if l.is_zst() {
             return Ok(Some(Held::None));
         }
         if let Some(s) = l.scalar {
-            return Ok(Some(Held::One(blaze_build::intrinsics::lir(s.prim).0)));
+            return Ok(Some(Held::One(lir(s.prim).0)));
         }
         if let Some((a, b)) = l.pair {
-            return Ok(Some(Held::Two(blaze_build::intrinsics::lir(a.prim).0, blaze_build::intrinsics::lir(b.prim).0)));
+            return Ok(Some(Held::Two(lir(a.prim).0, lir(b.prim).0)));
         }
         Ok(None)
     }
@@ -96,12 +187,112 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         Ok(self.b.slot(size, l.align, kind))
     }
 
-    /// Use the same layout decision for a parameter, an argument and a return place.
+    /// Use the same layout decision for a parameter, an argument and a return place under the Rust ABI.
     pub(crate) fn pass_of(&mut self, g: PTy) -> Result<Pass, BuildError> {
         let id = self.layout(g)?;
         let layout = *self.layouts.get(id);
         layout.rust_pass(self.subst.ground.view())
             .map_err(|why| BuildError::Layout { stmt: self.stmt, error: LayoutError { ty: g, why } })
+    }
+
+    /// How ground type `g` crosses a call of `abi` (`Rust`, `RustCall`, or `C`), matching
+    /// `blaze-build`'s `walk.rs` `pass`.
+    pub(crate) fn pass_of_abi(&mut self, g: PTy, abi: Abi) -> Result<Pass, BuildError> {
+        if matches!(abi, Abi::Rust | Abi::RustCall) {
+            return self.pass_of(g);
+        }
+        let stmt = self.stmt;
+        let refuse = |why| BuildError::CAbi { stmt, why };
+        let id = self.layout(g)?;
+        let class = {
+            let mut cx = LayoutCx { ground: &mut *self.subst.ground, facts: self.adts.facts(), scratch: self.subst.scratch };
+            cabi::class_of(&mut self.layouts, g, &mut cx, self.alloc)
+        };
+        let class = class.map_err(|error| match error {
+            CAbiError::Layout(error) => BuildError::Layout { stmt, error },
+            CAbiError::Refused { why, .. } => refuse(why),
+            CAbiError::TooLarge => refuse("more than 2 GiB of stacked arguments"),
+        })?;
+        let l = *self.layouts.get(id);
+        Ok(match class {
+            Class::Ignore => Pass::Ignore,
+            Class::Int { size: 16, .. } => return Err(refuse("a 128-bit integer (a register pair)")),
+            Class::Int { size, signed } => {
+                let ext = match (size < 4, signed) {
+                    (true, true) => Ext::Sext,
+                    (true, false) => Ext::Zext,
+                    (false, _) => Ext::None,
+                };
+                let s = l.scalar.ok_or(self.malformed("a C integer class of a type with no scalar"))?;
+                Pass::Scalar { ty: lir(s.prim).0, ext, agg: false }
+            }
+            Class::Float { .. } => {
+                let s = l.scalar.ok_or(self.malformed("a C float class of a type with no scalar"))?;
+                Pass::Scalar { ty: lir(s.prim).0, ext: Ext::None, agg: false }
+            }
+            Class::Hfa { .. } => return Err(refuse("a homogeneous float aggregate (the SIMD registers are not built)")),
+            Class::Composite { size, align } if size > 16 => {
+                let size = u32::try_from(size).map_err(|_| refuse("a composite past 4 GiB"))?;
+                Pass::Memory { size, align }
+            }
+            Class::Composite { align: 4.., .. } => return Err(refuse("a 16-byte-aligned composite (an even register pair)")),
+            Class::Composite { size, .. } => match self.pass_of(g)? {
+                wide @ Pass::Wide { .. } => wide,
+                _ => {
+                    let size = u32::try_from(size).map_err(|_| refuse("a composite past 4 GiB"))?;
+                    Pass::Words { size }
+                }
+            },
+        })
+    }
+
+    /// Reads `size` (1..=8) bytes at `ptr + off + start` (aligned to `align`) into a zero-extended
+    /// `i64` using power-of-two loads that never read past the value.
+    pub(crate) fn read_word(&mut self, ptr: Value, off: i32, start: u32, size: u32, align: u8) -> Result<Value, BuildError> {
+        let mut word = None;
+        let mut pos = 0u32;
+        while pos < size {
+            let log = (31 - (size - pos).leading_zeros()).min(3);
+            let ty = word_width(log);
+            let log_u8 = u8::try_from(log).unwrap_or(3);
+            let tz_u8 = u8::try_from((start + pos).trailing_zeros().min(7)).unwrap_or(7);
+            let a = align.min(log_u8).min(tz_u8);
+            let delta = i32::try_from(start + pos).map_err(|_| self.malformed("a C register offset past i32"))?;
+            let x = self.b.load(ty, Flags::NONE, ptr, off + delta, MemAttrs::aligned(a));
+            let mut x = resize_in(&mut self.b, x, Ty::I64, false);
+            if pos > 0 {
+                let by = self.b.iconst(Ty::I64, u128::from(pos * 8));
+                x = self.b.binary(Op::Shl, Flags::NONE, x, by);
+            }
+            word = Some(match word {
+                None => x,
+                Some(w) => self.b.binary(Op::Or, Flags::NONE, w, x),
+            });
+            pos += 1 << log;
+        }
+        word.ok_or(self.malformed("a C register of no bytes"))
+    }
+
+    /// Writes the low `size` (1..=8) bytes of `i64` `word` at `ptr + off + start` (aligned to
+    /// `align`) in power-of-two stores that never write past the value.
+    pub(crate) fn write_word(&mut self, word: Value, ptr: Value, off: i32, start: u32, size: u32, align: u8) {
+        let mut pos = 0u32;
+        while pos < size {
+            let log = (31 - (size - pos).leading_zeros()).min(3);
+            let ty = word_width(log);
+            let log_u8 = u8::try_from(log).unwrap_or(3);
+            let tz_u8 = u8::try_from((start + pos).trailing_zeros().min(7)).unwrap_or(7);
+            let a = align.min(log_u8).min(tz_u8);
+            let mut x = word;
+            if pos > 0 {
+                let by = self.b.iconst(Ty::I64, u128::from(pos * 8));
+                x = self.b.binary(Op::Lshr, Flags::NONE, x, by);
+            }
+            let x = resize_in(&mut self.b, x, ty, false);
+            let delta = i32::try_from(start + pos).unwrap_or(0);
+            self.b.store(Flags::NONE, x, ptr, off + delta, MemAttrs::aligned(a));
+            pos += 1 << log;
+        }
     }
 
     /// The two typed registers of a wide pointer, whether kept in registers or in a slot.
@@ -126,7 +317,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
     /// The frame (the module doc): every local's ground type, layout and hold; the signature;
     /// the entry block, which takes the parameters and jumps to the body's first block; and
     /// the LIR block of every body block.
-    pub(crate) fn frame(&mut self) -> Result<(), BuildError> {
+    pub(crate) fn frame_inner(&mut self, is_closure: bool) -> Result<(), BuildError> {
         let taken = self.address_taken()?;
         let locals = self.v.locals() as usize;
         let mut args: Vec<Option<Local>, A> = Vec::new_in(self.alloc);
@@ -148,17 +339,90 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
             }
         }
         let ret_local = ret_local.ok_or(self.malformed("a body without its return place"))?;
-        // The signature: a result pointer first when the result is passed by reference.
+        let abi = self.abi;
+        let c_variadic = !is_closure && self.adts.c_variadic(self.item).is_some();
+        let va_local = if c_variadic {
+            let last = args
+                .last()
+                .copied()
+                .flatten()
+                .ok_or(self.malformed("a C-variadic function missing its trailing `...` parameter"))?;
+            Some(last)
+        } else {
+            None
+        };
+        // The signature: a result pointer first when the result is passed indirectly (`Pass::Ref`
+        // or C's `Pass::Memory` sret). For `Abi::RustCall`, the last parameter's tuple is spread
+        // into its field passes. For C-variadic definitions, the trailing `VaList` local is
+        // materialized via `blaze.va_start` rather than taken as a fixed LIR parameter.
         let ret_ty = *self.tys.get(ret_local.index()).ok_or(self.malformed("a return local past the frame"))?;
-        self.ret = self.pass_of(ret_ty)?;
+        self.ret = self.pass_of_abi(ret_ty, abi)?;
         let mut passes: Vec<Pass, A> = Vec::with_capacity_in(args.len(), self.alloc);
-        for a in args.iter() {
+        let mut rust_call_spread: Option<(Local, Vec<(u32, LayoutId, Pass), A>)> = None;
+        let regular_count = if c_variadic || (abi == Abi::RustCall && !args.is_empty()) {
+            args.len().saturating_sub(1)
+        } else {
+            args.len()
+        };
+        for a in args.iter().take(regular_count) {
             let a = a.ok_or(self.malformed("an argument without its local"))?;
             let a_ty = *self.tys.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
-            passes.push(self.pass_of(a_ty)?);
+            passes.push(self.pass_of_abi(a_ty, abi)?);
         }
+        if !c_variadic
+            && abi == Abi::RustCall
+            && let Some(last) = args.last()
+        {
+            let last = last.ok_or(self.malformed("an argument without its local"))?;
+            let last_ty = *self.tys.get(last.index()).ok_or(self.malformed("an argument local past the frame"))?;
+            let PNode::Tuple(list) = self.node(last_ty)? else {
+                return Err(self.malformed("a \"rust-call\" fn whose last parameter is not a tuple"));
+            };
+            let field_tys: Vec<PTy, A> = {
+                let cap = usize::try_from(list.len).unwrap_or(0);
+                let mut out = Vec::with_capacity_in(cap, self.alloc);
+                let slice = self.subst.ground.view().list(list).map_err(|_| self.malformed("a tuple's fields past the ground table"))?;
+                out.extend_from_slice(slice);
+                out
+            };
+            let mut fields_plan: Vec<(u32, LayoutId, Pass), A> = Vec::with_capacity_in(field_tys.len(), self.alloc);
+            for (idx, &fty) in field_tys.iter().enumerate() {
+                let flay = self.layout(fty)?;
+                let fpass = self.pass_of(fty)?;
+                passes.push(fpass);
+                let idx_u32 = u32::try_from(idx).map_err(|_| self.malformed("too many fields in a \"rust-call\" tuple"))?;
+                fields_plan.push((idx_u32, flay, fpass));
+            }
+            rust_call_spread = Some((last, fields_plan));
+        }
+        // `#[track_caller]`: a tracked fn takes one hidden last parameter (`&'static Location`).
+        let own_tracked = if is_closure {
+            self.track = Track::No;
+            false
+        } else {
+            let own_args = self.subst.ground.intern_list(self.subst.args).map_err(|_| self.malformed("the ground table is full"))?;
+            let own_inst = Instance { item: self.item, args: own_args };
+            match self.adts.track_caller(own_inst, self.subst.ground) {
+                Some(true) => {
+                    if c_variadic {
+                        return Err(self.malformed("a C-variadic fn that is `#[track_caller]` (E0737)"));
+                    }
+                    passes.push(Pass::Scalar { ty: Ty::PTR, ext: Ext::None, agg: false });
+                    true
+                }
+                Some(false) => {
+                    self.track = Track::No;
+                    false
+                }
+                None => {
+                    self.track = Track::Unsaid;
+                    false
+                }
+            }
+        };
         let (params, rets) = abi::sig_of_in(&passes, self.ret, self.alloc);
-        let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        let variadic = if c_variadic { Variadic::Yes } else { Variadic::No };
+        let sig = self.b.sig(Conv::C, variadic, &params, &rets);
         self.b.set_signature(sig);
         let entry = self.b.create_block(BlockKind::Normal);
         self.b.begin(entry);
@@ -171,26 +435,33 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         let mut decided: Vec<Option<Held>, A> = Vec::new_in(self.alloc);
         decided.resize(locals, None);
         let mut memory: Vec<bool, A> = Vec::with_capacity_in(locals, self.alloc);
-        for (&is_taken, &lay) in taken.iter().zip(self.lays.iter()) {
-            memory.push(is_taken || self.value_held(lay)?.is_none());
+        for ((&is_taken, &lay), &g) in taken.iter().zip(self.lays.iter()).zip(self.tys.iter()) {
+            memory.push(is_taken || self.value_held(lay, g)?.is_none());
         }
         let mut next = values.iter().copied();
-        if self.ret == Pass::Ref {
+        if matches!(self.ret, Pass::Ref | Pass::Memory { .. }) {
             let hidden = next.next().ok_or(self.malformed("a signature without its result pointer"))?;
+            self.sret = Some(hidden);
             *decided.get_mut(ret_local.index()).ok_or(self.malformed("a return local past the frame"))? = Some(Held::At(hidden));
         }
-        let mut given = Vec::with_capacity_in(args.len(), self.alloc);
-        for (a, &pass) in args.iter().zip(passes.iter()) {
+        let mut given: Vec<(Local, V), A> = Vec::with_capacity_in(args.len(), self.alloc);
+        let mut given_words: Vec<(Local, u32, [Option<Value>; 2]), A> = Vec::new_in(self.alloc);
+        for (a, &pass) in args.iter().take(regular_count).zip(passes.iter()) {
             let a = a.ok_or(self.malformed("an argument without its local"))?;
             match pass {
                 Pass::Ignore => {}
-                pass @ (Pass::Scalar { .. } | Pass::Ref) => {
+                pass @ (Pass::Scalar { .. } | Pass::Ref | Pass::Memory { .. }) => {
                     let x = next.next().ok_or(self.malformed("a parameter without its register"))?;
                     let is_mem = *memory.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
-                    if pass == Pass::Ref && is_mem {
+                    let indirect = matches!(pass, Pass::Ref | Pass::Memory { .. });
+                    let lay = *self.lays.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
+                    if pass == Pass::Ref {
+                        let l = *self.layouts.get(lay);
+                        self.ref_params.push((x, l.size, l.align));
+                    }
+                    if indirect && is_mem {
                         *decided.get_mut(a.index()).ok_or(self.malformed("an argument local past the frame"))? = Some(Held::At(x));
-                    } else if pass == Pass::Ref {
-                        let lay = *self.lays.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
+                    } else if indirect {
                         let value = self.load_at(x, 0, lay)?;
                         given.push((a, value));
                     } else {
@@ -202,14 +473,50 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     let hi = next.next().ok_or(self.malformed("a wide parameter without its metadata"))?;
                     given.push((a, V::Two(lo, hi)));
                 }
-                Pass::Memory { .. } | Pass::Words { .. } => return Err(self.malformed("a C pass of a value of the Rust ABI")),
+                Pass::Words { size } => {
+                    let w0 = next.next().ok_or(self.malformed("a C composite parameter without its first word"))?;
+                    let w1 = if size > 8 {
+                        Some(next.next().ok_or(self.malformed("a C composite parameter without its second word"))?)
+                    } else {
+                        None
+                    };
+                    given_words.push((a, size, [Some(w0), w1]));
+                }
             }
+        }
+        // Unpack `Abi::RustCall` spread tuple fields from the remaining entry parameters.
+        let mut spread_values: Option<(Local, Vec<(u32, V, LayoutId), A>)> = None;
+        if let Some((last, fields_plan)) = rust_call_spread {
+            let mut fvals: Vec<(u32, V, LayoutId), A> = Vec::with_capacity_in(fields_plan.len(), self.alloc);
+            for &(idx, flay, fpass) in fields_plan.iter() {
+                let v = match fpass {
+                    Pass::Ignore => V::None,
+                    Pass::Scalar { .. } => V::One(next.next().ok_or(self.malformed("a spread parameter without its register"))?),
+                    Pass::Wide { .. } => {
+                        let lo = next.next().ok_or(self.malformed("a spread wide parameter without its address"))?;
+                        let hi = next.next().ok_or(self.malformed("a spread wide parameter without its metadata"))?;
+                        V::Two(lo, hi)
+                    }
+                    Pass::Ref => {
+                        let ptr = next.next().ok_or(self.malformed("a spread indirect parameter without its pointer"))?;
+                        self.load_at(ptr, 0, flay)?
+                    }
+                    Pass::Memory { .. } | Pass::Words { .. } => return Err(self.malformed("a C pass in a \"rust-call\" tuple")),
+                };
+                fvals.push((idx, v, flay));
+            }
+            spread_values = Some((last, fvals));
+        }
+        if own_tracked {
+            let loc = next.next().ok_or(self.malformed("a `#[track_caller]` fn without its hidden location parameter"))?;
+            self.track = Track::Passed(loc);
         }
         self.cur.resize(locals, [None, None]);
         for i in 0..locals {
             let dec = *decided.get(i).ok_or(self.malformed("a local past the frame"))?;
             let is_mem = *memory.get(i).ok_or(self.malformed("a local past the frame"))?;
             let lay = *self.lays.get(i).ok_or(self.malformed("a local past the frame"))?;
+            let g = *self.tys.get(i).ok_or(self.malformed("a local past the frame"))?;
             let held = match dec {
                 Some(held) => held,
                 None if is_mem => {
@@ -219,7 +526,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     };
                     Held::Slot(self.new_slot(lay, kind)?)
                 }
-                None => self.value_held(lay)?.ok_or(self.malformed("a value local of no value hold"))?,
+                None => self.value_held(lay, g)?.ok_or(self.malformed("a value local of no value hold"))?,
             };
             self.held.push(held);
         }
@@ -227,6 +534,46 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         for &(a, value) in given.iter() {
             let lay = *self.lays.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
             self.put(a, value, lay)?;
+        }
+        for &(a, size, [w0, w1]) in given_words.iter() {
+            let lay = *self.lays.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
+            let align = self.layouts.get(lay).align;
+            let held = *self.held.get(a.index()).ok_or(self.malformed("an argument local past the frame"))?;
+            let (ptr, is_temp) = match held {
+                Held::Slot(_) | Held::At(_) | Held::AtOff(..) => (self.base(a)?, false),
+                _ => {
+                    let slot = self.new_slot(lay, SlotKind::Temp)?;
+                    (self.b.slot_addr(slot), true)
+                }
+            };
+            if let Some(w0) = w0 {
+                self.write_word(w0, ptr, 0, 0, size.min(8), align);
+            }
+            if let Some(w1) = w1 {
+                self.write_word(w1, ptr, 0, 8, size - 8, align);
+            }
+            if is_temp {
+                let v = self.load_at(ptr, 0, lay)?;
+                self.put(a, v, lay)?;
+            }
+        }
+        if let Some((last, fvals)) = spread_values {
+            let lay = *self.lays.get(last.index()).ok_or(self.malformed("an argument local past the frame"))?;
+            let place = self.v.local_place(last);
+            self.write_fields(place, lay, None, &fvals)?;
+        }
+        if let Some(va_local) = va_local {
+            let va_lay = *self.lays.get(va_local.index()).ok_or(self.malformed("a C-variadic local past the frame"))?;
+            let va_l = *self.layouts.get(va_lay);
+            if va_l.size != 8 || va_l.scalar.map(|s| s.prim) != Some(Prim::Ptr) {
+                return Err(self.unsupported(
+                    "a C-variadic definition on a target whose `VaList` is not a single pointer (Linux AAPCS64 register save area)",
+                ));
+            }
+            let va_sig = self.b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::PTR)]);
+            let va_intr = self.b.intrinsic("blaze.va_start", va_sig);
+            let va_ptr = self.b.target_intrinsic(va_intr, &[]);
+            self.put(va_local, V::One(va_ptr), va_lay)?;
         }
         // The body's blocks; a cleanup block only when panics unwind.
         for bi in 0..self.v.blocks() {
@@ -279,21 +626,28 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     _ => Err(self.malformed("a value of another shape written to a two-value local")),
                 }
             }
-            Held::Slot(_) | Held::At(_) => {
-                let base = self.base(l)?;
-                self.store_v(base, 0, lay, x)
+            Held::Slot(_) | Held::At(_) | Held::AtOff(..) => {
+                let (ptr, off) = self.base_at(l)?;
+                self.store_v(ptr, off, lay, x)
             }
+        }
+    }
+
+    /// Base pointer and constant byte offset of memory-held local `l`.
+    pub(crate) fn base_at(&mut self, l: Local) -> Result<(Value, i32), BuildError> {
+        let i = self.ix(l)?;
+        match *self.held.get(i).ok_or(self.malformed("a local past the frame"))? {
+            Held::Slot(slot) => Ok((self.b.slot_addr(slot), 0)),
+            Held::At(ptr) => Ok((ptr, 0)),
+            Held::AtOff(ptr, off) => Ok((ptr, off)),
+            Held::None | Held::One(_) | Held::Two(..) => Err(self.malformed("the address of a value local")),
         }
     }
 
     /// The address of memory-held local `l`.
     pub(crate) fn base(&mut self, l: Local) -> Result<Value, BuildError> {
-        let i = self.ix(l)?;
-        match *self.held.get(i).ok_or(self.malformed("a local past the frame"))? {
-            Held::Slot(slot) => Ok(self.b.slot_addr(slot)),
-            Held::At(ptr) => Ok(ptr),
-            Held::None | Held::One(_) | Held::Two(..) => Err(self.malformed("the address of a value local")),
-        }
+        let (ptr, off) = self.base_at(l)?;
+        Ok(self.addr(ptr, off))
     }
 
     /// The values every value local holds now, in local order: what an edge passes. One not
@@ -318,7 +672,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                         out.push(x);
                     }
                 }
-                Held::None | Held::Slot(_) | Held::At(_) => {}
+                Held::None | Held::Slot(_) | Held::At(_) | Held::AtOff(..) => {}
             }
         }
         Ok(out)
@@ -352,7 +706,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                     let a = self.b.param(t);
                     [Some(a), Some(self.b.param(u))]
                 }
-                Held::None | Held::Slot(_) | Held::At(_) => [None, None],
+                Held::None | Held::Slot(_) | Held::At(_) | Held::AtOff(..) => [None, None],
             };
         }
         Ok(())
@@ -399,7 +753,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
                         let err = self.malformed("a local past the frame");
                         *self.cur.get_mut(i).ok_or(err)? = [None, None];
                     }
-                    Held::None | Held::At(_) => {}
+                    Held::None | Held::At(_) | Held::AtOff(..) => {}
                 }
                 Ok(())
             }

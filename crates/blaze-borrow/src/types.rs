@@ -173,16 +173,14 @@ impl Kids<'_> {
         match self {
             Kids::None => 0,
             Kids::One(_) => 1,
-            Kids::List(l) => l.len() as u32,
-            Kids::ListThen(l, _) => l.len() as u32 + 1,
+            Kids::List(l) => u32::try_from(l.len()).unwrap_or(u32::MAX),
+            Kids::ListThen(l, _) => u32::try_from(l.len()).unwrap_or(u32::MAX).saturating_add(1),
         }
     }
 
     /// The `k`-th child.
     pub fn get(&self, k: u32) -> Option<PTy> {
-        let Ok(idx) = usize::try_from(k) else {
-            return None;
-        };
+        let idx = usize::try_from(k).ok()?;
         match *self {
             Kids::None => None,
             Kids::One(t) => (k == 0).then_some(t),

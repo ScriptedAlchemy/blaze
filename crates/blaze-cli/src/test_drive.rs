@@ -21,11 +21,13 @@
 //! and never the command's.
 //!
 //! What this cannot say yet, and says: the launcher's run mode writes no descriptor-3 REPORT
-//! (test.md piece 10's tracer and report, and the zygote of piece 9, are the next pieces), so a
-//! pass is never kept (`NotKept::Untraced`: nothing it entered was seen), a panic is told by its
-//! signal and its output, not by its message, and `#[should_panic]` is judged by the plan's own
-//! rule on a signal (no panic seen), so such a test FAILS rather than passing falsely. With no
-//! tracer there is no head: every suite is opened with no head and no postings, so nothing kept
+//! (test.md piece 10's tracer and report, and the zygote of piece 9, are the next pieces). For
+//! harnessed tests, the launcher runs the entry with `End::Return`, writes a per-row unwind marker
+//! beside `stderr-<row>` on `RunModeError::Unwound`, and exits 101, so uncaught Rust panics are
+//! reported as `How::Reported(Said::Panicked { .. })` with the payload parsed from captured stderr
+//! (`#[should_panic]` and `#[should_panic(expected = "...")]` are judged by the plan's own rule)
+//! while genuine `SIGABRT`s (C `abort()`, double-panic, allocator abort) remain `How::Signal`. With
+//! no tracer there is no head: every suite is opened with no head and no postings, so nothing kept
 //! is reused, and the records the loop files ([`Filed`]) are counted and named in one closing line
 //! on the error stream ([`Unkept`]), not written (NOT DONE: the store's test records and roots).
 //!
@@ -46,9 +48,8 @@ use core::time::Duration;
 
 use blaze_id::ItemKey as LibKey;
 use blaze_ids::{ContentId, Hasher};
-use blaze_ladder::body_ids::{BodyId, BodyIds, Read};
-use blaze_ladder::code_records::{Builder, CodeClass};
-use blaze_ladder::run::make_one::{Maker, NamesRecords, SecondCheck};
+use blaze_ladder::code_records::Builder;
+use blaze_ladder::run::make_one::{ByKind, Maker, NamesRecords};
 use blaze_ladder::run::special::Roots;
 use blaze_ladder::run::special::test_roots::test_roots;
 use blaze_launch::wire::run::Symbol;
@@ -68,35 +69,35 @@ use bstd::fs::{Dir, Durable, FsError, FsKind, ReadWrite};
 use bstd::io::Missing;
 use bstd::mem::Frame;
 use bstd::path::{Path, PathError};
-use bstd::procs::{ChannelError, Exit, GRACE, Held, Message, OutPipe, ParentDeath, ParentSignals, Read as Piped, Relay, RelayAct, RunChild, RunError as ProcError, RunFault, RunSpec, SignalError, Spawner, Started, Streams, Waited};
+use bstd::procs::{ChannelError, Exit, GRACE, Held, Message, OutPipe, ParentDeath, ParentSignals, Read as Piped, Relay, RelayAct, RunChild, RunError as ProcError, RunFault, RunSpec, RunStep, SignalError, Spawner, Started, Streams, Waited, Write as ChannelWrite};
 
 use crate::code_store::HomeCodeStore;
 use crate::run_names::{Found, TestRows, TestUnit};
 use crate::run_ids::RunIds;
 use crate::run_loop::LoopError as RunLoopError;
-use crate::run_bytes::{Chosen, Delivery};
-use crate::run_parent::{self, CodeRefusal, Codes, Front, Gate, Lazy, Needs, ParentError, RECORDS, RecordsDir, Resolve, Resolved, Start as _, WRITE_BOUND};
+use crate::run_parent::{self, CodeRefusal, Codes, Needs, ParentError, RECORDS, WRITE_BOUND};
 
-/// THE TEST'S MAKER: every body checked by the run, as before D197 root 1, for now. `run`
-/// reads bodies from the check's records by kind (run_parent.rs `RunMaker`); a test's code
-/// workers cannot yet: the command's store handle (`CommandLent`) is a `RefCell`, not `Sync`,
-/// and the shared snapshot does not hold this command's own puts. What a worker needs: a `Sync`
-/// view that sees this command's puts, or the relay serving the record reads. The serial
-/// step's maker and the workers' are one type, so they flip together.
-pub(crate) type TestMaker<'h> = Maker<'h, crate::run_ids::Runnable, SecondCheck>;
+/// THE TEST WORKER'S MAKER: reads each workspace body's checked columns directly from the
+/// post-check [`StoreSnapshot`](crate::store::StoreSnapshot) via [`SnapshotTyped`](crate::engine_body_record::SnapshotTyped)
+/// (`ByKind`, zero lock contention across worker threads), matching `RunMaker` (`FromRecord`)
+/// without re-typechecking workspace bodies on worker threads.
+pub(crate) type TestMaker<'h> = Maker<'h, crate::run_ids::Runnable, ByKind<crate::engine_body_record::SnapshotTyped<'h>>>;
 use blaze_engine::SVec;
 use blaze_engine::code_pool::relay::{self as code_relay, Relay as PoolRelay, RelayError, Reply};
 use blaze_engine::code_pool::{Child, Time, Worker};
-use blaze_ladder::run::special::MakerStart;
+use blaze_ladder::run::special::{MakerKind, MakerStart};
 use blaze_own::SharedAlloc;
 use crate::store::CommandLent;
 use crate::test_loop::{CannotRun, Effect, Event, LoopConfig, LoopError, Status, SuiteId, TestLoop};
 use crate::test_run::{Answers, ChildEnd, Heard, Host as TestHost, RunError, Runner, Start, Zygotes};
 
+#[path = "test_suite_cache.rs"]
+pub(crate) mod suite_cache;
+
 /// The system's launcher of `sandbox_init` (blaze-proc-macro native_sandbox.rs uses the same):
 /// it applies the profile, then executes the launcher in its place, so the launcher's process is
 /// the test's and its end is the test's end.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// How often a running test's pipes are emptied while its channel is quiet: a writer blocks on
 /// a full pipe (64 KiB) for at most this long.
@@ -209,12 +210,6 @@ pub(crate) enum OneError {
     LauncherNotLooked { launcher: Box<str>, why: Box<str> },
     /// The Seatbelt profile could not say a path, or words did not fit: in words.
     Profile { why: Box<str> },
-    /// Linux Landlock ABI is older than the minimum required to confine a test (rule 9).
-    #[cfg(target_os = "linux")]
-    LandlockAbi { abi: u32, least: u32 },
-    /// Preparing the Linux Landlock/seccomp test confinement failed (rule 9).
-    #[cfg(target_os = "linux")]
-    Confine { step: &'static str, errno: u16 },
     Start(ProcError),
     Pipe(ProcError),
     MissingPipe { stream: &'static str },
@@ -231,6 +226,10 @@ pub(crate) enum OneError {
     /// A make, or a worker's ask for the proc-macro runner, could not be handed over the code
     /// workers' channel `chan` (D194): the worker `worker` is gone, or the hand-over stopped so.
     CodeHandOff { chan: &'static str, worker: usize, why: &'static str },
+    /// Preparing `CARGO_BIN_EXE_*` launcher stubs or their Unix code-server socket failed.
+    Bins(crate::test_bins::BinStubError),
+    /// Host-side code serving for a spawned `CARGO_BIN_EXE_*` workspace binary failed.
+    BinServe(crate::test_bins::BinServeError),
 }
 
 impl fmt::Display for OneError {
@@ -253,17 +252,10 @@ impl fmt::Display for OneError {
             ),
             OneError::LauncherNotLooked { launcher, why } => write!(f, "whether the launcher is at `{launcher}` could not be looked at: {why}"),
             OneError::Profile { why } => write!(f, "a test's sandbox profile: {why}"),
-            #[cfg(target_os = "linux")]
-            OneError::LandlockAbi { abi, least } => write!(
-                f,
-                "Linux Landlock ABI {abi} is older than {least}, required to confine tests (rule 9)"
-            ),
-            #[cfg(target_os = "linux")]
-            OneError::Confine { step, errno } => write!(
-                f,
-                "preparing the Linux test sandbox failed at {step} (errno {errno}; rule 9)"
-            ),
-            OneError::Start(error) => write!(f, "a test's launcher did not start under the test sandbox: {error}"),
+            #[cfg(target_os = "macos")]
+            OneError::Start(error) => write!(f, "a test's launcher did not start under {SANDBOX_EXEC}: {error}"),
+            #[cfg(not(target_os = "macos"))]
+            OneError::Start(error) => write!(f, "a test's launcher did not start in its sandbox: {error}"),
             OneError::Pipe(error) => write!(f, "a test's output: {error}"),
             OneError::MissingPipe { stream } => write!(f, "the test launcher was started with piped {stream} but supplied no read end"),
             OneError::Capture(error) => write!(f, "the test's stderr capture: {error}"),
@@ -280,6 +272,8 @@ impl fmt::Display for OneError {
                 waited / 1_000_000_000,
                 waited % 1_000_000_000 / 100_000_000,
             ),
+            OneError::Bins(error) => write!(f, "{error}"),
+            OneError::BinServe(error) => write!(f, "{error}"),
         }
     }
 }
@@ -375,13 +369,13 @@ impl fmt::Display for InstanceRefusal {
 /// Only a refusal of the requested instance belongs to its test. A broken shared record, a
 /// wire error, or an invariant of the parent stops the command; a names-record read that did
 /// not answer while one instance was made (`LazyRefusal::RecordsVoid`) is that test's. Keep the walk alive until the instance and item-relative site have been named.
-fn test_parent_error<F: Front, D: run_parent::Folder>(lazy: &mut Lazy<'_, '_, F, D>, cause: ParentError) -> OneError {
+fn test_parent_error_places(places: &mut impl crate::run_fault::Places, cause: ParentError) -> OneError {
     let Some((symbol, location)) = instance_site(&cause) else { return OneError::Parent(cause) };
-    let site = location.map(|(item, byte)| match lazy.site_of(item, byte) {
+    let site = location.map(|(item, byte)| match places.site(item, byte) {
         Some(shown) => InstanceSite::Source(shown),
         None => InstanceSite::Item { item, byte },
     });
-    OneError::CannotBuild(InstanceRefusal { instance: lazy.name_of(symbol), symbol, site, cause: RefusalCause::Build(cause) })
+    OneError::CannotBuild(InstanceRefusal { instance: places.named(symbol), symbol, site, cause: RefusalCause::Build(cause) })
 }
 
 /// The test whose instance could not be made, and where (its tabled fn and [`refused_byte`]),
@@ -556,6 +550,105 @@ pub(crate) mod refusal_tests {
         assert_eq!(instance_site(&make(RunError::Front2(capped))), None, "control: the program's queue cap stops the suite");
         assert_eq!(instance_site(&make(RunError::TooManyInstances)), None, "control: the run's instance bound stops the suite");
     }
+
+    #[test]
+    fn stop_child_reaps_already_exited_and_handles_macos_zombie_killpg_eperm() {
+        use bstd::procs::{Act, ProcId, Reaped, SimChild};
+
+        // 1. Already exited: reaped directly without calling kill() (which would fail with EPERM on macOS).
+        let acts_exited = [Act::Exit { after: Duration::ZERO, status: 0 }];
+        let mut exited = SimChild::new(&acts_exited, 1, ProcId(2650));
+        assert!(matches!(stop_child(&mut exited), Ok(Stopped::Exited { exit: Exit::Exited(0), .. })));
+        assert!(!exited.killed(), "already-exited child must be reaped without calling kill()");
+
+        // 2. Running and kill() succeeds.
+        let acts_running = [Act::Hang];
+        let mut running = SimChild::new(&acts_running, 2, ProcId(2651));
+        assert!(matches!(stop_child(&mut running), Ok(Stopped::Killed { exit: Exit::Signaled(9), .. })));
+        assert!(running.killed(), "still-running child must be killed");
+
+        // 3. Narrow TOCTOU race: wait saw Running, then child exited to zombie before kill(-pgid, SIGKILL) -> EPERM.
+        let eperm = ProcError {
+            proc: Some(ProcId(2650)),
+            step: RunStep::Kill,
+            fault: RunFault::Host { what: "killing its process group", os: 1 },
+        };
+        let race: Result<Reaped<()>, ProcError> = Err(eperm);
+        if cfg!(target_os = "macos") {
+            assert!(matches!(classify_kill(race), Ok(Stopped::ZombieRace)), "macOS zombie killpg EPERM race must not abort suite");
+        } else {
+            assert!(classify_kill(race).is_err(), "non-macOS EPERM must remain an error");
+        }
+
+        // 4. Control: non-EPERM host errors are never swallowed on any OS.
+        let einval = ProcError {
+            proc: Some(ProcId(2650)),
+            step: RunStep::Kill,
+            fault: RunFault::Host { what: "killing its process group", os: 22 },
+        };
+        let bad: Result<Reaped<()>, ProcError> = Err(einval);
+        assert!(classify_kill(bad).is_err(), "control: non-EPERM kill error must propagate");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stop_child_reaps_real_macos_zombie_own_group_without_eperm() {
+        use bstd::io::Io;
+        use bstd::mem::TASK_FRAME;
+        use bstd::test::BUDGET;
+
+        let io: Io = bstd::test::native("/tmp".as_ref()).expect("native world over /tmp");
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let spawner = io.need_host().expect("host").spawner().expect("spawner");
+
+        // 1. Spawn a real own-group child that exits immediately (becomes a zombie).
+        //    Raw `kill()` on this child returns EPERM on macOS XNU; `stop_child()` must reap cleanly.
+        let args_exit = ["-c", "exit 0"];
+        let spec_exit = RunSpec {
+            program: "/bin/sh",
+            arg0: None,
+            args: &args_exit,
+            env: &[],
+            dir: "/",
+            streams: Streams::PIPED,
+            own_group: true,
+            parent_death: ParentDeath::STRONGEST,
+        };
+        let Started { child, pipes } = spawner.start_served(&cx, &spec_exit).expect("start exiting child");
+        // Wait for the child's stdout pipe to close (EOF) so the child has definitely exited to a zombie.
+        let stdout = pipes.stdout.expect("stdout pipe");
+        let mut scratch = [0u8; 16];
+        let eof_deadline = Deadline::after(child.now(), Duration::from_secs(5));
+        loop {
+            match stdout.read(&mut scratch, eof_deadline).expect("read stdout") {
+                Piped::Closed => break,
+                Piped::Bytes(_) => {}
+                Piped::Deadline => panic!("exiting child did not close stdout within 5s"),
+            }
+        }
+        match stop_child(child) {
+            Ok(Stopped::Exited { exit: Exit::Exited(0), .. } | Stopped::ZombieRace | Stopped::Killed { .. }) => {}
+            other => panic!("expected zombie own-group child to reap cleanly without EPERM, got {:?}", other.map(|_| ())),
+        }
+
+        // 2. Control: a real live own-group child is killed cleanly with SIGKILL.
+        let args_sleep = ["30"];
+        let spec_sleep = RunSpec {
+            program: "/bin/sleep",
+            arg0: None,
+            args: &args_sleep,
+            env: &[],
+            dir: "/",
+            streams: Streams::PIPED,
+            own_group: true,
+            parent_death: ParentDeath::STRONGEST,
+        };
+        let Started { child, .. } = spawner.start_served(&cx, &spec_sleep).expect("start sleeping child");
+        match stop_child(child) {
+            Ok(Stopped::Killed { exit: Exit::Signaled(9), .. }) => {}
+            other => panic!("expected live own-group child to be killed with SIGKILL, got {:?}", other.map(|_| ())),
+        }
+    }
 }
 
 /// What the loop files: blaze-run result.rs records, the head and the postings.
@@ -614,30 +707,24 @@ impl<D: blaze_core::Driver> Answers for CacheAnswers<'_, '_, '_, D> {
     }
 }
 
-/// Drive the selected rows through one bounded pool, retaining their owning suites.
+/// Continue driving an already-begun [`TestLoop`] whose initial `Effect::Look`s have been
+/// resolved and whose pending `Effect::Run`s are in `out`.
 #[expect(clippy::too_many_arguments, reason = "the driver's edge: each argument one seam of it")]
-fn drive<'a, 'r, 'm, Z: Zygotes, D: blaze_core::Driver>(
-    config: LoopConfig<'r>,
-    asked: AVec<'a, blaze_run::plan::Asked<'r>>,
-    owners: &'r [SuiteId],
-    suite_heads: &'r [Head<'r>],
-    postings: Postings<'r>,
-    moved: &[Ask],
-    filtered: u32,
-    runner: &mut Runner<'a, Z>,
+fn drive_pending<'a, 'r, 'm, 'z, Z: Zygotes, D: blaze_core::Driver>(
+    machine: &mut TestLoop<'a, 'r>,
+    mut out: AVec<'a, Effect<'a>>,
+    steps_left: usize,
+    most: usize,
+    runner: &mut Runner<'z, Z>,
     refuse: &mut dyn Refuse,
     cache: &mut crate::test_cache::TestCache<'a, 'm, D>,
     entered_sink: &RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>>,
+    on_run: &mut dyn FnMut(u32, &mut crate::test_cache::TestCache<'a, 'm, D>),
     print: &mut dyn FnMut(&[u8]) -> Result<(), DriveError>,
     alloc: Alloc<'a>,
 ) -> Result<Status, DriveError> {
-    let most = STEPS_FIXED.saturating_add(STEPS_PER_TEST.saturating_mul(asked.len()));
-    let mut machine = TestLoop::new(config, alloc)?;
-    let mut out: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
     let mut effects: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
-    machine.begin_inventory(asked, owners, suite_heads, postings, moved, filtered, runner.zygotes().now(), &mut out)?;
-    machine.step(Event::Checked { errors: 0 }, runner.zygotes().now(), &mut out)?;
-    for _ in 0..most {
+    for _ in 0..steps_left {
         core::mem::swap(&mut out, &mut effects);
         let mut done = None;
         for effect in effects.drain(..) {
@@ -655,7 +742,10 @@ fn drive<'a, 'r, 'm, Z: Zygotes, D: blaze_core::Driver>(
                         machine.row_detail(*row, line.into_bytes());
                         machine.step(Event::CannotRun { test: *test, why: CannotRun::EntryRefused }, runner.zygotes().now(), &mut out)?;
                     }
-                    None => runner.effect(&effect)?,
+                    None => {
+                        on_run(*row, cache);
+                        runner.effect(&effect)?;
+                    }
                 },
                 Effect::Kill { .. } => runner.effect(&effect)?,
                 Effect::File { suite, test, address, slot, bytes } => cache.file(*suite, *test, *address, *slot, bytes.as_slice())?,
@@ -677,7 +767,7 @@ fn drive<'a, 'r, 'm, Z: Zygotes, D: blaze_core::Driver>(
             return Err(DriveError::Stalled);
         }
         let mut answers = CacheAnswers { cache, sink: entered_sink };
-        runner.step(&mut machine, &mut answers, &mut out)?;
+        runner.step(machine, &mut answers, &mut out)?;
     }
     Err(DriveError::Steps { most })
 }
@@ -717,6 +807,7 @@ impl<'o> Output<'o> {
 pub(crate) struct RunOutcome {
     pub how: How,
     pub keep: Result<(), NotKept>,
+    pub panic_text: AString<'static>,
     pub entered: AVec<'static, FnName>,
 }
 
@@ -724,6 +815,19 @@ pub(crate) trait RunOne {
     /// Runs row `row` in a process of its own, killed `budget` after its start: how it ended,
     /// its purity verdict, its entered functions, and its output into `output`.
     async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError>;
+
+    /// Non-blocking pump for workspace binary launcher stubs (`CARGO_BIN_EXE_*`). Returns `Ok(true)`
+    /// when any binary connection was accepted or made progress, or `Err(OneError)` on host-side
+    /// binary serving failure.
+    fn pump_bins(&self) -> Result<bool, OneError> {
+        Ok(false)
+    }
+
+    /// Resolves a `(suite, row)` pair carried by a workspace binary connection back to the
+    /// runner's flat row index so binary-serving failures are attributed to the spawning test.
+    fn flat_of(&self, _suite: u32, _row: u32) -> Option<u32> {
+        None
+    }
 }
 
 /// Process-wide dispositions belong to the pool. A SIGTERM is observed by every child,
@@ -753,6 +857,9 @@ pub(crate) struct Signals {
     /// after its process started: passed in by [`OneEach`] before each poll so `run_captured`
     /// extends its own `until` deadline by the same amount the runner credits.
     stalled: Cell<u64>,
+    /// Set by any child turn that observed socket/pipe I/O, started a child, or handled a reply,
+    /// so [`OneEach::wait`] immediately does another non-blocking sweep instead of sleeping.
+    progress: Cell<bool>,
 }
 
 /// What one child's run was doing on the command thread. Every child is served by that one
@@ -852,7 +959,7 @@ async fn next_turn() {
 /// What [`OneEach`] heard, kept until the runner reads it.
 enum Item {
     Ready,
-    Ended { row: u32, test: TestId, micros: u64, how: How, keep: Result<(), NotKept>, entered: AVec<'static, FnName>, output: Output<'static> },
+    Ended { row: u32, test: TestId, micros: u64, how: How, keep: Result<(), NotKept>, text: AString<'static>, entered: AVec<'static, FnName>, output: Output<'static> },
     CannotBuild { row: u32, test: TestId, why: InstanceRefusal },
     Closed,
     Exited(ZygoteExit),
@@ -894,6 +1001,9 @@ pub(crate) struct OneEach<'b, R: RunOne, C: Fn() -> Nanos> {
     /// The error that stopped a run in blaze, and the tests record row it was of: printed by
     /// [`run_suites`] as one line naming the test, before the command's own error line.
     pub failed: Option<(u32, OneError)>,
+    /// An unattached host-side failure (e.g. a pre-handshake workspace binary server error)
+    /// that does not belong to any single test row.
+    pub failed_unowned: Option<OneError>,
     /// The longest turn any child's poll took ([`Turn`]): printed by [`run_suites`] when the
     /// runner stops, so a zygote "silent" past an allowance says what held the thread.
     pub longest: Option<Turn>,
@@ -907,7 +1017,7 @@ impl<'b, R: RunOne, C: Fn() -> Nanos> OneEach<'b, R, C> {
         let running = std::vec::Vec::new_in(*proof.allocator());
         Ok(OneEach {
             runs, signals, now, heap, suite: SuiteId(0), width: 0,
-            pending: Vec::new_in(alloc), batch: Vec::new_in(alloc), running, failed: None, longest: None,
+            pending: Vec::new_in(alloc), batch: Vec::new_in(alloc), running, failed: None, failed_unowned: None, longest: None,
         })
     }
 
@@ -978,6 +1088,7 @@ impl<'b, R: RunOne, C: Fn() -> Nanos> OneEach<'b, R, C> {
                     micros: after.0.saturating_sub(began.0) / 1_000,
                     how: outcome.how,
                     keep: outcome.keep,
+                    text: outcome.panic_text,
                     entered: outcome.entered,
                     output,
                 },
@@ -1051,10 +1162,51 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
             let before_sweep = (self.now)();
             let left = Duration::from_nanos(until.0.saturating_sub(before_sweep.0));
             self.signals.wait.set(interval.min(left));
+            self.signals.progress.set(false);
+            let bin_before = (self.now)();
+            let bin_progress = match self.runs.pump_bins() {
+                Ok(prog) => prog,
+                Err(error) => {
+                    let owner_row = match &error {
+                        OneError::BinServe(err) => err.owner.and_then(|(suite, row)| self.runs.flat_of(suite, row)),
+                        _ => None,
+                    };
+                    if let Some(row) = owner_row {
+                        self.failed = Some((row, error));
+                    } else {
+                        self.failed_unowned = Some(error);
+                    }
+                    return Err(RunError::Seam {
+                        call: "serving workspace binary stub",
+                        errno: 0,
+                        suite: Some(self.suite),
+                    });
+                }
+            };
+            let bin_nanos = (self.now)().0.saturating_sub(bin_before.0);
+            if bin_progress {
+                self.signals.progress.set(true);
+                self.signals.wait.set(Duration::ZERO);
+            }
+            if bin_nanos > 0 {
+                for running in self.running.iter_mut() {
+                    if !running.started {
+                        running.pre_start = Nanos(running.pre_start.0.saturating_add(bin_nanos));
+                    } else if running.parked_now {
+                        running.parked = Nanos(running.parked.0.saturating_add(bin_nanos));
+                    } else {
+                        running.stalled = Nanos(running.stalled.0.saturating_add(bin_nanos));
+                    }
+                }
+            }
             self.sweep(&mut context)?;
             swept = true;
             crossed_until = before_sweep < until && (self.now)() >= until;
-            interval = DRAIN_EVERY;
+            interval = if self.signals.progress.get() {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(1).min(DRAIN_EVERY)
+            };
         }
         // If `until` was crossed mid-sweep, give every remaining child one non-blocking poll so
         // earlier-indexed children can report ready exits, enforce their own timeout, or refresh
@@ -1073,13 +1225,13 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
     fn heard(&self, at: usize) -> Option<Heard<'_>> {
         Some(match self.batch.get(at)? {
             Item::Ready => Heard::Ready,
-            Item::Ended { row, test, micros, how, keep, entered, output } => Heard::Ended(ChildEnd {
+            Item::Ended { row, test, micros, how, keep, text, entered, output } => Heard::Ended(ChildEnd {
                 row: *row,
                 test: *test,
                 micros: *micros,
                 how: *how,
                 keep: *keep,
-                text: "",
+                text: text.as_str(),
                 entered: entered.as_slice(),
                 reads: &[],
                 output: output.captured(),
@@ -1128,7 +1280,7 @@ mod pool_tests {
             output.push(&row.to_le_bytes());
             next_turn().await;
             self.live.set(self.live.get() - 1);
-            Ok(RunOutcome { how: How::Reported(Said::Returned), keep: Err(NotKept::Untraced), entered: Vec::new_in(blaze_own::testing::heap().alloc()) })
+            Ok(RunOutcome { how: How::Reported(Said::Returned), keep: Err(NotKept::Untraced), panic_text: String::new_in(blaze_own::testing::heap().alloc()), entered: Vec::new_in(blaze_own::testing::heap().alloc()) })
         }
     }
 
@@ -1162,6 +1314,71 @@ mod pool_tests {
         }
     }
 
+    #[test]
+    fn bin_serve_failure_attributed_to_owner_or_unowned() {
+        struct BinFail {
+            owner: Option<(u32, u32)>,
+            pumped: Cell<bool>,
+        }
+
+        impl RunOne for BinFail {
+            async fn run(&self, _: u32, _: Nanos, _: &mut Output<'_>, _: &Signals) -> Result<RunOutcome, OneError> {
+                next_turn().await;
+                let heap = blaze_own::testing::heap().alloc();
+                Ok(RunOutcome {
+                    how: How::Reported(Said::Returned),
+                    keep: Err(NotKept::Untraced),
+                    panic_text: String::new_in(heap),
+                    entered: Vec::new_in(heap),
+                })
+            }
+
+            fn pump_bins(&self) -> Result<bool, OneError> {
+                if self.pumped.replace(true) {
+                    return Ok(false);
+                }
+                let heap = blaze_own::testing::heap().alloc();
+                Err(OneError::BinServe(crate::test_bins::BinServeError {
+                    owner: self.owner,
+                    package: String::from_str_in("binapp", heap),
+                    bin: String::from_str_in("helper", heap),
+                    why: crate::test_bins::BinServeWhy::Protocol("injected failure"),
+                }))
+            }
+
+            fn flat_of(&self, suite: u32, row: u32) -> Option<u32> {
+                (suite == 2 && row == 5).then_some(7)
+            }
+        }
+
+        let heap = blaze_own::testing::heap().alloc();
+        let signals = Signals::default();
+        let clock = || Nanos(1);
+
+        // Owned failure while rows 3 and 7 are running: must blame row 7, NOT `running.first()` (row 3).
+        let owned = BinFail { owner: Some((2, 5)), pumped: Cell::new(false) };
+        let mut pool = OneEach::new(&owned, &signals, clock, heap, heap).expect("heap");
+        pool.start(SuiteId(0), 2).expect("start");
+        pool.ask(3, TestId([3; 32]), Nanos(100)).expect("row 3");
+        pool.ask(7, TestId([7; 32]), Nanos(100)).expect("row 7");
+        pool.wait(Nanos(100)).expect("ready");
+        pool.clear();
+        assert!(pool.wait(Nanos(100)).is_err());
+        assert!(matches!(pool.failed, Some((7, OneError::BinServe(_)))));
+        assert!(pool.failed_unowned.is_none());
+
+        // Pre-handshake / unowned failure (`owner: None`): must go to `failed_unowned`, NOT blame row 3.
+        let unowned = BinFail { owner: None, pumped: Cell::new(false) };
+        let mut pool = OneEach::new(&unowned, &signals, clock, heap, heap).expect("heap");
+        pool.start(SuiteId(0), 2).expect("start");
+        pool.ask(3, TestId([3; 32]), Nanos(100)).expect("row 3");
+        pool.wait(Nanos(100)).expect("ready");
+        pool.clear();
+        assert!(pool.wait(Nanos(100)).is_err());
+        assert!(pool.failed.is_none());
+        assert!(matches!(pool.failed_unowned, Some(OneError::BinServe(_))));
+    }
+
     /// A child whose first turn makes its roots' code for a long time (the clock moved 5000 in
     /// that one poll), then starts its process: the pool's longest turn is that child's, named
     /// by the code making, not by the light step after it. Twin: a light child's turns are
@@ -1179,7 +1396,7 @@ mod pool_tests {
             }
             signals.begin(Doing::Relaying);
             next_turn().await;
-            Ok(RunOutcome { how: How::Reported(Said::Returned), keep: Err(NotKept::Untraced), entered: Vec::new_in(blaze_own::testing::heap().alloc()) })
+            Ok(RunOutcome { how: How::Reported(Said::Returned), keep: Err(NotKept::Untraced), panic_text: String::new_in(blaze_own::testing::heap().alloc()), entered: Vec::new_in(blaze_own::testing::heap().alloc()) })
         }
     }
 
@@ -1331,6 +1548,7 @@ mod pool_tests {
                     return Ok(RunOutcome {
                         how: How::Reported(Said::Returned),
                         keep: Err(NotKept::Untraced),
+                        panic_text: String::new_in(blaze_own::testing::heap().alloc()),
                         entered: Vec::new_in(blaze_own::testing::heap().alloc()),
                     });
                 }
@@ -1350,6 +1568,7 @@ mod pool_tests {
                 Ok(RunOutcome {
                     how: How::Reported(Said::Returned),
                     keep: Err(NotKept::Untraced),
+                    panic_text: String::new_in(blaze_own::testing::heap().alloc()),
                     entered: Vec::new_in(blaze_own::testing::heap().alloc()),
                 })
             }
@@ -1401,6 +1620,7 @@ mod pool_tests {
                         return Ok(RunOutcome {
                             how: How::TimedOut { after: budget },
                             keep: Err(NotKept::Untraced),
+                            panic_text: String::new_in(blaze_own::testing::heap().alloc()),
                             entered: Vec::new_in(blaze_own::testing::heap().alloc()),
                         });
                     }
@@ -1479,13 +1699,15 @@ impl Refuse for EntryCheck<'_, '_> {
 }
 
 /// Where `blaze test`'s code is made (D194, rule 78: THE seam, one line to flip). `Serial`: in
-/// the turn of the test that asked, on the command thread (today's; one long make holds every
-/// other test's answer). `Pooled`: each make is handed to a worker through [`CodeRelay`], the
-/// command thread only relays, and the asking test is parked, its allowance stopped, until its
-/// code comes or [`CODE_WAIT`] passes. `Pooled` for the real command needs [`CodeWorkers`] made
-/// on the command's pool (piece 2 of D194, [`pooled`]); with no worker beside the command
-/// thread, [`run_suites`] refuses it by name (`DriveError::NoCodeWorkers`), never runs serially.
-pub(crate) const CODES: Codes = Codes::Serial;
+/// the turn of the test that asked, on the command thread. `Pooled`: cache hits (`SuiteCache` /
+/// CAS store) answer immediately on the command thread, while cold misses are handed to off-thread
+/// [`CodeWorkers`] through [`CodeRelay`] in parallel whenever `workers > 1` (falling back cleanly
+/// to `Serial` when `--workers 1`, only one test runs, or the thread pool has 1 thread).
+pub(crate) const CODES: Codes = Codes::Pooled;
+
+/// Upper cap on concurrent `CodePool` compiler workers so per-worker `Maker` memory stays bounded
+/// even on 128-core hosts while scaling parallel JIT compilation across cores.
+const MAX_CODE_WORKERS: usize = 16;
 
 /// How long one test's ask for its code may wait for a worker's make (rule 18): past it the test
 /// is stopped with [`OneError::CodeLate`] naming the instance. The longest make met on tempo was
@@ -1511,6 +1733,8 @@ pub(crate) struct Job<'a> {
     /// The asking test's roots as its maker is made of them ([`TestFront::maker`]).
     pub entry: Option<ItemKey>,
     pub start: MakerStart,
+    /// Outermost-first declarer chain for a body-local item (`LibKey::INNER` set), empty otherwise.
+    pub enclosers: suite_cache::LocalEnclosers,
 }
 
 /// A worker's refusal of one make: the walk's error of it, as the serial step's would be.
@@ -1570,14 +1794,17 @@ impl<'a> CodeRelay<'a> {
     }
 
     /// One turn of relaying, never waiting: every finished make given back, the asks' deadlines
-    /// ticked, every make the pool wants handed to its worker.
-    pub(crate) fn pump(&self) -> Result<(), OneError> {
+    /// ticked, every make the pool wants handed to its worker. Returns whether any finished make
+    /// was drained from the workers.
+    pub(crate) fn pump(&self) -> Result<bool, OneError> {
         if let Some(fault) = self.fault.take() {
             return Err(OneError::Relay(fault));
         }
         let now = self.time();
         let mut relay = self.relay.borrow_mut();
+        let mut drained = false;
         while let Some((worker, result)) = self.workers.finished()? {
+            drained = true;
             match result {
                 Ok(bytes) => relay.made(now, worker, bytes),
                 Err(why) => relay.refused(now, worker, why),
@@ -1588,14 +1815,15 @@ impl<'a> CodeRelay<'a> {
         while let Some((worker, _, job)) = relay.job() {
             self.workers.give(worker, job)?;
         }
-        Ok(())
+        Ok(drained)
     }
 
     /// Child `child` asks for the code of `key` (`None`: unkeyed, its own), to be made by `job`.
     pub(crate) fn ask(&self, child: Child, key: Option<blaze_ladder::code_records::CodeKey>, job: Job<'static>) -> Result<(), OneError> {
         let key = key.map(|key| blaze_engine::code_pool::CodeKey(key.0));
         self.relay.borrow_mut().ask(self.time(), child, key, job).map_err(OneError::Relay)?;
-        self.pump()
+        let _ = self.pump()?;
+        Ok(())
     }
 
     /// Child `child`'s answer through `with`, once it came; `None` while it has not.
@@ -1633,11 +1861,35 @@ const HAND_WAIT: Duration = Duration::from_secs(5);
 /// the command fails naming the workers ([`DriveError::CodeWorkers`]), never waits on.
 const END_WAIT: Duration = CODE_WAIT;
 
-/// The most makers one code worker keeps (rule 18: a table has a cap): one a (suite, entry,
-/// start) its makes asked, the oldest dropped first. A test's roots start at its fn, so this is
-/// about the tests whose code one worker made lately; a maker dropped is made again, cheaply
-/// (make_one.rs `Maker::of_start` reads nothing), its program state lowered again by need.
-const MOST_MAKERS: usize = 64;
+/// The most makers one code worker keeps (rule 18: a table has a cap): one per `(suite,
+/// MakerKind)` its makes asked, least-recently-used dropped first. Every `MakerStart::Direct(_)`
+/// test in a suite shares ONE `(suite, MakerKind::Direct)` maker, so keeping 4 makers per worker
+/// prevents boundary thrashing when `OneEach` overlaps tail tests across adjacent suites while
+/// still evicting finished suites' multi-GB `LazyProgram` tables on large multi-crate workspaces.
+/// A maker dropped is made again cleanly (`Maker::of_start` reads nothing).
+const MOST_MAKERS: usize = 4;
+
+/// Soft frame budget per code worker: once a worker's `Frame` reaches this usage between makes,
+/// the worker drops its [`SuiteMakers`], resets and trims its `Frame` back to
+/// [`WORKER_FRAME_KEEP`], and rebuilds cleanly so multi-suite and heavy-suite test runs never
+/// exhaust `FRAME_RESERVE` (4 GiB) or accumulate unbounded RSS. Set to 2 GiB (half of
+/// `FRAME_RESERVE`) so large single-suite workspaces (e.g. `tempo-e2e` at ~550+ MiB of loaded
+/// crate trees and heads) stay warm across makes instead of resetting after every function.
+const WORKER_FRAME_RESET_AT: usize = 2 << 30;
+
+/// Hard frame ceiling per code worker (still 1 GiB below `FRAME_RESERVE`) for the adaptive
+/// cold-baseline bump: if a single cold make already fills past [`WORKER_FRAME_RESET_AT`], the
+/// worker keeps warm headroom up to this ceiling rather than thrashing on every make.
+const WORKER_FRAME_HARD_RESET_AT: usize = 3 << 30;
+
+/// Lower frame budget applied once [`Makers`] has evicted a suite at [`MOST_MAKERS`]: if the
+/// worker's `Frame` holds at least this much memory from evicted suites, reclaim it between
+/// makes instead of retaining dead suites' `NamesRecords` and `Front2` arenas.
+const WORKER_FRAME_EVICT_RESET_AT: usize = 128 << 20;
+
+/// Warm bytes kept in a code worker's `Frame` across resets; blocks past this are returned via
+/// `Frame::trim`.
+const WORKER_FRAME_KEEP: usize = 16 << 20;
 
 /// The scratch of a code worker's task (bstd `Scope::must_overlap`): its waits and spans; its
 /// names records and makers are in a frame of its own ([`work`]).
@@ -1782,6 +2034,35 @@ pub(crate) trait KeptMakers {
     /// `Lazy::site_of`). A maker never made (the make refused before it) names nothing. Read
     /// only on a refusal's path.
     fn shown(&mut self, job: &Job<'static>, refusal: &mut CodeRefusal);
+    /// Whether the worker should drop this keeper, reset and trim its `Frame`, and rebuild
+    /// before the next make (after [`KeptMakers::forget`], LRU eviction past budget, or frame
+    /// growth past [`WORKER_FRAME_RESET_AT`]).
+    fn needs_reset(&self) -> bool {
+        false
+    }
+    /// Whether this keeper already holds frame allocations from prior makes, so a panic during
+    /// `make` (such as frame exhaustion) should be retried once on a freshly reset empty frame.
+    fn is_warm(&self) -> bool {
+        false
+    }
+}
+
+/// Builds a [`KeptMakers`] borrowing a worker's reusable [`Frame`], so [`WorkerLane::run_with_frame`]
+/// can drop the keeper, call `Frame::reset` + `Frame::trim` safely (`#![forbid(unsafe_code)]`),
+/// and rebuild on the reclaimed frame between makes or before retrying a warm-frame panic.
+pub(crate) trait MakerFactory {
+    type Makers<'f>: KeptMakers + 'f
+    where
+        Self: 'f;
+    fn build<'f>(&'f self, frame: &'f Frame) -> Self::Makers<'f>;
+}
+
+/// Result of attempting one make on a code worker.
+pub(crate) enum MakeOutcome {
+    Done(Result<SVec<'static, u8>, CodeRefusal>),
+    /// The make panicked while the worker's frame held allocations from prior makes; the worker
+    /// should drop its keeper, reset and trim its `Frame`, and retry this exact job ONCE.
+    RetryOnFreshFrame,
 }
 
 /// The one make of a worker (sans-IO, rule 14): `job` made into `scratch` by `makers`, copied
@@ -1790,22 +2071,49 @@ pub(crate) trait KeptMakers {
 /// `Lazy::refused`), and the suite's state is forgotten, as it may be half made. The refusal
 /// crosses as a [`CodeRefusal`] ([`crossing`]).
 pub(crate) fn make_one(makers: &mut dyn KeptMakers, job: &Job<'static>, scratch: &mut AVec<'_, u8>, alloc: SharedAlloc<'static>) -> Result<SVec<'static, u8>, CodeRefusal> {
+    match make_one_or_retry(makers, job, scratch, alloc, false) {
+        MakeOutcome::Done(result) => result,
+        MakeOutcome::RetryOnFreshFrame => Err(crossing(refused(job, PANICKED), alloc)),
+    }
+}
+
+/// [`make_one`] with optional single retry on a fresh frame when `allow_retry` is true and
+/// `makers.is_warm()` was true before the panic.
+pub(crate) fn make_one_or_retry(
+    makers: &mut dyn KeptMakers,
+    job: &Job<'static>,
+    scratch: &mut AVec<'_, u8>,
+    alloc: SharedAlloc<'static>,
+    allow_retry: bool,
+) -> MakeOutcome {
     scratch.clear();
+    let was_warm = allow_retry && makers.is_warm();
     match crate::work::unwinding(|| makers.make(job, scratch)) {
         Ok(Ok(())) => {
             let mut made = SVec::with_capacity_in(scratch.len(), alloc);
             made.extend_from_slice(scratch.as_slice());
-            Ok(made)
+            MakeOutcome::Done(Ok(made))
         }
         Ok(Err(why)) => {
             let mut refusal = crossing(why, alloc);
-            makers.shown(job, &mut refusal);
-            Err(refusal)
+            // `shown` walks the maker's records/loader, which may allocate into the worker frame
+            // (e.g. `StoreLoad::unserved`); isolate any panic here too (rule 20) so a refusal
+            // never crashes the code worker task.
+            if crate::work::unwinding(|| makers.shown(job, &mut refusal)).is_err() {
+                makers.forget(job.suite);
+            }
+            MakeOutcome::Done(Err(refusal))
         }
-        // The suite's makers are forgotten (half made): nothing names the instance but its fn.
+        // The suite's makers are forgotten (half made): if the frame was warm from prior makes
+        // (e.g. frame exhaustion after earlier suites), ask the worker loop to reset & trim its
+        // frame and retry once; otherwise fail this make alone as `PANICKED`.
         Err(_panicked) => {
             makers.forget(job.suite);
-            Err(crossing(refused(job, PANICKED), alloc))
+            if was_warm {
+                MakeOutcome::RetryOnFreshFrame
+            } else {
+                MakeOutcome::Done(Err(crossing(refused(job, PANICKED), alloc)))
+            }
         }
     }
 }
@@ -1903,47 +2211,67 @@ impl<'l, 'p> WorkerLane<'l, 'p> {
         self.lanes.inboxes.get(self.me.0).ok_or(WorkerEnd::NoLane { worker: self.me.0 })
     }
 
-    /// The worker's loop: each make waited for (named, until `cx`'s deadline, which is the
-    /// command's, and ended by the close), made and handed back; `Ok` once the command closed it.
-    pub(crate) fn run(self, cx: &Cx, clock: &bstd::clock::Clock, makers: &mut dyn KeptMakers, heap: &'static blaze_own::Heap) -> Result<(), WorkerEnd> {
+    /// The worker's loop over a reusable [`Frame`]: each make waited for (named, until `cx`'s
+    /// deadline, which is the command's, and ended by the close), made and handed back; `Ok`
+    /// once the command closed it. When `makers` requests a reset (after `forget`, LRU eviction
+    /// past budget, or frame growth past [`WORKER_FRAME_RESET_AT`]) or a warm-frame panic asks
+    /// for a single retry on a fresh frame, drops `makers`, calls `frame.reset()` and
+    /// `frame.trim(trim_keep)`, and rebuilds `makers` on the reclaimed frame.
+    pub(crate) fn run_with_frame<F: MakerFactory>(
+        self,
+        cx: &Cx,
+        clock: &bstd::clock::Clock,
+        frame: &mut Frame,
+        trim_keep: usize,
+        factory: &F,
+        heap: &'static blaze_own::Heap,
+    ) -> Result<(), WorkerEnd> {
         use bstd::sync::RecvError;
         let inbox = self.inbox()?;
-        let mut scratch: AVec<'static, u8> = Vec::new_in(heap.alloc());
-        loop {
-            let waiting = cx.span(WAIT_JOB);
-            let job = match inbox.recv(&waiting) {
-                Ok(job) => job,
-                Err(RecvError::Closed { .. }) => return Ok(()),
-                Err(RecvError::Empty { chan }) => return Err(WorkerEnd::Full { chan }),
-                Err(RecvError::Stopped(stopped)) => return Err(WorkerEnd::Stopped { what: WAIT_JOB, stopped }),
-            };
-            drop(waiting);
-            self.answer(cx, clock, makers, &job, &mut scratch, heap)?;
-        }
+        drive_with_frame(
+            frame,
+            trim_keep,
+            factory,
+            || {
+                let waiting = cx.span(WAIT_JOB);
+                match inbox.recv(&waiting) {
+                    Ok(job) => Ok(Some(job)),
+                    Err(RecvError::Closed { .. }) => Ok(None),
+                    Err(RecvError::Empty { chan }) => Err(WorkerEnd::Full { chan }),
+                    Err(RecvError::Stopped(stopped)) => Err(WorkerEnd::Stopped { what: WAIT_JOB, stopped }),
+                }
+            },
+            |made| self.send_done(cx, clock, made),
+            |job, makers, scratch, allow_retry| {
+                let _making = cx.span("blaze test: a code worker makes one entry");
+                make_one_or_retry(makers, job, scratch, heap.shared(), allow_retry)
+            },
+            heap,
+        )
     }
 
-    /// The seam test's turn of this worker (rule 78: the same make and hand-back as [`run`]'s,
-    /// driven inline): the make in its inbox now, if one is, made and handed back. Whether one
-    /// was.
+    /// The seam test's turn of this worker (rule 78: the same make and hand-back as
+    /// [`run_with_frame`]'s, driven inline): the make in its inbox now, if one is, made and
+    /// handed back. Whether one was.
     #[cfg_attr(not(test), expect(dead_code, reason = "the seam test's inline worker (run_parent_tests.rs `pooled_codes_equal_serial`)"))]
     pub(crate) fn step(self, cx: &Cx, clock: &bstd::clock::Clock, makers: &mut dyn KeptMakers, scratch: &mut AVec<'_, u8>, heap: &'static blaze_own::Heap) -> Result<bool, WorkerEnd> {
         match self.inbox()?.try_recv() {
             Ok(job) => {
-                self.answer(cx, clock, makers, &job, scratch, heap)?;
+                let made = {
+                    let _making = cx.span("blaze test: a code worker makes one entry");
+                    make_one(makers, &job, scratch, heap.shared())
+                };
+                self.send_done(cx, clock, made)?;
                 Ok(true)
             }
             Err(_) => Ok(false),
         }
     }
 
-    /// `job` made and handed back. A done channel closed is the command's end: what was made
+    /// Hands back a finished make. A done channel closed is the command's end: what was made
     /// is dropped (its asker is gone), by design and said here, never an error of the worker.
-    fn answer(self, cx: &Cx, clock: &bstd::clock::Clock, makers: &mut dyn KeptMakers, job: &Job<'static>, scratch: &mut AVec<'_, u8>, heap: &'static blaze_own::Heap) -> Result<(), WorkerEnd> {
+    fn send_done(self, cx: &Cx, clock: &bstd::clock::Clock, made: Result<SVec<'static, u8>, CodeRefusal>) -> Result<(), WorkerEnd> {
         use bstd::sync::SendError;
-        let made = {
-            let _making = cx.span("blaze test: a code worker makes one entry");
-            make_one(makers, job, scratch, heap.shared())
-        };
         let by = cx.until(Deadline::after(clock.now().since_start(), HAND_WAIT));
         let handing = by.span(WAIT_DONE);
         match self.lanes.done.send(&handing, (self.me, made)) {
@@ -1972,6 +2300,58 @@ impl<'l, 'p> WorkerLane<'l, 'p> {
     }
 }
 
+/// Sans-IO frame-epoch loop behind [`WorkerLane::run_with_frame`]: rebuilds `factory.build(frame)`
+/// after `frame.reset()` + `frame.trim(trim_keep)` whenever a keeper requests a reset (after
+/// `forget`, LRU suite eviction past budget, or frame growth past [`WORKER_FRAME_RESET_AT`]) or
+/// when a warm-frame panic triggers a single clean retry on a fresh empty frame.
+pub(crate) fn drive_with_frame<F: MakerFactory>(
+    frame: &mut Frame,
+    trim_keep: usize,
+    factory: &F,
+    mut next_job: impl FnMut() -> Result<Option<Job<'static>>, WorkerEnd>,
+    mut on_done: impl FnMut(Result<SVec<'static, u8>, CodeRefusal>) -> Result<(), WorkerEnd>,
+    mut run_make: impl FnMut(&Job<'static>, &mut dyn KeptMakers, &mut AVec<'_, u8>, bool) -> MakeOutcome,
+    heap: &'static blaze_own::Heap,
+) -> Result<(), WorkerEnd> {
+    let mut scratch: AVec<'static, u8> = Vec::new_in(heap.alloc());
+    let mut pending: Option<Job<'static>> = None;
+    loop {
+        let reset = {
+            let mut makers = factory.build(frame);
+            let mut want_reset = false;
+            loop {
+                let (job, allow_retry) = match pending.take() {
+                    Some(job) => (job, false),
+                    None => match next_job()? {
+                        Some(job) => (job, true),
+                        None => break,
+                    },
+                };
+                match run_make(&job, &mut makers, &mut scratch, allow_retry) {
+                    MakeOutcome::RetryOnFreshFrame => {
+                        pending = Some(job);
+                        want_reset = true;
+                        break;
+                    }
+                    MakeOutcome::Done(made) => {
+                        on_done(made)?;
+                        if makers.needs_reset() {
+                            want_reset = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            want_reset
+        };
+        if !reset {
+            return Ok(());
+        }
+        frame.reset();
+        frame.trim(trim_keep);
+    }
+}
+
 /// A worker's proc-macro runner by need (job_texts.rs `ProcsByNeed`): asked of the command
 /// thread at its first call, once (the same answer on every later call, as `MadeOnce`).
 pub(crate) struct WorkerProcs<'w, 'p> {
@@ -1981,64 +2361,93 @@ pub(crate) struct WorkerProcs<'w, 'p> {
     got: core::cell::OnceCell<crate::job_texts::MadeProcs<'p>>,
 }
 
-impl<'w, 'p: 'w> crate::job_texts::ProcsByNeed<'w> for WorkerProcs<'w, 'p> {
-    fn procs(&self) -> Result<&'static crate::proc_runner::ProcRunner<'static>, &'w str> {
+impl<'f, 'w, 'p: 'f> crate::job_texts::ProcsByNeed<'f> for WorkerProcs<'w, 'p> {
+    fn procs(&self) -> Result<&'static crate::proc_runner::ProcRunner<'static>, &'f str> {
         *self.got.get_or_init(|| self.lane.ask_procs(self.cx, self.clock))
     }
 }
 
-/// What a maker was made for (make_one.rs `Maker::made_for`): its entry and start.
+/// What start class a maker was made for (make_one.rs `Maker::made_for`): `ByRule(entry)` or
+/// `Direct`. All `MakerStart::Direct(_)` tests in one suite share a single `Direct` maker,
+/// retargeted cleanly via [`MadeFor::set_direct_entry`] without rebuilding cached program state.
 pub(crate) trait MadeFor {
-    fn made_for(&self) -> (Option<ItemKey>, MakerStart);
+    fn made_for(&self) -> MakerKind;
+    fn set_direct_entry(&mut self, entry: Option<ItemKey>, start: MakerStart) -> bool;
 }
 
 impl MadeFor for TestMaker<'_> {
-    fn made_for(&self) -> (Option<ItemKey>, MakerStart) {
+    fn made_for(&self) -> MakerKind {
         Maker::made_for(self)
+    }
+
+    fn set_direct_entry(&mut self, entry: Option<ItemKey>, start: MakerStart) -> bool {
+        Maker::set_direct_entry(self, entry, start)
     }
 }
 
 /// A PLANTED BUG for the seam test's control (skill `testing`): `BySuiteAlone` finds a kept
-/// maker by its suite alone, so a make may be handed a maker of another test's start, which
-/// [`Makers::of`] must catch. Always `None` outside the test.
+/// maker by its suite alone, so a make may be handed a maker of another start class (e.g. a
+/// different `ByRule` entry or `ByRule` vs `Direct`), which [`Makers::of`] must catch. Always
+/// `None` outside the test.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MakersPlant {
     None,
     BySuiteAlone,
 }
 
-/// One worker's makers, one a (suite, entry, start) its makes asked, made at the first and kept
-/// (at most [`MOST_MAKERS`], the oldest dropped first), in the command's heap.
+/// One worker's makers, one per `(suite, MakerKind)` its makes asked, made at the first and kept
+/// (at most [`MOST_MAKERS`], the oldest dropped first), in the command's heap. All
+/// `MakerStart::Direct(_)` tests in the same suite share ONE persistent `Direct` maker per
+/// worker rather than allocating or evicting one per test function.
 pub(crate) struct Makers<M> {
-    kept: AVec<'static, (SuiteId, Option<ItemKey>, MakerStart, M)>,
+    kept: AVec<'static, (SuiteId, MakerKind, M)>,
     plant: MakersPlant,
+    evicted: bool,
 }
 
 impl<M: MadeFor> Makers<M> {
     pub(crate) fn new(alloc: Alloc<'static>, plant: MakersPlant) -> Makers<M> {
-        Makers { kept: Vec::new_in(alloc), plant }
+        Makers { kept: Vec::new_in(alloc), plant, evicted: false }
     }
 
-    /// The maker of `job`'s suite, entry and start: kept, or made by `make` and kept. A kept
-    /// maker made for another entry or start than `job`'s is refused by name (its control:
-    /// [`MakersPlant::BySuiteAlone`]), never used.
+    /// Whether any LRU eviction occurred since this `Makers` was constructed.
+    pub(crate) fn evicted(&self) -> bool {
+        self.evicted
+    }
+
+    /// The maker of `job`'s suite and start class: kept, or made by `make` and kept. A kept
+    /// maker made for another start class than `job`'s is refused by name (its control:
+    /// [`MakersPlant::BySuiteAlone`]), never used. For `MakerStart::Direct(_)`, retargets the
+    /// shared suite maker to `job`'s direct entry without recreating its program or tables.
     pub(crate) fn of(&mut self, job: &Job<'_>, make: impl FnOnce() -> Result<M, Unmade>) -> Result<&mut M, Unmade> {
         let plant = self.plant;
-        let found = self.kept.iter().position(|(suite, entry, start, _)| *suite == job.suite && (plant == MakersPlant::BySuiteAlone || (*entry == job.entry && *start == job.start)));
+        let kind = MakerKind::of(job.entry, job.start);
+        let found = self.kept.iter().position(|(suite, kept_kind, _)| *suite == job.suite && (plant == MakersPlant::BySuiteAlone || *kept_kind == kind));
         let at = match found {
-            Some(at) => at,
+            Some(at) => {
+                if at + 1 < self.kept.len()
+                    && let Some(tail) = self.kept.get_mut(at..)
+                {
+                    tail.rotate_left(1);
+                }
+                self.kept.len() - 1
+            }
             None => {
                 let maker = make()?;
                 if self.kept.len() >= MOST_MAKERS {
-                    // The oldest first: at most `MOST_MAKERS` moved, once a maker is made.
+                    // Least-recently-used first: at most `MOST_MAKERS` moved, once a maker is made.
                     drop(self.kept.remove_shift(0));
+                    self.evicted = true;
                 }
-                self.kept.push((job.suite, job.entry, job.start, maker));
+                self.kept.push((job.suite, kind, maker));
                 self.kept.len() - 1
             }
         };
-        let Some((_, _, _, maker)) = self.kept.get_mut(at) else { return Err(refused(job, ANOTHER_START)) };
-        if maker.made_for() != (job.entry, job.start) {
+        let Some((_, _, maker)) = self.kept.get_mut(at) else { return Err(refused(job, ANOTHER_START)) };
+        if maker.made_for() != kind {
+            return Err(refused(job, ANOTHER_START));
+        }
+        if matches!(job.start, MakerStart::Direct(_)) && !maker.set_direct_entry(job.entry, job.start) {
             return Err(refused(job, ANOTHER_START));
         }
         Ok(maker)
@@ -2048,9 +2457,10 @@ impl<M: MadeFor> Makers<M> {
         self.kept.retain(|(kept, ..)| *kept != suite);
     }
 
-    /// The kept maker of `job`'s suite, entry and start, never made here: `None` when none is kept.
+    /// The kept maker of `job`'s suite and start class, never made here: `None` when none is kept.
     pub(crate) fn kept(&self, job: &Job<'_>) -> Option<&M> {
-        let (_, _, _, maker) = self.kept.iter().find(|(suite, entry, start, _)| *suite == job.suite && *entry == job.entry && *start == job.start)?;
+        let kind = MakerKind::of(job.entry, job.start);
+        let (_, _, maker) = self.kept.iter().find(|(suite, kept_kind, _)| *suite == job.suite && *kept_kind == kind)?;
         Some(maker)
     }
 }
@@ -2061,7 +2471,7 @@ impl<M: MadeFor> Makers<M> {
 pub(crate) struct SuiteSide<'s> {
     pub crates: crate::run_names::RunCrates<'s>,
     pub builder: Builder,
-    /// The command's make watch ([`Launched::make_watch`]): every worker's makers are handed it.
+    /// The command's make watch (run_parent.rs `command_make_watch`): every worker's makers are handed it.
     pub make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
 }
 
@@ -2078,26 +2488,53 @@ const NO_SUITE: &str = "the make names a suite this command does not have (test_
 pub(crate) struct SuiteMakers<'w> {
     cx: &'w Cx,
     root: &'w Dir<ReadWrite>,
-    sides: &'w [SuiteSide<'w>],
+    sides: &'w [Option<SuiteSide<'w>>],
+    typed: crate::engine_body_record::SyncTypedFrom<'w>,
     procs: crate::job_texts::Procs<'w>,
     frame: &'w Frame,
     tables: Alloc<'static>,
     names: AVec<'static, Option<NamesRecords<'w>>>,
     makers: Makers<TestMaker<'w>>,
+    reset_needed: bool,
+    makes: usize,
+    reset_at: usize,
+    evict_reset_at: usize,
 }
 
 impl<'w> SuiteMakers<'w> {
-    pub(crate) fn new(cx: &'w Cx, root: &'w Dir<ReadWrite>, sides: &'w [SuiteSide<'w>], procs: crate::job_texts::Procs<'w>, frame: &'w Frame, heap: &'static blaze_own::Heap) -> SuiteMakers<'w> {
+    pub(crate) fn new(
+        cx: &'w Cx,
+        root: &'w Dir<ReadWrite>,
+        sides: &'w [Option<SuiteSide<'w>>],
+        typed: crate::engine_body_record::SyncTypedFrom<'w>,
+        procs: crate::job_texts::Procs<'w>,
+        frame: &'w Frame,
+        heap: &'static blaze_own::Heap,
+    ) -> SuiteMakers<'w> {
         let mut names = Vec::with_capacity_in(sides.len(), heap.alloc());
         names.resize(sides.len(), None);
-        SuiteMakers { cx, root, sides, procs, frame, tables: heap.alloc(), names, makers: Makers::new(heap.alloc(), MakersPlant::None) }
+        SuiteMakers {
+            cx,
+            root,
+            sides,
+            typed,
+            procs,
+            frame,
+            tables: heap.alloc(),
+            names,
+            makers: Makers::new(heap.alloc(), MakersPlant::None),
+            reset_needed: false,
+            makes: 0,
+            reset_at: WORKER_FRAME_RESET_AT,
+            evict_reset_at: WORKER_FRAME_EVICT_RESET_AT,
+        }
     }
 }
 
 impl KeptMakers for SuiteMakers<'_> {
     fn make(&mut self, job: &Job<'static>, entry: &mut AVec<'_, u8>) -> Result<(), Unmade> {
-        let at = job.suite.0 as usize;
-        let side = *self.sides.get(at).ok_or_else(|| refused(job, NO_SUITE))?;
+        let at = usize::try_from(job.suite.0).map_err(|_| refused(job, NO_SUITE))?;
+        let side = self.sides.get(at).and_then(|side| *side).ok_or_else(|| refused(job, NO_SUITE))?;
         let names = match self.names.get(at).copied().flatten() {
             Some(names) => names,
             None => {
@@ -2112,20 +2549,35 @@ impl KeptMakers for SuiteMakers<'_> {
                 names
             }
         };
+        let cx = self.cx;
+        let typed = self.typed;
         let tables = self.tables;
         let maker = self.makers.of(job, || {
-            let mut maker = Maker::of_start(names, job.entry, job.start, SecondCheck, &side.builder, tables);
+            let reader = typed.reader(cx, side.crates.snapshot(), tables);
+            let mut maker = Maker::of_start(names, job.entry, job.start, ByKind::new(reader), &side.builder, tables);
             maker.watch(side.make_watch);
             Ok(maker)
         })?;
-        job.order.make(maker, &job.proof, job.name.as_slice(), entry)
+        maker.prepare_local(job.enclosers.locals(), job.enclosers.enclosers());
+        let out = job.order.make(maker, &job.proof, job.name.as_slice(), entry);
+        self.makes = self.makes.saturating_add(1);
+        if self.makes == 1 {
+            let used = self.frame.used();
+            if used >= self.reset_at && used < WORKER_FRAME_HARD_RESET_AT {
+                self.reset_at = used.saturating_add(256 << 20).min(WORKER_FRAME_HARD_RESET_AT);
+            }
+        }
+        out
     }
 
     fn forget(&mut self, suite: SuiteId) {
         self.makers.forget(suite);
-        if let Some(slot) = self.names.get_mut(suite.0 as usize) {
+        if let Ok(at) = usize::try_from(suite.0)
+            && let Some(slot) = self.names.get_mut(at)
+        {
             *slot = None;
         }
+        self.reset_needed = true;
     }
 
     fn shown(&mut self, job: &Job<'static>, refusal: &mut CodeRefusal) {
@@ -2133,20 +2585,66 @@ impl KeptMakers for SuiteMakers<'_> {
             shown_by(maker, job, refusal);
         }
     }
+
+    fn needs_reset(&self) -> bool {
+        let used = self.frame.used();
+        self.reset_needed || used >= self.reset_at || (self.makers.evicted() && used >= self.evict_reset_at)
+    }
+
+    fn is_warm(&self) -> bool {
+        self.frame.used() > 0
+    }
 }
 
-/// One code worker's task (D194 piece 2): its frame, its proc-macro runner by need, its
-/// makers over every suite, then its loop until the command closes its lane.
-pub(crate) fn work(cx: &Cx, lane: WorkerLane<'_, '_>, clock: &bstd::clock::Clock, sides: &[SuiteSide<'_>], root: &Dir<ReadWrite>, procs: ProcsSide<'_>, heap: &'static blaze_own::Heap) -> Result<(), WorkerEnd> {
-    let frame = Frame::new(bstd::mem::Tag::Other).map_err(WorkerEnd::Frame)?;
-    let by_need = WorkerProcs { cx, clock, lane, got: core::cell::OnceCell::new() };
-    let procs = match procs {
-        ProcsSide::None => crate::job_texts::Procs::None,
-        ProcsSide::Made(made) => crate::job_texts::Procs::Made(made),
-        ProcsSide::ByNeed => crate::job_texts::Procs::ByNeed(&by_need),
+struct SuiteMakersFactory<'w, 'p> {
+    cx: &'w Cx,
+    root: &'w Dir<ReadWrite>,
+    sides: &'w [Option<SuiteSide<'w>>],
+    typed: crate::engine_body_record::SyncTypedFrom<'w>,
+    procs: ProcsSide<'p>,
+    by_need: WorkerProcs<'w, 'p>,
+    heap: &'static blaze_own::Heap,
+}
+
+impl<'w, 'p: 'w> MakerFactory for SuiteMakersFactory<'w, 'p> {
+    type Makers<'f> = SuiteMakers<'f>
+    where
+        Self: 'f;
+
+    fn build<'f>(&'f self, frame: &'f Frame) -> SuiteMakers<'f> {
+        let procs = match self.procs {
+            ProcsSide::None => crate::job_texts::Procs::None,
+            ProcsSide::Made(made) => crate::job_texts::Procs::Made(made),
+            ProcsSide::ByNeed => crate::job_texts::Procs::ByNeed(&self.by_need),
+        };
+        SuiteMakers::new(self.cx, self.root, self.sides, self.typed, procs, frame, self.heap)
+    }
+}
+
+/// One code worker's task (D194 piece 2): its reusable frame, its proc-macro runner by need,
+/// its makers over every suite, then its loop until the command closes its lane.
+#[expect(clippy::too_many_arguments, reason = "worker task entry receives the shared read-only suite sides and typed lookup")]
+pub(crate) fn work<'p>(
+    cx: &Cx,
+    lane: WorkerLane<'_, 'p>,
+    clock: &bstd::clock::Clock,
+    sides: &[Option<SuiteSide<'_>>],
+    typed: crate::engine_body_record::SyncTypedFrom<'_>,
+    root: &Dir<ReadWrite>,
+    procs: ProcsSide<'p>,
+    heap: &'static blaze_own::Heap,
+) -> Result<(), WorkerEnd> {
+    let mut frame = Frame::new(bstd::mem::Tag::Other).map_err(WorkerEnd::Frame)?;
+    let factory = SuiteMakersFactory {
+        cx,
+        root,
+        sides,
+        typed,
+        procs,
+        by_need: WorkerProcs { cx, clock, lane, got: core::cell::OnceCell::new() },
+        heap,
     };
-    let mut makers = SuiteMakers::new(cx, root, sides, procs, &frame, heap);
-    lane.run(cx, clock, &mut makers, heap)
+    lane.run_with_frame(cx, clock, &mut frame, WORKER_FRAME_KEEP, &factory, heap)
 }
 
 /// THE [`CodeWorkers`] of the command (D194 piece 2), on the command thread: a make handed to
@@ -2219,11 +2717,31 @@ impl CodeWorkers<'static> for CodePool<'_, '_> {
     }
 }
 
-/// A test's run parked on its code (D194): since when (the run's clock) and for which symbol.
+/// A test's run parked on its code (D194): since when (the run's clock), which symbol and walk
+/// row generation it awaits, and whether it is waiting on a peer's unkeyed build without asking
+/// `CodeRelay`.
 #[derive(Clone, Copy)]
 struct Parked {
     since: Duration,
     symbol: [u8; 32],
+    row: usize,
+    epoch: u64,
+    peer: bool,
+}
+
+/// RAII guard ensuring a parked child always releases its waiter count in `SuiteCache` on drop
+/// (e.g. `OneEach::kill` or early error return) so no walk row stays stuck in `How::Making`.
+struct ParkedGuard<'c, 'h> {
+    cache: &'c RefCell<suite_cache::SuiteCache<'h>>,
+    parked: Option<Parked>,
+}
+
+impl Drop for ParkedGuard<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(park) = self.parked.take() && !park.peer {
+            self.cache.borrow_mut().release_in_flight(park.row, park.epoch);
+        }
+    }
 }
 
 /// What a parked run's answer was, taken out of the relay's borrow.
@@ -2231,6 +2749,30 @@ enum Came {
     Made,
     Failed(ParentError),
     Late { waited: u64 },
+}
+
+/// Per-suite temporary folder created lazily on the first test run in that suite so clean suites
+/// (all tests cached, filtered, or ignored) perform zero directory syscalls.
+pub(crate) struct LazySuiteDir<'c> {
+    parent: &'c Dir<ReadWrite>,
+    index: usize,
+    dir: core::cell::OnceCell<Dir<ReadWrite>>,
+}
+
+impl<'c> LazySuiteDir<'c> {
+    fn new(parent: &'c Dir<ReadWrite>, index: usize) -> LazySuiteDir<'c> {
+        LazySuiteDir { parent, index, dir: core::cell::OnceCell::new() }
+    }
+
+    fn get_or_create(&self, cx: &Cx, frame: &Frame) -> Result<&Dir<ReadWrite>, OneError> {
+        if let Some(dir) = self.dir.get() {
+            return Ok(dir);
+        }
+        let named = bstd::mem::format_in!(frame, "{}", self.index);
+        let suite_path = Path::new(named.as_str()).map_err(OneError::Path)?;
+        let made = self.parent.make_dir(cx, &suite_path, Durable::No).map_err(OneError::Temp)?;
+        Ok(self.dir.get_or_init(|| made))
+    }
 }
 
 /// A test's run under the lazy parent, as `blaze run`'s program runs (own_process.rs
@@ -2243,12 +2785,11 @@ pub(crate) struct Launched<'c, 'h, 'a> {
     pub spawner: &'c Spawner,
     /// `blaze-launcher` beside this binary (own_process.rs `launcher_beside`).
     pub launcher: &'c str,
-    /// The records folder (run_parent.rs `RECORDS` under the home), and its absolute path: the
+    /// Absolute path of the records folder (run_parent.rs `RECORDS` under the home): the
     /// launcher's `BLAZE_LAUNCH_STORE`.
-    pub records: &'c Dir<ReadWrite>,
     pub store: &'c str,
-    /// This command's folder of test folders, and its absolute path.
-    pub temps: &'c Dir<ReadWrite>,
+    /// This suite's lazy folder of per-test temporary folders, and its absolute path.
+    pub temps: &'c LazySuiteDir<'c>,
     pub temp: &'c str,
     /// The command's environment.
     pub env: &'c [(&'c str, &'c str)],
@@ -2264,9 +2805,6 @@ pub(crate) struct Launched<'c, 'h, 'a> {
     pub lent: &'c CommandLent,
     pub tables: Alloc<'static>,
     pub watch: &'c dyn Watch,
-    /// What its makers report their large or slow makes with: the command's one clock
-    /// (run_parent.rs `command_make_watch`, made in [`run_suites`]).
-    pub make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
     /// Its suite's native library ([`Suite::native`]), as `blaze run` starts its program
     /// (own_process.rs `run_own`): named in the start (`BLAZE_LAUNCH_NATIVE`), told as the first
     /// frame (`Down::Native`, before the personality and any `Declare`), and the one file the
@@ -2284,12 +2822,20 @@ pub(crate) struct Launched<'c, 'h, 'a> {
     pub entered_sink: &'c RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>>,
     /// Allocator matching `entered_sink`'s lifetime.
     pub cache_alloc: Alloc<'a>,
+    /// Suite-wide shared walk, maker, verified set, and publication cache (borrowed strictly
+    /// within synchronous calls, never across `.await`, rule 27).
+    pub suite_cache: &'c RefCell<suite_cache::SuiteCache<'h>>,
+    /// Command-wide binary launcher stub server (`CARGO_BIN_EXE_*`, `test.md` piece 17), borrowed
+    /// strictly within synchronous calls (never across `.await`, rule 27).
+    pub bins: Option<&'c RefCell<crate::test_bins::BinServer<'a, 'h>>>,
+    /// Whether this suite exposes `CARGO_BIN_EXE_*` (integration tests and benchmarks only).
+    pub expose_bins: bool,
 }
 
 /// The test profile with the one grant a native image needs: `dlopen` maps `<store>/<64 hex>`
 /// executable, which `(deny default)` refuses (blaze-launch-rt native_lib.rs, step 2). That one
 /// file, by its literal path, nothing else: it is the parent's own record, named by its key.
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(target_os = "macos", test))]
 fn with_native<'a>(mut profile: AString<'a>, store: &str, native: Option<crate::engine_native::NativeSend<'_>>) -> Result<AString<'a>, OneError> {
     let Some(send) = native else { return Ok(profile) };
     if store.contains(['"', '\\', '\n']) || !send.hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -2303,111 +2849,37 @@ fn with_native<'a>(mut profile: AString<'a>, store: &str, native: Option<crate::
     Ok(profile)
 }
 
-#[cfg(target_os = "linux")]
-struct LinuxTestConfine {
-    ruleset: blaze_sys::linux::OwnedFd,
-    filter: [blaze_sys::linux::SockFilter; blaze_sys::linux::confine::MOST_FILTER],
-    filter_len: usize,
-    limits: [(blaze_sys::linux::confine::Resource, blaze_sys::linux::confine::Rlimit); 1],
-}
-
-#[cfg(target_os = "linux")]
-impl LinuxTestConfine {
-    fn confine(&self) -> blaze_sys::linux::confine::ChildConfine<'_> {
-        blaze_sys::linux::confine::ChildConfine {
-            ruleset: self.ruleset.fd(),
-            filter: &self.filter[..self.filter_len],
-            limits: &self.limits,
-        }
+/// Allows the launcher to create the single per-row unwind marker file beside `stderr-<row>`
+/// (outside the test's `$TMPDIR`) when a harnessed test unwinds out of its entry.
+#[cfg(any(target_os = "macos", test))]
+fn with_unwound<'a>(mut profile: AString<'a>, unwound: Option<&str>) -> Result<AString<'a>, OneError> {
+    let Some(path) = unwound else { return Ok(profile) };
+    if path.contains(['"', '\\', '\n']) {
+        return Err(OneError::Profile { why: Box::from("the unwind marker's path holds a quote, a backslash or a line break, which a profile string cannot hold") });
     }
-}
-
-#[cfg(target_os = "linux")]
-fn add_landlock_path(
-    ruleset: blaze_sys::Fd,
-    path: &str,
-    allowed_access: u64,
-    is_dir: bool,
-    step: &'static str,
-) -> Result<(), OneError> {
-    let bytes = path.as_bytes();
-    let mut name = [0u8; 4096];
-    if bytes.is_empty() || bytes.len() + 1 > name.len() {
-        return Err(OneError::Confine { step, errno: blaze_sys::Errno::NameTooLong.raw() });
-    }
-    name[..bytes.len()].copy_from_slice(bytes);
-    let cstr = core::ffi::CStr::from_bytes_with_nul(&name[..=bytes.len()])
-        .map_err(|_| OneError::Confine { step, errno: blaze_sys::Errno::Inval.raw() })?;
-    let mut flags = blaze_sys::linux::OpenFlags::PATH.with(blaze_sys::linux::OpenFlags::CLOSE_ON_EXEC);
-    if is_dir {
-        flags = flags.with(blaze_sys::linux::OpenFlags::DIRECTORY);
-    }
-    let fd = blaze_sys::linux::openat(blaze_sys::linux::CWD, blaze_sys::Path::new(cstr), flags, 0)
-        .map_err(|errno| OneError::Confine { step, errno: errno.raw() })?;
-    let rule = blaze_sys::linux::PathBeneath { allowed_access, parent_fd: fd.fd().raw() };
-    blaze_sys::linux::landlock_add_rule_path(ruleset, &rule)
-        .map_err(|errno| OneError::Confine { step, errno: errno.raw() })
-}
-
-/// Prepares the Linux test sandbox (Landlock ABI >= 3 + seccomp + `RLIMIT_CORE = 0`, rule 9):
-/// reads and exec anywhere under `/`, writes only under the test's `temp` dir and `/dev/null`,
-/// scoped signals/abstract sockets on ABI >= 6, and seccomp denying ptrace/mount/bpf/io_uring/
-/// keyctl and non-{UNIX,INET,INET6} sockets. Fails closed when Landlock ABI < 3.
-#[cfg(target_os = "linux")]
-fn prepare_linux_test_confine(temp: &str) -> Result<LinuxTestConfine, OneError> {
-    const LEAST_ABI: u32 = 3;
-    const SCOPES: u64 = 0b11;
-    let abi = blaze_sys::linux::landlock_abi()
-        .map_err(|errno| OneError::Confine { step: "landlock_create_ruleset(version)", errno: errno.raw() })?;
-    if abi < LEAST_ABI {
-        return Err(OneError::LandlockAbi { abi, least: LEAST_ABI });
-    }
-    let handled = blaze_sys::linux::AccessFs::ALL_ABI1
-        .with(blaze_sys::linux::AccessFs::REFER)
-        .with(blaze_sys::linux::AccessFs::TRUNCATE);
-    let attr = blaze_sys::linux::RulesetAttr {
-        handled_access_fs: handled.bits(),
-        handled_access_net: 0,
-        scoped: if abi >= 6 { SCOPES } else { 0 },
-    };
-    let ruleset = blaze_sys::linux::landlock_create_ruleset(&attr)
-        .map_err(|errno| OneError::Confine { step: "landlock_create_ruleset", errno: errno.raw() })?;
-    let read_exec = blaze_sys::linux::AccessFs::READ_FILE
-        .with(blaze_sys::linux::AccessFs::READ_DIR)
-        .with(blaze_sys::linux::AccessFs::EXECUTE)
-        .bits();
-    add_landlock_path(ruleset.fd(), "/", read_exec, true, "landlock_add_rule(/)")?;
-    let temp_write = handled.bits()
-        & !(blaze_sys::linux::AccessFs::MAKE_CHAR
-            .with(blaze_sys::linux::AccessFs::MAKE_BLOCK)
-            .bits());
-    add_landlock_path(ruleset.fd(), temp, temp_write, true, "landlock_add_rule(TMPDIR)")?;
-    let dev_null_rw = blaze_sys::linux::AccessFs::READ_FILE
-        .with(blaze_sys::linux::AccessFs::WRITE_FILE)
-        .with(blaze_sys::linux::AccessFs::TRUNCATE)
-        .bits();
-    add_landlock_path(ruleset.fd(), "/dev/null", dev_null_rw, false, "landlock_add_rule(/dev/null)")?;
-    let mut filter = [blaze_sys::linux::SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; blaze_sys::linux::confine::MOST_FILTER];
-    let filter_len = blaze_sys::linux::confine::build_test(&mut filter).len();
-    let limits = [(
-        blaze_sys::linux::confine::Resource::Core,
-        blaze_sys::linux::confine::Rlimit { soft: 0, hard: 0 },
-    )];
-    Ok(LinuxTestConfine { ruleset, filter, filter_len, limits })
+    profile.push_str("(allow file-write* (literal \"");
+    profile.push_str(path);
+    profile.push_str("\"))\n");
+    Ok(profile)
 }
 
 impl RunOne for Launched<'_, '_, '_> {
     async fn run(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
         let frame = Frame::new(bstd::mem::Tag::Other).map_err(OneError::Frame)?;
+        let suite_dir = self.temps.get_or_create(self.cx, &frame)?;
         let name = bstd::mem::format_in!(&frame, "stderr-{row}");
         let path = Path::new(name.as_str()).map_err(OneError::Path)?;
+        let unwound_name = bstd::mem::format_in!(&frame, "unwound-{row}");
+        let unwound_path = Path::new(unwound_name.as_str()).map_err(OneError::Path)?;
         // The parent owns this file beside the child's writable directory. A child cannot
         // replace the evidence. Quiet tests create no file.
-        let mut stderr = StderrCapture { dir: self.temps, path, prefix: Vec::new_in(&frame), spilled: false, bytes: 0 };
-        let result = self.run_captured(row, budget, output, signals, &mut stderr, &frame).await;
+        let mut stderr = StderrCapture { dir: suite_dir, path, prefix: Vec::new_in(&frame), spilled: false, bytes: 0 };
+        let result = self.run_captured(row, budget, output, signals, suite_dir, &mut stderr, &unwound_path, &frame).await;
         if stderr.spilled {
             stderr.dir.remove(self.cx, &stderr.path, Durable::No).map_err(OneError::Capture)?;
         }
+        // Best-effort cleanup of the unwind marker on any early-return or non-101 path.
+        let _ = suite_dir.remove(self.cx, &unwound_path, Durable::No);
         result
     }
 }
@@ -2461,37 +2933,53 @@ impl StderrCapture<'_> {
         }
         Ok(())
     }
-}
 
-/// One fd 3 request is served per turn. The resolver sees the symbol even for a request
-/// by slot, after Needs has looked the slot up in its own declaration table.
-struct TestResolve<'r, R> {
-    parent: &'r mut R,
-    requested: Option<TestAnswer>,
-}
-
-enum TestAnswer {
-    Ready { symbol: Symbol, record: blaze_launch::wire::RecordId },
-    Unresolved(Symbol),
-    /// Its row waits for its code, made by a worker (run_parent.rs `Codes::Pooled`, D194): the
-    /// need is not taken, and the run parks until the relay answers it.
-    Waiting(Symbol),
-}
-
-impl<R: Resolve> Resolve for TestResolve<'_, R> {
-    #[cfg(test)]
-    fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
-        self.parent.resolve(symbol)
-    }
-
-    fn publication(&mut self, symbol: &Symbol, values: &mut AVec<'_, u8>) -> Result<Resolved<'_>, ParentError> {
-        let answer = self.parent.publication(symbol, values)?;
-        self.requested = Some(match answer {
-            Resolved::Record { record, .. } => TestAnswer::Ready { symbol: *symbol, record },
-            Resolved::Unknown => TestAnswer::Unresolved(*symbol),
-            Resolved::Waiting => TestAnswer::Waiting(*symbol),
-        });
-        Ok(answer)
+    /// Reads the last `min(self.bytes, OUTPUT_CAP)` bytes of captured stderr for panic message
+    /// extraction after the child has exited and pipes have been drained.
+    fn tail_bytes<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<Vec<u8, &'a Frame>, OneError> {
+        let cap = u64::try_from(OUTPUT_CAP).unwrap_or(u64::MAX);
+        let want_u64 = self.bytes.min(cap);
+        let want = usize::try_from(want_u64).unwrap_or(OUTPUT_CAP);
+        let mut buf = Vec::with_capacity_in(want, frame);
+        if !self.spilled {
+            let start = self.prefix.len().saturating_sub(want);
+            if let Some(slice) = self.prefix.get(start..) {
+                buf.extend_from_slice(slice);
+            }
+            return Ok(buf);
+        }
+        let prefix_len_u64 = u64::try_from(self.prefix.len()).unwrap_or(u64::MAX);
+        let start = self.bytes.saturating_sub(want_u64);
+        let mut file_off = 0u64;
+        if start < prefix_len_u64 {
+            let prefix_start = usize::try_from(start).unwrap_or(self.prefix.len());
+            if let Some(slice) = self.prefix.get(prefix_start..) {
+                buf.extend_from_slice(slice);
+            }
+        } else {
+            file_off = start - prefix_len_u64;
+        }
+        let remain = want.saturating_sub(buf.len());
+        if remain == 0 {
+            return Ok(buf);
+        }
+        let file = self.dir.open_read(cx, &self.path).map_err(OneError::Capture)?;
+        let mut chunk = [0u8; 16 * 1024];
+        let mut read = 0usize;
+        while read < remain {
+            let take = (remain - read).min(chunk.len());
+            let Some(slice) = chunk.get_mut(..take) else { break };
+            let off = file_off.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            let n = file.read_into(slice, off).wait(cx).map_err(OneError::Capture)?;
+            if n == 0 {
+                break;
+            }
+            if let Some(got) = chunk.get(..n) {
+                buf.extend_from_slice(got);
+            }
+            read += n;
+        }
+        Ok(buf)
     }
 }
 
@@ -2504,132 +2992,289 @@ struct FirstCall {
     unkeyed: usize,
 }
 
-impl<'c> Launched<'c, '_, '_> {
-    /// The make `lazy`'s waiting row asked for, handed to the relay as child `child`'s ask: its
-    /// order, name and proof, and the maker its roots make ([`TestFront::maker`]).
-    fn ask_code<'r, D: run_parent::Folder>(&self, code: &'c CodeRelay<'c>, child: Child, lazy: &Lazy<'_, '_, TestFront<'_, '_, 'r>, D>) -> Result<(), OneError> {
-        let start = lazy.start().ok_or(OneError::Parent(ParentError::NothingAsked))?;
-        let ask = lazy.asked().ok_or(OneError::Parent(ParentError::NothingAsked))?;
-        let mut name = SVec::new_in(code.alloc);
-        name.extend_from_slice(ask.name);
-        let job = Job { suite: self.suite, order: ask.order, name, proof: ask.proof, entry: start.maker_entry(), start: start.maker_start };
-        code.ask(child, ask.key, job)
-    }
+/// On macOS (XNU `killpg1`), signalling a process group (`kill(-pgid, sig)`) returns `EPERM`
+/// (`os error 1`) instead of `ESRCH` when the group's sole remaining member is an unreaped zombie
+/// leader (zero live processes remain in the group).
+fn is_macos_group_eperm(error: &ProcError, step: RunStep) -> bool {
+    cfg!(target_os = "macos")
+        && error.step == step
+        && matches!(error.fault, RunFault::Host { os: 1, .. })
+}
 
-    async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, stderr: &mut StderrCapture<'_>, frame: &Frame) -> Result<RunOutcome, OneError> {
+/// Result of stopping a test child whose own process group may already have exited.
+enum Stopped<L> {
+    /// Already exited before `kill()` was needed (reaped with its actual exit status).
+    Exited { exit: Exit, left: L },
+    /// Killed by `SIGKILL` (its whole process group) and reaped.
+    Killed { exit: Exit, left: L },
+    /// Narrow macOS TOCTOU race: the child exited to a zombie (zero live group members) between
+    /// `wait(Deadline::PASSED)` and `kill(-pgid, SIGKILL)`, causing XNU to return `EPERM`;
+    /// `LinkedChild::drop` already reaped the zombie.
+    ZombieRace,
+}
+
+/// Classifies the outcome of `RunChild::kill()`, treating the narrow macOS zombie-pgrp `EPERM`
+/// race as [`Stopped::ZombieRace`] while propagating every other host error.
+fn classify_kill<L>(result: Result<bstd::procs::Reaped<L>, ProcError>) -> Result<Stopped<L>, ProcError> {
+    match result {
+        Ok(killed) => Ok(Stopped::Killed { exit: killed.exit, left: killed.left }),
+        Err(error) if is_macos_group_eperm(&error, RunStep::Kill) => Ok(Stopped::ZombieRace),
+        Err(error) => Err(error),
+    }
+}
+
+/// Stops and reaps a test child without tripping over macOS XNU's `kill(-pgid, SIGKILL) -> EPERM`
+/// on an already-exited zombie process-group leader. Reaps an already-exited child directly via
+/// `wait(Deadline::PASSED)`, kills its process group if still running, and treats the narrow
+/// macOS zombie TOCTOU `EPERM` as already reaped while still propagating every other host error.
+fn stop_child<C: RunChild>(run: C) -> Result<Stopped<C::Left>, ProcError> {
+    let running = match run.wait(Deadline::PASSED)? {
+        Waited::Ended(reaped) => return Ok(Stopped::Exited { exit: reaped.exit, left: reaped.left }),
+        Waited::Running(running) => running,
+    };
+    classify_kill(running.kill())
+}
+
+impl<'c> Launched<'c, '_, '_> {
+    /// Unified suite-cached test execution path for BOTH `Codes::Serial` (`self.codes.is_none()`)
+    /// and `Codes::Pooled` (`self.codes.is_some()`):
+    /// - Cache hits (`SuiteCache` RAM / CAS store) answer immediately on the command thread with
+    ///   zero worker round-trip (preserving warm cache speed and lazy-native incremental caching).
+    /// - Under `Codes::Pooled`, cold misses dispatch to off-thread `CodePool` workers in parallel
+    ///   via `CodeRelay` (deduplicating in-flight symbols across children and suites), parking
+    ///   this child with its execution allowance paused until the worker finishes.
+    #[expect(clippy::too_many_arguments, reason = "runs one sandboxed test child with its suite dir, unwind marker, and captures")]
+    async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, suite_dir: &Dir<ReadWrite>, stderr: &mut StderrCapture<'_>, unwound_path: &Path, frame: &Frame) -> Result<RunOutcome, OneError> {
+        use suite_cache::{ChildAnswer, ChildResolver, ChildSent, NeedCode};
+
         let cx = self.cx;
         let test = key_of(&self.tests, row)?;
-        // The test's own frame: everything of its run, dropped with it.
         let erased = blaze_own::Erased::new(frame);
         let alloc = erased.handle();
-        // 1. Its temporary folder, made empty: one already there is refused by name, so
-        // nothing another run left is read as this one's.
+        // 1. Per-test temporary folder.
         let name = bstd::mem::format_in!(frame, "{row}");
         let named = Path::new(name.as_str()).map_err(OneError::Path)?;
-        self.temps.make_dir(cx, &named, Durable::No).map_err(OneError::Temp)?;
+        suite_dir.make_dir(cx, &named, Durable::No).map_err(OneError::Temp)?;
         let temp = bstd::mem::format_in!(frame, "{}/{row}", self.temp);
-        // 2. The lazy parent with the test's roots; nothing built yet.
+        // 2. Per-test roots rooted into the suite's single shared walk.
         let exports = self.native.map_or(&[][..], |send| send.items);
-        let front = TestFront { names: self.names, ids: self.ids, builder: self.builder, tables: self.tables, alloc, test, exports, harness: self.tests.harnessed(), watch: self.watch, make_watch: self.make_watch };
-        let mut codes = HomeCodeStore::new(self.lent);
-        // THE SEAM LINE: how the records reach the program (run_bytes.rs `Delivery`; `Inline`
-        // sends them over descriptor 3 and files none).
-        let mut lazy = Lazy::new(cx, front, Chosen::of(Delivery::Inline, RecordsDir { cx, dir: self.records }, alloc), &mut codes, self.builder, alloc);
-        // Its place in the relay, told its end however the run ends (D194).
-        let child = Child(self.child_base + row as usize);
-        let _asking = self.codes.map(|code| Asking { code, child });
-        if self.codes.is_some() {
-            lazy.make_by(Codes::Pooled);
-        }
-        let mut needs = Needs::new(alloc);
-        let mut ahead = std::vec::Vec::new_in(alloc);
-        let mut placed = Vec::new_in(alloc);
-        // The native library first, before any `Declare`: the child hands its entry over only
-        // once it has loaded it (own_process.rs `run_own`, the same order).
-        if let Some(send) = self.native {
-            needs.tell_native(send.library, send.words, &mut ahead).map_err(|cause| test_parent_error(&mut lazy, cause))?;
-        }
         signals.begin(Doing::Roots);
-        let head = run_parent::ahead_of(None, &mut lazy, &mut needs, &mut placed, &mut ahead)
-            .map_err(|cause| test_parent_error(&mut lazy, cause))?;
+        let roots = entry_roots(self.tests.harnessed(), self.names, test, exports, self.builder, self.tables, alloc)
+            .map_err(|why| OneError::Parent(ParentError::Roots(why)))?;
+        let head = roots.head();
+        let test_entry = {
+            let mut sc = self.suite_cache.borrow_mut();
+            match sc.root_test(&roots) {
+                Ok(entry_sym) => entry_sym,
+                Err(cause) => return Err(test_parent_error_places(&mut *sc, cause)),
+            }
+        };
+        let mut codes = HomeCodeStore::new(self.lent);
+        // Its place in the relay, told its end however the run ends (D194).
+        let child = Child(self.child_base + usize::try_from(row).unwrap_or(0));
+        let _asking = self.codes.map(|code| Asking { code, child });
+        let code_mode = if self.codes.is_some() { Codes::Pooled } else { Codes::Serial };
+        let mut needs = Needs::new(alloc);
+        let mut child_sent = ChildSent::new(alloc);
+        let mut ahead = run_parent::wire_out(alloc);
+        let mut tally = run_parent::Tally::default();
+        // Eager native library first, before any `Declare`, when the image carries C initializers,
+        // shadows a pure libc symbol, or runs an unharnessed custom test. Otherwise arm lazy
+        // delivery so pure tests never load the dylib and remain cacheable.
+        let eager_native = self.native.is_some_and(|send| {
+            send.load_mode == crate::engine_native::NativeLoadMode::Eager || !self.tests.harnessed()
+        });
+        if let Some(send) = self.native {
+            if eager_native {
+                if let Err(cause) = needs.tell_native(send.library, send.words, &mut ahead) {
+                    return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+                }
+            } else {
+                needs.arm_lazy_native(send.library, send.words);
+            }
+        }
+        if let Err(cause) = needs.name_personality(head.personality, &mut ahead) {
+            return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+        }
+        let mut keep: Result<(), NotKept> = if !self.tests.harnessed() {
+            Err(NotKept::Untraced)
+        } else if eager_native {
+            Err(NotKept::Foreign)
+        } else {
+            Ok(())
+        };
+        let mut entered_fns: AVec<'_, crate::test_cache::EnteredFn<'_>> = Vec::new_in(self.cache_alloc);
+        // If this test is already impure at launch (eager native C image or custom harness), batch
+        // pre-publish the suite's warm functions into `ahead` before spawning.
+        //
+        // Pure tests (`keep.is_ok()`) intentionally NEVER receive pre-published warm functions
+        // (not even pure `CodeClass::Toolchain` / closed functions): pure tests derive their
+        // `entered_fns` set — and therefore their `BZTR` `Address` and `Postings` asks — from the
+        // child's demand-driven `Up::Need` stream. Pre-publishing any function would suppress its
+        // `Up::Need` and make `entered_fns` depend on sibling test execution order (`warm_order`),
+        // violating Rule 25 determinism and breaking `Effect::Look` undo-cache and flakiness
+        // address matching (and for impure functions, bypassing per-test `NotKept` tracking).
+        if keep.is_err() {
+            let prep = self.suite_cache.borrow().prepublish_warm(
+                test_entry,
+                head,
+                &mut child_sent,
+                &mut needs,
+                &mut ahead,
+                &mut tally,
+                alloc,
+            );
+            if let Err(cause) = prep {
+                return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+            }
+        }
         let line = head.line;
         let entry = bstd::mem::format_in!(frame, "{line}");
-        // 3. Its environment: its own `TMPDIR`, its package's variables (`PackageRun`), then the
-        // command's (less the names those set), then the run mode's names.
-        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + self.place.vars.len() + 8, frame);
+        // 3. Environment.
+        let mut vars: Vec<(&str, &str), &Frame> = Vec::with_capacity_in(self.env.len() + self.place.vars.len() + 16, frame);
         vars.push(("TMPDIR", temp.as_str()));
         vars.extend_from_slice(self.place.vars);
         let package = self.place.vars;
-        let command = self.env.iter().copied().filter(|(name, _)| *name != "TMPDIR" && package.binary_search_by(|(set, _)| set.cmp(name)).is_err());
-        run_parent::launch_env(command, self.store, entry.as_str(), None, &mut vars);
-        // `launch_env` left out any `BLAZE_LAUNCH_NATIVE` of the command's own: the parent's word.
-        if let Some(send) = self.native {
-            vars.push(("BLAZE_LAUNCH_NATIVE", send.hex));
+        // Borrow `self.bins` strictly synchronously here to materialize per-row read-only stubs
+        // (`owner=<suite>:<row>` inside the read-only sidecar — zero extra guest env vars!) and
+        // snapshot `CARGO_BIN_EXE_*` into `frame` (never across `.await`, rule 27).
+        let mut bin_env_pairs: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
+        let mut bin_map_text: Option<String<&Frame>> = None;
+        let mut bin_dir_text: Option<String<&Frame>> = None;
+        #[cfg(target_os = "linux")]
+        let mut bin_sock_dir_text: Option<String<&Frame>> = None;
+        #[cfg(target_os = "macos")]
+        let mut bin_socket_text: Option<String<&Frame>> = None;
+        #[cfg(target_os = "macos")]
+        let mut bin_natives: Vec<crate::engine_native::NativeSend<'_>, &Frame> = Vec::new_in(frame);
+        let mut _row_stubs = None;
+        if self.expose_bins
+            && let Some(bins_cell) = self.bins
+        {
+            let bins_ref = bins_cell.borrow();
+            if let Some(prepared) = bins_ref
+                .prepare_row_stubs(cx, self.package, self.suite.0, row, frame)
+                .map_err(OneError::Bins)?
+            {
+                bin_env_pairs = prepared.env_pairs;
+                bin_map_text = prepared.bin_map;
+                bin_dir_text = Some(String::from_str_in(prepared.guard.dir_str(), frame));
+                #[cfg(target_os = "linux")]
+                {
+                    bin_sock_dir_text = Some(String::from_str_in(bins_ref.sock_dir(), frame));
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    bin_socket_text = Some(String::from_str_in(bins_ref.socket_path(), frame));
+                    bin_natives.extend_from_slice(bins_ref.bin_natives());
+                }
+                _row_stubs = Some(prepared.guard);
+            }
         }
-        // 4. The test sandbox (macOS Seatbelt via sandbox-exec; Linux Landlock + seccomp).
-        signals.begin(Doing::Starting);
+        vars.extend_from_slice(bin_env_pairs.as_slice());
+        let command = self.env.iter().copied().filter(|(name, _)| {
+            *name != "TMPDIR"
+                && package.binary_search_by(|(set, _)| set.cmp(name)).is_err()
+                && !bin_env_pairs.iter().any(|(set, _)| set == name)
+        });
+        run_parent::launch_env(command, self.store, entry.as_str(), None, &mut vars);
+        let lazy_native = self.native.filter(|_| !eager_native).map(|send| bstd::mem::format_in!(frame, "lazy:{}", send.hex));
+        if let Some(send) = self.native {
+            let value = lazy_native.as_ref().map_or(send.hex, |s| s.as_str());
+            vars.push(("BLAZE_LAUNCH_NATIVE", value));
+        }
+        if let Some(map) = bin_map_text.as_ref() {
+            vars.push(("BLAZE_LAUNCH_BIN_MAP", map.as_str()));
+        }
+        #[cfg(target_os = "macos")]
+        let unwound_full = self.tests.harnessed().then(|| bstd::mem::format_in!(frame, "{}/unwound-{row}", self.temp));
+        #[cfg(target_os = "macos")]
+        if let Some(unwound) = unwound_full.as_ref() {
+            vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", unwound.as_str()));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            vars.push(("BLAZE_LAUNCH_SANDBOX_TEMP", temp.as_str()));
+            if let Some(dir) = bin_dir_text.as_ref() {
+                vars.push(("BLAZE_LAUNCH_BINS_DIR", dir.as_str()));
+            }
+            if let Some(sock_dir) = bin_sock_dir_text.as_ref() {
+                vars.push(("BLAZE_LAUNCH_BINS_SOCK_DIR", sock_dir.as_str()));
+            }
+            if self.tests.harnessed() {
+                vars.push(("BLAZE_LAUNCH_UNWOUND_FILE", "fd:4"));
+            }
+        }
         #[cfg(not(target_os = "linux"))]
+        let _ = &bin_dir_text;
+        // 4. Sandbox + spawn.
+        #[cfg(target_os = "macos")]
         let Started { child: mut run, pipes: given } = {
-            let profile = blaze_run::child::seatbelt(temp.as_str(), None, alloc).map_err(|why| OneError::Profile { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) })?;
-            let profile = with_native(profile, self.store, self.native)?;
+            let profile = seatbelt_profile(
+                temp.as_str(),
+                self.store,
+                self.native,
+                unwound_full.as_ref().map(|s| s.as_str()),
+                bin_socket_text.as_ref().map(|s| s.as_str()),
+                bin_natives.as_slice(),
+                frame,
+                alloc,
+            )?;
             let mut args = Vec::with_capacity_in(self.args.len() + 3, frame);
             args.extend_from_slice(&["-p", profile.as_str(), self.launcher]);
             args.extend_from_slice(self.args);
-            // Its working directory: its package's root, as `cargo test` runs it (`PackageRun`).
             let spec = RunSpec { program: SANDBOX_EXEC, arg0: None, args: args.as_slice(), env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
+            signals.begin(Doing::Starting);
             self.spawner.start_served(cx, &spec).map_err(OneError::Start)?
         };
         #[cfg(target_os = "linux")]
-        let Started { child: mut run, pipes: given } = {
-            let prepared = prepare_linux_test_confine(temp.as_str())?;
-            let confine = prepared.confine();
+        let (Started { child: mut run, pipes: given }, mut unwound_channel) = {
             let spec = RunSpec { program: self.launcher, arg0: None, args: self.args, env: vars.as_slice(), dir: self.place.dir, streams: Streams::PIPED, own_group: true, parent_death: ParentDeath::STRONGEST };
-            self.spawner.start_served_confined(cx, &spec, &confine).map_err(OneError::Start)?
+            let sandbox = bstd::procs::TestSandbox {
+                temp: temp.as_str(),
+                unwound_channel: self.tests.harnessed(),
+            };
+            signals.begin(Doing::Starting);
+            self.spawner.start_served_test(cx, &spec, &sandbox).map_err(OneError::Start)?
         };
-        // Its allowance runs from its start, less the time it was parked waiting for its code
-        // (D194) or stalled behind command-thread host work: those waits never eat the test's own
-        // execution budget.
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let Started { child: mut run, pipes: given } = {
+            let _ = (vars, signals);
+            return Err(OneError::Profile { why: Box::from("no test sandbox is built for this host") });
+        };
         let started_at = run.now();
         signals.started.set(true);
+        signals.progress.set(true);
         let allowance = Duration::from_nanos(budget.0);
         let mut parked_for = Duration::ZERO;
-        let mut parked: Option<Parked> = None;
+        let mut parked_guard = ParkedGuard { cache: self.suite_cache, parked: None };
         // Its code came: the inbox kept from the waiting frame on is served again, unread.
         let mut again = false;
         let stdout = given.stdout.ok_or(OneError::MissingPipe { stream: "stdout" })?;
         let stderr_pipe = given.stderr.ok_or(OneError::MissingPipe { stream: "stderr" })?;
         let mut pipes = [Some(stdout), Some(stderr_pipe)];
         let mut relay = Relay::new(GRACE);
-        let mut inbox = std::vec::Vec::new_in(alloc);
+        let mut inbox = run_parent::wire_out(alloc);
         let mut reply = ahead;
+        let mut reply_at = 0usize;
+        let mut write_since: Option<Duration> = None;
         let mut open = true;
         let mut calls = Vec::new_in(alloc);
         let mut published = 0;
         let mut service_time = Duration::ZERO;
         let mut torn = None;
-        let mut keep: Result<(), NotKept> = if !self.tests.harnessed() {
-            Err(NotKept::Untraced)
-        } else if self.native.is_some() {
-            Err(NotKept::Foreign)
-        } else {
-            Ok(())
-        };
-        let mut entered_fns: AVec<'_, crate::test_cache::EnteredFn<'_>> = Vec::new_in(self.cache_alloc);
-        let mut rec_bytes = bstd::mem::Bytes::new_in(frame, "the code record inspected for test purity");
         let child_error = |error| OneError::Loop(RunLoopError::Child(error));
-        // Start the other ready children before building any first-call answer. The loop ends
-        // with the child's end and what it left (its channel, still read for what it wrote).
-        let (ended, mut over) = loop {
+        let (mut ended, mut over) = loop {
             next_turn().await;
             let _span = cx.span("blaze test: service one child's pipes, requests and deadline");
             signals.begin(Doing::Relaying);
             let now = run.now();
-            let open_park = parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since));
-            let host_stalled = Duration::from_nanos(signals.stalled.get());
-            let until = Deadline::after(started_at, allowance.saturating_add(parked_for).saturating_add(open_park).saturating_add(host_stalled));
+            let open_park = parked_guard.parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since));
             if let Some(code) = self.codes {
                 let pumping = run.now();
-                code.pump()?;
+                if code.pump()? {
+                    signals.progress.set(true);
+                }
                 let pumped = run.now().saturating_sub(pumping);
                 if pumped >= DRAIN_EVERY {
                     signals.begin(Doing::Serving);
@@ -2637,74 +3282,162 @@ impl<'c> Launched<'c, '_, '_> {
                 }
                 // The runner's watch moves its answer's due by it (test_run.rs `answer_due`).
                 signals.parked.set(u64::try_from(parked_for.saturating_add(open_park).as_nanos()).unwrap_or(u64::MAX));
-                signals.parked_now.set(parked.is_some());
+                signals.parked_now.set(parked_guard.parked.is_some());
             }
-            if let (Some(park), Some(code)) = (parked, self.codes) {
-                let came = code.answer(child, |reply| match reply {
-                    Reply::Made(entry) => match lazy.made(entry) {
-                        Ok(()) => Came::Made,
-                        Err(cause) => Came::Failed(cause),
-                    },
-                    // Every asker of the key is handed the same refusal (rule 19).
-                    Reply::Refused(why) => Came::Failed(lazy.refused(why.for_asker())),
-                    Reply::Late { waited, .. } => Came::Late { waited },
-                })?;
-                if let Some(came) = came {
-                    parked_for = parked_for.saturating_add(open_park);
-                    parked = None;
-                    signals.parked.set(u64::try_from(parked_for.as_nanos()).unwrap_or(u64::MAX));
-                    signals.parked_now.set(false);
-                    let stop = match came {
-                        Came::Made => None,
-                        Came::Failed(cause) => Some(test_parent_error(&mut lazy, cause)),
-                        Came::Late { waited } => Some(match lazy.withdraw() {
-                            Ok(()) => OneError::CodeLate { instance: lazy.name_of(park.symbol), symbol: park.symbol, waited },
-                            Err(cause) => OneError::Parent(cause),
-                        }),
-                    };
-                    if let Some(error) = stop {
-                        // Its process waits for code it will never receive.
-                        run.kill().map_err(child_error)?;
-                        return Err(error);
+            if let (Some(park), Some(code)) = (parked_guard.parked, self.codes) {
+                if park.peer {
+                    let done = !self.suite_cache.borrow().is_in_flight(park.row, park.epoch);
+                    if done {
+                        parked_for = parked_for.saturating_add(open_park);
+                        parked_guard.parked = None;
+                        signals.parked.set(u64::try_from(parked_for.as_nanos()).unwrap_or(u64::MAX));
+                        signals.parked_now.set(false);
+                        signals.progress.set(true);
+                        again = true;
+                    } else if open_park >= CODE_WAIT {
+                        parked_guard.parked = None;
+                        signals.parked_now.set(false);
+                        stop_child(run).map_err(child_error)?;
+                        let instance = self.suite_cache.borrow().name_of(park.symbol);
+                        let waited = u64::try_from(open_park.as_nanos()).unwrap_or(u64::MAX);
+                        return Err(OneError::CodeLate { instance, symbol: park.symbol, waited });
                     }
-                    again = true;
+                } else {
+                    let came = code.answer(child, |reply| match reply {
+                        Reply::Made(entry) => {
+                            match self.suite_cache.borrow_mut().finish_in_flight(
+                                park.row,
+                                park.epoch,
+                                entry,
+                                self.ids,
+                                &mut codes,
+                                cx,
+                                self.watch,
+                            ) {
+                                Ok(()) => Came::Made,
+                                Err(cause) => Came::Failed(cause),
+                            }
+                        }
+                        // Every asker of the key is handed the same refusal (rule 19).
+                        Reply::Refused(why) => {
+                            let refused = self.suite_cache.borrow_mut().refused_in_flight(park.row, park.epoch);
+                            match refused {
+                                Ok(()) => Came::Failed(ParentError::CodeRefused { symbol: park.symbol, why: why.for_asker() }),
+                                Err(cause) => Came::Failed(cause),
+                            }
+                        }
+                        Reply::Late { waited, .. } => Came::Late { waited },
+                    })?;
+                    if let Some(came) = came {
+                        parked_for = parked_for.saturating_add(open_park);
+                        parked_guard.parked = None;
+                        signals.parked.set(u64::try_from(parked_for.as_nanos()).unwrap_or(u64::MAX));
+                        signals.parked_now.set(false);
+                        signals.progress.set(true);
+                        let stop = match came {
+                            Came::Made => None,
+                            Came::Failed(cause) => Some(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause)),
+                            Came::Late { waited } => {
+                                let mut sc = self.suite_cache.borrow_mut();
+                                sc.release_in_flight(park.row, park.epoch);
+                                Some(OneError::CodeLate { instance: sc.name_of(park.symbol), symbol: park.symbol, waited })
+                            }
+                        };
+                        if let Some(error) = stop {
+                            stop_child(run).map_err(child_error)?;
+                            return Err(error);
+                        }
+                        again = true;
+                    }
                 }
             }
+            let total_parked = parked_for.saturating_add(parked_guard.parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since)));
+            let until = current_until(started_at, allowance, total_parked, signals);
             if until.passed(now) {
-                let killed = run.kill().map_err(child_error)?;
-                break (How::TimedOut { after: budget }, killed.left);
+                match stop_child(run).map_err(child_error)? {
+                    Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                    Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                    Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                }
             }
             match relay.turn(now, signals.terminate(now)?) {
-                RelayAct::Forward => run.terminate().map_err(child_error)?,
+                RelayAct::Forward => {
+                    if let Err(error) = run.terminate() {
+                        if is_macos_group_eperm(&error, RunStep::Terminate) {
+                            match run.wait(Deadline::PASSED).map_err(child_error)? {
+                                Waited::Ended(reaped) => break (child_outcome(reaped.exit), Some(reaped.left)),
+                                Waited::Running(_) => return Err(child_error(error)),
+                            }
+                        }
+                        return Err(child_error(error));
+                    }
+                }
                 RelayAct::Kill => {
-                    // A kill reaps: its end is always known.
-                    let killed = run.kill().map_err(child_error)?;
-                    break (child_outcome(killed.exit), killed.left);
+                    match stop_child(run).map_err(child_error)? {
+                        Stopped::Exited { exit, left } | Stopped::Killed { exit, left } => break (child_outcome(exit), Some(left)),
+                        Stopped::ZombieRace => break (How::Signal { number: 9 }, None),
+                    }
                 }
                 RelayAct::Nothing => {}
             }
             let bound = until.min(relay.bound());
-            drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)?;
-            if open && !reply.is_empty() {
-                let by = Deadline::after(run.now(), WRITE_BOUND).min(bound);
-                match run.send(&reply, by) {
-                    Ok(()) => published = calls.len(),
-                    Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
-                    Err(error) => return Err(child_error(error)),
-                }
-                reply.clear();
+            if drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)? {
+                signals.progress.set(true);
             }
-            let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound);
-            // Parked, nothing is read or served: its frames wait in the channel, in order.
-            if open && parked.is_none() {
+            if open && reply_at < reply.len() {
+                match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, until, signals) {
+                    Ok(FlushOut::Done) => published = calls.len(),
+                    Ok(FlushOut::Pending) => {}
+                    Ok(FlushOut::Hangup) => open = false,
+                    Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
+                        Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                        Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                        Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                    },
+                    Err(error) => {
+                        stop_child(run).map_err(child_error)?;
+                        return Err(error);
+                    }
+                }
+            }
+            let write_bound = write_since.map_or(Deadline::NEVER, |since| Deadline::after(since, WRITE_BOUND));
+            let poll = Deadline::after(run.now(), signals.wait.replace(Duration::ZERO)).min(bound).min(write_bound);
+            let mut try_recv = open && parked_guard.parked.is_none();
+            let mut recv_deadline = poll;
+            if open && reply_at < reply.len() {
+                let ready = run.wait_ready(parked_guard.parked.is_none(), true, poll).map_err(child_error)?;
+                if ready.writable {
+                    match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, until, signals) {
+                        Ok(FlushOut::Done) => published = calls.len(),
+                        Ok(FlushOut::Pending) => {}
+                        Ok(FlushOut::Hangup) => open = false,
+                        Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
+                            Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                            Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                            Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                        },
+                        Err(error) => {
+                            stop_child(run).map_err(child_error)?;
+                            return Err(error);
+                        }
+                    }
+                }
+                try_recv = open && parked_guard.parked.is_none() && ready.readable;
+                recv_deadline = Deadline::PASSED;
+            }
+            if try_recv {
                 let got = if core::mem::take(&mut again) {
                     // Its code came: the frames kept from the waiting one on, served again.
                     Some(inbox.len())
                 } else {
-                    match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, poll) {
-                        Ok(Message::Whole { len }) => Some(len),
+                    match run.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, recv_deadline) {
+                        Ok(Message::Whole { len }) => {
+                            signals.progress.set(true);
+                            Some(len)
+                        }
                         Ok(Message::Closed) => {
                             open = false;
+                            signals.progress.set(true);
                             None
                         }
                         Err(error @ ProcError { fault: RunFault::Channel(ChannelError::Torn { .. }), .. }) => {
@@ -2717,189 +3450,360 @@ impl<'c> Launched<'c, '_, '_> {
                     }
                 };
                 if let Some(len) = got {
-                        self.watch.see(blaze_screen::Step::Waits);
-                        signals.begin(Doing::Serving);
-                        let serving = run.now();
-                        let before = lazy.tally();
-                        let mut resolver = TestResolve { parent: &mut lazy, requested: None };
-                        let taken = match needs.serve(&mut resolver, &inbox[..len], &mut reply) {
-                            Ok(taken) => taken,
-                            Err(cause) => {
-                                signals.add_host_nanos(run.now().saturating_sub(serving));
-                                // This group is waiting for code it will never receive.
-                                // Kill and reap before returning its typed outcome to the plan.
-                                run.kill().map_err(child_error)?;
-                                return Err(test_parent_error(&mut lazy, cause));
-                            }
-                        };
-                        let elapsed = run.now().saturating_sub(serving);
-                        service_time += elapsed;
-                        signals.add_host_nanos(elapsed);
-                        match resolver.requested {
-                            Some(TestAnswer::Unresolved(Symbol(symbol))) => {
-                                // Sending Failed would turn the unavailable instance into a launcher exit.
-                                run.kill().map_err(child_error)?;
-                                return Err(OneError::CannotBuild(InstanceRefusal {
-                                    instance: lazy.name_of(symbol), symbol, site: None, cause: RefusalCause::Unresolved,
-                                }));
-                            }
-                            Some(TestAnswer::Ready { symbol, record }) => {
-                                let after = lazy.tally();
-                                let unkeyed = after.unkeyed - before.unkeyed;
-                                if keep.is_ok() {
-                                    if unkeyed > 0 {
-                                        keep = Err(NotKept::Untraced);
-                                    } else {
-                                        rec_bytes.clear();
-                                        match lazy.read_record(&record, &mut rec_bytes) {
-                                            Ok(()) => {
-                                                if let Err(why) = crate::test_cache::check_record_purity(rec_bytes.as_slice()) {
-                                                    keep = Err(why);
-                                                }
-                                            }
-                                            Err(_) => keep = Err(NotKept::Untraced),
-                                        }
-                                    }
-                                    if keep.is_ok() {
-                                        let cache_alloc = self.cache_alloc;
-                                        lazy.walked_entered(&symbol, |sym, tabled, name, key| {
-                                            if key.is_none() {
-                                                keep = Err(NotKept::Untraced);
-                                                return;
-                                            }
-                                            match blaze_ladder::body_ids::instance_key(
-                                                blaze_code::record::Symbol(sym.0),
-                                                tabled,
-                                                name,
-                                                self.ids,
-                                                &self.builder,
-                                                &self.builder.producer,
-                                                cache_alloc,
-                                            ) {
-                                                Some(inst_key) => {
-                                                    let mut name_copy = Vec::with_capacity_in(name.len(), cache_alloc);
-                                                    name_copy.extend_from_slice(name);
-                                                    entered_fns.push(crate::test_cache::EnteredFn {
-                                                        symbol: FnName(sym.0),
-                                                        code_key: inst_key.0.0,
-                                                        tabled,
-                                                        name: name_copy,
-                                                    });
-                                                }
-                                                None => keep = Err(NotKept::Untraced),
-                                            }
-                                        });
-                                    }
-                                }
-                                calls.push(FirstCall {
-                                    symbol, elapsed, made: after.made - before.made,
-                                    found: after.found - before.found, unkeyed,
-                                });
-                            }
-                            // Its row waits for its code, made by a worker (D194): the run parks.
-                            Some(TestAnswer::Waiting(Symbol(symbol))) => {
-                                let asked = match self.codes {
-                                    Some(code) => self.ask_code(code, child, &lazy),
-                                    // `Serial` makes inside the step and never waits.
-                                    None => Err(OneError::Parent(ParentError::NotReady { symbol })),
-                                };
-                                if let Err(error) = asked {
-                                    run.kill().map_err(child_error)?;
-                                    return Err(error);
-                                }
-                                parked = Some(Parked { since: run.now(), symbol });
-                                signals.parked_now.set(true);
-                            }
-                            // Faults and requests for an already answered slot need no resolution.
-                            None => {}
+                    compact_reply(&mut reply, &mut reply_at);
+                    self.watch.see(blaze_screen::Step::Waits);
+                    signals.begin(Doing::Serving);
+                    let serving = run.now();
+                    let was_keep_ok = keep.is_ok();
+                    let mut resolver = ChildResolver::new(
+                        self.suite_cache,
+                        &mut child_sent,
+                        &roots,
+                        test_entry,
+                        code_mode,
+                        self.ids,
+                        &mut codes,
+                        cx,
+                        self.watch,
+                        &mut tally,
+                        &mut keep,
+                        &mut entered_fns,
+                        self.cache_alloc,
+                        alloc,
+                    );
+                    let frame_bytes = inbox.get(..len).unwrap_or(inbox.as_slice());
+                    let taken = match needs.serve(&mut resolver, frame_bytes, &mut reply) {
+                        Ok(taken) => taken,
+                        Err(cause) => {
+                            signals.add_host_nanos(run.now().saturating_sub(serving));
+                            stop_child(run).map_err(child_error)?;
+                            return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
                         }
-                        self.watch.see(blaze_screen::Step::Answers);
-                        // The served prefix out, the rest kept in order, as run_loop.rs does
-                        // (`drain` wants the nightly-only allocator trait of the vec's allocator).
-                        let left = inbox.len() - taken;
-                        inbox.copy_within(taken.., 0);
-                        inbox.truncate(left);
-                        continue;
+                    };
+                    let requested = resolver.requested.take();
+                    drop(resolver);
+                    match requested {
+                        Some(ChildAnswer::Unresolved(Symbol(symbol))) => {
+                            signals.add_host_nanos(run.now().saturating_sub(serving));
+                            stop_child(run).map_err(child_error)?;
+                            let instance = self.suite_cache.borrow().name_of(symbol);
+                            return Err(OneError::CannotBuild(InstanceRefusal {
+                                instance, symbol, site: None, cause: RefusalCause::Unresolved,
+                            }));
+                        }
+                        Some(ChildAnswer::Ready { symbol, counts }) => {
+                            // Batch pre-publish for impure tests: when a test becomes impure (or
+                            // warm_order grew by >= 256 while impure), push all remaining warm
+                            // suite functions in one batch. Pure tests never receive pre-published
+                            // functions so their `entered_fns` and `BZTR` addresses stay exact.
+                            let warm_len = self.suite_cache.borrow().warm_len();
+                            if keep.is_err()
+                                && child_sent.warm_cursor < warm_len
+                                && (was_keep_ok || warm_len.saturating_sub(child_sent.warm_cursor) >= 256)
+                            {
+                                // Ensure any lazily-armed native library is loaded before pre-publishing
+                                // warm suite functions (which may include foreign callers from earlier tests).
+                                if let Err(cause) = needs.flush_pending_native(&mut reply) {
+                                    signals.add_host_nanos(run.now().saturating_sub(serving));
+                                    stop_child(run).map_err(child_error)?;
+                                    return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+                                }
+                                if let Err(cause) = self.suite_cache.borrow().prepublish_warm(
+                                    test_entry,
+                                    head,
+                                    &mut child_sent,
+                                    &mut needs,
+                                    &mut reply,
+                                    &mut tally,
+                                    alloc,
+                                ) {
+                                    signals.add_host_nanos(run.now().saturating_sub(serving));
+                                    stop_child(run).map_err(child_error)?;
+                                    return Err(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause));
+                                }
+                            }
+                            let elapsed = run.now().saturating_sub(serving);
+                            service_time += elapsed;
+                            signals.add_host_nanos(elapsed);
+                            calls.push(FirstCall {
+                                symbol, elapsed, made: counts.made, found: counts.found, unkeyed: counts.unkeyed,
+                            });
+                        }
+                        Some(ChildAnswer::Waiting(need)) => {
+                            let elapsed = run.now().saturating_sub(serving);
+                            service_time += elapsed;
+                            signals.add_host_nanos(elapsed);
+                            match need {
+                                NeedCode::Ask(ask) => {
+                                    let asked = match self.codes {
+                                        Some(code) => {
+                                            let job = self.suite_cache.borrow().job_for(self.suite, &ask, code.alloc);
+                                            code.ask(child, ask.key, job)
+                                        }
+                                        None => Err(OneError::Parent(ParentError::NotReady { symbol: ask.symbol })),
+                                    };
+                                    if let Err(error) = asked {
+                                        self.suite_cache.borrow_mut().release_in_flight(ask.row, ask.epoch);
+                                        stop_child(run).map_err(child_error)?;
+                                        return Err(error);
+                                    }
+                                    parked_guard.parked = Some(Parked {
+                                        since: run.now(),
+                                        symbol: ask.symbol,
+                                        row: ask.row,
+                                        epoch: ask.epoch,
+                                        peer: false,
+                                    });
+                                    signals.parked_now.set(true);
+                                }
+                                NeedCode::WaitPeer { row: wait_row, epoch, symbol } => {
+                                    parked_guard.parked = Some(Parked {
+                                        since: run.now(),
+                                        symbol,
+                                        row: wait_row,
+                                        epoch,
+                                        peer: true,
+                                    });
+                                    signals.parked_now.set(true);
+                                }
+                            }
+                        }
+                        None => {
+                            let elapsed = run.now().saturating_sub(serving);
+                            service_time += elapsed;
+                            signals.add_host_nanos(elapsed);
+                        }
+                    }
+                    self.watch.see(blaze_screen::Step::Answers);
+                    let left = inbox.len() - taken;
+                    inbox.copy_within(taken.., 0);
+                    inbox.truncate(left);
+                    // Flush as much as fits non-blockingly on the same turn so small replies wake
+                    // the child immediately while large batches stream without blocking or deadlocking.
+                    if open && reply_at < reply.len() {
+                        let fresh_parked = parked_for.saturating_add(parked_guard.parked.map_or(Duration::ZERO, |park| run.now().saturating_sub(park.since)));
+                        let fresh_until = current_until(started_at, allowance, fresh_parked, signals);
+                        match flush_reply(&mut run, &mut reply, &mut reply_at, &mut write_since, fresh_until, signals) {
+                            Ok(FlushOut::Done) => published = calls.len(),
+                            Ok(FlushOut::Pending) => {}
+                            Ok(FlushOut::Hangup) => open = false,
+                            Ok(FlushOut::TimedOut) => match stop_child(run).map_err(child_error)? {
+                                Stopped::Exited { exit, left } => break (child_outcome(exit), Some(left)),
+                                Stopped::Killed { left, .. } => break (How::TimedOut { after: budget }, Some(left)),
+                                Stopped::ZombieRace => break (How::TimedOut { after: budget }, None),
+                            },
+                            Err(error) => {
+                                stop_child(run).map_err(child_error)?;
+                                return Err(error);
+                            }
+                        }
+                    }
+                    continue;
                 }
             }
-            // Parked, the turn's wait is the sweep's interval (as a read's would be).
-            let look = if open && parked.is_none() { Deadline::PASSED } else { poll };
+            let look = if open && parked_guard.parked.is_none() { Deadline::PASSED } else if open && reply_at < reply.len() { Deadline::PASSED } else { poll };
             run = match run.wait(look).map_err(child_error)? {
-                Waited::Ended(reaped) => break (child_outcome(reaped.exit), reaped.left),
+                Waited::Ended(reaped) => break (child_outcome(reaped.exit), Some(reaped.left)),
                 Waited::Running(running) => running,
             };
         };
-        // The reaped child's remaining output belongs to its own capture.
-        let drain_until = Deadline::after(over.now(), DRAIN_AFTER);
-        while pipes.iter().any(Option::is_some) && !drain_until.passed(over.now()) {
-            let poll = Deadline::after(over.now(), signals.wait.replace(Duration::ZERO)).min(drain_until);
-            drain_pipes(cx, &mut pipes, output, stderr, poll)?;
-            if pipes.iter().any(Option::is_some) {
-                next_turn().await;
+        drop(parked_guard);
+        if let Some(over_ref) = over.as_ref() {
+            let drain_until = Deadline::after(over_ref.now(), DRAIN_AFTER);
+            while pipes.iter().any(Option::is_some) && !drain_until.passed(over_ref.now()) {
+                let poll = Deadline::after(over_ref.now(), signals.wait.replace(Duration::ZERO)).min(drain_until);
+                let _ = drain_pipes(cx, &mut pipes, output, stderr, poll)?;
+                if pipes.iter().any(Option::is_some) {
+                    next_turn().await;
+                }
+            }
+        } else {
+            let _ = drain_pipes(cx, &mut pipes, output, stderr, Deadline::PASSED)?;
+        }
+        let mut panic_text = String::new_in(self.tables);
+        if self.tests.harnessed() && matches!(ended, How::NoReport { code: 101, torn: 0 }) {
+            #[cfg(target_os = "linux")]
+            let unwound = {
+                let _ = unwound_path;
+                unwound_channel.as_mut().is_some_and(|ch| ch.did_unwind(frame))
+            };
+            #[cfg(not(target_os = "linux"))]
+            let unwound = match suite_dir.open_read(cx, unwound_path) {
+                Ok(marker) => {
+                    let mut byte = [0u8; 1];
+                    let n = marker.read_into(&mut byte, 0).wait(cx).map_err(OneError::Capture)?;
+                    drop(marker);
+                    let _ = suite_dir.remove(cx, unwound_path, Durable::No);
+                    n > 0 && byte[0] == b'1'
+                }
+                Err(error) if error.kind == FsKind::NotFound => false,
+                Err(error) => return Err(OneError::Capture(error)),
+            };
+            if unwound {
+                ended = How::Reported(Said::Panicked { at: None });
+                let tail = stderr.tail_bytes(cx, frame)?;
+                let mut lossy = String::new_in(alloc);
+                for chunk in tail.utf8_chunks() {
+                    lossy.push_str(chunk.valid());
+                    if !chunk.invalid().is_empty() {
+                        lossy.push('\u{FFFD}');
+                    }
+                }
+                panic_text.push_str(extract_panic_message(lossy.as_str()));
             }
         }
         if let How::Signal { number } = ended {
-            let path = self.tests.row(row as usize).map_err(OneError::Record)?.ok_or(OneError::NoRow { row })?.path;
-            let err = self.err;
-            let diagnostic = OneError::Diagnostic;
-            err.line(cx, format_args!("---- {}/{}/{path} signal {number}: stderr ({} bytes) ----", self.package, self.target, stderr.bytes)).map_err(diagnostic)?;
-            let mut first = [0u8; 4000];
-            let wanted = stderr.bytes.min(first.len() as u64) as usize;
-            let held = wanted.min(stderr.prefix.len());
-            first[..held].copy_from_slice(&stderr.prefix[..held]);
-            if held < wanted {
-                // The spill starts immediately after the in-memory prefix, even when
-                // the first pipe read was too large to keep any prefix.
-                let file = stderr.dir.open_read(cx, &stderr.path).map_err(OneError::Capture)?;
-                let mut read = held;
-                while read < wanted {
-                    let n = file.read_into(&mut first[read..wanted], (read - held) as u64).wait(cx).map_err(OneError::Capture)?;
-                    if n == 0 {
-                        return Err(OneError::ShortCapture { read: read as u64, written: stderr.bytes });
-                    }
-                    read += n;
-                }
+            let mut sc = self.suite_cache.borrow_mut();
+            self.write_signal_report(
+                row,
+                number,
+                stderr,
+                pipes[1].is_some(),
+                service_time,
+                tally,
+                calls.as_slice(),
+                published,
+                &needs,
+                &mut over,
+                &mut inbox,
+                torn,
+                frame,
+                &mut *sc,
+                |sc, rec, bytes| sc.read_record(rec, bytes),
+            )?;
+        } else if let Some(error) = torn {
+            return Err(child_error(error));
+        }
+        if self.expose_bins
+            && let Some(bins_cell) = self.bins
+        {
+            bins_cell
+                .borrow_mut()
+                .drain_owner_evidence(self.suite.0, row, &mut entered_fns, &mut keep)
+                .map_err(OneError::BinServe)?;
+        }
+        if entered_fns.is_empty() && keep.is_ok() {
+            keep = Err(NotKept::Untraced);
+        }
+        entered_fns.sort_unstable_by_key(|e| e.symbol);
+        entered_fns.dedup_by_key(|e| e.symbol);
+        let mut entered = Vec::with_capacity_in(entered_fns.len(), self.tables);
+        for e in entered_fns.iter() {
+            entered.push(e.symbol);
+        }
+        if !entered_fns.is_empty() {
+            let mut sink = self.entered_sink.borrow_mut();
+            for e in entered_fns {
+                sink.push((self.suite, e));
             }
-            let mut line = [0u8; 101];
-            let mut width = 0;
-            for &byte in &first[..wanted] {
-                let escaped = core::ascii::escape_default(byte);
-                if width + escaped.len() > 100 {
-                    line[width] = b'\n';
-                    err.write_all(cx, &line[..=width]).map_err(diagnostic)?;
-                    width = 0;
+        }
+        Ok(RunOutcome { how: ended, keep, panic_text, entered })
+    }
+
+    /// Formats one signaled test child's diagnostic report (shared by `run_captured` and
+    /// `run_captured_cached`).
+    #[expect(clippy::too_many_arguments, reason = "formats one child's signal diagnostic from the run's captured state")]
+    fn write_signal_report<P, R>(
+        &self,
+        row: u32,
+        number: i32,
+        stderr: &StderrCapture<'_>,
+        stderr_open: bool,
+        service_time: Duration,
+        tally: run_parent::Tally,
+        calls: &[FirstCall],
+        published: usize,
+        needs: &Needs<'_>,
+        over: &mut Option<bstd::procs::ServedEnd>,
+        inbox: &mut run_parent::WireOut<Alloc<'_>>,
+        mut torn: Option<ProcError>,
+        frame: &Frame,
+        places: &mut P,
+        mut read_record: R,
+    ) -> Result<(), OneError>
+    where
+        P: crate::run_fault::Places,
+        R: FnMut(&mut P, &blaze_launch::wire::RecordId, &mut bstd::mem::Bytes<'_>) -> Result<(), ParentError>,
+    {
+        let cx = self.cx;
+        let row_idx = usize::try_from(row).unwrap_or(usize::MAX);
+        let path = self.tests.row(row_idx).map_err(OneError::Record)?.ok_or(OneError::NoRow { row })?.path;
+        let err = self.err;
+        let diagnostic = OneError::Diagnostic;
+        let child_error = |error| OneError::Loop(RunLoopError::Child(error));
+        err.line(cx, format_args!("---- {}/{}/{path} signal {number}: stderr ({} bytes) ----", self.package, self.target, stderr.bytes)).map_err(diagnostic)?;
+        let mut first = [0u8; 4000];
+        let cap = u64::try_from(first.len()).unwrap_or(u64::MAX);
+        let wanted = usize::try_from(stderr.bytes.min(cap)).unwrap_or(first.len());
+        let held = wanted.min(stderr.prefix.len());
+        if let (Some(dst), Some(src)) = (first.get_mut(..held), stderr.prefix.get(..held)) {
+            dst.copy_from_slice(src);
+        }
+        if held < wanted {
+            let file = stderr.dir.open_read(cx, &stderr.path).map_err(OneError::Capture)?;
+            let mut read = held;
+            while read < wanted {
+                let Some(slice) = first.get_mut(read..wanted) else { break };
+                let off = u64::try_from(read - held).unwrap_or(u64::MAX);
+                let n = file.read_into(slice, off).wait(cx).map_err(OneError::Capture)?;
+                if n == 0 {
+                    return Err(OneError::ShortCapture { read: u64::try_from(read).unwrap_or(u64::MAX), written: stderr.bytes });
                 }
-                for ascii in escaped {
-                    line[width] = ascii;
+                read += n;
+            }
+        }
+        let mut line = [0u8; 101];
+        let mut width = 0;
+        for &byte in first.iter().take(wanted) {
+            let escaped = core::ascii::escape_default(byte);
+            if width + escaped.len() > 100 {
+                if let Some(slot) = line.get_mut(width) {
+                    *slot = b'\n';
+                }
+                if let Some(chunk) = line.get(..=width) {
+                    err.write_all(cx, chunk).map_err(diagnostic)?;
+                }
+                width = 0;
+            }
+            for ascii in escaped {
+                if let Some(slot) = line.get_mut(width) {
+                    *slot = ascii;
                     width += 1;
                 }
             }
-            if width != 0 {
-                line[width] = b'\n';
-                err.write_all(cx, &line[..=width]).map_err(diagnostic)?;
+        }
+        if width != 0 {
+            if let Some(slot) = line.get_mut(width) {
+                *slot = b'\n';
             }
-            err.line(cx, "---- end escaped stderr ----").map_err(diagnostic)?;
-            if pipes[1].is_some() {
-                err.line(cx, "\nstderr was still open at the post-exit drain deadline").map_err(diagnostic)?;
+            if let Some(chunk) = line.get(..=width) {
+                err.write_all(cx, chunk).map_err(diagnostic)?;
             }
-            err.line(cx, format_args!("\nfirst calls: {}; parent serving requests: {service_time:?}; {}", calls.len(), lazy.tally())).map_err(diagnostic)?;
-            match calls[..published].last() {
-                Some(call) => err.line(cx, format_args!("last published: {}", InstanceName(&lazy.name_of(call.symbol.0), call.symbol.0))),
-                None => err.line(cx, "last published: none"),
-            }.map_err(diagnostic)?;
-            for call in &calls[published..] {
-                err.line(cx, format_args!("pending need: {}", InstanceName(&lazy.name_of(call.symbol.0), call.symbol.0))).map_err(diagnostic)?;
-            }
-            // A last request or fault may have reached fd 3 between the final poll and
-            // waitpid. Read already-queued messages without building anything for a dead child.
-            let mut fault = needs.fault();
-            let mut queued = false;
-            let wire_error = |why| OneError::Parent(ParentError::Wire(why));
+        }
+        err.line(cx, "---- end escaped stderr ----").map_err(diagnostic)?;
+        if stderr_open {
+            err.line(cx, "\nstderr was still open at the post-exit drain deadline").map_err(diagnostic)?;
+        }
+        err.line(cx, format_args!("\nfirst calls: {}; parent serving requests: {service_time:?}; {tally}", calls.len())).map_err(diagnostic)?;
+        let pub_slice = calls.get(..published).unwrap_or(calls);
+        let pend_slice = calls.get(published..).unwrap_or(&[]);
+        match pub_slice.last() {
+            Some(call) => err.line(cx, format_args!("last published: {}", InstanceName(&places.named(call.symbol.0), call.symbol.0))),
+            None => err.line(cx, "last published: none"),
+        }.map_err(diagnostic)?;
+        for call in pend_slice {
+            err.line(cx, format_args!("pending need: {}", InstanceName(&places.named(call.symbol.0), call.symbol.0))).map_err(diagnostic)?;
+        }
+        let mut fault = needs.fault();
+        let mut queued = false;
+        let wire_error = |why| OneError::Parent(ParentError::Wire(why));
+        if let Some(over) = over.as_mut() {
             let read_until = Deadline::after(over.now(), DRAIN_AFTER);
             while torn.is_none() && !read_until.passed(over.now()) {
-                match over.recv_message(&mut inbox, blaze_launch::wire::LONGEST_FRAME, Deadline::PASSED) {
+                match over.recv_message(inbox, blaze_launch::wire::LONGEST_FRAME, Deadline::PASSED) {
                     Ok(Message::Whole { len }) => {
-                        let (_, up) = blaze_launch::wire::run::Up::decode(&inbox[4..len]).map_err(wire_error)?;
+                        let body = inbox.get(4..len).unwrap_or(&[]);
+                        let (_, up) = blaze_launch::wire::run::Up::decode(body).map_err(wire_error)?;
                         match up {
                             blaze_launch::wire::run::Up::Need { need, .. } => {
                                 queued = true;
@@ -2920,51 +3824,56 @@ impl<'c> Launched<'c, '_, '_> {
                     Err(error) => return Err(child_error(error)),
                 }
             }
-            if !queued && calls.len() == published && inbox.is_empty() {
-                err.line(cx, "pending need: none").map_err(diagnostic)?;
-            }
-            if let Some(error) = torn {
-                err.line(cx, format_args!("incomplete first-call channel message: {error}")).map_err(diagnostic)?;
-            } else if !inbox.is_empty() {
-                err.line(cx, format_args!("unprocessed first-call channel bytes at exit: {}", inbox.len())).map_err(diagnostic)?;
-            }
-            err.line(cx, "refusal stub: no refused first call observed by the parent").map_err(diagnostic)?;
-            if let Some(fault) = fault {
-                let mut bytes = bstd::mem::Bytes::new_in(frame, "the code record a test struck in");
-                let record = match fault.at {
-                    Some(spot) if spot.placed == blaze_launch::wire::fault::Placed::Code => Some(lazy.read_record(&spot.record, &mut bytes).map(|()| bytes.as_slice())),
-                    _ => None,
-                };
-                err.line(cx, format_args!("{}", crate::run_fault::report(fault, &mut lazy, record))).map_err(diagnostic)?;
-            } else {
-                err.line(cx, format_args!("the launcher sent no fault location for signal {number}")).map_err(diagnostic)?;
-            }
-            for call in &calls[..published] {
-                err.line(cx, format_args!("published: {} in {:?} (records made {}, found {}, unkeyed {})",
-                    InstanceName(&lazy.name_of(call.symbol.0), call.symbol.0), call.elapsed, call.made, call.found, call.unkeyed)).map_err(diagnostic)?;
-            }
-            err.line(cx, "---- end signal report ----").map_err(diagnostic)?;
-            err.flush(cx).map_err(diagnostic)?;
-        } else if let Some(error) = torn {
-            return Err(child_error(error));
         }
-        if entered_fns.is_empty() && keep.is_ok() {
-            keep = Err(NotKept::Untraced);
+        if !queued && calls.len() == published && inbox.is_empty() {
+            err.line(cx, "pending need: none").map_err(diagnostic)?;
         }
-        entered_fns.sort_unstable_by_key(|e| e.symbol);
-        entered_fns.dedup_by_key(|e| e.symbol);
-        let mut entered = Vec::with_capacity_in(entered_fns.len(), self.tables);
-        for e in entered_fns.iter() {
-            entered.push(e.symbol);
+        if let Some(error) = torn {
+            err.line(cx, format_args!("incomplete first-call channel message: {error}")).map_err(diagnostic)?;
+        } else if !inbox.is_empty() {
+            err.line(cx, format_args!("unprocessed first-call channel bytes at exit: {}", inbox.len())).map_err(diagnostic)?;
         }
-        if !entered_fns.is_empty() {
-            let mut sink = self.entered_sink.borrow_mut();
-            for e in entered_fns {
-                sink.push((self.suite, e));
-            }
+        err.line(cx, "refusal stub: no refused first call observed by the parent").map_err(diagnostic)?;
+        if let Some(fault) = fault {
+            let mut bytes = bstd::mem::Bytes::new_in(frame, "the code record a test struck in");
+            let record = match fault.at {
+                Some(spot) if spot.placed == blaze_launch::wire::fault::Placed::Code => Some(read_record(places, &spot.record, &mut bytes).map(|()| bytes.as_slice())),
+                _ => None,
+            };
+            err.line(cx, format_args!("{}", crate::run_fault::report(fault, places, record))).map_err(diagnostic)?;
+        } else {
+            err.line(cx, format_args!("the launcher sent no fault location for signal {number}")).map_err(diagnostic)?;
         }
-        Ok(RunOutcome { how: ended, keep, entered })
+        for call in pub_slice {
+            err.line(cx, format_args!("published: {} in {:?} (records made {}, found {}, unkeyed {})",
+                InstanceName(&places.named(call.symbol.0), call.symbol.0), call.elapsed, call.made, call.found, call.unkeyed)).map_err(diagnostic)?;
+        }
+        err.line(cx, "---- end signal report ----").map_err(diagnostic)?;
+        err.flush(cx).map_err(diagnostic)?;
+        Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_profile<'a>(
+    temp: &str,
+    store: &str,
+    native: Option<crate::engine_native::NativeSend<'_>>,
+    unwound: Option<&str>,
+    control: Option<&str>,
+    bin_natives: &[crate::engine_native::NativeSend<'_>],
+    frame: &Frame,
+    alloc: Alloc<'a>,
+) -> Result<AString<'a>, OneError> {
+    let profile = blaze_run::child::seatbelt(temp, control, alloc).map_err(|why| {
+        let text = bstd::mem::format_in!(frame, "{why}");
+        OneError::Profile { why: text.as_str().into() }
+    })?;
+    let mut profile = with_native(profile, store, native)?;
+    for &bin_native in bin_natives {
+        profile = with_native(profile, store, Some(bin_native))?;
+    }
+    with_unwound(profile, unwound)
 }
 
 fn child_outcome(exit: Exit) -> How {
@@ -2975,114 +3884,200 @@ fn child_outcome(exit: Exit) -> How {
     }
 }
 
+/// Parses a single line matching Rust's standard panic hook header:
+/// `thread '<name>' panicked at <rest>` or `thread '<name>' (<tid>) panicked at <rest>`.
+fn parse_panic_header(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("thread '")?;
+    if let Some(at) = rest.find("' panicked at ") {
+        return rest.get(at + "' panicked at ".len()..);
+    }
+    if let Some(at) = rest.find("' (") {
+        let after_open = rest.get(at + "' (".len()..)?;
+        let (digits, after_close) = after_open.split_once(") panicked at ")?;
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(after_close);
+        }
+    }
+    None
+}
+
+/// Returns true when `line` begins Rust's standard post-payload panic trailer.
+fn is_panic_trailer(line: &str) -> bool {
+    line.starts_with("note: run with `RUST_BACKTRACE=") || line == "stack backtrace:"
+}
+
+/// Extracts the panic payload message emitted by Rust's standard panic hook from captured stderr.
+///
+/// Handles both modern multi-line (`thread '...' panicked at <loc>:\n<payload>`) and legacy
+/// single-line (`thread '...' panicked at '<payload>', <loc>`) formats, returning the last panic
+/// header's payload when multiple threads panicked. Returns `""` when no standard Rust panic
+/// header is found, so unrelated stderr lines never falsely satisfy `#[should_panic(expected = ...)]`.
+fn extract_panic_message(stderr: &str) -> &str {
+    let mut last_match: Option<(usize, &str)> = None;
+    let mut offset = 0;
+    for raw_line in stderr.split_inclusive('\n') {
+        let line_end = offset + raw_line.len();
+        let trimmed = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+        if let Some(after) = parse_panic_header(trimmed) {
+            last_match = Some((line_end, after));
+        }
+        offset = line_end;
+    }
+    let Some((body_start, after)) = last_match else {
+        return "";
+    };
+    if after.ends_with(':') {
+        let rest = stderr.get(body_start..).unwrap_or("");
+        let mut end = 0;
+        for raw_line in rest.split_inclusive('\n') {
+            let trimmed = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+            let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
+            if is_panic_trailer(trimmed) {
+                break;
+            }
+            end += raw_line.len();
+        }
+        let body = rest.get(..end).unwrap_or("");
+        let body = body.strip_suffix('\n').unwrap_or(body);
+        return body.strip_suffix('\r').unwrap_or(body);
+    }
+    if let Some(quoted) = after.strip_prefix('\'')
+        && let Some((payload, _loc)) = quoted.rsplit_once("', ")
+    {
+        return payload;
+    }
+    ""
+}
+
+/// Computes the test's execution deadline crediting both previously accumulated command-thread
+/// stall time (`signals.stalled`) and host work already performed during this poll
+/// (`signals.host_nanos`). Ensures a long compilation turn never leaves `until` stale in the past.
+fn current_until(started_at: Duration, allowance: Duration, parked: Duration, signals: &Signals) -> Deadline {
+    let stalled = signals.stalled.get().saturating_add(signals.host_nanos.get().unwrap_or(0));
+    Deadline::after(
+        started_at,
+        allowance.saturating_add(parked).saturating_add(Duration::from_nanos(stalled)),
+    )
+}
+
+/// Removes already-sent prefix bytes from `reply` before appending new frames.
+fn compact_reply<A: core::alloc::Allocator>(reply: &mut run_parent::WireOut<A>, reply_at: &mut usize) {
+    if *reply_at == 0 {
+        return;
+    }
+    let rem = reply.len().saturating_sub(*reply_at);
+    if rem == 0 {
+        reply.clear();
+    } else {
+        reply.copy_within(*reply_at.., 0);
+        reply.truncate(rem);
+    }
+    *reply_at = 0;
+}
+
+/// Outcome of one non-blocking incremental flush of the child's reply outbox.
+enum FlushOut {
+    /// All queued bytes were written into the child's channel.
+    Done,
+    /// Socket buffer filled before all bytes were written; remaining bytes stay queued for the
+    /// next turn while pipes and incoming child messages continue to drain.
+    Pending,
+    /// The child closed its end of the channel.
+    Hangup,
+    /// The test's execution deadline (`until`) passed while waiting for room to write.
+    TimedOut,
+}
+
+/// Non-blockingly flushes as much of `reply[*reply_at..]` as the kernel socket accepts without
+/// stalling sibling tests or deadlocking on large batches (e.g. `prepublish_warm` or large inline
+/// records). Resets `write_since` on every byte written and only fails with `WriteDeadline` if no
+/// progress occurs for `WRITE_BOUND` while `until` has not expired.
+fn flush_reply<A: core::alloc::Allocator>(
+    run: &mut bstd::procs::Served,
+    reply: &mut run_parent::WireOut<A>,
+    reply_at: &mut usize,
+    write_since: &mut Option<Duration>,
+    until: Deadline,
+    signals: &Signals,
+) -> Result<FlushOut, OneError> {
+    let Some(pending) = reply.get(*reply_at..) else {
+        reply.clear();
+        *reply_at = 0;
+        *write_since = None;
+        return Ok(FlushOut::Done);
+    };
+    if pending.is_empty() {
+        reply.clear();
+        *reply_at = 0;
+        *write_since = None;
+        return Ok(FlushOut::Done);
+    }
+    match run.send_some(pending, Deadline::PASSED) {
+        Ok(ChannelWrite::Bytes(n)) if n > 0 => {
+            *reply_at += n;
+            signals.progress.set(true);
+            if *reply_at >= reply.len() {
+                reply.clear();
+                *reply_at = 0;
+                *write_since = None;
+                Ok(FlushOut::Done)
+            } else {
+                *write_since = Some(run.now());
+                Ok(FlushOut::Pending)
+            }
+        }
+        Ok(ChannelWrite::Bytes(_) | ChannelWrite::Deadline) => {
+            let now = run.now();
+            if until.passed(now) {
+                return Ok(FlushOut::TimedOut);
+            }
+            let since = *write_since.get_or_insert(now);
+            if now.saturating_sub(since) >= WRITE_BOUND {
+                return Err(OneError::Loop(RunLoopError::Child(ProcError {
+                    step: RunStep::Send,
+                    proc: Some(run.id()),
+                    fault: RunFault::Channel(ChannelError::WriteDeadline { sent: *reply_at, of: reply.len() }),
+                })));
+            }
+            Ok(FlushOut::Pending)
+        }
+        Err(ProcError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => {
+            reply.clear();
+            *reply_at = 0;
+            *write_since = None;
+            Ok(FlushOut::Hangup)
+        }
+        Err(error) => Err(OneError::Loop(RunLoopError::Child(error))),
+    }
+}
+
 /// At most a pipeful from each stream per turn, so a writer that never stops cannot starve
-/// another child's first-call channel or deadline.
-fn drain_pipes(cx: &Cx, pipes: &mut [Option<OutPipe>; 2], output: &mut Output<'_>, stderr: &mut StderrCapture<'_>, by: Deadline) -> Result<(), OneError> {
+/// another child's first-call channel or deadline. Returns `true` if any pipe produced bytes
+/// or closed on this call.
+fn drain_pipes(cx: &Cx, pipes: &mut [Option<OutPipe>; 2], output: &mut Output<'_>, stderr: &mut StderrCapture<'_>, by: Deadline) -> Result<bool, OneError> {
     let mut chunk = [0u8; 16 * 1024];
+    let mut active = false;
     for (stream, slot) in pipes.iter_mut().enumerate() {
         for _ in 0..4 {
             let Some(pipe) = slot.as_ref() else { break };
             match pipe.read(&mut chunk, by).map_err(OneError::Pipe)? {
                 Piped::Bytes(n) => {
+                    active = true;
                     output.push(&chunk[..n]);
                     if stream == 1 {
                         stderr.push(cx, &chunk[..n])?;
                     }
                 }
-                Piped::Closed => *slot = None,
+                Piped::Closed => {
+                    active = true;
+                    *slot = None;
+                }
                 Piped::Deadline => break,
             }
         }
     }
-    Ok(())
-}
-
-/// The front of one test's run: the command's names records and body ids (made once for the
-/// suite, shared by every test), the roots of row n's test fn (test_roots.rs).
-pub(crate) struct TestFront<'s, 'h, 'r> {
-    pub harness: bool,
-    pub names: NamesRecords<'h>,
-    pub ids: &'s RunIds<'h>,
-    pub builder: Builder,
-    pub tables: Alloc<'static>,
-    pub alloc: Alloc<'r>,
-    pub test: LibKey,
-    /// The Rust fns the test binary's C calls (its image's words, `NativeSend::items`): roots.
-    pub exports: &'s [LibKey],
-    pub watch: &'s dyn Watch,
-    /// The command's make watch ([`Launched::make_watch`]), handed to each maker made.
-    pub make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
-}
-
-impl<'s, 'h, 'r> Front for TestFront<'s, 'h, 'r> {
-    type Start = Roots<'r>;
-    type Ids = &'s RunIds<'h>;
-    type Maker = TestMaker<'h>;
-
-    fn start(&mut self) -> Result<Roots<'r>, ParentError> {
-        entry_roots(self.harness, self.names, self.test, self.exports, self.builder, self.tables, self.alloc).map_err(ParentError::Roots)
-    }
-
-    fn ids(&mut self) -> Result<&'s RunIds<'h>, ParentError> {
-        Ok(self.ids)
-    }
-
-    fn maker(&mut self, start: &Roots<'r>, _ids: &&'s RunIds<'h>) -> Result<TestMaker<'h>, ParentError> {
-        // The test's roots start its program at the test fn (`MakerStart::Direct`), not at `main`.
-        // The typing is the test's ([`TestMaker`]: the workers' too).
-        let mut maker = Maker::of_roots(self.names, start.maker_entry(), start, SecondCheck, &self.builder, self.tables);
-        maker.watch(self.make_watch);
-        Ok(maker)
-    }
-
-    /// As run_parent.rs `CommandFront::path_of`: the one printer over the names records.
-    fn path_of(&mut self, item: ItemKey) -> Option<Box<str>> {
-        use blaze_ladder::front2::source::NamesSource;
-        let lib = self.names.records.key_beginning(item.0.to_be_bytes())?;
-        blaze_ladder::front2::item_shown::ItemShown::of_lib(self.names.records, lib).path().map(Box::from)
-    }
-
-    fn named(&mut self, maker: Option<&TestMaker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
-        use crate::run_fault::Named;
-        if let Some(shown) = maker.and_then(|maker| maker.instance_shown(tabled, name)) {
-            return Named::Shown { item: shown.item, args: shown.args };
-        }
-        match self.path_of(tabled) {
-            Some(path) => Named::Path(path),
-            None => Named::Item(tabled),
-        }
-    }
-
-    fn site_shown(&mut self, maker: Option<&TestMaker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
-        let (file, line, column) = maker?.site_shown(item, site)?;
-        Some(crate::run_fault::SiteShown { file: Box::from(file), line, column })
-    }
-
-    fn watch(&self) -> &dyn Watch {
-        self.watch
-    }
-}
-
-/// The body ids one suite's tests share: each test's lazy parent borrows them.
-impl BodyIds for &RunIds<'_> {
-    fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
-        (**self).body_check(item)
-    }
-    fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
-        (**self).today(fact)
-    }
-    fn crate_fact(&self, item: ItemKey) -> Option<Read> {
-        (**self).crate_fact(item)
-    }
-    fn class(&self, item: ItemKey) -> CodeClass {
-        (**self).class(item)
-    }
-}
-
-impl Gate for &RunIds<'_> {
-    fn runnable(&self, item: ItemKey) -> Result<crate::run_ids::Runnable, crate::run_ids::NotRunnable> {
-        RunIds::runnable(self, item)
-    }
+    Ok(active)
 }
 
 /// `name` beneath `dir`, made; one already there taken as it is (a folder is the state wanted);
@@ -3261,75 +4256,434 @@ struct Selected<'r, T> {
     rows: &'r [Location],
 }
 
-impl Refuse for Selected<'_, EntryCheck<'_, '_>> {
+impl Refuse for Selected<'_, Option<EntryCheck<'_, '_>>> {
     fn refusal(&mut self, flat: u32) -> Result<Option<&str>, OneError> {
-        let loc = self.rows.get(flat as usize).ok_or(OneError::NoRow { row: flat })?;
-        self.suites[loc.suite.0 as usize].refusal(loc.row)
+        let flat_idx = usize::try_from(flat).map_err(|_| OneError::NoRow { row: flat })?;
+        let loc = self.rows.get(flat_idx).ok_or(OneError::NoRow { row: flat })?;
+        let suite_idx = usize::try_from(loc.suite.0).map_err(|_| OneError::NoRow { row: flat })?;
+        let check = self.suites.get_mut(suite_idx).and_then(|suite| suite.as_mut()).ok_or(OneError::NoRow { row: flat })?;
+        check.refusal(loc.row)
     }
 }
 
-impl RunOne for Selected<'_, Launched<'_, '_, '_>> {
+impl RunOne for Selected<'_, Option<Launched<'_, '_, '_>>> {
     async fn run(&self, flat: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
-        let loc = self.rows.get(flat as usize).ok_or(OneError::NoRow { row: flat })?;
-        self.suites[loc.suite.0 as usize].run(loc.row, budget, output, signals).await
+        let flat_idx = usize::try_from(flat).map_err(|_| OneError::NoRow { row: flat })?;
+        let loc = self.rows.get(flat_idx).ok_or(OneError::NoRow { row: flat })?;
+        let suite_idx = usize::try_from(loc.suite.0).map_err(|_| OneError::NoRow { row: flat })?;
+        let launched = self.suites.get(suite_idx).and_then(|suite| suite.as_ref()).ok_or(OneError::NoRow { row: flat })?;
+        launched.run(loc.row, budget, output, signals).await
+    }
+
+    fn pump_bins(&self) -> Result<bool, OneError> {
+        let Some(first) = self.suites.iter().find_map(|s| s.as_ref()) else { return Ok(false) };
+        let Some(bins) = first.bins else { return Ok(false) };
+        bins.borrow_mut()
+            .pump(first.cx, first.ids, first.lent, first.watch)
+            .map_err(OneError::BinServe)
+    }
+
+    fn flat_of(&self, suite: u32, row: u32) -> Option<u32> {
+        self.rows
+            .iter()
+            .position(|loc| loc.suite.0 == suite && loc.row == row)
+            .and_then(|idx| u32::try_from(idx).ok())
     }
 }
 
-/// The selected suites run, their code made where [`CODES`] says (D194, THE seam): `Serial`, in
-/// each test's own turn; `Pooled`, by the command's code workers ([`pooled`]), the relay handed
-/// to every test's run. `root` is the checkout's (each worker's names records read its trees
-/// through it); `procs` is the command's proc-macro runner (by need: a worker asks for it,
-/// [`CodePool`]); `heap` is the command's, the relay's and the workers' tables in it.
-#[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and specific runtime capabilities")]
-pub(crate) fn run_suites<'h>(
+/// Cheap suite descriptor sufficient for `TestCache::open` and `TestLoop` planning without
+/// linking native images or opening crate names records.
+#[derive(Clone, Copy)]
+pub(crate) struct SuiteSpec<'s> {
+    pub unit: TestUnit<'s>,
+    pub builder: Builder,
+    pub digests: crate::test_cache::SuiteDigests,
+}
+
+/// Outcome of the pure `TestCache` + `TestLoop` planning pass ([`prepare_suites`]).
+pub(crate) enum PreparedSuites<'a, 'm, D: blaze_core::Driver> {
+    /// Every targeted test hit `TestCache` (or was ignored/filtered/empty): `TestCache` has
+    /// already committed and printed the closing line with zero code workers, zero launcher
+    /// spawns, zero `$TMPDIR` syscalls, and zero native-image / names-record setup.
+    Done(Status),
+    /// At least one test requires execution; only suites where [`DirtySuites::is_suite_dirty`] is
+    /// `true` need `Suite` materialization (`image_for`, `crates_of`, `names_in`, `package_run`).
+    Dirty(DirtySuites<'a, 'm, D>),
+}
+
+/// State carried from the pure `TestCache` pass into dirty-test execution ([`DirtySuites::run`]).
+pub(crate) struct DirtySuites<'a, 'm, D: blaze_core::Driver> {
+    cache: crate::test_cache::TestCache<'a, 'm, D>,
+    machine: TestLoop<'a, 'a>,
+    pending_runs: AVec<'a, Effect<'a>>,
+    locations: &'a [Location],
+    dirty_suites: &'a [bool],
+    steps_left: usize,
+    most: usize,
+    alloc: Alloc<'a>,
+}
+
+impl<'a, 'm, D: blaze_core::Driver> DirtySuites<'a, 'm, D> {
+    /// Whether suite `index` has at least one runnable test that missed `TestCache`.
+    pub(crate) fn is_suite_dirty(&self, index: usize) -> bool {
+        self.dirty_suites.get(index).copied().unwrap_or(false)
+    }
+
+    /// Number of initial `Effect::Run` dispatches queued in `pending_runs`.
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending_runs.len()
+    }
+}
+
+/// Opens `TestCache` and resolves all pure `Effect::Look` cache checks BEFORE materializing
+/// per-suite native images/names records, spawning code workers, or creating `$TMPDIR` folders:
+/// - When every targeted test hits `TestCache` (0 tests left to run), commits `TestCache` and
+///   returns [`PreparedSuites::Done`] with ZERO worker/process spawns and ZERO setup overhead.
+/// - When some tests are dirty, returns [`PreparedSuites::Dirty`] naming the exact subset of
+///   suites that need execution so clean suites pay zero setup.
+#[expect(clippy::too_many_arguments, reason = "pure cache-resolution edge takes the suite specs, run ids, and cache handles")]
+pub(crate) fn prepare_suites<'a, 'm: 'a, D: blaze_core::Driver>(
     cx: &Cx,
-    fs: &bstd::fs::Fs,
-    env: Option<&bstd::env::Env>,
-    host: &bstd::host::Host,
     clock: &bstd::clock::Clock,
-    rng: &mut bstd::rng::Rng,
     out: &bstd::out::Out,
-    err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
-    args: &[&str], lent: &CommandLent, root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap, watch: &dyn Watch, frame: &Frame,
-) -> Result<Status, DriveError> {
-    let tables = heap.alloc();
-    // The command's one make watch (rule 75: its clock started here, at the edge), handed to
-    // every maker, the serial turns' and each code worker's (rule 16: a large or slow make's line).
-    let make_watch = crate::run_parent::command_make_watch();
-    match CODES {
-        Codes::Serial => run_selected(cx, fs, env, host, clock, out, err, suites, ids, config, args, lent, tables, watch, make_watch, frame, None),
-        Codes::Pooled => pooled(cx, clock, rng, suites, root, procs, heap, make_watch, |relay| run_selected(cx, fs, env, host, clock, out, err, suites, ids, config, args, lent, tables, watch, make_watch, frame, Some(relay))),
+    specs: &[SuiteSpec<'a>],
+    ids: &RunIds<'_>,
+    certificate: &crate::start_list::Certificate,
+    tools_digest: [u8; 32],
+    config: LoopConfig<'a>,
+    args: &[&str],
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    watch: &dyn Watch,
+    bump: blaze_own::Bump<'a>,
+) -> Result<PreparedSuites<'a, 'm, D>, DriveError> {
+    let sel_cx = cx.span("blaze test: check test cache");
+    let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
+    let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
+        watch.see(blaze_screen::Step::Says);
+        for chunk in bytes.utf8_chunks() {
+            out.write(&sel_cx, chunk.valid()).map_err(|_| DriveError::Print)?;
+            if !chunk.invalid().is_empty() {
+                out.write(&sel_cx, "\u{FFFD}").map_err(|_| DriveError::Print)?;
+            }
+        }
+        Ok(())
+    };
+    watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Testing));
+    let prepared = prepare_suites_with(specs, ids, certificate, tools_digest, config, args, lent, &now, &mut print, bump)?;
+    if matches!(prepared, PreparedSuites::Done(_)) {
+        watch.see(blaze_screen::Step::Says);
+    }
+    Ok(prepared)
+}
+
+/// Sans-IO core of [`prepare_suites`]: resolves `TestCache` and pure `TestLoop` effects over an
+/// injected clock and print sink so tests can verify the zero-spawn fast path deterministically.
+#[expect(clippy::too_many_arguments, reason = "sans-IO test-cache preparation core")]
+pub(crate) fn prepare_suites_with<'a, 'm: 'a, D: blaze_core::Driver>(
+    specs: &[SuiteSpec<'a>],
+    ids: &RunIds<'_>,
+    certificate: &crate::start_list::Certificate,
+    tools_digest: [u8; 32],
+    config: LoopConfig<'a>,
+    args: &[&str],
+    lent: &'m blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    now: &dyn Fn() -> Nanos,
+    print: &mut dyn FnMut(&[u8]) -> Result<(), DriveError>,
+    bump: blaze_own::Bump<'a>,
+) -> Result<PreparedSuites<'a, 'm, D>, DriveError> {
+    let alloc = bump.alloc();
+    let (mut cache, heads_vec, postings_list, moved) =
+        crate::test_cache::TestCache::open(lent, specs, ids, certificate, tools_digest, alloc);
+    let mut heads_bump: Vec<Head<'a>, blaze_own::Bump<'a>> = Vec::with_capacity_in(heads_vec.len(), bump);
+    for head in heads_vec {
+        heads_bump.push(head);
+    }
+    let heads: &'a [Head<'a>] = heads_bump.into_bump_slice();
+    // `TestLoop::begin_inventory` / `Plan::decide` only ever queries `postings.tests_of(ask)` for
+    // `ask` in `moved`: skip O(all suites * all asks) full postings re-encoding completely when
+    // `moved` is empty, and for multi-suite edits probe ONLY the moved asks directly against each
+    // suite's already-opened `BZPS` postings record (O(|moved| * suites * log P)).
+    let postings: Postings<'a> = if moved.is_empty() || postings_list.is_empty() {
+        Postings::EMPTY
+    } else if postings_list.len() == 1 {
+        postings_list.first().copied().unwrap_or(Postings::EMPTY)
+    } else {
+        let mut pairs: AVec<'a, (Ask, TestId)> = Vec::new_in(alloc);
+        let mut named: AVec<'a, TestId> = Vec::new_in(alloc);
+        for &ask in moved.iter() {
+            for suite_postings in postings_list.iter() {
+                named.clear();
+                suite_postings.tests_of(ask, &mut named);
+                for &test in named.iter() {
+                    pairs.push((ask, test));
+                }
+            }
+        }
+        if pairs.is_empty() {
+            Postings::EMPTY
+        } else {
+            let encoded = blaze_run::postings::encode(pairs.as_slice(), alloc)
+                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?;
+            let mut held: Vec<u8, blaze_own::Bump<'a>> = Vec::with_capacity_in(encoded.len(), bump);
+            held.extend_from_slice(encoded.as_slice());
+            let slice: &'a [u8] = held.into_bump_slice();
+            Postings::open(slice)
+                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?
+        }
+    };
+    let select = blaze_run::plan::Plan::new(config.plan, alloc).map_err(LoopError::from)?;
+    let mut locations_bump: Vec<Location, blaze_own::Bump<'a>> = Vec::new_in(bump);
+    let mut owners_bump: Vec<SuiteId, blaze_own::Bump<'a>> = Vec::new_in(bump);
+    let mut rows = Vec::new_in(alloc);
+    let mut row_meta: AVec<'a, (TestId, SuiteId, bool, bool)> = Vec::new_in(alloc);
+    let mut filtered = 0u32;
+    for (index, spec) in specs.iter().enumerate() {
+        let unit = spec.unit;
+        let tests = unit.tests;
+        let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: specs.len() })?);
+        for at in 0..tests.len() {
+            let mut row = asked(unit, record_row(tests, at)?, &spec.builder, args);
+            // Custom harnesses receive the raw arguments themselves.
+            if tests.harnessed() && !select.lets_through(&row) {
+                filtered = filtered
+                    .checked_add(1)
+                    .ok_or(DriveError::TooManyRows { count: usize::try_from(u32::MAX).unwrap_or(usize::MAX).saturating_add(1) })?;
+                continue;
+            }
+            if specs.len() > 1 {
+                let mut path: String<blaze_own::Bump<'a>> = String::new_in(bump);
+                let _ = write!(path, "{}/{}/{}", unit.package, unit.target, row.path);
+                row.path = path.into_bump_str();
+            }
+            row_meta.push((row.test, suite_id, row.ignore.is_some(), row.bench));
+            rows.push(row);
+            owners_bump.push(suite_id);
+            locations_bump.push(Location { suite: suite_id, row: u32::try_from(at).map_err(|_| DriveError::TooManyRows { count: tests.len() })? });
+        }
+    }
+    let owners: &'a [SuiteId] = owners_bump.into_bump_slice();
+    let locations: &'a [Location] = locations_bump.into_bump_slice();
+    cache.set_owners(rows.as_slice(), owners);
+
+    let most = STEPS_FIXED.saturating_add(STEPS_PER_TEST.saturating_mul(rows.len()));
+    let mut machine = TestLoop::new(config, alloc)?;
+    let mut out_effects: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
+    let mut effects: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
+    let mut pending_runs: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
+    let mut looked_misses: AVec<'a, TestId> = Vec::new_in(alloc);
+    machine.begin_inventory(rows, owners, heads, postings, moved.as_slice(), filtered, now(), &mut out_effects)?;
+    machine.step(Event::Checked { errors: 0 }, now(), &mut out_effects)?;
+    let mut steps_used = 0usize;
+    let mut done = None;
+    while !out_effects.is_empty() {
+        if steps_used >= most {
+            return Err(DriveError::Steps { most });
+        }
+        steps_used += 1;
+        core::mem::swap(&mut out_effects, &mut effects);
+        for effect in effects.drain(..) {
+            match effect {
+                Effect::Open { suite } => return Err(DriveError::NoSuite { suite }),
+                Effect::Moved { .. } => return Err(DriveError::NoHead { effect: "the moved asks" }),
+                Effect::Look { suite, test, .. } => {
+                    let found = cache.look(suite, test)?;
+                    if !found {
+                        looked_misses.push(test);
+                    }
+                    machine.step(Event::Looked { test, found }, now(), &mut out_effects)?;
+                }
+                Effect::Run { .. } | Effect::Kill { .. } => pending_runs.push(effect),
+                Effect::File { suite, test, address, slot, bytes } => {
+                    cache.file(suite, test, address, slot, bytes.as_slice())?;
+                }
+                Effect::Flaky { suite, finding } => cache.flaky(suite, finding.flaky.test)?,
+                Effect::WriteHead { suite, bytes } => cache.head(suite, bytes.as_slice())?,
+                Effect::WritePostings { suite, bytes } => cache.postings(suite, bytes.as_slice())?,
+                Effect::Print { text } => print(text.as_slice())?,
+                Effect::Done { status } => done = Some(status),
+            }
+        }
+    }
+    if let Some(status) = done {
+        cache.commit(ids)?;
+        return Ok(PreparedSuites::Done(status));
+    }
+    if pending_runs.is_empty() {
+        return Err(DriveError::Stalled);
+    }
+
+    // Identify the exact subset of suites with at least one runnable test that missed `TestCache`
+    // (including tests still queued behind `config.plan.width` inside `TestLoop`).
+    looked_misses.sort_unstable();
+    let mut dirty_bump: Vec<bool, blaze_own::Bump<'a>> = Vec::with_capacity_in(specs.len(), bump);
+    dirty_bump.resize(specs.len(), false);
+    for effect in pending_runs.iter() {
+        if let Effect::Run { row, .. } = effect
+            && let Ok(row_idx) = usize::try_from(*row)
+            && let Some(loc) = locations.get(row_idx)
+            && let Ok(suite_idx) = usize::try_from(loc.suite.0)
+            && let Some(flag) = dirty_bump.get_mut(suite_idx)
+        {
+            *flag = true;
+        }
+    }
+    for &(test_id, owner, is_ignored, is_bench) in row_meta.iter() {
+        let Ok(suite_idx) = usize::try_from(owner.0) else { continue };
+        if dirty_bump.get(suite_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        if is_bench && !config.plan.benches {
+            continue;
+        }
+        if is_ignored && config.plan.ignored == blaze_run::plan::Ignored::Skip {
+            continue;
+        }
+        let dirty = if config.plan.run_all {
+            true
+        } else {
+            match heads.get(suite_idx).and_then(|head| head.row(test_id)) {
+                None => true,
+                Some(row) => match row.kept.last {
+                    blaze_run::plan::Last::Failed | blaze_run::plan::Last::NotKept(_) => true,
+                    blaze_run::plan::Last::Passed { .. } | blaze_run::plan::Last::Unsettled { .. } => {
+                        looked_misses.binary_search(&test_id).is_ok()
+                    }
+                },
+            }
+        };
+        if dirty && let Some(flag) = dirty_bump.get_mut(suite_idx) {
+            *flag = true;
+        }
+    }
+    Ok(PreparedSuites::Dirty(DirtySuites {
+        cache,
+        machine,
+        pending_runs,
+        locations,
+        dirty_suites: dirty_bump.into_bump_slice(),
+        steps_left: most.saturating_sub(steps_used),
+        most,
+        alloc,
+    }))
+}
+
+impl<'a, 'm> DirtySuites<'a, 'm, bstd::io::LentDriver> {
+    /// Executes the remaining dirty tests across the materialized dirty suites (`Some(Suite)` for
+    /// every suite where [`Self::is_suite_dirty`] is `true`, `None` for clean cached suites),
+    /// spawning code workers only when `CODES == Pooled` and more than one dirty test runs in
+    /// parallel, then commits `TestCache`.
+    #[expect(clippy::too_many_arguments, reason = "the command supplies the dirty suites and specific runtime capabilities")]
+    pub(crate) fn run<'h>(
+        mut self,
+        cx: &Cx,
+        fs: &'a bstd::fs::Fs,
+        env: Option<&bstd::env::Env>,
+        host: &bstd::host::Host,
+        clock: &bstd::clock::Clock,
+        rng: &mut bstd::rng::Rng,
+        out: &bstd::out::Out,
+        err: &bstd::out::Out,
+        suites: &[Option<Suite<'_, 'h>>],
+        bins: &[crate::test_bins::BinSuite<'a, 'h>],
+        ids: &RunIds<'h>,
+        typed: crate::engine_body_record::TypedFrom<'h>,
+        certificate: crate::start_list::Certificate,
+        config: LoopConfig<'a>,
+        args: &[&str],
+        lent: &CommandLent,
+        root: &Dir<ReadWrite>,
+        procs: crate::job_texts::Procs<'_>,
+        heap: &'static blaze_own::Heap,
+        watch: &dyn Watch,
+        frame: &Frame,
+    ) -> Result<Status, DriveError> {
+        let sel_cx = cx.span("blaze test: selected suites");
+        let tables = heap.alloc();
+        let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
+            watch.see(blaze_screen::Step::Says);
+            for chunk in bytes.utf8_chunks() {
+                out.write(&sel_cx, chunk.valid()).map_err(|_| DriveError::Print)?;
+                if !chunk.invalid().is_empty() {
+                    out.write(&sel_cx, "\u{FFFD}").map_err(|_| DriveError::Print)?;
+                }
+            }
+            Ok(())
+        };
+        // The command's one make watch (rule 75: its clock started here, at the edge), handed to
+        // every maker, the serial turns' and each code worker's (rule 16: a large or slow make's line).
+        let make_watch = crate::run_parent::command_make_watch();
+        let want_workers = if TestHost::THIS.has_sandbox() {
+            usize::try_from(config.plan.width)
+                .unwrap_or(MAX_CODE_WORKERS)
+                .min(self.pending_runs.len())
+                .min(MAX_CODE_WORKERS)
+        } else {
+            0
+        };
+        let status = match CODES {
+            Codes::Pooled if want_workers > 1 && cx.workers() > 1 => {
+                let sync_typed = typed.sync_over(*ids);
+                pooled(cx, clock, rng, suites, sync_typed, want_workers, root, procs, heap, make_watch, |relay| {
+                    run_dirty(
+                        &sel_cx, fs, env, host, clock, err, suites, bins, ids, typed, certificate, config, args, lent,
+                        tables, watch, make_watch, frame, self.alloc, Some(relay), &mut self.machine, self.pending_runs,
+                        self.steps_left, self.most, self.locations, &mut self.cache, &mut print,
+                    )
+                })
+            }
+            Codes::Serial | Codes::Pooled => {
+                run_dirty(
+                    &sel_cx, fs, env, host, clock, err, suites, bins, ids, typed, certificate, config, args, lent,
+                    tables, watch, make_watch, frame, self.alloc, None, &mut self.machine, self.pending_runs,
+                    self.steps_left, self.most, self.locations, &mut self.cache, &mut print,
+                )
+            }
+        }?;
+        self.cache.commit(ids)?;
+        Ok(status)
     }
 }
 
-/// [`run_suites`] under `Codes::Pooled` (D194 piece 2): the command's code workers started (one
-/// a worker of the pool beside the command thread, as many as are idle now: the pool's size is
-/// the machine's, never waited for; none is a refusal by name, never a serial run in its place,
-/// rule 3), the relay made over them, `run` handed it; then every lane closed and each worker
-/// joined within [`END_WAIT`] (a make in flight ends, its entry dropped: its asker is gone).
+/// [`DirtySuites::run`] under `Codes::Pooled` (D194 piece 2): spawns up to `want_workers` code workers
+/// (bounded by available pool threads beside the command thread and [`MAX_CODE_WORKERS`]), runs
+/// `run` over the shared [`CodeRelay`], then closes every lane and joins all workers within
+/// [`END_WAIT`].
 ///
 /// What is shared and what is not (the doc of run_names.rs `RunCrates`): each worker reads the
-/// suites' crates in place and makes its own names records, trees, environments and makers; the
-/// proc-macro runner, made by need on this thread, is relayed ([`CodePool::finished`]).
+/// suites' crates and post-check typed records (`SyncTypedFrom` + `StoreSnapshot`) lock-free in
+/// place and maintains ONE persistent per-suite `Maker` (`Makers`), lazily initialized on its
+/// first cold miss; the proc-macro runner, made by need on this thread, is relayed
+/// ([`CodePool::finished`]).
 #[expect(clippy::too_many_arguments, reason = "the command supplies the suites, the workers' inputs and the run")]
 fn pooled<'h>(
-    cx: &Cx, clock: &bstd::clock::Clock, rng: &mut bstd::rng::Rng, suites: &[Suite<'_, 'h>], root: &Dir<ReadWrite>, procs: crate::job_texts::Procs<'_>, heap: &'static blaze_own::Heap,
+    cx: &Cx,
+    clock: &bstd::clock::Clock,
+    rng: &mut bstd::rng::Rng,
+    suites: &[Option<Suite<'_, 'h>>],
+    typed: crate::engine_body_record::SyncTypedFrom<'h>,
+    want_workers: usize,
+    root: &Dir<ReadWrite>,
+    procs: crate::job_texts::Procs<'_>,
+    heap: &'static blaze_own::Heap,
     make_watch: blaze_ladder::run::make_one::MakeWatch<'static>,
     run: impl FnOnce(&CodeRelay<'_>) -> Result<Status, DriveError>,
 ) -> Result<Status, DriveError> {
     let cx = cx.span("blaze test: the command's code workers");
     let hash_seed = rng.next_u64();
     let have = cx.workers();
-    let Some(most) = core::num::NonZeroUsize::new(usize::try_from(have.saturating_sub(1)).unwrap_or(0)) else {
+    let avail = usize::try_from(have.saturating_sub(1)).unwrap_or(0);
+    let Some(most) = core::num::NonZeroUsize::new(avail.min(want_workers).min(MAX_CODE_WORKERS)) else {
         return Err(DriveError::NoCodeWorkers { have });
     };
     let lanes = Lanes::new(most, heap);
-    let mut sides: AVec<'static, SuiteSide<'_>> = Vec::with_capacity_in(suites.len(), heap.alloc());
-    sides.extend(suites.iter().map(|suite| SuiteSide { crates: suite.crates, builder: suite.builder, make_watch }));
+    let mut sides: AVec<'static, Option<SuiteSide<'_>>> = Vec::with_capacity_in(suites.len(), heap.alloc());
+    sides.extend(suites.iter().map(|suite| {
+        suite.as_ref().map(|suite| SuiteSide { crates: suite.crates, builder: suite.builder, make_watch })
+    }));
     let sides = sides.as_slice();
     let side = ProcsSide::of(procs);
-    let children = suites.iter().map(|suite| suite.unit.tests.len()).sum::<usize>();
+    let children = suites.iter().map(|suite| suite.as_ref().map_or(0, |suite| suite.unit.tests.len())).sum::<usize>();
     let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
     // The scope is linear: nothing returns between it and its join.
     let scope = cx.scope();
@@ -3337,7 +4691,7 @@ fn pooled<'h>(
     for at in 0..most.get() {
         let lane = lanes.lane(at);
         let clock = clock.clone();
-        match scope.must_overlap("blaze test: a code worker", WORKER_SCRATCH, move |cx: &Cx| work(cx, lane, &clock, sides, root, side, heap)) {
+        match scope.must_overlap("blaze test: a code worker", WORKER_SCRATCH, move |cx: &Cx| work(cx, lane, &clock, sides, typed, root, side, heap)) {
             Ok(task) => tasks.push(task),
             // No worker idle now: the workers are the ones the pool gave at the start.
             Err(_) => break,
@@ -3373,112 +4727,126 @@ fn pooled<'h>(
     Ok(status)
 }
 
-#[expect(clippy::too_many_arguments, reason = "the command supplies the selected records and specific runtime capabilities")]
-fn run_selected<'h>(
+#[expect(clippy::too_many_arguments, reason = "the command supplies the dirty test loop, records, and specific runtime capabilities")]
+fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     cx: &Cx,
-    fs: &bstd::fs::Fs,
+    fs: &'a bstd::fs::Fs,
     env: Option<&bstd::env::Env>,
     host: &bstd::host::Host,
     clock: &bstd::clock::Clock,
-    out: &bstd::out::Out,
     err: &bstd::out::Out,
-    suites: &[Suite<'_, 'h>], ids: &RunIds<'h>, config: LoopConfig<'_>,
+    suites: &[Option<Suite<'_, 'h>>], bins: &[crate::test_bins::BinSuite<'a, 'h>], ids: &RunIds<'h>, typed: crate::engine_body_record::TypedFrom<'h>, certificate: crate::start_list::Certificate, config: LoopConfig<'r>,
     args: &[&str], lent: &CommandLent, tables: Alloc<'static>, watch: &dyn Watch, make_watch: blaze_ladder::run::make_one::MakeWatch<'static>, frame: &Frame,
-    relay: Option<&CodeRelay<'_>>,
+    alloc: Alloc<'a>, relay: Option<&CodeRelay<'_>>, machine: &mut TestLoop<'a, 'r>, pending_runs: AVec<'a, Effect<'a>>,
+    steps_left: usize, most: usize, locations: &[Location], cache: &mut crate::test_cache::TestCache<'a, 'm, D>,
+    print: &mut dyn FnMut(&[u8]) -> Result<(), DriveError>,
 ) -> Result<Status, DriveError> {
-    let cx = cx.span("blaze test: selected suites");
     let env = env.ok_or(DriveError::Missing(bstd::io::Missing { capability: "env" }))?;
-    let erased = blaze_own::Erased::new(frame);
-    let alloc = erased.handle();
     let one = DriveError::One;
-    // 1. The records folder and this command's test folders, under the command's own home
-    // (rule 75: read here, at the edge).
+    // 1. The records folder and this command's test folder, under the command's own home
+    // (rule 75: read here, at the edge). Per-suite subfolders are created lazily on first run.
     let home_name = bstd::env::VarName::new("HOME").map_err(|_| one(OneError::NoHome))?;
     let home = env.get(&home_name).ok().flatten().ok_or(one(OneError::NoHome))?;
     let home = home.trim_end_matches('/');
-    let records = fs.home(&cx, home, &Path::new(RECORDS).map_err(|why| one(OneError::Path(why)))?).map_err(|why| one(OneError::Home(why)))?;
-    // The test folders, each level made or taken as it is beneath the home's `.blaze/v2` (which
-    // holds the toolchain this command has read, so it is there): a home folder's handle makes
-    // nothing until a file is made in it (bstd fs.rs `home`), and `make_dir` makes one level
-    // (first real run, 2026-11-18: "make_dir of .blaze/v2/test/tmp/<pid>: No such file").
-    let v2 = fs.home(&cx, home, &Path::new(".blaze/v2").map_err(|why| one(OneError::Path(why)))?).map_err(|why| one(OneError::Home(why)))?;
-    let test = made_or_there(&cx, &v2, "test").map_err(one)?;
-    let temps = made_or_there(&cx, &test, "tmp").map_err(one)?;
+    let v2 = fs.home(cx, home, &Path::new(".blaze/v2").map_err(|why| one(OneError::Path(why)))?).map_err(|why| one(OneError::Home(why)))?;
+    let test = made_or_there(cx, &v2, "test").map_err(one)?;
+    let temps = made_or_there(cx, &test, "tmp").map_err(one)?;
     let command = bstd::mem::format_in!(frame, "{}-{}", host.pid(), clock.now().since_start().as_nanos());
     let command_path = Path::new(command.as_str()).map_err(|why| one(OneError::Path(why)))?;
-    let mine = temps.make_dir(&cx, &command_path, Durable::No).map_err(|why| one(OneError::Temp(why)))?;
+    let mine = temps.make_dir(cx, &command_path, Durable::No).map_err(|why| one(OneError::Temp(why)))?;
+    // RAII guard ensures `<mine>` (`v2/test/tmp/<pid>-<ns>`) is removed even if any setup step
+    // below (launcher check, `BinServer::start`, etc.) returns an error before tests run.
+    struct MineCleanup<'c, 't> {
+        cx: &'c Cx,
+        temps: &'t Dir<ReadWrite>,
+        path: &'t Path,
+    }
+    impl Drop for MineCleanup<'_, '_> {
+        fn drop(&mut self) {
+            let _ = crate::gc::remove_tree_best_effort(self.cx, self.temps, self.path);
+        }
+    }
+    let _mine_cleanup = MineCleanup { cx, temps: &temps, path: &command_path };
     let store = bstd::mem::format_in!(frame, "{home}/{RECORDS}");
     // 2. The launcher beside this binary, the spawner, the command's environment.
     let exe = host.exe().map_err(DriveError::Missing)?;
     let launcher = crate::own_process::launcher_beside(&exe, frame).map_err(|why| one(OneError::Launcher(why)))?;
-    // Looked at once, before any test starts: a missing launcher under `sandbox-exec` is the
-    // sandbox's own exit 71 for every test, which names no cause (rule 19; seen 2026-11-21 in a
-    // cargo target folder holding `blaze` and no `blaze-launcher`, rounds/wave-1119/t82). A host
-    // with no test sandbox starts no test (each is NOT RUN: test_run.rs `Host::has_sandbox`).
-    if crate::test_run::Host::THIS.has_sandbox() && !launcher_there(&cx, &fs, launcher.as_str(), frame).map_err(one)? {
+    if crate::test_run::Host::THIS.has_sandbox() && !launcher_there(cx, fs, launcher.as_str(), frame).map_err(one)? {
         return Err(one(OneError::NoLauncher { launcher: Box::from(launcher.as_str()), exe: Box::from(&*exe) }));
     }
     let spawner = host.spawner().map_err(DriveError::Missing)?;
     let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
     vars.extend(env.each());
-    let select = blaze_run::plan::Plan::new(config.plan, alloc).map_err(LoopError::from)?;
-    let mut dirs = Vec::with_capacity_in(suites.len(), frame);
-    for index in 0..suites.len() {
-        let named = bstd::mem::format_in!(frame, "{index}");
-        let suite_path = Path::new(named.as_str()).map_err(|why| one(OneError::Path(why)))?;
-        let dir = mine.make_dir(&cx, &suite_path, Durable::No).map_err(|why| one(OneError::Temp(why)))?;
-        let temp = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}/{index}", command.as_str());
-        dirs.push((dir, temp));
-    }
-    // THE seam of D194 ([`CODES`]): `None` makes each test's code in its own turn; `Some`, the
-    // command's relay over its code workers ([`pooled`]), which lives in the caller's frame and
-    // outlives every run borrowing it (`Launched::codes`; E0597 when it was owned here, a1850).
-    let mut child_base = 0usize;
-    let entered_sink: RefCell<AVec<'_, (SuiteId, crate::test_cache::EnteredFn<'_>)>> = RefCell::new(Vec::new_in(alloc));
-    let mut suite_specs = Vec::with_capacity_in(suites.len(), alloc);
-    for suite in suites {
-        suite_specs.push((suite.unit, suite.builder));
-    }
-    let (mut cache, heads, postings_list, moved) = crate::test_cache::TestCache::open(lent, suite_specs.as_slice(), ids, alloc);
-    let merged_postings_bytes: AVec<'_, u8>;
-    let postings = if postings_list.len() == 1 {
-        postings_list[0]
-    } else if postings_list.is_empty() {
-        Postings::EMPTY
+    let sock_nonce = u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(0)
+        ^ (u64::from(host.pid()).rotate_left(32));
+    let bin_server = if !bins.is_empty() && TestHost::THIS.has_sandbox() {
+        Some(RefCell::new(
+            crate::test_bins::BinServer::start(
+                cx,
+                fs,
+                sock_nonce,
+                launcher.as_str(),
+                store.as_str(),
+                bins,
+                lent,
+                &certificate,
+                typed,
+                tables,
+                make_watch,
+                frame,
+                alloc,
+            )
+            .map_err(|err| one(OneError::Bins(err)))?,
+        ))
     } else {
-        let mut pairs: AVec<'_, (Ask, TestId)> = Vec::new_in(alloc);
-        for head in heads.iter() {
-            for row in head.rows() {
-                for ask in head.asks(row) {
-                    pairs.push((ask, row.kept.test));
-                }
-            }
-        }
-        if pairs.is_empty() {
-            Postings::EMPTY
-        } else {
-            merged_postings_bytes = blaze_run::postings::encode(pairs.as_slice(), alloc)
-                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?;
-            Postings::open(merged_postings_bytes.as_slice())
-                .map_err(|error| LoopError::Postings { suite: SuiteId(u32::MAX), error })?
-        }
+        None
     };
+    let mut dirs = Vec::with_capacity_in(suites.len(), frame);
+    for (index, suite) in suites.iter().enumerate() {
+        if suite.is_some() {
+            let dir = LazySuiteDir::new(&mine, index);
+            let temp = bstd::mem::format_in!(frame, "{home}/{TEMPS}/{}/{index}", command.as_str());
+            dirs.push(Some((dir, temp)));
+        } else {
+            dirs.push(None);
+        }
+    }
+    // 3. Lazy per-suite `SuiteCache` shells (`load_verified` deferred until a suite runs a test),
+    // allocated ONLY for dirty suites.
+    let mut child_base = 0usize;
+    let entered_sink: RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>> = RefCell::new(Vec::new_in(alloc));
+    let mut suite_caches = Vec::with_capacity_in(suites.len(), alloc);
+    for suite in suites {
+        match suite {
+            Some(suite) => {
+                let sc = suite_cache::SuiteCache::new(suite.names, suite.builder, typed, tables, make_watch);
+                suite_caches.push(Some(RefCell::new(sc)));
+            }
+            None => suite_caches.push(None),
+        }
+    }
     let mut launches = Vec::with_capacity_in(suites.len(), alloc);
     let mut checks = Vec::with_capacity_in(suites.len(), alloc);
-    let mut locations = Vec::new_in(alloc);
-    let mut owners = Vec::new_in(alloc);
-    let mut rows = Vec::new_in(alloc);
-    let mut filtered = 0u32;
-    for (index, suite) in suites.iter().enumerate() {
+    for (index, (suite, suite_cache)) in suites.iter().zip(suite_caches.iter()).enumerate() {
+        let Some(suite) = suite else {
+            launches.push(None);
+            checks.push(None);
+            continue;
+        };
         let unit = suite.unit;
         let tests = unit.tests;
-        let (dir, temp) = &dirs[index];
         let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
-        launches.push(Launched {
-            err: &err, package: unit.package, target: unit.target,
-            cx: &cx, spawner: &spawner, launcher: launcher.as_str(), records: &records, store: store.as_str(),
+        let Some((dir, temp)) = dirs.get(index).and_then(|entry| entry.as_ref()) else {
+            return Err(DriveError::NoSuite { suite: suite_id });
+        };
+        let Some(suite_cache) = suite_cache.as_ref() else {
+            return Err(DriveError::NoSuite { suite: suite_id });
+        };
+        launches.push(Some(Launched {
+            err, package: unit.package, target: unit.target,
+            cx, spawner: &spawner, launcher: launcher.as_str(), store: store.as_str(),
             temps: dir, temp: temp.as_str(), env: vars.as_slice(), place: suite.place, tests, names: suite.names, ids,
-            builder: suite.builder, lent, tables, watch, make_watch,
+            builder: suite.builder, lent, tables, watch,
             args: if tests.harnessed() { &[] } else { args },
             native: suite.native.ok().flatten(),
             codes: relay,
@@ -3486,88 +4854,104 @@ fn run_selected<'h>(
             child_base,
             entered_sink: &entered_sink,
             cache_alloc: alloc,
-        });
+            suite_cache,
+            bins: bin_server.as_ref(),
+            expose_bins: unit.expose_bins,
+        }));
         child_base += tests.len();
-        checks.push(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) });
-        for at in 0..tests.len() {
-            let mut row = asked(unit, record_row(tests, at)?, &suite.builder, args);
-            // Custom harnesses receive the raw arguments themselves.
-            if tests.harnessed() && !select.lets_through(&row) {
-                filtered = filtered.checked_add(1).ok_or(DriveError::TooManyRows { count: u32::MAX as usize + 1 })?;
-                continue;
-            }
-            if suites.len() > 1 {
-                let path = bstd::mem::format_in!(frame, "{}/{}/{}", unit.package, unit.target, row.path);
-                row.path = crate::work::held_str(path.as_str(), frame);
-            }
-            rows.push(row);
-            owners.push(suite_id);
-            locations.push(Location { suite: suite_id, row: u32::try_from(at).map_err(|_| DriveError::TooManyRows { count: tests.len() })? });
-        }
+        checks.push(Some(EntryCheck { tests, names: suite.names, builder: suite.builder, tables, image: suite.native.map(|native| native.map_or(&[][..], |send| send.items)), said: String::new_in(alloc) }));
     }
-    cache.set_owners(rows.as_slice(), owners.as_slice());
     let now = || Nanos(u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX));
-    let launched = Selected { suites: launches.as_mut_slice(), rows: &locations };
-    let mut refuse = Selected { suites: checks.as_mut_slice(), rows: &locations };
+    let launched = Selected { suites: launches.as_mut_slice(), rows: locations };
+    let mut refuse = Selected { suites: checks.as_mut_slice(), rows: locations };
     let signals = Signals::default();
     let zygotes = OneEach::new(&launched, &signals, now, alloc, tables)?;
     let mut runner = Runner::new(zygotes, &config.plan, TestHost::THIS, alloc);
-    let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
-        watch.see(blaze_screen::Step::Says);
-        for chunk in bytes.utf8_chunks() {
-            out.write(&cx, chunk.valid()).map_err(|_| DriveError::Print)?;
-            if !chunk.invalid().is_empty() {
-                out.write(&cx, "\u{FFFD}").map_err(|_| DriveError::Print)?;
+    let mut verified_loaded: AVec<'_, bool> = Vec::with_capacity_in(suites.len(), alloc);
+    verified_loaded.resize(suites.len(), false);
+    let mut on_run = |flat: u32, active_cache: &mut crate::test_cache::TestCache<'a, 'm, D>| {
+        if !TestHost::THIS.has_sandbox() {
+            return;
+        }
+        if let Ok(flat_idx) = usize::try_from(flat)
+            && let Some(loc) = locations.get(flat_idx)
+            && let Ok(suite_idx) = usize::try_from(loc.suite.0)
+            && let Some(loaded) = verified_loaded.get_mut(suite_idx)
+            && !*loaded
+        {
+            *loaded = true;
+            if let Some(Some(sc)) = suite_caches.get(suite_idx) {
+                let mut sc = sc.borrow_mut();
+                let (closed_set, ws_set) = sc.verified_sets_mut();
+                let _ = active_cache.load_verified(loc.suite, closed_set, ws_set);
             }
         }
-        Ok(())
     };
-    watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Testing));
-    let status = drive(
-        config,
-        rows,
-        &owners,
-        heads.as_slice(),
-        postings,
-        moved.as_slice(),
-        filtered,
+    let status = drive_pending(
+        machine,
+        pending_runs,
+        steps_left,
+        most,
         &mut runner,
         &mut refuse,
-        &mut cache,
+        cache,
         &entered_sink,
-        &mut print,
+        &mut on_run,
+        print,
         alloc,
     );
     watch.see(blaze_screen::Step::Says);
-    // Clean up this command's per-run `$TMPDIR` tree (`v2/test/tmp/<pid>-<ns>`) on both Ok and Err
-    // paths now that all child test processes have exited.
-    let _ = crate::gc::remove_tree_best_effort(&cx, &temps, &command_path);
-    // A run that stopped in blaze: ONE line naming the test, what failed and its cause, then
-    // the command's own error (`OneStopped`) says the line above is why (rule 19). The
-    // runner's `Seam` error says only that one stopped, so it is not shown.
+    let mut one_stopped = false;
     if let (Err(DriveError::Run(_)), Some((row, failed))) = (&status, runner.zygotes().failed.as_ref()) {
-        let location = locations.get(*row as usize).ok_or(one(OneError::NoRow { row: *row }))?;
-        let unit = suites[location.suite.0 as usize].unit;
+        let row_idx = usize::try_from(*row).map_err(|_| one(OneError::NoRow { row: *row }))?;
+        let location = locations.get(row_idx).ok_or(one(OneError::NoRow { row: *row }))?;
+        let suite_idx = usize::try_from(location.suite.0).map_err(|_| DriveError::NoSuite { suite: location.suite })?;
+        let unit = suites.get(suite_idx).and_then(|suite| suite.as_ref()).ok_or(DriveError::NoSuite { suite: location.suite })?.unit;
         let tests = unit.tests;
-        let path = record_row(tests, location.row as usize)?.path;
-        err.line(&cx, format_args!("blaze test: the test `{}/{}/{path}` could not be run: {failed}", unit.package, unit.target)).map_err(|_| DriveError::Print)?;
-        return Err(DriveError::OneStopped);
-    }
-    // A zygote "silent" past a run's allowance: what held the command thread, which serves every
-    // child, said before the runner's own line (stop 3 of the first real run: tempo's
-    // `tempo-precompiles-macros` row 7, five runs in a row). The longest turn names its test,
-    // its length and what it was doing; it may be another test's turn than the silent row's.
-    if let (Err(DriveError::Run(RunError::ZygoteSilent { .. })), Some(turn)) = (&status, runner.zygotes().longest) {
-        let location = locations.get(turn.row as usize).ok_or(one(OneError::NoRow { row: turn.row }))?;
-        let unit = suites[location.suite.0 as usize].unit;
-        let path = record_row(unit.tests, location.row as usize)?.path;
-        err.line(&cx, format_args!(
+        let loc_row = usize::try_from(location.row).map_err(|_| one(OneError::NoRow { row: location.row }))?;
+        let path = record_row(tests, loc_row)?.path;
+        err.line(cx, format_args!("blaze test: the test `{}/{}/{path}` could not be run: {failed}", unit.package, unit.target)).map_err(|_| DriveError::Print)?;
+        one_stopped = true;
+    } else if let (Err(DriveError::Run(_)), Some(failed)) = (&status, runner.zygotes().failed_unowned.as_ref()) {
+        err.line(cx, format_args!("blaze test: workspace binary server failed: {failed}")).map_err(|_| DriveError::Print)?;
+        one_stopped = true;
+    } else if let (Err(DriveError::Run(RunError::ZygoteSilent { .. })), Some(turn)) = (&status, runner.zygotes().longest) {
+        let row_idx = usize::try_from(turn.row).map_err(|_| one(OneError::NoRow { row: turn.row }))?;
+        let location = locations.get(row_idx).ok_or(one(OneError::NoRow { row: turn.row }))?;
+        let suite_idx = usize::try_from(location.suite.0).map_err(|_| DriveError::NoSuite { suite: location.suite })?;
+        let unit = suites.get(suite_idx).and_then(|suite| suite.as_ref()).ok_or(DriveError::NoSuite { suite: location.suite })?.unit;
+        let loc_row = usize::try_from(location.row).map_err(|_| one(OneError::NoRow { row: location.row }))?;
+        let path = record_row(unit.tests, loc_row)?.path;
+        err.line(cx, format_args!(
             "blaze test: the command thread, which serves every test's process, was held {}.{} s in one turn of `{}/{}/{path}` (row {}): {}; while a turn runs no test is answered (test_drive.rs `OneEach`)",
             turn.nanos / 1_000_000_000, turn.nanos % 1_000_000_000 / 100_000_000, unit.package, unit.target, turn.row, turn.doing,
         )).map_err(|_| DriveError::Print)?;
     }
+    // Persist verified binary stub pairs (`BZTV`) before dropping `bin_server` so even a failed
+    // first run warms subsequent spawns of the same workspace binary under today's certificate.
+    let bin_saved = bin_server.as_ref().map(|server| server.borrow().save_verified(lent, &certificate));
+    // Close the binary stub listener and drop any remaining connections before `_mine_cleanup`
+    // removes `<mine>` (`v2/test/tmp/<pid>-<ns>`).
+    drop(runner);
+    drop(launched);
+    drop(launches);
+    drop(bin_server);
+    drop(_mine_cleanup);
+    if let Some(Err(err)) = bin_saved {
+        return Err(err);
+    }
+    if one_stopped {
+        return Err(DriveError::OneStopped);
+    }
     let status = status?;
-    cache.commit()?;
+    for (index, sc) in suite_caches.iter().enumerate() {
+        let Some(sc) = sc.as_ref() else { continue };
+        let sc = sc.borrow();
+        if sc.verified_dirty() {
+            let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
+            cache.record_verified(suite_id, sc.verified_closed_pairs(), sc.verified_workspace_pairs());
+        }
+    }
     Ok(status)
 }
 
@@ -3639,7 +5023,13 @@ mod native_tests {
     const HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     fn send(hex: &'static str) -> NativeSend<'static> {
-        NativeSend { library: blaze_launch::wire::RecordId([7; 32]), hex, words: &[], items: &[] }
+        NativeSend {
+            library: blaze_launch::wire::RecordId([7; 32]),
+            hex,
+            words: &[],
+            items: &[],
+            load_mode: crate::engine_native::NativeLoadMode::Lazy,
+        }
     }
 
     /// A test program whose image holds C gets one grant more than the test profile: its
@@ -3662,5 +5052,653 @@ mod native_tests {
         // PLANTED: a store path with a quote would end the profile's string early.
         assert!(matches!(with_native(plain(), "/h/\"/records", Some(send(HEX))), Err(OneError::Profile { .. })));
         assert!(matches!(with_native(plain(), "/h/records", Some(send("../x"))), Err(OneError::Profile { .. })));
+    }
+
+    #[test]
+    fn current_until_credits_in_progress_host_serve_time() {
+        let signals = Signals::default();
+        let started = Duration::from_secs(10);
+        let allowance = Duration::from_secs(60);
+        signals.stalled.set(Duration::from_secs(5).as_nanos() as u64);
+        // Simulate a 190 s compile inside `needs.serve` on the current turn before `sweep` rolls
+        // `host_nanos` into `stalled`.
+        signals.add_host_nanos(Duration::from_secs(190));
+        let now = started + Duration::from_secs(195);
+        let until = current_until(started, allowance, Duration::ZERO, &signals);
+        assert!(
+            !until.passed(now),
+            "current_until must credit same-turn host_nanos so send deadline is never already expired"
+        );
+    }
+}
+
+#[cfg(test)]
+mod should_panic_tests {
+    use super::*;
+    use blaze_run::plan::ShouldPanic;
+
+    struct DummyAnswers;
+
+    impl Answers for DummyAnswers {
+        fn answer<'s>(
+            &'s mut self,
+            _suite: SuiteId,
+            test: TestId,
+            _entered: &[FnName],
+            _reads: &[ReadName],
+            _digests: &mut AVec<'_, (ReadName, ReadDigest)>,
+        ) -> Result<(Address, AtAddress<'s>), RunError> {
+            Ok((Address(test.0), AtAddress::EMPTY))
+        }
+    }
+
+    struct ScriptedCase {
+        path: &'static str,
+        should_panic: ShouldPanic<'static>,
+        how: How,
+        panic_text: &'static str,
+        output: &'static [u8],
+    }
+
+    struct Scripted<'a> {
+        cases: &'a [ScriptedCase],
+    }
+
+    impl RunOne for Scripted<'_> {
+        async fn run(&self, row: u32, _: Nanos, output: &mut Output<'_>, _: &Signals) -> Result<RunOutcome, OneError> {
+            let heap = blaze_own::testing::heap().alloc();
+            let index = usize::try_from(row).unwrap_or(usize::MAX);
+            let Some(case) = self.cases.get(index) else {
+                return Err(OneError::NoRow { row });
+            };
+            output.push(case.output);
+            let mut text = String::new_in(heap);
+            text.push_str(case.panic_text);
+            Ok(RunOutcome {
+                how: case.how,
+                keep: Err(NotKept::Untraced),
+                panic_text: text,
+                entered: Vec::new_in(heap),
+            })
+        }
+    }
+
+    fn run_cases(cases: &[ScriptedCase]) -> Result<(Status, AString<'static>), RunError> {
+        let g = blaze_own::testing::heap().alloc();
+        let budget = Nanos(10_000_000_000);
+        let config = LoopConfig {
+            plan: blaze_run::plan::Config {
+                width: 2,
+                deadline: budget,
+                run_all: false,
+                ignored: blaze_run::plan::Ignored::Skip,
+                benches: false,
+                filter: blaze_run::plan::Filter::All,
+                skip: &[],
+            },
+            style: blaze_run::report::Style::text(80, false),
+            list: false,
+            run: blaze_run::CheckoutKey([2; 32]),
+            suites: 1,
+        };
+        let mut asked: AVec<'static, blaze_run::plan::Asked<'static>> = Vec::new_in(g);
+        let mut owners: AVec<'static, SuiteId> = Vec::new_in(g);
+        for (row, case) in cases.iter().enumerate() {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x77;
+            bytes[1] = u8::try_from(row).unwrap_or(u8::MAX);
+            asked.push(blaze_run::plan::Asked {
+                test: TestId(bytes),
+                path: case.path,
+                ignore: None,
+                bench: false,
+                should_panic: case.should_panic,
+            });
+            owners.push(SuiteId(0));
+        }
+        let owners_slice = owners.as_slice();
+        let heads = [Head::EMPTY];
+        let signals = Signals::default();
+        let scripted = Scripted { cases };
+        let tick = Cell::new(0u64);
+        let clock = || {
+            let next = tick.get().saturating_add(1_000);
+            tick.set(next);
+            Nanos(next)
+        };
+        let Ok(pool) = OneEach::new(&scripted, &signals, clock, g, g) else {
+            return Err(RunError::NothingOwed);
+        };
+        let mut runner = Runner::new(pool, &config.plan, TestHost::Macos, g);
+        let mut machine = TestLoop::new(config, g)?;
+        let mut out: AVec<'static, Effect<'static>> = Vec::new_in(g);
+        let mut effects: AVec<'static, Effect<'static>> = Vec::new_in(g);
+        machine.begin_inventory(asked, owners_slice, &heads, Postings::EMPTY, &[], 0, runner.zygotes().now(), &mut out)?;
+        machine.step(Event::Checked { errors: 0 }, runner.zygotes().now(), &mut out)?;
+        let mut text = String::new_in(g);
+        let mut answers = DummyAnswers;
+        for _ in 0..10_000 {
+            core::mem::swap(&mut out, &mut effects);
+            let mut done = None;
+            for effect in effects.drain(..) {
+                match &effect {
+                    Effect::Run { .. } | Effect::Kill { .. } => runner.effect(&effect)?,
+                    Effect::Print { text: bytes } => {
+                        if let Ok(valid) = core::str::from_utf8(bytes.as_slice()) {
+                            text.push_str(valid);
+                        }
+                    }
+                    Effect::Done { status } => done = Some(*status),
+                    _ => {}
+                }
+            }
+            if let Some(status) = done {
+                runner.finish()?;
+                return Ok((status, text));
+            }
+            if !out.is_empty() {
+                continue;
+            }
+            runner.step(&mut machine, &mut answers, &mut out)?;
+        }
+        Err(RunError::NothingOwed)
+    }
+
+    #[test]
+    fn extract_panic_message_handles_rust_formats_and_noise() {
+        let modern = "thread '<unnamed>' panicked at src/queue.rs:367:35:\nfinalized L1 queue invariant violated: gap 5 -> 7\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        assert_eq!(extract_panic_message(modern), "finalized L1 queue invariant violated: gap 5 -> 7");
+
+        let with_tid = "debug line before\nthread '<unnamed>' (4219) panicked at src/lib.rs:10:5:\nexpected boom\nstack backtrace:\n   0: foo\n";
+        assert_eq!(extract_panic_message(with_tid), "expected boom");
+
+        let multiline = "thread 'main' panicked at src/lib.rs:4:5:\nassertion `left == right` failed\n  left: 1\n right: 2\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        assert_eq!(extract_panic_message(multiline), "assertion `left == right` failed\n  left: 1\n right: 2");
+
+        let two_panics = "thread 'bg' panicked at src/bg.rs:1:1:\nbackground boom\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nthread '<unnamed>' panicked at src/main.rs:9:5:\nmain boom\n";
+        assert_eq!(extract_panic_message(two_panics), "main boom");
+
+        let empty_payload = "thread '<unnamed>' panicked at src/lib.rs:2:5:\n\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        assert_eq!(extract_panic_message(empty_payload), "");
+
+        let legacy = "thread 'main' panicked at 'legacy boom', src/lib.rs:3:5\n";
+        assert_eq!(extract_panic_message(legacy), "legacy boom");
+
+        let silenced_or_c_abort = "normal stderr mentioning expected substring\nAbort trap: 6\n";
+        assert_eq!(extract_panic_message(silenced_or_c_abort), "");
+    }
+
+    #[test]
+    fn should_panic_expected_sigabrt_and_normal_panic_verdicts() {
+        let cases = [
+            // 1a. #[should_panic] passes when panicking.
+            ScriptedCase {
+                path: "m::should_panic_ok",
+                should_panic: ShouldPanic::Yes,
+                how: How::Reported(Said::Panicked { at: None }),
+                panic_text: "anything",
+                output: b"thread '<unnamed>' panicked at src/lib.rs:1:1:\nanything\n",
+            },
+            // 1b. #[should_panic] fails when returning normally.
+            ScriptedCase {
+                path: "m::should_panic_did_not_panic",
+                should_panic: ShouldPanic::Yes,
+                how: How::Reported(Said::Returned),
+                panic_text: "",
+                output: b"",
+            },
+            // 2a. #[should_panic(expected = "...")] passes when payload contains expected text.
+            ScriptedCase {
+                path: "m::expected_matches",
+                should_panic: ShouldPanic::WithText("finalized L1 queue invariant violated"),
+                how: How::Reported(Said::Panicked { at: None }),
+                panic_text: "finalized L1 queue invariant violated: discontinuity",
+                output: b"thread '<unnamed>' panicked at src/queue.rs:367:35:\nfinalized L1 queue invariant violated: discontinuity\n",
+            },
+            // 2b. #[should_panic(expected = "...")] fails when payload has a different message.
+            ScriptedCase {
+                path: "m::expected_wrong_text",
+                should_panic: ShouldPanic::WithText("expected foo"),
+                how: How::Reported(Said::Panicked { at: None }),
+                panic_text: "actual bar",
+                output: b"thread '<unnamed>' panicked at src/lib.rs:2:1:\nactual bar\n",
+            },
+            // 2c. #[should_panic(expected = "...")] fails when returning normally.
+            ScriptedCase {
+                path: "m::expected_did_not_panic",
+                should_panic: ShouldPanic::WithText("expected foo"),
+                how: How::Reported(Said::Returned),
+                panic_text: "",
+                output: b"",
+            },
+            // 3a. Real SIGABRT (C abort / double-panic / allocator abort) fails even with #[should_panic].
+            ScriptedCase {
+                path: "m::real_sigabrt_under_should_panic",
+                should_panic: ShouldPanic::Yes,
+                how: How::Signal { number: 6 },
+                panic_text: "",
+                output: b"",
+            },
+            // 3b. Explicit exit(101) without unwinding fails even with #[should_panic].
+            ScriptedCase {
+                path: "m::exit_101_without_unwind",
+                should_panic: ShouldPanic::Yes,
+                how: How::NoReport { code: 101, torn: 0 },
+                panic_text: "",
+                output: b"",
+            },
+            // 4. Normal test that panics still fails and reports its panic message and output cleanly.
+            ScriptedCase {
+                path: "m::normal_test_panics",
+                should_panic: ShouldPanic::No,
+                how: How::Reported(Said::Panicked { at: None }),
+                panic_text: "boom in normal test",
+                output: b"thread '<unnamed>' panicked at src/lib.rs:9:5:\nboom in normal test\n",
+            },
+        ];
+
+        let outcome = run_cases(&cases);
+        assert!(outcome.is_ok(), "driver failed: {outcome:?}");
+        if let Ok((status, report)) = outcome {
+            assert_eq!((status.passed, status.failed), (2, 6), "{report}");
+            assert!(!report.contains("FAILED m::should_panic_ok"), "{report}");
+            assert!(!report.contains("FAILED m::expected_matches"), "{report}");
+            assert!(report.contains("m::should_panic_did_not_panic") && report.contains("did not panic"), "{report}");
+            assert!(report.contains("m::expected_wrong_text") && report.contains("without the expected text: actual bar"), "{report}");
+            assert!(report.contains("m::expected_did_not_panic") && report.contains("did not panic"), "{report}");
+            assert!(report.contains("m::real_sigabrt_under_should_panic") && report.contains("ended by signal 6"), "{report}");
+            assert!(report.contains("m::exit_101_without_unwind") && report.contains("exited with code 101"), "{report}");
+            assert!(report.contains("m::normal_test_panics") && report.contains("panicked: boom in normal test"), "{report}");
+        }
+    }
+
+    #[test]
+    fn with_unwound_allows_exact_marker_and_rejects_unsafe_paths() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let plain = blaze_run::child::seatbelt("/h/.blaze/v2/test/tmp/1/0/3", None, alloc);
+        assert!(plain.is_ok());
+        if let Ok(base) = plain {
+            let marker = "/h/.blaze/v2/test/tmp/1/0/unwound-3";
+            let granted = with_unwound(base, Some(marker));
+            assert!(granted.is_ok());
+            if let Ok(profile) = granted {
+                assert!(profile.as_str().ends_with("(allow file-write* (literal \"/h/.blaze/v2/test/tmp/1/0/unwound-3\"))\n"));
+            }
+        }
+        let plain2 = blaze_run::child::seatbelt("/h/.blaze/v2/test/tmp/1/0/3", None, alloc);
+        if let Ok(base) = plain2 {
+            assert!(matches!(with_unwound(base, Some("/h/\"bad/unwound-3")), Err(OneError::Profile { .. })));
+        }
+    }
+}
+
+#[cfg(test)]
+mod zero_spawn_tests {
+    use super::*;
+    use blaze_cas::plain::{Lent, Settings as StoreSettings};
+    use blaze_core::FileName;
+    use blaze_core::sim::{Faults, Sim};
+    use blaze_drive::{Cell as DriveCell, Kind, Name, Tool};
+    use blaze_emit::{Isa, Os};
+    use blaze_id::CrateItemKey;
+    use blaze_ladder::run::OverflowChecks;
+    use blaze_toolchain::ToolchainId;
+
+    use crate::run_ids::{
+        Answer, Asked as IdsAsked, BodyFacts, BodyReads, BodyScratch, ByNeed, Checked, CrateTable, Most, Place, Proof, ProofFold,
+        ReadsFrom, RunIds, RunIdsError, Seen, Today, Unread, WorkspaceBody,
+    };
+    use crate::store::plain_place::{Facts, StoreAlloc, after_answer, config, open, test_cx};
+
+    const S0: u8 = 0x41;
+    const S1: u8 = 0x42;
+
+    struct TwoCrates;
+
+    impl CrateTable<'static> for TwoCrates {
+        fn len(&self) -> usize {
+            2
+        }
+        fn key(&self, at: usize) -> CrateItemKey {
+            let b = if at == 0 { S0 } else { S1 };
+            CrateItemKey(ContentId([b; 32]))
+        }
+        fn name(&self, at: usize) -> &'static str {
+            if at == 0 { "suite_a" } else { "suite_b" }
+        }
+        fn place(&self, _at: usize) -> Place {
+            Place::Checkout
+        }
+        fn each_dep(&self, _at: usize, _each: &mut dyn FnMut(usize)) {}
+    }
+
+    struct CleanBody {
+        chk0: Name,
+        key0: ContentId,
+        chk1: Name,
+        key1: ContentId,
+    }
+
+    impl Today for CleanBody {
+        fn out(&self, _name: Name) -> Option<ContentId> {
+            Some(ContentId([0x77; 32]))
+        }
+        fn cell(&self, _name: Name, _cell: DriveCell) -> Option<ContentId> {
+            None
+        }
+    }
+
+    impl Answer for CleanBody {
+        fn open(&mut self, _cx: &Cx, _name: Name, _seen: &mut dyn FnMut(Seen<'_>) -> Result<(), RunIdsError<'static>>) -> Result<bool, RunIdsError<'static>> {
+            Ok(false)
+        }
+        fn skipped(&self, _file: Name) -> bool {
+            false
+        }
+        fn body(&mut self, _cx: &Cx, check: Name, _tool: Tool, known: Option<(ContentId, Name)>, out: &mut BodyScratch<'_>) -> Result<Option<BodyFacts>, RunIdsError<'static>> {
+            out.clear();
+            let Some((text, file)) = known else { return Ok(None) };
+            let key = if check == self.chk0 {
+                self.key0
+            } else if check == self.chk1 {
+                self.key1
+            } else {
+                return Ok(None);
+            };
+            Ok(Some(BodyFacts { key, checked: Checked::Clean, text, file }))
+        }
+    }
+
+    struct StandingProofs;
+
+    impl BodyReads for StandingProofs {
+        fn proof(&self, check: Name, _most: u32) -> Result<Proof, Unread> {
+            let mut fold = ProofFold::new(check);
+            let digest = ContentId([0x33; 32]);
+            fold.read(&[0x12; 32], &digest, &digest);
+            Ok(fold.finish())
+        }
+    }
+
+    fn item_of(byte: u8, low: u64) -> ItemKey {
+        let mut b = [byte; 16];
+        if let Some(tail) = b.get_mut(8..16) {
+            tail.copy_from_slice(&low.to_be_bytes());
+        }
+        ItemKey(u128::from_be_bytes(b))
+    }
+
+    fn test_builder() -> Result<Builder, crate::run_parent::ParentError> {
+        let producer = blaze_ids::producer::Producers::for_tests(b"test_drive zero spawn").get::<blaze_ids::producer::CodeBuilder>();
+        let isa = Isa { os: Os::MacOs, lse: true };
+        crate::run_parent::builder_for("2024", OverflowChecks::On, blaze_ladder::run::Panic::Unwind, producer, isa)
+    }
+
+    fn open_sim_lent(sim: Sim, nonce: u64, alloc: Alloc<'static>) -> Option<Lent<Sim, StoreAlloc>> {
+        let name = FileName::new("store")?;
+        let cfg = config(name, &StoreSettings::default(), Facts { boot: Some(1), nonce }, alloc);
+        open(sim, cfg, alloc).ok()
+    }
+
+    fn build_ids<'a>(
+        cx: &Cx,
+        tools: &[Tool; blaze_drive::key::KINDS],
+        chk0: Name,
+        key0: ContentId,
+        chk1: Name,
+        key1: ContentId,
+        proofs: &'a StandingProofs,
+        asked: &'a IdsAsked,
+        bump: blaze_own::Bump<'a>,
+    ) -> Option<RunIds<'a>> {
+        let file0 = Name::file(b"a/src/lib.rs");
+        let file1 = Name::file(b"b/src/lib.rs");
+        let bodies = [
+            WorkspaceBody { item: item_of(S0, 1), check: chk0, text: key0, file: file0 },
+            WorkspaceBody { item: item_of(S1, 1), check: chk1, text: key1, file: file1 },
+        ];
+        let mut ans = CleanBody { chk0, key0, chk1, key1 };
+        let ids = RunIds::new(cx, ToolchainId(blaze_toolchain::PINNED.0), &TwoCrates, tools, &bodies, &[], &mut ans, None, Most::USUAL, bump).ok()?;
+        ids.reading::<ByNeed>(ReadsFrom::new(proofs, asked, Most::USUAL)).ok()
+    }
+
+    struct NoRefusal;
+
+    impl Refuse for NoRefusal {
+        fn refusal(&mut self, _row: u32) -> Result<Option<&str>, OneError> {
+            Ok(None)
+        }
+    }
+
+    fn instance_name_bytes(item: ItemKey) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        if let Some(head) = out.get_mut(..16) {
+            head.copy_from_slice(&item.0.to_le_bytes());
+        }
+        out
+    }
+
+    struct CountingPureRun<'s, 'a> {
+        spawns: Cell<u32>,
+        syms: [FnName; 2],
+        items: [ItemKey; 2],
+        keys: [[u8; 32]; 2],
+        entered_sink: &'s RefCell<AVec<'a, (SuiteId, crate::test_cache::EnteredFn<'a>)>>,
+        alloc: Alloc<'a>,
+    }
+
+    impl RunOne for CountingPureRun<'_, '_> {
+        async fn run(&self, row: u32, _budget: Nanos, _output: &mut Output<'_>, _signals: &Signals) -> Result<RunOutcome, OneError> {
+            self.spawns.set(self.spawns.get().saturating_add(1));
+            let idx = usize::try_from(row).unwrap_or(0);
+            let sym = self.syms.get(idx).copied().unwrap_or(FnName([0; 32]));
+            let tabled = self.items.get(idx).copied().unwrap_or(ItemKey(0));
+            let code_key = self.keys.get(idx).copied().unwrap_or([0; 32]);
+            let suite = SuiteId(row);
+            let mut name = Vec::with_capacity_in(20, self.alloc);
+            name.extend_from_slice(&instance_name_bytes(tabled));
+            self.entered_sink.borrow_mut().push((
+                suite,
+                crate::test_cache::EnteredFn {
+                    symbol: sym,
+                    code_key,
+                    tabled,
+                    name,
+                },
+            ));
+            let heap = blaze_own::testing::heap().alloc();
+            let mut entered = Vec::new_in(heap);
+            entered.push(sym);
+            Ok(RunOutcome {
+                how: How::Reported(Said::Returned),
+                keep: Ok(()),
+                panic_text: String::new_in(heap),
+                entered,
+            })
+        }
+    }
+
+    /// Verifies the zero-spawn `TestCache` fast path end-to-end:
+    /// 1. Cold run returns `PreparedSuites::Dirty` with both suites dirty; driving it runs both
+    ///    tests and persists `SuiteState` + `BZTH` + `BZPS` + `BZTR` into simulated CAS.
+    /// 2. Repeat run where all targeted tests hit `TestCache` returns `PreparedSuites::Done`
+    ///    directly with ZERO worker/process spawns and ZERO suite materializations, printing the
+    ///    exact `test result: ok. ran 0:` / `2 reused from kept results` summary.
+    /// 3. Partial edit moving only suite 0's body key returns `PreparedSuites::Dirty` with
+    ///    `is_suite_dirty(0) == true` and `is_suite_dirty(1) == false` (`pending_count() == 1`),
+    ///    so unchanged suite 1 skips all native-image / names-record setup.
+    #[test]
+    fn all_cached_tests_hit_zero_spawn_fast_path_and_partial_edit_dirties_only_changed_suite() {
+        let heap = blaze_own::testing::heap().alloc();
+        let cx = test_cx();
+        let Ok(builder) = test_builder() else { panic!("builder_for must succeed") };
+        let tools: [Tool; blaze_drive::key::KINDS] = core::array::from_fn(|at| Tool(ContentId([u8::try_from(at).unwrap_or(u8::MAX); 32])));
+        let tools_digest = crate::test_cache::tools_digest(&tools);
+        let chk0 = Name::new(Kind::BodyCheck, ContentId([0x61; 32]));
+        let chk1 = Name::new(Kind::BodyCheck, ContentId([0x62; 32]));
+        let item0 = item_of(S0, 1);
+        let item1 = item_of(S1, 1);
+        let sym0 = FnName([0x91; 32]);
+        let sym1 = FnName([0x92; 32]);
+
+        let unit0 = TestUnit {
+            at: 0,
+            key: CrateItemKey(ContentId([S0; 32])),
+            package: "pkg_a",
+            target: "a",
+            tests: TestRows::Main(LibKey(ContentId([0x81; 32]))),
+            edition: blaze_surface::Edition::E2024,
+            expose_bins: false,
+        };
+        let unit1 = TestUnit {
+            at: 1,
+            key: CrateItemKey(ContentId([S1; 32])),
+            package: "pkg_b",
+            target: "b",
+            tests: TestRows::Main(LibKey(ContentId([0x82; 32]))),
+            edition: blaze_surface::Edition::E2024,
+            expose_bins: false,
+        };
+        let make_specs = |ids: &RunIds<'_>| {
+            [
+                SuiteSpec { unit: unit0, builder, digests: crate::test_cache::test_suite_digests(unit0.key, &builder, ids, tools_digest) },
+                SuiteSpec { unit: unit1, builder, digests: crate::test_cache::test_suite_digests(unit1.key, &builder, ids, tools_digest) },
+            ]
+        };
+        let make_config = |root_byte: u8| LoopConfig {
+            plan: blaze_run::plan::Config {
+                width: 2,
+                deadline: Nanos(10_000_000_000),
+                run_all: false,
+                ignored: blaze_run::plan::Ignored::Skip,
+                benches: false,
+                filter: blaze_run::plan::Filter::All,
+                skip: &[],
+            },
+            style: blaze_run::report::Style::text(80, false),
+            list: false,
+            run: blaze_run::CheckoutKey([root_byte; 32]),
+            suites: 2,
+        };
+
+        let proofs = StandingProofs;
+        let asked1 = IdsAsked::default();
+        let Some(ids1) = build_ids(&cx, &tools, chk0, ContentId([0x11; 32]), chk1, ContentId([0x22; 32]), &proofs, &asked1, blaze_own::testing::bump()) else { panic!("ids1") };
+        let specs1 = make_specs(&ids1);
+        let name0 = instance_name_bytes(item0);
+        let name1 = instance_name_bytes(item1);
+        let Some(code_key0) = blaze_ladder::body_ids::instance_key(blaze_code::record::Symbol(sym0.0), item0, &name0, &ids1, &builder, &builder.producer, heap).map(|k| k.0.0) else { panic!("instance_key 0") };
+        let Some(code_key1) = blaze_ladder::body_ids::instance_key(blaze_code::record::Symbol(sym1.0), item1, &name1, &ids1, &builder, &builder.producer, heap).map(|k| k.0.0) else { panic!("instance_key 1") };
+
+        let cert1 = crate::start_list::Certificate::for_tests([0xaa; 32]);
+        let Some(lent1) = open_sim_lent(Sim::new(11, Faults::default()), 1, heap) else { panic!("open sim lent 1") };
+
+        // 1. Cold run: both suites are dirty, execute both via mock `RunOne` (no OS spawns), commit cache.
+        let tick = Cell::new(0u64);
+        let clock = || {
+            let next = tick.get().saturating_add(1_000);
+            tick.set(next);
+            Nanos(next)
+        };
+        {
+            let mut cold_out = String::new_in(heap);
+            let mut cold_print = |bytes: &[u8]| -> Result<(), DriveError> {
+                if let Ok(text) = core::str::from_utf8(bytes) {
+                    cold_out.push_str(text);
+                }
+                Ok(())
+            };
+            let cfg1 = make_config(0xaa);
+            let prepared1 = prepare_suites_with(&specs1, &ids1, &cert1, tools_digest, cfg1, &[], &lent1, &clock, &mut cold_print, blaze_own::testing::bump());
+            let Ok(PreparedSuites::Dirty(mut dirty1)) = prepared1 else { panic!("cold run must be Dirty") };
+            assert!(dirty1.is_suite_dirty(0) && dirty1.is_suite_dirty(1), "both suites dirty on cold run");
+            assert_eq!(dirty1.pending_count(), 2);
+
+            let entered_sink: RefCell<AVec<'_, (SuiteId, crate::test_cache::EnteredFn<'_>)>> = RefCell::new(Vec::new_in(dirty1.alloc));
+            {
+                let mock_runs = CountingPureRun {
+                    spawns: Cell::new(0),
+                    syms: [sym0, sym1],
+                    items: [item0, item1],
+                    keys: [code_key0, code_key1],
+                    entered_sink: &entered_sink,
+                    alloc: dirty1.alloc,
+                };
+                let signals = Signals::default();
+                let Ok(pool) = OneEach::new(&mock_runs, &signals, &clock, dirty1.alloc, heap) else { panic!("OneEach") };
+                let mut runner = Runner::new(pool, &cfg1.plan, TestHost::Macos, dirty1.alloc);
+                let mut refuse = NoRefusal;
+                let mut on_run = |_row: u32, _cache: &mut crate::test_cache::TestCache<'_, '_, Sim>| {};
+                let cold_status = drive_pending(
+                    &mut dirty1.machine,
+                    dirty1.pending_runs,
+                    dirty1.steps_left,
+                    dirty1.most,
+                    &mut runner,
+                    &mut refuse,
+                    &mut dirty1.cache,
+                    &entered_sink,
+                    &mut on_run,
+                    &mut cold_print,
+                    dirty1.alloc,
+                );
+                assert!(cold_status.is_ok(), "cold drive failed: {cold_status:?}");
+                if let Ok(status) = cold_status {
+                    assert_eq!((status.passed, status.failed), (2, 0), "{cold_out}");
+                }
+                assert_eq!(mock_runs.spawns.get(), 2, "cold run executes both tests");
+            }
+            assert!(dirty1.cache.commit(&ids1).is_ok(), "cache commit");
+        }
+        assert!(after_answer(&cx, &lent1, 0).is_ok(), "commit lent1");
+
+        // 2. Repeat run after restart: all tests hit `TestCache` -> `PreparedSuites::Done` with
+        // ZERO spawns, ZERO suite materialization, exact output line & exit status.
+        let Some(lent2) = open_sim_lent(lent1.into_store().into_driver(), 2, heap) else { panic!("reopen sim lent 2") };
+        let mut warm_out = String::new_in(heap);
+        let mut warm_print = |bytes: &[u8]| -> Result<(), DriveError> {
+            if let Ok(text) = core::str::from_utf8(bytes) {
+                warm_out.push_str(text);
+            }
+            Ok(())
+        };
+        let prepared2 = prepare_suites_with(&specs1, &ids1, &cert1, tools_digest, make_config(0xaa), &[], &lent2, &clock, &mut warm_print, blaze_own::testing::bump());
+        match prepared2 {
+            Ok(PreparedSuites::Done(status)) => {
+                assert_eq!(status, Status { passed: 2, failed: 0, ignored: 0, not_run: 0, check_errors: 0 });
+                assert!(warm_out.contains("test result: ok. ran 0:"), "missing ran 0 summary: {warm_out}");
+                assert!(warm_out.contains("2 reused from kept results"), "missing reused count: {warm_out}");
+            }
+            Ok(PreparedSuites::Dirty(_)) => panic!("all-cached run must return PreparedSuites::Done without spawning workers"),
+            Err(err) => panic!("warm prepare failed: {err}"),
+        }
+
+        // 3. Partial edit: only suite 0's body key moves (`0x11` -> `0x99`); suite 1 stays identical.
+        let asked2 = IdsAsked::default();
+        let Some(ids2) = build_ids(&cx, &tools, chk0, ContentId([0x99; 32]), chk1, ContentId([0x22; 32]), &proofs, &asked2, blaze_own::testing::bump()) else { panic!("ids2") };
+        let specs2 = make_specs(&ids2);
+        let cert2 = crate::start_list::Certificate::for_tests([0xbb; 32]);
+        let mut partial_out = String::new_in(heap);
+        let mut partial_print = |bytes: &[u8]| -> Result<(), DriveError> {
+            if let Ok(text) = core::str::from_utf8(bytes) {
+                partial_out.push_str(text);
+            }
+            Ok(())
+        };
+        let prepared3 = prepare_suites_with(&specs2, &ids2, &cert2, tools_digest, make_config(0xbb), &[], &lent2, &clock, &mut partial_print, blaze_own::testing::bump());
+        match prepared3 {
+            Ok(PreparedSuites::Dirty(dirty3)) => {
+                assert!(dirty3.is_suite_dirty(0), "changed suite 0 must be dirty");
+                assert!(!dirty3.is_suite_dirty(1), "unchanged suite 1 must NOT be dirty (zero setup)");
+                assert_eq!(dirty3.pending_count(), 1, "only 1 dirty test queued");
+                assert_eq!(
+                    asked2.bodies(),
+                    1,
+                    "untouched suite 1 must hit per-suite SuiteCert in O(1) without opening its BodyCheck proof",
+                );
+            }
+            Ok(PreparedSuites::Done(status)) => panic!("edited suite 0 must not be Done: {status:?}"),
+            Err(err) => panic!("partial prepare failed: {err}"),
+        }
     }
 }

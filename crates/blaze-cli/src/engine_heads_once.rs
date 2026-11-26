@@ -92,6 +92,7 @@
 //! twice by a race, and constants evaluated against distinct constants.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use blaze_cas::plain::Snapshot;
 use blaze_drive::{Key, Name};
@@ -109,7 +110,7 @@ use blaze_ladder::front2::tables::head::SeededHeadsOpts;
 use blaze_ladder::front2::tables::owned_reads::{OwnedRecorder, ReadOwners as _};
 #[cfg(test)]
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
-use blaze_ladder::front2::tables::recorder::TableRead;
+use blaze_ladder::front2::tables::recorder::{ReadOf, TableRead};
 use blaze_ladder::front2::tables::seeds::MOST_CELLS;
 use blaze_ladder::front2::tables::task::cell_id;
 use blaze_ladder::front2::tables::view::Tables;
@@ -117,6 +118,7 @@ use blaze_ladder::front2::receiver::Pointers;
 use blaze_own::{Alloc, SharedAlloc, Vec};
 use bstd::cx::Cx;
 use bstd::mem::Frame;
+use bstd::sync::CachePadded;
 
 use crate::CliError;
 use crate::engine_seeds::{DependencyFinder, HeadRecords, KEY_BYTES, Keyed};
@@ -125,25 +127,121 @@ use crate::engine_head_notes::{Cause, head_result, leak, published};
 use crate::engine_heads::{HeadAt, MOST_HEAD_READS, Owners, Subjects, names_read};
 use crate::engine_tasks::WHOLE;
 
-/// One cell in the request's table: its frozen bytes, their meaning and the cell's own reads,
-/// all in the request's heap, lent to every worker until the request ends.
+const SLAB_INNER: usize = 1024;
+const SLAB_OUTER: usize = 2048;
+
+/// 1-based index into a [`SliceSlab`] (`0` denotes the empty slice `&[]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct SliceRef(u32);
+
+/// Safe, lock-free-on-read, append-only store of boxed slices owned by [`HeadsOnce`].
+/// Every slice lives as long as `&self` (zero `leak_static()`, zero `unsafe`) and is freed in
+/// full when [`HeadsOnce`] drops at the end of `Stage::Heads`.
+struct SliceSlab<T> {
+    next: CachePadded<AtomicU32>,
+    outer: Vec<OnceLock<Vec<OnceLock<blaze_own::Box<[T], SharedAlloc<'static>>>, SharedAlloc<'static>>>, SharedAlloc<'static>>,
+    alloc: SharedAlloc<'static>,
+}
+
+impl<T: Copy> SliceSlab<T> {
+    fn new(alloc: SharedAlloc<'static>) -> SliceSlab<T> {
+        let mut outer = Vec::with_capacity_in(SLAB_OUTER, alloc);
+        for _ in 0..SLAB_OUTER {
+            outer.push(OnceLock::new());
+        }
+        SliceSlab { next: CachePadded::new(AtomicU32::new(0)), outer, alloc }
+    }
+
+    fn push(&self, items: &[T]) -> Option<SliceRef> {
+        if items.is_empty() {
+            return Some(SliceRef(0));
+        }
+        let raw = self.next.fetch_add(1, Ordering::Relaxed);
+        let slot = usize::try_from(raw).ok()?;
+        let hi = slot / SLAB_INNER;
+        let lo = slot % SLAB_INNER;
+        let bucket = self.outer.get(hi)?;
+        let inner = bucket.get_or_init(|| {
+            let mut slots = Vec::with_capacity_in(SLAB_INNER, self.alloc);
+            for _ in 0..SLAB_INNER {
+                slots.push(OnceLock::new());
+            }
+            slots
+        });
+        let cell = inner.get(lo)?;
+        let mut copy = Vec::with_capacity_in(items.len(), self.alloc);
+        copy.extend_from_slice(items);
+        let _ = cell.set(copy.into_boxed_slice());
+        raw.checked_add(1).map(SliceRef)
+    }
+
+    fn get(&self, r: SliceRef) -> &[T] {
+        if r.0 == 0 {
+            return &[];
+        }
+        let Ok(slot) = usize::try_from(r.0 - 1) else {
+            return &[];
+        };
+        let hi = slot / SLAB_INNER;
+        let lo = slot % SLAB_INNER;
+        self.outer
+            .get(hi)
+            .and_then(|bucket| bucket.get())
+            .and_then(|inner| inner.get(lo))
+            .and_then(|cell| cell.get())
+            .map_or(&[], |boxed| &boxed[..])
+    }
+}
+
+/// `'static` handle stored inside `HeadsOnce::cells` (`SharedMap` requires `V: 'static`).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Entry {
+struct StoredEntry {
+    want: Want,
+    member: bool,
+    bytes: SliceRef,
+    out: ContentId,
+    reads: SliceRef,
+    heads: SliceRef,
+    consts: SliceRef,
+    record: Option<(Key, Key)>,
+}
+
+/// `'static` handle stored inside `HeadsOnce::failures`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoredFailedEntry {
+    want: Want,
+    cause: Cause,
+    needs: Option<Want>,
+    reads: SliceRef,
+    heads: SliceRef,
+}
+
+/// `'static` handle stored inside `HeadsOnce::covers`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoredCover {
+    cells: SliceRef,
+    members: SliceRef,
+}
+
+/// One cell in the request's table: its frozen bytes, their meaning and the cell's own reads,
+/// owned by [`HeadsOnce`] and reclaimed when `Stage::Heads` ends.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Entry<'a> {
     pub(crate) want: Want,
     /// Its item is a member crate's (its key's crate prefix is a member unit's): else a
     /// dependency's, whose reads are coarse ([`coarse`]) and whose readers take its [`Cover`].
     pub(crate) member: bool,
     /// The frozen head (the `BZFZ` form).
-    pub(crate) bytes: &'static [u8],
+    pub(crate) bytes: &'a [u8],
     /// The bytes' meaning (head.rs `FrozenHead::meaning`): what a reader of its cell records.
     pub(crate) out: ContentId,
     /// Its own reads as cells, sorted, each once: its freeze's names reads, its constants'
     /// evaluation's (with the lang index's when it evaluated) and its constants' text cells.
-    pub(crate) reads: &'static [CellId],
+    pub(crate) reads: &'a [CellId],
     /// The heads its freeze read (head.rs `CellReads::heads`), sorted by their bytes.
-    pub(crate) heads: &'static [Want],
+    pub(crate) heads: &'a [Want],
     /// The constants' values its store held (head.rs `CellReads::consts`), sorted by key.
-    pub(crate) consts: &'static [(LibKey, u128)],
+    pub(crate) consts: &'a [(LibKey, u128)],
     /// A CLOSED dependency's head (lane H9; engine_seeds.rs `CrateAt::closed`): its record's key
     /// and the names key it is made of. Its reads, heads and constants are then empty: a reader
     /// reads its crate's `WHOLE` cell alone ([`task_reads`]), and the head is valid by its key.
@@ -151,9 +249,9 @@ pub(crate) struct Entry {
 }
 
 /// One cell in the request's table that did not freeze (lane HF1, module docs): its failure as a
-/// function of the cell, lent from the request's heap to every worker until the request ends.
+/// function of the cell, owned by [`HeadsOnce`] and reclaimed when `Stage::Heads` ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FailedEntry {
+pub(crate) struct FailedEntry<'a> {
     pub(crate) want: Want,
     /// Its own failure, or the reason it stopped at its direct need.
     pub(crate) cause: Cause,
@@ -162,9 +260,9 @@ pub(crate) struct FailedEntry {
     pub(crate) needs: Option<Want>,
     /// Its own reads as cells, sorted, each once (as [`Entry::reads`]): its attempts' names reads
     /// and its constants' evaluation's, by owner.
-    pub(crate) reads: &'static [CellId],
+    pub(crate) reads: &'a [CellId],
     /// The heads its last attempt read (its need among them), sorted by their bytes.
-    pub(crate) heads: &'static [Want],
+    pub(crate) heads: &'a [Want],
 }
 
 /// What the table found of a closed dependency head under its key, on its first look this
@@ -252,56 +350,61 @@ pub(crate) struct HeadsOnce<R = CommandRecords> {
     deps: Option<DependencyFinder<R>>,
     /// Each closed dependency cell looked up under its key, by its bytes ([`Looked`]).
     looked: blaze_core::SharedMap<[u8; WANT_BYTES], Looked, SharedAlloc<'static>>,
-    /// Closed dependency heads found under their keys (each once), and frozen here.
-    deps_found: AtomicU32,
-    deps_frozen: AtomicU32,
+    /// Closed dependency heads found under their keys (each once), and frozen here (128B padded, rule 86).
+    deps_found: CachePadded<AtomicU32>,
+    deps_frozen: CachePadded<AtomicU32>,
     /// The keys this request put (sorted), for the root (engine_seeds.rs `RequestTable::list_too`).
     put_keys: Vec<Key, SharedAlloc<'static>>,
     /// The bytes of the dependency heads whose records were committed: answered from the store
-    /// since, though still lent from the heap to the request's end (module docs, "NOT YET").
+    /// since, and reclaimed when [`HeadsOnce`] drops at the end of `Stage::Heads`.
     committed_bytes: u64,
     /// The cells the planted [`OncePlant::ForgetAtPut`] stopped answering.
     forgot: blaze_core::SharedSet<[u8; WANT_BYTES], SharedAlloc<'static>>,
     sources: Sources,
-    cells: blaze_core::SharedMap<[u8; WANT_BYTES], Entry, blaze_own::SharedAlloc<'static>>,
+    cells: blaze_core::SharedMap<[u8; WANT_BYTES], StoredEntry, blaze_own::SharedAlloc<'static>>,
     /// The cells that did not freeze (lane HF1), by their bytes: never a key of `cells` too.
-    failures: blaze_core::SharedMap<[u8; WANT_BYTES], FailedEntry, blaze_own::SharedAlloc<'static>>,
+    failures: blaze_core::SharedMap<[u8; WANT_BYTES], StoredFailedEntry, blaze_own::SharedAlloc<'static>>,
     /// Failures published by the job sources (each put, kept or twice), and seconds of equal
     /// words counted.
-    failed: AtomicU32,
-    failed_twice: AtomicU32,
+    failed: CachePadded<AtomicU32>,
+    failed_twice: CachePadded<AtomicU32>,
     /// Each constant evaluated, by its key and the unit it was evaluated for.
     consts: blaze_core::SharedSet<([u8; 8], LibKey), blaze_own::SharedAlloc<'static>>,
     heap: &'static blaze_own::Heap,
+    /// Owned slice slabs backing all entries, failures, and covers; freed completely on drop.
+    bytes_slab: SliceSlab<u8>,
+    reads_slab: SliceSlab<CellId>,
+    heads_slab: SliceSlab<Want>,
+    consts_slab: SliceSlab<(LibKey, u128)>,
     plant: OncePlant,
     /// Freezes done by the job sources (each put, kept or twice).
-    frozen: AtomicU32,
-    twice: AtomicU32,
+    frozen: CachePadded<AtomicU32>,
+    twice: CachePadded<AtomicU32>,
     /// Seconds whose bytes were equal but whose reads were not (a fact of a race; module docs).
-    reads_unequal: AtomicU32,
+    reads_unequal: CachePadded<AtomicU32>,
     /// Wants lowered by every source of the phase (heads.rs `Store::lowered`).
-    lowered: AtomicU64,
+    lowered: CachePadded<AtomicU64>,
     /// Cells a job source took from the table.
-    found: AtomicU32,
+    found: CachePadded<AtomicU32>,
     /// Heads frozen over a source of their own ([`alone`]): every head under [`Sources::Head`],
     /// none under [`Sources::Job`] (lane HF1: the floor 0).
-    alone: AtomicU32,
+    alone: CachePadded<AtomicU32>,
     /// Constants evaluated (each ask of an evaluator).
-    evaluated: AtomicU32,
+    evaluated: CachePadded<AtomicU32>,
     /// Head tasks whose read list was kept, the cells in all of them, the most in one: the
     /// memory the reader index is built from (coordinator, 2026-11-18: 892 MB in 1,408 lists).
-    read_lists: AtomicU32,
-    read_cells: AtomicU64,
-    read_most: AtomicU32,
+    read_lists: CachePadded<AtomicU32>,
+    read_cells: CachePadded<AtomicU64>,
+    read_most: CachePadded<AtomicU32>,
     /// Each dependency head's [`Cover`], made on its first read by a head task ([`cover`]).
-    covers: blaze_core::SharedMap<[u8; WANT_BYTES], Cover, blaze_own::SharedAlloc<'static>>,
+    covers: blaze_core::SharedMap<[u8; WANT_BYTES], StoredCover, blaze_own::SharedAlloc<'static>>,
     /// Entries kept of a member's head and of a dependency's, and the frozen bytes they hold.
-    members: AtomicU32,
-    dependencies: AtomicU32,
-    bytes_held: AtomicU64,
+    members: CachePadded<AtomicU32>,
+    dependencies: CachePadded<AtomicU32>,
+    bytes_held: CachePadded<AtomicU64>,
     /// Two covers of one dependency head made with other cells (a fact of the walk: never, as
     /// a cover is a function of the table's entries, which only insert).
-    covers_unequal: AtomicU32,
+    covers_unequal: CachePadded<AtomicU32>,
 }
 
 /// What a read of a DEPENDENCY's head is, for a head task (lane H8; rule 77): the `WHOLE` cell
@@ -315,9 +418,9 @@ pub(crate) struct HeadsOnce<R = CommandRecords> {
 /// (a dependency that depends on a member, rare): the reader places and follows each as its
 /// own (`task_reads`), and such a cover is not kept (its placing is the reader's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Cover {
-    pub(crate) cells: &'static [CellId],
-    pub(crate) members: &'static [Want],
+pub(crate) struct Cover<'a> {
+    pub(crate) cells: &'a [CellId],
+    pub(crate) members: &'a [Want],
 }
 
 /// The most heads one dependency head's cover walks (rule 18): past it the reading task fails
@@ -389,8 +492,8 @@ impl OnceCounts {
 }
 
 impl HeadsOnce {
-    /// An empty table over the request's heap (the phase's handed one, engine_heads.rs
-    /// `run_items`), finding no dependency head by key until [`HeadsOnce::find_dependencies`].
+    /// An empty table over `heap`, finding no dependency head by key until
+    /// [`HeadsOnce::find_dependencies`]. All slice storage is freed when this table drops.
     pub(crate) fn new(heap: &'static blaze_own::Heap, plant: OncePlant, sources: Sources) -> HeadsOnce {
         HeadsOnce::empty(heap, plant, sources)
     }
@@ -404,83 +507,153 @@ impl HeadsOnce {
             return Err(CliError::Text { what: why });
         }
         let g = self.heap.alloc();
-        let puts = self.pending_puts(g);
-        for (key, names_at, bytes) in puts.iter() {
-            let parts: [&[u8]; 2] = [&names_at.0.0, *bytes];
-            ledger.put(Stage::Heads, *key, &parts, 0);
-            store.put_parts(cx, *key, &parts)?;
-        }
         let keys: Vec<Key, Alloc<'static>> = {
+            let puts = self.pending_puts(g);
+            for (key, names_at, bytes) in puts.iter() {
+                let parts: [&[u8]; 2] = [&names_at.0.0, *bytes];
+                ledger.put(Stage::Heads, *key, &parts, 0);
+                store.put_parts(cx, *key, &parts)?;
+            }
             let mut keys = Vec::with_capacity_in(puts.len(), g);
             keys.extend(puts.iter().map(|(key, _, _)| *key));
             keys
         };
+        let count = u32::try_from(keys.len()).unwrap_or(u32::MAX);
         self.mark_put(&keys);
-        Ok(u32::try_from(puts.len()).unwrap_or(u32::MAX))
+        Ok(count)
     }
 }
 
 impl<R: HeadRecords> HeadsOnce<R> {
     /// [`HeadsOnce::new`] over any records (a test's model store).
     pub(crate) fn empty(heap: &'static blaze_own::Heap, plant: OncePlant, sources: Sources) -> HeadsOnce<R> {
+        let shared = heap.shared();
         HeadsOnce {
             deps: None,
-            looked: blaze_core::SharedMap::new_in("engine.dependency heads looked up by key", heap.shared()),
-            deps_found: AtomicU32::new(0),
-            deps_frozen: AtomicU32::new(0),
-            put_keys: Vec::new_in(heap.shared()),
+            looked: blaze_core::SharedMap::new_in("engine.dependency heads looked up by key", shared),
+            deps_found: CachePadded::new(AtomicU32::new(0)),
+            deps_frozen: CachePadded::new(AtomicU32::new(0)),
+            put_keys: Vec::new_in(shared),
             committed_bytes: 0,
-            forgot: blaze_core::SharedSet::new_in("engine.dependency heads forgotten at their put (planted)", heap.shared()),
+            forgot: blaze_core::SharedSet::new_in("engine.dependency heads forgotten at their put (planted)", shared),
             sources,
-            cells: blaze_core::SharedMap::new_in("engine.heads frozen once a request, with their reads", heap.shared()),
-            failures: blaze_core::SharedMap::new_in("engine.heads failed once a request, with their reads", heap.shared()),
-            failed: AtomicU32::new(0),
-            failed_twice: AtomicU32::new(0),
-            consts: blaze_core::SharedSet::new_in("engine.head constants evaluated, by unit", heap.shared()),
+            cells: blaze_core::SharedMap::new_in("engine.heads frozen once a request, with their reads", shared),
+            failures: blaze_core::SharedMap::new_in("engine.heads failed once a request, with their reads", shared),
+            failed: CachePadded::new(AtomicU32::new(0)),
+            failed_twice: CachePadded::new(AtomicU32::new(0)),
+            consts: blaze_core::SharedSet::new_in("engine.head constants evaluated, by unit", shared),
             heap,
+            bytes_slab: SliceSlab::new(shared),
+            reads_slab: SliceSlab::new(shared),
+            heads_slab: SliceSlab::new(shared),
+            consts_slab: SliceSlab::new(shared),
             plant,
-            frozen: AtomicU32::new(0),
-            twice: AtomicU32::new(0),
-            reads_unequal: AtomicU32::new(0),
-            lowered: AtomicU64::new(0),
-            found: AtomicU32::new(0),
-            alone: AtomicU32::new(0),
-            evaluated: AtomicU32::new(0),
-            read_lists: AtomicU32::new(0),
-            read_cells: AtomicU64::new(0),
-            read_most: AtomicU32::new(0),
-            covers: blaze_core::SharedMap::new_in("engine.dependency heads' covers, by cell", heap.shared()),
-            members: AtomicU32::new(0),
-            dependencies: AtomicU32::new(0),
-            bytes_held: AtomicU64::new(0),
-            covers_unequal: AtomicU32::new(0),
+            frozen: CachePadded::new(AtomicU32::new(0)),
+            twice: CachePadded::new(AtomicU32::new(0)),
+            reads_unequal: CachePadded::new(AtomicU32::new(0)),
+            lowered: CachePadded::new(AtomicU64::new(0)),
+            found: CachePadded::new(AtomicU32::new(0)),
+            alone: CachePadded::new(AtomicU32::new(0)),
+            evaluated: CachePadded::new(AtomicU32::new(0)),
+            read_lists: CachePadded::new(AtomicU32::new(0)),
+            read_cells: CachePadded::new(AtomicU64::new(0)),
+            read_most: CachePadded::new(AtomicU32::new(0)),
+            covers: blaze_core::SharedMap::new_in("engine.dependency heads' covers, by cell", shared),
+            members: CachePadded::new(AtomicU32::new(0)),
+            dependencies: CachePadded::new(AtomicU32::new(0)),
+            bytes_held: CachePadded::new(AtomicU64::new(0)),
+            covers_unequal: CachePadded::new(AtomicU32::new(0)),
         }
     }
 
+    fn view_entry(&self, stored: StoredEntry) -> Entry<'_> {
+        Entry {
+            want: stored.want,
+            member: stored.member,
+            bytes: self.bytes_slab.get(stored.bytes),
+            out: stored.out,
+            reads: self.reads_slab.get(stored.reads),
+            heads: self.heads_slab.get(stored.heads),
+            consts: self.consts_slab.get(stored.consts),
+            record: stored.record,
+        }
+    }
+
+    fn view_failed(&self, stored: StoredFailedEntry) -> FailedEntry<'_> {
+        FailedEntry {
+            want: stored.want,
+            cause: stored.cause,
+            needs: stored.needs,
+            reads: self.reads_slab.get(stored.reads),
+            heads: self.heads_slab.get(stored.heads),
+        }
+    }
+
+    fn view_cover(&self, stored: StoredCover) -> Cover<'_> {
+        Cover {
+            cells: self.reads_slab.get(stored.cells),
+            members: self.heads_slab.get(stored.members),
+        }
+    }
+
+    fn store_entry(&self, entry: Entry<'_>) -> Result<StoredEntry, OnceError> {
+        let full = || OnceError::Full { cell: entry.want, most: MOST_CELLS };
+        Ok(StoredEntry {
+            want: entry.want,
+            member: entry.member,
+            bytes: self.bytes_slab.push(entry.bytes).ok_or_else(full)?,
+            out: entry.out,
+            reads: self.reads_slab.push(entry.reads).ok_or_else(full)?,
+            heads: self.heads_slab.push(entry.heads).ok_or_else(full)?,
+            consts: self.consts_slab.push(entry.consts).ok_or_else(full)?,
+            record: entry.record,
+        })
+    }
+
+    fn store_failed(&self, entry: FailedEntry<'_>) -> Result<StoredFailedEntry, OnceError> {
+        let full = || OnceError::Full { cell: entry.want, most: MOST_CELLS };
+        Ok(StoredFailedEntry {
+            want: entry.want,
+            cause: entry.cause,
+            needs: entry.needs,
+            reads: self.reads_slab.push(entry.reads).ok_or_else(full)?,
+            heads: self.heads_slab.push(entry.heads).ok_or_else(full)?,
+        })
+    }
+
+    fn store_cover(&self, cell: Want, made: Cover<'_>) -> Result<StoredCover, OnceError> {
+        let full = || OnceError::Full { cell, most: MOST_CELLS };
+        Ok(StoredCover {
+            cells: self.reads_slab.push(made.cells).ok_or_else(full)?,
+            members: self.heads_slab.push(made.members).ok_or_else(full)?,
+        })
+    }
+
     /// Dependency head `cell`'s cover, when a head task made it.
-    pub(crate) fn cover_of(&self, cell: Want) -> Option<Cover> {
-        self.covers.pin().get(&want_bytes(cell)).copied()
+    pub(crate) fn cover_of(&self, cell: Want) -> Option<Cover<'_>> {
+        self.covers.pin().get(&want_bytes(cell)).copied().map(|stored| self.view_cover(stored))
     }
 
     /// `made`, one worker's cover of dependency head `cell`: the first kept (a second of other
     /// cells counted, never kept: the first is what readers took); the cover readers take.
     /// Past [`MOST_CELLS`] covers (one a dependency entry at most, so never before the entries'
     /// own cap) a typed refusal (rule 18).
-    pub(crate) fn put_cover(&self, cell: Want, made: Cover) -> Result<Cover, OnceError> {
+    pub(crate) fn put_cover(&self, cell: Want, made: Cover<'_>) -> Result<Cover<'_>, OnceError> {
         let covers = self.covers.pin();
         if covers.len() >= MOST_CELLS {
             return Err(OnceError::Full { cell, most: MOST_CELLS });
         }
-        match covers.try_insert(want_bytes(cell), made) {
-            Ok(_) => Ok(made),
+        let stored = self.store_cover(cell, made)?;
+        match covers.try_insert(want_bytes(cell), stored) {
+            Ok(_) => Ok(self.view_cover(stored)),
             Err(occupied) => {
-                let held = *occupied.current;
+                let held = self.view_cover(*occupied.current);
                 if held != made {
                     self.covers_unequal.fetch_add(1, Ordering::Relaxed);
                     // PLANTED BUG (tests only): the second cover replaces the first.
                     if self.plant == OncePlant::SecondWins {
-                        self.covers.pin().insert(want_bytes(cell), made);
-                        return Ok(made);
+                        self.covers.pin().insert(want_bytes(cell), stored);
+                        return Ok(self.view_cover(stored));
                     }
                 }
                 Ok(held)
@@ -497,25 +670,26 @@ impl<R: HeadRecords> HeadsOnce<R> {
     }
 
     /// Cell `cell`'s entry, when some worker put it.
-    pub(crate) fn look(&self, cell: Want) -> Option<Entry> {
-        self.cells.pin().get(&want_bytes(cell)).copied()
+    pub(crate) fn look(&self, cell: Want) -> Option<Entry<'_>> {
+        self.cells.pin().get(&want_bytes(cell)).copied().map(|stored| self.view_entry(stored))
     }
 
     /// `entry`, one worker's freeze of its cell: the first kept, an equal second counted, other
     /// bytes refused (module docs). Two steps a race can interleave: the look, then the insert.
-    pub(crate) fn put(&self, entry: Entry) -> Result<Put, OnceError> {
+    pub(crate) fn put(&self, entry: Entry<'_>) -> Result<Put, OnceError> {
         let key = want_bytes(entry.want);
         if self.failures.pin().get(&key).is_some() {
             return Err(OnceError::FrozenAndFailed { cell: entry.want });
         }
         let cells = self.cells.pin();
         if let Some(held) = cells.get(&key) {
-            return self.again(held, entry);
+            return self.again(*held, entry);
         }
         if cells.len() >= MOST_CELLS {
             return Err(OnceError::Full { cell: entry.want, most: MOST_CELLS });
         }
-        match cells.try_insert(key, entry) {
+        let stored = self.store_entry(entry)?;
+        match cells.try_insert(key, stored) {
             Ok(_) => {
                 match entry.member {
                     true => self.members.fetch_add(1, Ordering::Relaxed),
@@ -524,15 +698,17 @@ impl<R: HeadRecords> HeadsOnce<R> {
                 self.bytes_held.fetch_add(u64::try_from(entry.bytes.len()).unwrap_or(u64::MAX), Ordering::Relaxed);
                 Ok(Put::Kept)
             }
-            Err(occupied) => self.again(occupied.current, entry),
+            Err(occupied) => self.again(*occupied.current, entry),
         }
     }
 
     /// One more freeze of a cell the table holds as `held`.
-    fn again(&self, held: &Entry, entry: Entry) -> Result<Put, OnceError> {
+    fn again(&self, held: StoredEntry, entry: Entry<'_>) -> Result<Put, OnceError> {
+        let held = self.view_entry(held);
         if held.bytes != entry.bytes {
             if self.plant == OncePlant::SecondWins {
-                self.cells.pin().insert(want_bytes(entry.want), entry);
+                let stored = self.store_entry(entry)?;
+                self.cells.pin().insert(want_bytes(entry.want), stored);
                 return Ok(Put::Kept);
             }
             return Err(OnceError::Unequal { cell: entry.want });
@@ -545,13 +721,13 @@ impl<R: HeadRecords> HeadsOnce<R> {
     }
 
     /// Cell `cell`'s failed entry, when some worker put it failed (lane HF1).
-    pub(crate) fn look_failed(&self, cell: Want) -> Option<FailedEntry> {
-        self.failures.pin().get(&want_bytes(cell)).copied()
+    pub(crate) fn look_failed(&self, cell: Want) -> Option<FailedEntry<'_>> {
+        self.failures.pin().get(&want_bytes(cell)).copied().map(|stored| self.view_failed(stored))
     }
 
     /// Cell `cell`'s own reads and the heads it read, frozen or failed: what a reader of it
     /// follows ([`reads_from`], [`cover`]).
-    fn read_of(&self, cell: Want) -> Option<(&'static [CellId], &'static [Want])> {
+    fn read_of(&self, cell: Want) -> Option<(&[CellId], &[Want])> {
         if let Some(entry) = self.look(cell) {
             return Some((entry.reads, entry.heads));
         }
@@ -561,7 +737,7 @@ impl<R: HeadRecords> HeadsOnce<R> {
     /// `entry`, one worker's failure of its cell (lane HF1, module docs): the first kept, a second
     /// of equal words and need counted, another a typed refusal; a cell the table holds frozen
     /// refused too (rule 21). Two steps a race can interleave, as [`HeadsOnce::put`]'s.
-    pub(crate) fn put_failed(&self, entry: FailedEntry) -> Result<Put, OnceError> {
+    pub(crate) fn put_failed(&self, entry: FailedEntry<'_>) -> Result<Put, OnceError> {
         let key = want_bytes(entry.want);
         self.failed.fetch_add(1, Ordering::Relaxed);
         if self.cells.pin().get(&key).is_some() {
@@ -569,19 +745,21 @@ impl<R: HeadRecords> HeadsOnce<R> {
         }
         let failures = self.failures.pin();
         if let Some(held) = failures.get(&key) {
-            return self.failed_again(held, entry);
+            return self.failed_again(*held, entry);
         }
         if failures.len() >= MOST_CELLS {
             return Err(OnceError::Full { cell: entry.want, most: MOST_CELLS });
         }
-        match failures.try_insert(key, entry) {
+        let stored = self.store_failed(entry)?;
+        match failures.try_insert(key, stored) {
             Ok(_) => Ok(Put::Kept),
-            Err(occupied) => self.failed_again(occupied.current, entry),
+            Err(occupied) => self.failed_again(*occupied.current, entry),
         }
     }
 
     /// One more failure of a cell the table holds failed as `held`.
-    fn failed_again(&self, held: &FailedEntry, entry: FailedEntry) -> Result<Put, OnceError> {
+    fn failed_again(&self, held: StoredFailedEntry, entry: FailedEntry<'_>) -> Result<Put, OnceError> {
+        let held = self.view_failed(held);
         if held.cause != entry.cause || held.needs != entry.needs {
             return Err(OnceError::UnequalFailure { cell: entry.want });
         }
@@ -637,18 +815,11 @@ impl<R: HeadRecords> HeadsOnce<R> {
         }
     }
 
-    /// `items` copied into the request's heap, lent until it ends.
-    fn lend<T: Copy>(&self, items: &[T]) -> &'static [T] {
-        let mut copy = Vec::with_capacity_in(items.len(), self.heap.alloc());
-        copy.extend_from_slice(items);
-        copy.leak_static()
-    }
-
     /// Closed dependency head `cell` frozen by a worker (`bytes`, of meaning `out`), its record's
     /// key `key` over names key `names_at`: put into the table with no reads (a reader reads its
     /// crate's `WHOLE`), counted as a freeze of a dependency head, for the phase's put.
     pub(crate) fn put_closed(&self, cell: Want, bytes: &[u8], out: ContentId, key: Key, names_at: Key) -> Result<Put, OnceError> {
-        let entry = Entry { want: cell, member: false, bytes: self.lend(bytes), out, reads: &[], heads: &[], consts: &[], record: Some((key, names_at)) };
+        let entry = Entry { want: cell, member: false, bytes, out, reads: &[], heads: &[], consts: &[], record: Some((key, names_at)) };
         self.frozen.fetch_add(1, Ordering::Relaxed);
         self.deps_frozen.fetch_add(1, Ordering::Relaxed);
         self.put(entry)
@@ -715,7 +886,7 @@ impl<R: HeadRecords> HeadsOnce<R> {
     /// Each closed dependency head frozen in this request and not yet put: (its key, its names
     /// key, its frozen bytes), sorted by key, each once (rule 25). A cell found under its key
     /// is the store's already and is not here.
-    pub(crate) fn pending_puts<A: core::alloc::Allocator>(&self, alloc: A) -> Vec<(Key, Key, &'static [u8]), A> {
+    pub(crate) fn pending_puts<'a, A: core::alloc::Allocator>(&'a self, alloc: A) -> Vec<(Key, Key, &'a [u8]), A> {
         let mut puts = Vec::new_in(alloc);
         let looked = self.looked.pin();
         for (at, entry) in self.cells.pin().iter() {
@@ -726,7 +897,7 @@ impl<R: HeadRecords> HeadsOnce<R> {
             if self.put_keys.binary_search(&key).is_ok() {
                 continue;
             }
-            puts.push((key, names_at, entry.bytes));
+            puts.push((key, names_at, self.bytes_slab.get(entry.bytes)));
         }
         puts.sort_unstable_by_key(|(key, _, _)| *key);
         puts.dedup_by_key(|(key, _, _)| *key);
@@ -760,7 +931,7 @@ impl<R: HeadRecords> HeadsOnce<R> {
         let mut bytes = 0u64;
         for (_, entry) in self.cells.pin().iter() {
             if entry.record.is_some_and(|(key, _)| self.put_keys.binary_search(&key).is_ok()) {
-                bytes = bytes.saturating_add(u64::try_from(entry.bytes.len()).unwrap_or(u64::MAX));
+                bytes = bytes.saturating_add(u64::try_from(self.bytes_slab.get(entry.bytes).len()).unwrap_or(u64::MAX));
             }
         }
         self.committed_bytes = bytes;
@@ -806,7 +977,7 @@ impl<R: HeadRecords> KnownHeads for HeadsOnce<R> {
 
 /// The Heads stage's counts of the table (zero when no Heads phase ran).
 pub(crate) fn counts(heads: &crate::engine_heads::HeadsStage) -> OnceCounts {
-    heads.once.as_ref().map(HeadsOnce::counts).unwrap_or_default()
+    heads.once_counts
 }
 
 /// The profile's line of the table (module docs, "THE MEASURE").
@@ -884,19 +1055,36 @@ pub(crate) struct OnceConsts<'r, 'n, S> {
     bump: blaze_own::Bump<'n>,
     once: &'r HeadsOnce,
     unit: [u8; 8],
+    sources: Option<&'n dyn blaze_ladder::front2::body_host::BodySources>,
 }
 
 impl<'r, 'n, S> OnceConsts<'r, 'n, S> {
     pub(crate) fn new(names: S, index: &'r Index<'n>, bump: blaze_own::Bump<'n>, once: &'r HeadsOnce, unit: [u8; 8]) -> OnceConsts<'r, 'n, S> {
-        OnceConsts { names, index, bump, once, unit }
+        OnceConsts { names, index, bump, once, unit, sources: None }
+    }
+
+    pub(crate) fn with_sources(mut self, sources: Option<&'n dyn blaze_ladder::front2::body_host::BodySources>) -> OnceConsts<'r, 'n, S> {
+        self.sources = sources;
+        self
     }
 }
 
 impl<'n, S: NamesSource<'n>> ConstValues<'n> for OnceConsts<'_, 'n, S> {
     fn eval(&mut self, store: &mut Store<'n>, keys: &mut Keys, c: LibKey) -> Result<(), ConstFail> {
         self.once.evaluated_one(c, self.unit);
-        HeadConsts::new(self.names, self.index, self.bump).eval(store, keys, c)
+        HeadConsts::new(self.names, self.index, self.bump).with_sources(self.sources).eval(store, keys, c)
     }
+}
+
+/// Precomputed per-crate scope placement entry for one crate in a split job's scope, sorted by
+/// `prefix`: allows [`place_read`] to resolve `TableRead::Names` without re-hashing
+/// `crate_scope_name`, querying `view.cell(CELLS)`, or hashing `NameCell::key()` for dependencies.
+#[derive(Clone, Copy)]
+pub(crate) struct ScopeCrate {
+    pub(crate) prefix: [u8; 8],
+    pub(crate) scope: Name,
+    pub(crate) is_member: bool,
+    pub(crate) has_cells: bool,
 }
 
 /// What one job's heads are frozen with (engine_heads.rs `heads_of`, once a job).
@@ -932,6 +1120,12 @@ pub(crate) struct JobCx<'j, 't, 'n, 'v, 'w> {
     /// The scope names of the job's crates that are members (sorted): every other crate's names
     /// reads are kept at its record's `WHOLE` ([`coarse`]).
     pub(crate) members: &'j [Name],
+    /// Precomputed scope metadata for each crate in `records`, sorted by 8-byte crate prefix.
+    pub(crate) crate_scopes: &'j [ScopeCrate],
+    /// Body expansion sources (`include_str!`, `include_bytes!`, `env!`) for head constant evaluation.
+    pub(crate) sources: Option<&'n dyn blaze_ladder::front2::body_host::BodySources>,
+    /// Underlying `JobTexts` recording data-file reads made during head constant evaluation (rule 21).
+    pub(crate) texts: &'n crate::job_texts::JobTexts<'n>,
 }
 
 /// Whether `want`'s item is a member crate's: its key's crate prefix is a member unit's (one of
@@ -973,13 +1167,24 @@ pub(crate) fn one_head<'n, 's: 'n>(
     }
     let mark = source.kept_len();
     let fail_mark = source.failed_len();
+    let data_mark = job.texts.data.borrow().len();
     // The task's own lookups (its item's text, `cell_of`) are its cell's.
     job.names.enter(want);
     job.evals.enter(want);
     let made = head_task_with_key(job.shared, source, want, task.key, job.g);
     job.names.leave();
     job.evals.leave();
-    if let Err(why) = publish_since(job, owners, source, mark, fail_mark) {
+    let data_cells = match data_read_cells(job, data_mark) {
+        Some(cells) => cells,
+        None => {
+            failed.get_or_insert(UNPLANNED_DATA_CELL);
+            Vec::new_in(job.g)
+        }
+    };
+    for &id in data_cells.iter() {
+        push(id);
+    }
+    if let Err(why) = publish_since(job, owners, source, mark, fail_mark, &data_cells) {
         failed.get_or_insert(why);
     }
     let result = head_result(job, source, want, made);
@@ -1009,20 +1214,54 @@ pub(crate) fn one_head<'n, 's: 'n>(
     result
 }
 
+const UNPLANNED_DATA_CELL: &str = "a data file read while evaluating a head's constant has no planned cell in this request (rule 21)";
+
+/// Data-file cells read via `include_str!`/`include_bytes!` while evaluating a head's constant
+/// since `from` in `job.texts.data` (rule 21: every read file enters the cell's read list).
+fn data_read_cells<'n>(job: &JobCx<'_, '_, 'n, '_, '_>, from: usize) -> Option<Vec<CellId, Alloc<'static>>> {
+    let data = job.texts.data.borrow();
+    let slice = data.get(from..).unwrap_or(&[]);
+    let mut out: Vec<CellId, Alloc<'static>> = Vec::with_capacity_in(slice.len(), job.g);
+    for &(path, _, bytes) in slice {
+        let file = CellId { of: Name::file(path.as_bytes()), cell: WHOLE };
+        let seen = bytes.map_or_else(crate::data_include::absent_out, crate::data_include::data_out);
+        if job.view.cell(&file) == seen {
+            out.push(file);
+            continue;
+        }
+        let data_cell = CellId { of: file.of, cell: crate::engine_tasks::DATA };
+        if job.view.cell(&data_cell) == seen {
+            out.push(data_cell);
+            continue;
+        }
+        return None;
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
 /// Every cell `source` froze itself from its kept index `mark` on, and every cell that failed in
 /// it from its failure mark `fail_mark` on (lane HF1), put into the table with its own reads
 /// (taken by owner from the job's recorders).
-fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, source: &mut SeededHeads<'n, '_, Tables<'_, 'n>>, mark: usize, fail_mark: usize) -> Result<(), &'static str> {
+fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, source: &mut SeededHeads<'n, '_, Tables<'_, 'n>>, mark: usize, fail_mark: usize, data_cells: &[CellId]) -> Result<(), &'static str> {
     let g = job.g;
-    let mut gave_up: Vec<FailedEntry, Alloc<'static>> = Vec::new_in(g);
+    let mut gave_up: Vec<(Want, Cause, Option<Want>, Vec<Want, Alloc<'static>>), Alloc<'static>> = Vec::new_in(g);
     for (w, failure, heads) in source.failures_from(fail_mark) {
         let Some((cause, needs)) = published(w, failure, job.records, g) else { continue };
-        gave_up.push(FailedEntry { want: w, cause, needs, reads: &[], heads: job.once.lend(heads) });
+        let mut owned_heads = Vec::with_capacity_in(heads.len(), g);
+        owned_heads.extend_from_slice(heads);
+        gave_up.push((w, cause, needs, owned_heads));
     }
-    for entry in gave_up.iter_mut() {
-        let reads = cell_reads(job, owners, entry.want, &[])?;
-        entry.reads = job.once.lend(&reads);
-        job.once.put_failed(*entry).map_err(|e| leak(g, format_args!("{e}")))?;
+    for (want, cause, needs, heads) in gave_up.iter() {
+        let mut reads = cell_reads(job, owners, *want, &[])?;
+        if !data_cells.is_empty() {
+            reads.extend_from_slice(data_cells);
+            reads.sort_unstable();
+            reads.dedup();
+        }
+        let entry = FailedEntry { want: *want, cause: *cause, needs: *needs, reads: &reads, heads };
+        job.once.put_failed(entry).map_err(|e| leak(g, format_args!("{e}")))?;
     }
     let mut fresh: Vec<Want, Alloc<'static>> = Vec::new_in(g);
     fresh.extend(source.frozen_from(mark).map(|(w, _)| w));
@@ -1034,15 +1273,20 @@ fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owner
             job.once.put_closed(w, frozen.bytes(), frozen.meaning(), key, names_at).map_err(|e| leak(g, format_args!("{e}")))?;
             continue;
         }
-        let reads = cell_reads(job, owners, w, read.consts)?;
+        let mut reads = cell_reads(job, owners, w, read.consts)?;
+        if !data_cells.is_empty() {
+            reads.extend_from_slice(data_cells);
+            reads.sort_unstable();
+            reads.dedup();
+        }
         let entry = Entry {
             want: w,
             member: is_member(job.subjects, w),
-            bytes: job.once.lend(frozen.bytes()),
+            bytes: frozen.bytes(),
             out: frozen.meaning(),
-            reads: job.once.lend(&reads),
-            heads: job.once.lend(read.heads),
-            consts: job.once.lend(read.consts),
+            reads: &reads,
+            heads: read.heads,
+            consts: read.consts,
             record: None,
         };
         job.once.frozen.fetch_add(1, Ordering::Relaxed);
@@ -1055,9 +1299,9 @@ fn publish_since<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owner
 /// evaluation's, and the text cell of each constant `consts` holds.
 fn cell_reads<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w: Want, consts: &[(LibKey, u128)]) -> Result<Vec<CellId, Alloc<'static>>, &'static str> {
     let g = job.g;
-    let mut out: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
-    names_of(job, owners, job.names, w, &mut out)?;
-    names_of(job, owners, job.evals, w, &mut out)?;
+    let mut out: Vec<CellId, Alloc<'static>> = Vec::with_capacity_in(16 + consts.len(), g);
+    names_of(job, owners, job.names, w, &mut |id| out.push(id))?;
+    names_of(job, owners, job.evals, w, &mut |id| out.push(id))?;
     for (c, _) in consts.iter() {
         match text_cell(job.records, job.subjects, *c) {
             Ok(Some(id)) => out.push(id),
@@ -1075,12 +1319,16 @@ fn cell_reads<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'
 }
 
 /// `w`'s reads in `recorder`, each as the cell a reader records (engine_heads.rs `names_read`).
-fn names_of<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, recorder: &OwnedRecorder<'_>, w: Want, out: &mut Vec<CellId, Alloc<'static>>) -> Result<(), &'static str> {
+fn names_of<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, recorder: &OwnedRecorder<'_>, w: Want, out: &mut dyn FnMut(CellId)) -> Result<(), &'static str> {
     let mut result = Ok(());
     recorder
         .reads_of(w, &mut |one| {
             if result.is_ok() {
-                result = place_read(job, owners, one).map(|cell| out.extend(cell));
+                result = place_read(job, owners, one).map(|cell| {
+                    if let Some(id) = cell {
+                        out(id);
+                    }
+                });
             }
         })
         .map_err(|e| leak(job.g, format_args!("its head's freeze: {e}")))?;
@@ -1095,6 +1343,21 @@ fn place_read<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'
             let shown = UnplacedIn { unplaced: &unplaced, crates: job.crates };
             leak(job.g, format_args!("placing a head's source read: {shown}"))
         });
+    }
+    // Fast path for `TableRead::Names`: resolve crate scope from precomputed `job.crate_scopes`,
+    // skipping `crate_scope_name` BLAKE3, `view.cell(CELLS)`, and (for dependencies) `NameCell::key()`.
+    if let ReadOf::Names { krate } = read.of() {
+        if krate == blaze_scope::BUILTIN_PREFIX {
+            return Ok(None);
+        }
+        if let Ok(at) = job.crate_scopes.binary_search_by_key(&krate, |c| c.prefix)
+            && let Some(&sc) = job.crate_scopes.get(at)
+        {
+            if !sc.is_member || !sc.has_cells {
+                return Ok(Some(CellId { of: sc.scope, cell: WHOLE }));
+            }
+            return Ok(Some(CellId { of: sc.scope, cell: blaze_drive::cells::Cell(read.cell()) }));
+        }
     }
     let Some(id) = cell_id(job.base, read).map_err(|why| leak(job.g, format_args!("placing a head's read {read:?}: {why}")))? else {
         return Ok(None);
@@ -1138,14 +1401,13 @@ fn reads_from<'n, 's: 'n>(
     }
     // Its task's own lookups in this job (its text, its `cell_of`): when another job froze it,
     // they are not in the entry.
-    let mut own: Vec<CellId, Alloc<'static>> = Vec::new_in(g);
-    names_of(job, owners, job.names, want, &mut own)?;
-    for id in own.iter() {
-        push(*id);
+    names_of(job, owners, job.names, want, push)?;
+    if heads.is_empty() {
+        return Ok(());
     }
-    let mut seen: blaze_hash::HashSet<[u8; WANT_BYTES], Alloc<'static>> = blaze_hash::HashSet::new_in(g);
+    let mut seen: blaze_hash::HashSet<[u8; WANT_BYTES], Alloc<'static>> = blaze_hash::HashSet::with_capacity_in(heads.len() + 1, g);
     seen.insert(want_bytes(want));
-    let mut next: Vec<Want, Alloc<'static>> = Vec::new_in(g);
+    let mut next: Vec<Want, Alloc<'static>> = Vec::with_capacity_in(heads.len(), g);
     next.extend_from_slice(heads);
     while let Some(w) = next.pop() {
         if !seen.insert(want_bytes(w)) {
@@ -1204,7 +1466,7 @@ fn reads_from<'n, 's: 'n>(
 /// later reader ([`HeadsOnce::put_cover`]: equal whoever makes it, as the entries only insert).
 /// A head the walk places as no dependency's (a member's, one of no crate of the records) is
 /// handed back in `members`, for the reader to place itself; such a cover is not kept.
-fn cover<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w: Want) -> Result<Cover, &'static str> {
+fn cover<'j, 'n, 's: 'n>(job: &JobCx<'j, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w: Want) -> Result<Cover<'j>, &'static str> {
     if let Some(held) = job.once.cover_of(w) {
         return Ok(held);
     }
@@ -1251,11 +1513,11 @@ fn cover<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
     cells.dedup();
     members.sort_unstable_by_key(|one| want_bytes(*one));
     members.dedup();
-    let made = Cover { cells: job.once.lend(&cells), members: job.once.lend(&members) };
     if !members.is_empty() {
-        return Ok(made);
+        let stored = job.once.store_cover(w, Cover { cells: &cells, members: &members }).map_err(|e| leak(g, format_args!("{e}")))?;
+        return Ok(job.once.view_cover(stored));
     }
-    job.once.put_cover(w, made).map_err(|e| leak(g, format_args!("{e}")))
+    job.once.put_cover(w, Cover { cells: &cells, members: &members }).map_err(|e| leak(g, format_args!("{e}")))
 }
 
 /// Head `want` frozen ALONE, over a source and recorders of its own, as every head was before
@@ -1271,10 +1533,21 @@ fn alone<'n, 's: 'n>(job: &JobCx<'_, '_, 'n, '_, '_>, owners: &mut Owners<'s>, w
     // The evaluator reads through a recorder of its own (engine_head_consts.rs).
     let evaluated = Recorder::new(RecorderOpts { alloc: g });
     let bump = job.frame.alloc(blaze_own::Erased::new(job.frame)).bump();
-    let mut consts = HeadConsts::new(job.base.reading_into(&evaluated), job.index, bump);
+    let mut consts = HeadConsts::new(job.base.reading_into(&evaluated), job.index, bump).with_sources(job.sources);
+    let data_mark = job.texts.data.borrow().len();
     job.once.alone.fetch_add(1, Ordering::Relaxed);
     let mut source = SeededHeads::new(SeededHeadsOpts { names, sized: job.sized, pointers: job.pointers, frame: job.frame, scratch: g, alloc: g, consts: Some(&mut consts as &mut dyn ConstValues<'_>), known: None, owners: None });
     let made = head_task_with_key(names, &mut source, want, task.key, g);
+    match data_read_cells(job, data_mark) {
+        Some(cells) => {
+            for &id in cells.iter() {
+                push(id);
+            }
+        }
+        None => {
+            failed.get_or_insert(UNPLANNED_DATA_CELL);
+        }
+    }
     let result = head_result(job, &source, want, made);
     for id in job.pointer_reads.iter() {
         push(*id);

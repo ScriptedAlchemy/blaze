@@ -159,6 +159,56 @@ impl Target<'static> {
             "vh",
         ],
     };
+
+    /// `aarch64-unknown-linux-gnu`, a dev build (pins/answers/rustc.json).
+    pub const AARCH64_UNKNOWN_LINUX_GNU: Target<'static> = Target {
+        os: "linux",
+        arch: "aarch64",
+        family: "unix",
+        pointer_width: "64",
+        endian: "little",
+        env: "gnu",
+        vendor: "unknown",
+        debug_assertions: true,
+        reliable_f16: true,
+        reliable_f128: true,
+        reliable_f128_math: true,
+        atomic_widths: &["8", "16", "32", "64", "128", "ptr"],
+        target_features: &["neon", "outline-atomics"],
+    };
+
+    /// `x86_64-unknown-linux-gnu`, a dev build (pins/answers/rustc.json).
+    pub const X86_64_UNKNOWN_LINUX_GNU: Target<'static> = Target {
+        os: "linux",
+        arch: "x86_64",
+        family: "unix",
+        pointer_width: "64",
+        endian: "little",
+        env: "gnu",
+        vendor: "unknown",
+        debug_assertions: true,
+        reliable_f16: true,
+        reliable_f128: true,
+        reliable_f128_math: true,
+        atomic_widths: &["8", "16", "32", "64", "ptr"],
+        target_features: &["fxsr", "sse", "sse2"],
+    };
+
+    /// The host's own target.
+    pub const fn host() -> Target<'static> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Self::AARCH64_APPLE_DARWIN
+        }
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        {
+            Self::AARCH64_UNKNOWN_LINUX_GNU
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            Self::X86_64_UNKNOWN_LINUX_GNU
+        }
+    }
 }
 
 impl fmt::Display for Target<'_> {
@@ -403,6 +453,10 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 None if stack.len() > base => stack.pop().expect("the stack is longer than its base"),
                 None => break,
             };
+            let content = skip_attr_trivia(content);
+            if content.is_empty() {
+                continue;
+            }
             let name = prelude_attr(head(content));
             if let Some(path) = cells_answer(head(content)) {
                 attrs.checks.push(path);
@@ -892,8 +946,50 @@ pub fn strip_attr(raw: &str) -> &str {
     s.trim()
 }
 
+/// Skips leading ASCII whitespace, `// ...` line comments, and nested `/* ... */` block
+/// comments from attribute text (the Reference, "Comments": comments are whitespace).
+fn skip_attr_trivia(text: &str) -> &str {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        match c {
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while b.get(i).is_some_and(|&ch| ch != b'\n') {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut open = 1u32;
+                i += 2;
+                while open > 0 {
+                    match (b.get(i), b.get(i + 1)) {
+                        (Some(&b'/'), Some(&b'*')) => {
+                            open += 1;
+                            i += 2;
+                        }
+                        (Some(&b'*'), Some(&b'/')) => {
+                            open -= 1;
+                            i += 2;
+                        }
+                        (Some(_), Some(_)) => i += 1,
+                        _ => break,
+                    }
+                }
+                if open > 0 {
+                    return "";
+                }
+            }
+            _ => break,
+        }
+    }
+    text.get(i..).unwrap_or("")
+}
+
 /// The path an attribute's content starts with.
 pub fn head(content: &str) -> &str {
+    let content = skip_attr_trivia(content);
     // An expansion's text holds spaces between its tokens (`:: core :: prelude :: v1 ::
     // derive (..)`): a space continues the path only beside a `::`.
     let b = content.as_bytes();
@@ -939,6 +1035,7 @@ pub fn prelude_attr(path: &str) -> &str {
 
 /// What is inside an attribute's outer parentheses, or nothing.
 pub fn args(content: &str) -> &str {
+    let content = skip_attr_trivia(content);
     match (content.find('('), content.rfind(')')) {
         (Some(open), Some(close)) if close > open => &content[open + 1..close],
         _ => "",
@@ -990,6 +1087,33 @@ impl<'t> Iterator for SplitTop<'t> {
             }
             match c {
                 b'"' => self.in_str = true,
+                b'/' if bytes.get(self.at) == Some(&b'/') => {
+                    self.at += 1;
+                    while bytes.get(self.at).is_some_and(|&ch| ch != b'\n') {
+                        self.at += 1;
+                    }
+                }
+                b'/' if bytes.get(self.at) == Some(&b'*') => {
+                    let mut open = 1u32;
+                    self.at += 1;
+                    while open > 0 {
+                        match (bytes.get(self.at), bytes.get(self.at + 1)) {
+                            (Some(&b'/'), Some(&b'*')) => {
+                                open += 1;
+                                self.at += 2;
+                            }
+                            (Some(&b'*'), Some(&b'/')) => {
+                                open -= 1;
+                                self.at += 2;
+                            }
+                            (Some(_), Some(_)) => self.at += 1,
+                            _ => break,
+                        }
+                    }
+                    if open > 0 {
+                        self.at = bytes.len();
+                    }
+                }
                 b'(' | b'[' | b'{' | b'<' => self.depth += 1,
                 b')' | b']' | b'}' => self.depth -= 1,
                 b'>' if at == 0 || bytes[at - 1] != b'-' => self.depth -= 1,
@@ -1196,9 +1320,21 @@ pub fn parse_path_marked<'t, 'a>(
     mark_of: &dyn Fn(&'t str) -> Option<blaze_expand::origin_column::TextMark>,
     alloc: Alloc<'a>,
 ) -> Option<Path<'a, &'t str>> {
+    parse_path_marked_in(text, krate, mark_of, alloc, alloc)
+}
+
+/// [`parse_path_marked`] keeping the temporary segment buffer in `scratch` and only writing the
+/// final [`Path`] into `alloc`.
+fn parse_path_marked_in<'t, 'a>(
+    text: &'t str,
+    krate: CrateItemKey,
+    mark_of: &dyn Fn(&'t str) -> Option<blaze_expand::origin_column::TextMark>,
+    scratch: Alloc<'_>,
+    alloc: Alloc<'a>,
+) -> Option<Path<'a, &'t str>> {
     let mut tokens = (PLex { text, at: 0 }).peekable();
     let mut abs = false;
-    let mut segments = AVec::new_in(alloc);
+    let mut segments = AVec::new_in(scratch);
     if tokens.peek() == Some(&Ok(PTok::Colons)) {
         abs = true;
         tokens.next();
@@ -1349,9 +1485,13 @@ pub trait Files<'t> {
     fn outline(&self, file: u32) -> &Outline<'_>;
 }
 
-/// Whether a module is one of the tree's.
+/// Whether a module is one of the tree's, and whether its own attributes mark it `macro_use`.
 pub trait Walked {
     fn walked(&self, module: ItemKey) -> bool;
+    /// Whether the walked module carries `#![macro_use]` (or `#[macro_use]` on its declaration).
+    fn macro_use(&self, _module: ItemKey) -> bool {
+        false
+    }
 }
 
 /// One module the walk found.
@@ -1369,6 +1509,8 @@ pub struct Module<'t, 'a> {
     /// What its children's `#[path]` is relative to.
     pub path_dir: AString<'a>,
     pub no_implicit_prelude: bool,
+    /// Its outer `#[macro_use]` or inner `#![macro_use]` (for an out-of-line module file).
+    pub macro_use: bool,
     /// `krate::a::b`.
     pub path: AString<'a>,
 }
@@ -1418,6 +1560,10 @@ impl Walked for Tree<'_, '_> {
     fn walked(&self, module: ItemKey) -> bool {
         self.by_key.contains_key(&module)
     }
+
+    fn macro_use(&self, module: ItemKey) -> bool {
+        self.by_key.get(&module).and_then(|&i| self.modules.get(i)).is_some_and(|m| m.macro_use)
+    }
 }
 
 /// What [`walk`] reads of one module's own text to make its children: one row per `mod` item
@@ -1430,13 +1576,15 @@ pub struct WalkRow<'t> {
     pub inline: bool,
     /// Its `#[no_implicit_prelude]`.
     pub no_implicit_prelude: bool,
+    /// Its `#[macro_use]`.
+    pub macro_use: bool,
     /// Its `#[path]`, read.
     pub path: Option<&'t str>,
 }
 
 /// The [`WalkRow`]s of module `item` of the file (`None`: the file's own items) and, for a
-/// file's own items, its inner `#![cfg]`'s verdict and `#![no_implicit_prelude]`: what the walk
-/// read of this text alone.
+/// file's own items, its inner `#![cfg]`'s verdict, `#![no_implicit_prelude]`, and `#![macro_use]`:
+/// what the walk read of this text alone.
 pub fn walk_rows<'t, 'a: 't>(
     cfg: &Cfg<'_, '_>,
     o: &Outline<'_>,
@@ -1445,14 +1593,14 @@ pub fn walk_rows<'t, 'a: 't>(
     edition: Edition,
     out: &mut AVec<'a, WalkRow<'t>>,
     bump: Bump<'a>,
-) -> Option<(bool, bool)> {
+) -> Option<(bool, bool, bool)> {
     let alloc = bump.alloc();
     // A file whose own `#![cfg]` is false has no `mod` lines to walk ([`walk`]).
     let own = item.is_none().then(|| {
         let f = file_attrs(cfg, o, text, alloc);
-        (f.cfg_ok, f.no_implicit_prelude)
+        (f.cfg_ok, f.no_implicit_prelude, f.macro_use)
     });
-    if own.is_some_and(|(cfg_ok, _)| !cfg_ok) {
+    if own.is_some_and(|(cfg_ok, _, _)| !cfg_ok) {
         return own;
     }
     for (_, child) in o.children(item) {
@@ -1468,7 +1616,7 @@ pub fn walk_rows<'t, 'a: 't>(
                 Err(_) => continue,
             }
         }
-        out.push(WalkRow { name, inline, no_implicit_prelude: attrs.no_implicit_prelude, path: attrs.path });
+        out.push(WalkRow { name, inline, no_implicit_prelude: attrs.no_implicit_prelude, macro_use: attrs.macro_use, path: attrs.path });
     }
     own
 }
@@ -1566,6 +1714,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
         dir: root_dir.clone_in(alloc),
         path_dir: root_dir,
         no_implicit_prelude: root_attrs.no_implicit_prelude,
+        macro_use: root_attrs.macro_use,
         path: copied(name, alloc),
     });
     // A false crate-level `#![cfg]` removes "all of the following crate contents" (the
@@ -1622,6 +1771,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
                     dir: d.clone_in(alloc),
                     path_dir: d,
                     no_implicit_prelude: attrs.no_implicit_prelude,
+                    macro_use: attrs.macro_use,
                     path: cpath,
                 });
                 continue;
@@ -1677,6 +1827,7 @@ pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
                 dir: cdir,
                 path_dir: cpdir,
                 no_implicit_prelude: attrs.no_implicit_prelude || fattrs.no_implicit_prelude,
+                macro_use: attrs.macro_use || fattrs.macro_use,
                 path: cpath,
             });
         }
@@ -1840,6 +1991,10 @@ pub struct BodySrc<'t> {
     pub loc: Loc,
     /// The file its text is written in ([`CallSrc::written`]): what its block modules' calls read from.
     pub written: &'t str,
+    /// The folder of the file an `include!` read this body from (`None` for a body written in a
+    /// module's own file or inside a module made from an included file): where a `#[path]` or
+    /// inline `mod` inside the body's blocks resolves from, matching `Made::dir`.
+    pub included_dir: Option<&'t str>,
     /// How many expansions (and bodies) deep its text is.
     pub depth: u16,
     /// Where it is written: the fragment (its owner's key: the module's own text, or a call's
@@ -1872,7 +2027,7 @@ impl<'t> BodySrc<'t> {
         depth: u16,
         place: (ItemKey, u32),
         marks: Option<crate::crate_roots::TextMarks<'t>>,
-        tokens: Option<crate::nested_input::ExpansionTokens<'t>>,
+        tokens: FragmentTokens<'_, 't>,
     ) -> Option<BodySrc<'t>> {
         let holds = matches!(
             detail,
@@ -1886,7 +2041,18 @@ impl<'t> BodySrc<'t> {
         // A `!` too: a statement call may declare items (crate::expanded_blocks); the scan
         // decides whether one is in statement position. The one test, shared with the names
         // digest (`blaze_file_items::nested::may_write_block`, lane CX19).
-        (holds && blaze_file_items::nested::may_write_block(text)).then_some(BodySrc { key, module, text, loc, written, depth, place, marks, tokens })
+        (holds && blaze_file_items::nested::may_write_block(text)).then(|| BodySrc {
+            key,
+            module,
+            text,
+            loc,
+            written,
+            included_dir: None,
+            depth,
+            place,
+            marks,
+            tokens: tokens.get_for_body(),
+        })
     }
 }
 
@@ -2000,35 +2166,35 @@ pub struct LowerNote<'t> {
 
 /// One fragment lowered: a module's own text, or one call's expansion.
 #[derive(Debug)]
-pub struct Lowered<'t, 'a> {
+pub struct Lowered<'t, 'a, 's> {
     pub decls: DeclsBuilder<'a, &'t str>,
-    pub macros: AVec<'a, (ItemKey, MacroSrc<'t>)>,
-    pub calls: AVec<'a, (ItemKey, CallSrc<'t>)>,
-    pub enums: AVec<'a, (ItemKey, AVec<'a, Variant<&'t str>>)>,
-    pub impls: AVec<'a, ImplSrc<'t>>,
-    pub langs: AVec<'a, LangSrc<'t>>,
+    pub macros: AVec<'s, (ItemKey, MacroSrc<'t>)>,
+    pub calls: AVec<'s, (ItemKey, CallSrc<'t>)>,
+    pub enums: AVec<'s, (ItemKey, AVec<'a, Variant<&'t str>>)>,
+    pub impls: AVec<'s, ImplSrc<'t>>,
+    pub langs: AVec<'s, LangSrc<'t>>,
     /// Where each of `decls.uses` is written, by index.
     pub use_locs: AVec<'a, Loc>,
     pub prelude: Option<PreludeImport<'t, 'a>>,
     /// The crates of `#[macro_use] extern crate x;` items, by the name written.
     pub macro_use: AVec<'a, &'t str>,
     /// Each item's text (an impl's too).
-    pub texts: AVec<'a, ItemText<'t>>,
+    pub texts: AVec<'s, ItemText<'t>>,
     /// The items and members whose body may write an impl in a block ([`BodySrc`]).
-    pub bodies: AVec<'a, BodySrc<'t>>,
+    pub bodies: AVec<'s, BodySrc<'t>>,
     /// The `mod` items of a module a macro wrote (or of one inside it): modules the walk did
     /// not see, for the driver to make.
-    pub mods_made: AVec<'a, ModMade<'t>>,
+    pub mods_made: AVec<'s, ModMade<'t>>,
     /// Each trait's and impl's members on under the cfg, in declaration order, by its key.
-    pub members: AVec<'a, (ItemKey, AVec<'a, Member<'t>>)>,
+    pub members: AVec<'s, (ItemKey, AVec<'a, Member<'t>>)>,
     /// The tuple and unit structs: each is its own constructor's key.
-    pub ctors: AVec<'a, ItemKey>,
-    pub notes: AVec<'a, LowerNote<'t>>,
+    pub ctors: AVec<'s, ItemKey>,
+    pub notes: AVec<'s, LowerNote<'t>>,
     /// The `link_name`/`export_name` values written as macro calls, each at its item's place.
-    pub values: AVec<'a, crate::attr_values::ValueSite<'t>>,
+    pub values: AVec<'s, crate::attr_values::ValueSite<'t>>,
 }
 
-impl Lowered<'_, '_> {
+impl Lowered<'_, '_, '_> {
     /// The declarations' entries.
     pub fn entries(&self) -> usize {
         let d = &self.decls;
@@ -2089,6 +2255,52 @@ impl<W: ?Sized> Clone for LowerCx<'_, '_, W> {
 
 impl<W: ?Sized> Copy for LowerCx<'_, '_, W> {}
 
+/// How a [`Fragment`] supplies the rendered tokens of a macro expansion to lowering: absent for a
+/// source file, already materialized, or lazily cloned into the crate frame on first consumer
+/// (nested call, attribute value call, or body that may write a block module) so expansions with
+/// none keep zero token/place/word tables in the crate frame (rule 11).
+#[derive(Clone, Copy)]
+pub enum FragmentTokens<'c, 't> {
+    None,
+    Ready(crate::nested_input::ExpansionTokens<'t>),
+    Lazy(&'c dyn Fn() -> crate::nested_input::ExpansionTokens<'t>),
+    /// Like [`FragmentTokens::Lazy`], but leaves [`BodySrc::tokens`] as `None` because the caller
+    /// (`resolve.rs::blocks_of`) runs `nested::scan` immediately and materializes tokens ONLY if
+    /// `nested.writes()` is true, avoiding cloning `TokenStream` for bodies that merely contain
+    /// `assert!()` / `panic!()` (rule 11).
+    LazyDeferBody(&'c dyn Fn() -> crate::nested_input::ExpansionTokens<'t>),
+    /// Like [`FragmentTokens::Lazy`], but the lazy producer may yield `None` (e.g. a block
+    /// module whose body text was not placed by the enclosing expansion's tokens).
+    LazyOpt(&'c dyn Fn() -> Option<crate::nested_input::ExpansionTokens<'t>>),
+}
+
+impl<'t> FragmentTokens<'_, 't> {
+    pub fn from_option(tokens: Option<crate::nested_input::ExpansionTokens<'t>>) -> Self {
+        match tokens {
+            Some(tokens) => FragmentTokens::Ready(tokens),
+            None => FragmentTokens::None,
+        }
+    }
+
+    pub fn get(self) -> Option<crate::nested_input::ExpansionTokens<'t>> {
+        match self {
+            FragmentTokens::None => None,
+            FragmentTokens::Ready(tokens) => Some(tokens),
+            FragmentTokens::Lazy(make) | FragmentTokens::LazyDeferBody(make) => Some(make()),
+            FragmentTokens::LazyOpt(make) => make(),
+        }
+    }
+
+    pub fn get_for_body(self) -> Option<crate::nested_input::ExpansionTokens<'t>> {
+        match self {
+            FragmentTokens::None | FragmentTokens::LazyDeferBody(_) => None,
+            FragmentTokens::Ready(tokens) => Some(tokens),
+            FragmentTokens::Lazy(make) => Some(make()),
+            FragmentTokens::LazyOpt(make) => make(),
+        }
+    }
+}
+
 /// One fragment's text and place.
 #[derive(Clone, Copy)]
 pub struct Fragment<'c, 't> {
@@ -2123,23 +2335,37 @@ pub struct Fragment<'c, 't> {
     /// segment's mark resolves its root. `None`: a file, or a text no column carries.
     pub marks: Option<crate::crate_roots::TextMarks<'t>>,
     /// The tokens `text` was rendered from (an expansion's; crate::nested_input): a call in it
-    /// takes its input as a range of them. `None`: a file, or a text rewritten after rendering.
-    pub tokens: Option<crate::nested_input::ExpansionTokens<'t>>,
+    /// takes its input as a range of them.
+    pub tokens: FragmentTokens<'c, 't>,
 }
 
 /// Lowers `fragment`'s items under `cx`.
-pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fragment: Fragment<'_, 't>, bump: Bump<'a>) -> Lowered<'t, 'a> {
+pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fragment: Fragment<'_, 't>, bump: Bump<'a>) -> Lowered<'t, 'a, 'a> {
+    lower_in_out(cx, fragment, bump.alloc(), bump.alloc(), bump)
+}
+
+/// Lowers `fragment`'s items under `cx`, keeping ephemeral lowering scratch AND the 12 transient
+/// outer output lists of [`Lowered`] in `scratch` (while long-lived `decls`, `use_locs`,
+/// `prelude`, `macro_use`, and moved member/enum lists stay in `bump`) so dropping `Lowered` after
+/// `Tables::add` leaves zero dead vectors in the crate frame (rule 11).
+pub fn lower_in<'p: 't, 't, 's, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fragment: Fragment<'_, 't>, scratch: Alloc<'s>, bump: Bump<'a>) -> Lowered<'t, 'a, 's> {
+    lower_in_out(cx, fragment, scratch, scratch, bump)
+}
+
+/// Like [`lower_in`], with distinct allocators for the returned transient [`Lowered`] vectors
+/// (`out_alloc`) and per-call temporaries (`scratch`).
+pub fn lower_in_out<'p: 't, 't, 'o, 's, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fragment: Fragment<'_, 't>, out_alloc: Alloc<'o>, scratch: Alloc<'s>, bump: Bump<'a>) -> Lowered<'t, 'a, 'o> {
     let alloc = bump.alloc();
     let entry = cx.entry
         && fragment.items.is_none()
         && fragment.depth == 0
         && matches!(fragment.at, Where::File(_))
-        && !exports_entry(cx.cfg, fragment.outline, fragment.text, alloc);
+        && !exports_entry(cx.cfg, fragment.outline, fragment.text, scratch);
     let harness = cx.harness && fragment.items.is_none() && fragment.depth == 0 && matches!(fragment.at, Where::File(_)) && fragment.members_of.is_none();
     let mut low = Lower {
         entry,
         harness,
-        harnessed: AVec::new_in(alloc),
+        harnessed: AVec::new_in(scratch),
         krate: cx.krate,
         tools: cx.tools,
         edition: cx.edition,
@@ -2160,28 +2386,29 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
         pos: 0,
         procs: cx.procs,
         alloc,
+        scratch,
         bump,
-        stack: AVec::new_in(alloc),
-        seen: HashMap::new_in(alloc),
-        checked: HashSet::new_in(alloc),
+        stack: AVec::new_in(scratch),
+        seen: HashMap::new_in(scratch),
+        checked: HashSet::new_in(scratch),
         checks_sent: 0,
         out: Lowered {
             decls: DeclsBuilder::new_in(alloc),
-            macros: AVec::new_in(alloc),
-            calls: AVec::new_in(alloc),
-            enums: AVec::new_in(alloc),
-            impls: AVec::new_in(alloc),
-            langs: AVec::new_in(alloc),
+            macros: AVec::new_in(out_alloc),
+            calls: AVec::new_in(out_alloc),
+            enums: AVec::new_in(out_alloc),
+            impls: AVec::new_in(out_alloc),
+            langs: AVec::new_in(out_alloc),
             use_locs: AVec::new_in(alloc),
             prelude: None,
             macro_use: AVec::new_in(alloc),
-            texts: AVec::new_in(alloc),
-            bodies: AVec::new_in(alloc),
-            mods_made: AVec::new_in(alloc),
-            members: AVec::new_in(alloc),
-            ctors: AVec::new_in(alloc),
-            notes: AVec::new_in(alloc),
-            values: AVec::new_in(alloc),
+            texts: AVec::new_in(out_alloc),
+            bodies: AVec::new_in(out_alloc),
+            mods_made: AVec::new_in(out_alloc),
+            members: AVec::new_in(out_alloc),
+            ctors: AVec::new_in(out_alloc),
+            notes: AVec::new_in(out_alloc),
+            values: AVec::new_in(out_alloc),
         },
     };
     // The entries left to lower, each a run of siblings (`at..end`): an extern block's items
@@ -2195,7 +2422,7 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
     // cfg.attr.crate-level-attrs: "removing all of the following crate contents"). The walk
     // keeps no module file whose `#![cfg]` is false, so this is the crate root's: the crate
     // exists and is empty (a proc-macro crate's harness lists nothing).
-    if fragment.items.is_none() && fragment.depth == 0 && matches!(fragment.at, Where::File(_)) && !file_attrs(low.cfg, outline, low.text, alloc).cfg_ok {
+    if fragment.items.is_none() && fragment.depth == 0 && matches!(fragment.at, Where::File(_)) && !file_attrs(low.cfg, outline, low.text, scratch).cfg_ok {
         if low.harness {
             low.proc_macro_harness();
         }
@@ -2207,7 +2434,7 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
             low.proc_macro(*export);
         }
     }
-    let mut runs: AVec<'a, (usize, usize)> = AVec::new_in(alloc);
+    let mut runs: AVec<'s, (usize, usize)> = AVec::new_in(scratch);
     runs.push(children_run(outline, fragment.items));
     while let Some(run) = runs.last_mut() {
         if run.0 >= run.1 {
@@ -2236,14 +2463,14 @@ fn children_run(outline: &Outline<'_>, parent: Option<ItemIndex>) -> (usize, usi
     }
 }
 
-struct Lower<'c, 't, 'a, W: ?Sized> {
+struct Lower<'c, 'o, 's, 't, 'a, W: ?Sized> {
     /// [`LowerCx::entry`], and the file exports no entry of its own.
     entry: bool,
     /// [`LowerCx::harness`], and this is the root file's own fragment.
     harness: bool,
     /// Under `harness`: each `#[proc_macro*]` fn at the root, in declaration order, its kind
     /// and its name as written (a raw `r#name` kept raw): the harness's list.
-    harnessed: AVec<'a, (ProcKind, &'t str)>,
+    harnessed: AVec<'s, (ProcKind, &'t str)>,
     krate: CrateItemKey,
     /// [`LowerCx::tools`].
     tools: &'c [&'c str],
@@ -2266,23 +2493,24 @@ struct Lower<'c, 't, 'a, W: ?Sized> {
     /// [`Fragment::marks`].
     marks: Option<crate::crate_roots::TextMarks<'t>>,
     /// [`Fragment::tokens`].
-    tokens: Option<crate::nested_input::ExpansionTokens<'t>>,
+    tokens: FragmentTokens<'c, 't>,
     pos: u32,
     procs: ProcDecls<'t>,
     alloc: Alloc<'a>,
+    scratch: Alloc<'s>,
     bump: Bump<'a>,
     /// `cfg_attr`'s attributes not yet read, for [`Cfg::attr`].
-    stack: AVec<'a, &'t str>,
+    stack: AVec<'s, &'t str>,
     /// How many entries of each owner, kind and name this fragment has keyed: [`Lower::key`].
-    seen: HashMap<(ItemKey, &'t str, &'t str), u32, Alloc<'a>>,
+    seen: HashMap<(ItemKey, &'t str, &'t str), u32, Alloc<'s>>,
     /// The attribute checks sent, by path and textual span: [`Lower::attr_checks`].
-    checked: HashSet<(&'t str, usize), Alloc<'a>>,
+    checked: HashSet<(&'t str, usize), Alloc<'s>>,
     /// How many of `out.decls.calls` are attribute checks.
     checks_sent: usize,
-    out: Lowered<'t, 'a>,
+    out: Lowered<'t, 'a, 'o>,
 }
 
-impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
+impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
     /// The key of `owner`'s next entry of kind `tag` named `name`. Its index counts only the
     /// earlier entries of that owner, kind and name (two `impl`s, two `_` consts, one item
     /// under two `#[cfg]`s): an item added, removed or moved changes no other item's key, so
@@ -2325,7 +2553,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             if !self.checked.insert((path, span)) {
                 continue;
             }
-            let Some(parsed) = parse_path_marked(path, self.krate, &|s| self.mark_of(s), self.alloc) else {
+            let Some(parsed) = parse_path_marked_in(path, self.krate, &|s| self.mark_of(s), self.scratch, self.alloc) else {
                 self.note(LowerNoteKind::AttrMacroNotLowered { attr: path }, at, path);
                 continue;
             };
@@ -2340,8 +2568,8 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         }
     }
 
-    fn attrs(&mut self, item: &Item) -> Attrs<'t, 'a> {
-        let mut attrs = Attrs::new_in(self.alloc);
+    fn attrs(&mut self, item: &Item) -> Attrs<'t, 's> {
+        let mut attrs = Attrs::new_in(self.scratch);
         let outline = self.outline;
         for attr in outline.attrs(item) {
             if attr.kind == AttrKind::Doc {
@@ -2391,7 +2619,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
 
     fn vis(&self, item: &Item) -> WrittenVis<Path<'a, &'t str>> {
         let path = |r| {
-            parse_path_marked(item.text(self.text, r), self.krate, &|s| self.mark_of(s), self.alloc)
+            parse_path_marked_in(item.text(self.text, r), self.krate, &|s| self.mark_of(s), self.scratch, self.alloc)
                 .unwrap_or_else(|| to_path(false, &[item.text(self.text, r)], self.krate, self.alloc))
         };
         match item.visibility {
@@ -2541,7 +2769,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             // The item is the call's input: what it declares is the expansion's (its derives
             // and later attribute macros too, lowered from the expansion).
             let call = self.key(self.owner, "attr", path);
-            let Some(parsed) = parse_path_marked(path, self.krate, &|s| self.mark_of(s), self.alloc) else {
+            let Some(parsed) = parse_path_marked_in(path, self.krate, &|s| self.mark_of(s), self.scratch, self.alloc) else {
                 self.note(LowerNoteKind::AttrMacroNotLowered { attr: path }, at, name.unwrap_or("_"));
                 return false;
             };
@@ -2719,7 +2947,13 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                     return false;
                 }
                 let pos = self.next_pos();
-                self.out.decls.mods.push(ChildModDecl { name, module, vis, macro_use: attrs.macro_use, pos });
+                self.out.decls.mods.push(ChildModDecl {
+                    name,
+                    module,
+                    vis,
+                    macro_use: attrs.macro_use || self.walked.macro_use(module),
+                    pos,
+                });
             }
             ItemDetail::Use { tree } => {
                 let Some(tree) = tree else {
@@ -2727,7 +2961,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                     return false;
                 };
                 let tree_text = item.text(text, tree);
-                let Some(leaves) = use_leaves(tree_text, self.alloc) else {
+                let Some(leaves) = use_leaves(tree_text, self.scratch) else {
                     self.note(LowerNoteKind::UseTreeNotRead, at, tree_text);
                     return false;
                 };
@@ -2774,7 +3008,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                 };
                 let pos = self.next_pos();
                 let export = exported || attrs.macro_export;
-                let shapes = if attrs.builtin { MacroShapes::FN_LIKE } else { rules_shapes(body, self.edition, self.alloc) };
+                let shapes = if attrs.builtin { MacroShapes::FN_LIKE } else { rules_shapes(body, self.edition, self.scratch) };
                 self.out.decls.macro_rules.push(MacroRulesDecl { name, def: key, pos, export, shapes });
                 let body = if attrs.builtin { MacroBody::BuiltinFn(attrs.builtin_name.unwrap_or(name)) } else { MacroBody::Rules(body) };
                 let src = MacroSrc { name, body, module: self.module, export, local_inner: attrs.local_inner };
@@ -2805,7 +3039,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                     // `macro m(..) {..}` is one function-like rule; `macro m {..}` has arms.
                     let shapes = match params {
                         Some(_) => MacroShapes::FN_LIKE,
-                        None => rules_shapes(body, self.edition, self.alloc),
+                        None => rules_shapes(body, self.edition, self.scratch),
                     };
                     (shapes, MacroBody::Macro2 { params, body })
                 };
@@ -2845,7 +3079,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
     /// found is kept as the refusal it is, for the expansion to report (rule 3).
     fn call_tokens(&self, input: &'t str, cut: crate::nested_input::InputCut) -> crate::nested_input::CallTokens<'t> {
         use crate::nested_input::CallTokens;
-        match self.tokens {
+        match self.tokens.get() {
             None => CallTokens::Text,
             Some(tokens) => match tokens.input(input, cut) {
                 Ok(input) => CallTokens::Expansion(input),
@@ -2865,7 +3099,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             return;
         };
         let path_text = item.text(text, path);
-        let Some(parsed) = parse_path_marked(path_text, self.krate, &|s| self.mark_of(s), self.alloc) else {
+        let Some(parsed) = parse_path_marked_in(path_text, self.krate, &|s| self.mark_of(s), self.scratch, self.alloc) else {
             self.note(LowerNoteKind::MacroCallPathNotRead, at, path_text);
             return;
         };
@@ -2934,7 +3168,9 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                 self.out.langs.push(LangSrc { name: lang, key, loc });
             }
         }
-        self.out.members.push((parent_key, members));
+        if !members.is_empty() {
+            self.out.members.push((parent_key, members));
+        }
     }
 
     /// An impl's header without its outer attributes: `unsafe impl<T> Tr for S<T> where ..`.

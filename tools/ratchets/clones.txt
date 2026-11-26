@@ -12,9 +12,9 @@ blaze-bstd-convert	41
 blaze-build	12
 blaze-build-script	22
 blaze-c	2
-blaze-cas	95
+blaze-cas	84
 blaze-check	7
-blaze-cli	65
+blaze-cli	59
 blaze-columns	29
 blaze-cond	3
 blaze-consteval	47
@@ -25,7 +25,7 @@ blaze-deflate	5
 blaze-dist	138
 blaze-dist-local	60
 blaze-drive	16
-blaze-emit	18
+blaze-emit	17
 blaze-engine	3
 blaze-expand	29
 blaze-fetch	12
@@ -47,7 +47,7 @@ blaze-inproc	3
 blaze-json	9
 blaze-keyed	4
 blaze-kit	15
-blaze-ladder	56
+blaze-ladder	54
 blaze-launch	4
 blaze-launch-rt	4
 blaze-launcher	2
@@ -74,7 +74,7 @@ blaze-rel	7
 blaze-remote	51
 blaze-report	1
 blaze-resolve	68
-blaze-scope	75
+blaze-scope	74
 blaze-screen	8
 blaze-script	45
 blaze-semver	12
@@ -94,7 +94,7 @@ blaze-test-reach	13
 blaze-toml	19
 blaze-trace	2
 blaze-typeck	20
-blaze-unit-graph	61
+blaze-unit-graph	52
 blaze-url	1
 blaze-watch	22
 blaze-wire	7

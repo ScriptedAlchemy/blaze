@@ -232,6 +232,19 @@ pub struct OwnerTraitImpl {
     pub self_shape: SelfShape,
 }
 
+/// Metadata for a trait fn's RPITIT opaque (`-> impl Trait` or `async fn` in a trait, RFC 3425):
+/// maps the opaque back to its trait, synthetic associated type name, trait fn, method name,
+/// trait generic count (including `Self`), and optional default `Twin` opaque key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpititOpaque {
+    pub trait_: ItemKey,
+    pub name: Name,
+    pub trait_fn: ItemKey,
+    pub fn_name: Name,
+    pub trait_types: u32,
+    pub default_twin: Option<ItemKey>,
+}
+
 /// What the lowering needs to know about a callee's signature (flow.md section 7, heads).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CalleeFacts {
@@ -240,6 +253,9 @@ pub struct CalleeFacts {
     pub writes_lifetimes: bool,
     /// The first input is `&self` or `&mut self`: elided outputs take its lifetime.
     pub self_ref: bool,
+    /// A C-variadic foreign fn (`extern "C" fn(..., ...)`): calls may pass extra trailing
+    /// arguments beyond the declared formal inputs (each carrying no lifetime slots).
+    pub c_variadic: bool,
 }
 
 /// The facts the type checker's record does not hold (flow.md section 7: the named questions).
@@ -370,10 +386,26 @@ pub trait Facts {
         let _ = trait_;
         false
     }
+    /// Whether `trait_` is an `auto trait` (`Send`, `Sync`, `Unpin`, `Freeze`, etc.), forwarded to
+    /// `blaze_borrow::Selected::is_auto_trait`.
+    fn is_auto_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
     /// Whether `trait_` is one of the callable traits (`Fn`, `FnMut`, `FnOnce`: lang items `fn`,
     /// `fn_mut`, `fn_once`). Used by `call_through_value` to locate a generic parameter's or
     /// trait object's callable signature in the owner's clause or signature columns.
     fn is_fn_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is `core::future::Future`.
+    fn is_future_trait(&self, trait_: ItemKey) -> bool {
+        let _ = trait_;
+        false
+    }
+    /// Whether `trait_` is `core::future::IntoFuture`.
+    fn is_into_future_trait(&self, trait_: ItemKey) -> bool {
         let _ = trait_;
         false
     }
@@ -384,10 +416,13 @@ pub trait Facts {
         None
     }
     /// If the body owner is a method of a trait impl `impl<..> Trait for SelfTy` (where `SelfTy`
-    /// is an `Adt`, `Ref`, or `Tuple`), returns its [`OwnerTraitImpl`] so `blaze-borrow` can
+    /// is an `Adt`, `Ref`, or `Tuple`), returns the [`OwnerTraitImpl`] for `trait_` (either `Trait`
+    /// itself or a supertrait of `Trait` with a unique impl for `SelfTy`) so `blaze-borrow` can
     /// normalize projections on the enclosing impl's own `Self` (e.g. `Cycle<I>::Item`,
-    /// `Zip<A, B>::Item`, `(&T0, &T1)::Item`) even when the call site has no explicit selection row.
-    fn owner_trait_impl(&self) -> Option<OwnerTraitImpl> {
+    /// `Zip<A, B>::Item`, `(&T0, &T1)::Item`, `Cloned<I>::Item`) even when the call site has no
+    /// explicit selection row.
+    fn owner_trait_impl(&self, trait_: ItemKey) -> Option<OwnerTraitImpl> {
+        let _ = trait_;
         None
     }
     /// The unique `Deref` impl for ADT `adt`, when known (`answer_impls(Deref, Adt(adt))` has
@@ -403,6 +438,17 @@ pub trait Facts {
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
         let _ = (trait_, name);
         false
+    }
+    /// If `opaque` is an RPITIT opaque of a trait fn, returns its [`RpititOpaque`] metadata so
+    /// `blaze-borrow` can normalize concrete RPITIT calls through the selected impl's method.
+    fn rpitit_opaque(&self, opaque: ItemKey) -> Option<RpititOpaque> {
+        let _ = opaque;
+        None
+    }
+    /// The impl method key overriding `fn_name` in trait impl `imp`, if overridden.
+    fn impl_fn(&self, imp: ItemKey, fn_name: Name) -> Option<ItemKey> {
+        let _ = (imp, fn_name);
+        None
     }
     /// The trait bounds with lifetime arguments of fn `item` ([`Ties`]): a callee's tie its
     /// trait lifetimes to what the call's arguments answer them with, the body's own say what
@@ -452,10 +498,31 @@ pub trait Facts {
     fn drop_args(&self, _adt: ItemKey) -> Option<&[bool]> {
         None
     }
+    /// For each generic argument of `adt`, whether dropping `adt` may directly inspect arbitrary
+    /// lifetimes inside that argument via a non-`#[may_dangle]` `Drop` impl (RFC 1327):
+    /// `[true]` for `BufWriter<W>` (and `struct Outer<W>(BufWriter<W>)`), `[false, true]` for
+    /// `Arc<T, A>` / `Vec<T, A>` / `Box<T, A>` (`#[may_dangle] T`), `[false, false]` for
+    /// `Map<S, F>` (holds `Arc<F>`). `None`: conservative (`true` when `drop_impl`, `false` when
+    /// structural).
+    fn drop_strict(&self, _adt: ItemKey) -> Option<&[bool]> {
+        None
+    }
+    /// For each declared lifetime parameter `0..lifetimes` of `adt`, whether dropping `adt` may
+    /// observe that lifetime (via a `Drop` impl, a dropping field whose drop observes it, a
+    /// strict `Drop` arg, or a trait object/opaque/alias in a dropping field). `None`:
+    /// conservative (`true` whenever `drop_impl || needs_drop`).
+    fn drop_lifetimes(&self, _adt: ItemKey) -> Option<&[bool]> {
+        None
+    }
     /// The number of fields of `variant`.
     fn field_count(&self, adt: ItemKey, variant: u32) -> Option<u32>;
     /// Whether the body's generic parameter `index` is bounded by `Copy`.
     fn param_copy(&self, index: u32) -> bool;
+    /// Whether a projection `PNode::Alias` in this body is bounded by `Copy` (via its
+    /// associated type item's bounds or the body owner's `where` clauses).
+    fn alias_copy(&self, _alias: PTy) -> bool {
+        false
+    }
 }
 
 /// Which check of a signature's laying refused it ([`Form::SigPositionsUnaligned`]). `input`:
@@ -944,22 +1011,6 @@ pub enum AwaitUnrelated {
     GenericUnaligned(Misfit),
 }
 
-impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c, F, A, R> {
-    /// Which row a call of `item`, whose head writes lifetimes, lacked to be related by its
-    /// signature (its [`Facts::sig`] read): the first of [`Facts::shape`],
-    /// [`Facts::call_bounds`] that is `None`, else [`CallLacks::Unaligned`] with why the last
-    /// instantiation tried at this call did not line up (`misfit`, reset at each try).
-    fn call_lacks(&self, item: ItemKey) -> CallLacks {
-        if self.facts.shape(item).is_none() {
-            CallLacks::Shape
-        } else if self.facts.call_bounds(item).is_none() {
-            CallLacks::Bounds
-        } else {
-            CallLacks::Unaligned(self.misfit)
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Refusal {
     pub form: Form,
@@ -1206,6 +1257,16 @@ struct PInfo {
 
 /// Which aggregate `Lower::aggregate` builds: a constructor call (`Some(x)`, `S(a, b)`), a
 /// literal (a tuple, a struct, an array), or `format_args!`'s arguments.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnsizeDone {
+    /// Exact closure-to-`dyn Fn*` unsizing that equated every owner signature slot onto the object.
+    ClosureSigTied,
+    /// Exact object unsizing that did not equate a closure's owner signature slots.
+    Handled,
+    /// Not handled here; fall back to `relate`.
+    Fallback,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Agg {
     Ctor,
@@ -1216,7 +1277,7 @@ enum Agg {
 #[derive(Clone, Copy, Debug)]
 enum Task {
     Eval(ExprId, bool),
-    Adjust(ExprId, bool),
+    Adjust(ExprId, bool, u32),
     Stmt(StmtId),
     OpenTemps,
     CloseTemps(ExprId),
@@ -1263,6 +1324,13 @@ enum Task {
     LoopBack(ExprId),
     BreakDone(ExprId, bool),
     ReturnDone(ExprId, bool),
+    /// Settles the top `n_vals` evaluated callee/argument values into fresh temps at `temp_mark..`
+    /// and drops all locals and pre-`become` temps (below `temp_mark`) before transferring control
+    /// to the tail-called callee (RFC 3407: locals drop before the call runs).
+    BecomeDrops(ExprId, u32, u32),
+    /// Finishes `become` after the tail call completes: assigns the return place, drops the
+    /// settled argument temps from `temp_mark` up, and branches to `ret_block`.
+    BecomeReturnDone(ExprId, u32),
     RootEnd(ExprId),
     CallDone(ExprId, u32, bool, u32),
     CtorDone(ExprId, u32),
@@ -1283,6 +1351,8 @@ enum Task {
     FieldDefaults(ExprId),
     IndexDone(ExprId, bool),
     FmtDone(ExprId, u32),
+    /// An `asm!` expression whose runtime operands have been evaluated onto `vals`.
+    AsmDone(ExprId, List, u16),
     LetInit(StmtId),
     /// An `.await`, its operand's value on the stack (coroutine.rs `await_done`).
     AwaitDone(ExprId),
@@ -1480,6 +1550,7 @@ pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
         | PNode::Ref(Mutbl::Not, _) => Some(true),
         PNode::Ref(Mutbl::Mut, _) => Some(false),
         PNode::Param(i) => Some(walk.facts.param_copy(i)),
+        PNode::Alias { .. } => Some(walk.facts.alias_copy(root)),
         PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len == 0 => Some(true),
         PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
         PNode::Closure { owner, .. } => match walk.closures {
@@ -1563,6 +1634,11 @@ pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
             }
             PNode::Param(i) => {
                 if !walk.facts.param_copy(i) {
+                    return set_false();
+                }
+            }
+            PNode::Alias { .. } => {
+                if !walk.facts.alias_copy(t) {
                     return set_false();
                 }
             }
@@ -1891,10 +1967,14 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule = one_
     async_root: Option<ExprId>,
     /// True when lowering a nested closure or async block body (not a top-level fn/async fn).
     in_nested: bool,
-    /// For a non-async RPIT fn (`-> impl Trait`), the placeholder representing the opaque's
-    /// captured lifetimes (`future_region(regions)`). Every concrete return position gets a
-    /// distinct existential constrained one-way into `rpit_out` at each return.
-    rpit_out: Option<Origin>,
+    /// For RPIT / RPITIT outputs (`-> impl Trait` or nested `-> Result<impl Trait, E>`):
+    /// each `(return_slot_index, future_region_placeholder)` pair. Every concrete return position
+    /// inside an RPIT opaque gets a distinct existential constrained one-way into its opaque's
+    /// captured-lifetimes placeholder at each return.
+    rpit_outs: Vec<(u32, Origin), A>,
+    /// Canonical rigid placeholders for `dyn for<..>` binder ordinals in invariant position
+    /// (`Sink::dyn_placeholder`), shared across calls in this body.
+    dyn_bound_placeholders: Vec<Origin, A>,
     /// True when the outer body is an `async fn` whose return place `Local(0)` holds the single
     /// opaque future region (`future_region`), so the root async block's capture origins flow one
     /// way into it without equating independent captures (`relate`).
@@ -1911,9 +1991,6 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule = one_
     /// Per local: what it stands for (identity.rs): the one table of identities, emitted in
     /// `LoweredAsync::identity`.
     identity: Vec<Identity, A>,
-    /// Why the last `call_by_generic_signature` related nothing (generic_call.rs `Misfit`):
-    /// what a `CallWritesLifetimes { lacks: Unaligned(..) }` refusal says.
-    misfit: Misfit,
     /// Per `.await` being lowered, innermost last: `(operand, await)`, so the call that is the
     /// operand knows it is awaited (await_call.rs `awaited_shadow`).
     awaiting: Vec<(ExprId, ExprId), A>,
@@ -1933,6 +2010,10 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule = one_
     place_field_source: Vec<(Place, ItemKey, u32, u32), A>,
     /// Pattern-bound `FnPtr` locals traced back to their source ADT field (`(pat, adt, variant, field)`).
     local_fn_field: Vec<(PatId, ItemKey, u32, u32), A>,
+    /// Whether this body is a `const` or `static` item initializer (`Facts::constant_initializer`,
+    /// or a parameterless body with no fn head): shared borrows of local-free `Freeze` non-drop
+    /// temporaries in a constant initializer are implicitly promoted to `'static` (RFC 3027).
+    const_init: bool,
 }
 
 /// Every type walk visits each node at most once per position: bounded by the table's size.
@@ -2017,20 +2098,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             nargs: n,
             async_root: None,
             in_nested: false,
-            rpit_out: None,
+            rpit_outs: Vec::new_in(alloc),
+            dyn_bound_placeholders: Vec::new_in(alloc),
             async_body: false,
             upvar_places: Vec::new_in(alloc),
             env_now: Vec::new_in(alloc),
             field_places: Vec::new_in(alloc),
             points: Vec::new_in(alloc),
             identity: Vec::new_in(alloc),
-            misfit: Misfit::NotTried,
             awaiting: Vec::new_in(alloc),
             awaited: Vec::new_in(alloc),
             coarse: core::cell::Cell::new(None),
             local_field_source: Vec::new_in(alloc),
             place_field_source: Vec::new_in(alloc),
             local_fn_field: Vec::new_in(alloc),
+            const_init: false,
         };
         blaze_own::Box::new_in(l, alloc)
     }
@@ -2312,13 +2394,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 // reference, then the captured type's own.
                 PNode::Future(fe, _, _) => {
                     let ck: &'c Checked<'c> = self.ck;
-                    for &row in self.captures_of(fe) {
-                        let i = row as usize;
-                        if ck.captures.column::<2>()[i] != blaze_typeck::CaptureKind::ByValue {
+                    for f in ck.env_fields_by::<blaze_typeck::Places>(fe) {
+                        if f.how != blaze_typeck::CaptureKind::ByValue {
                             n += 1;
                         }
-                        match ck.local_ty.get(ck.captures.column::<1>()[i].ix()) {
-                            Some(&t) => stack.push(t),
+                        match f.place_ty(ck) {
+                            Some(t) => stack.push(t),
                             None => return self.refuse(Form::Malformed, e),
                         }
                     }
@@ -2379,7 +2460,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // start in the closure's, how many, and its type.
         let mut rel: Vec<(Place, u32, u32, TyD), A> = Vec::new_in(self.alloc);
         let mut at = ci.start;
-        if matches!(self.expr(e)?, Expr::Closure { .. }) {
+        if matches!(self.expr(e)?, Expr::Closure { .. } | Expr::AsyncBlock { .. }) {
             let mut fields: Vec<blaze_typeck::EnvField, A> = Vec::new_in(self.alloc);
             for f in ck.env_fields_by::<blaze_typeck::Places>(e) {
                 fields.push(f);
@@ -2478,8 +2559,25 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Need::Sig(k) if ci.exact && caps + k < ci.len => Ok(self.origs[(ci.start + caps + k) as usize]),
             Need::OwnerParam(i) => Ok(self.universal(Region::Param(i))),
             Need::Param(u) => Ok(self.param_origin(u)),
+            Need::DynPlaceholder(ord) => Ok(self.dyn_placeholder_origin(ord)),
             Need::Capture(_) | Need::Sig(_) => self.refuse(Form::Malformed, e),
         }
+    }
+
+    fn dyn_placeholder_origin(&mut self, ordinal: u32) -> Origin {
+        let Ok(idx) = usize::try_from(ordinal) else { return self.b.origin(true) };
+        if let Some(&o) = self.dyn_bound_placeholders.get(idx) {
+            return o;
+        }
+        let st = self.universal(Region::Static);
+        let mut last = st;
+        while self.dyn_bound_placeholders.len() <= idx {
+            let o = self.b.origin(true);
+            self.b.known(st, o);
+            self.dyn_bound_placeholders.push(o);
+            last = o;
+        }
+        last
     }
 
     fn npos_d(&self, t: TyD, e: ExprId) -> Result<u32, Refusal> {
@@ -2584,18 +2682,29 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         if n == 0 {
             return Ok(());
         }
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DropMode {
+            /// Behind `&`/`&mut`/`*const`/`fn(..)`/union/non-dropping field: no drop runs.
+            None,
+            /// Structural drop glue or `#[may_dangle]` `Drop` parameter: only inner `Drop` impls
+            /// keep origins live; references and by-ref closure captures are `OriginLive::NoDrop`.
+            Glue,
+            /// Inside a non-`#[may_dangle]` parameter of a `Drop` impl (e.g. `BufWriter<W>`):
+            /// `Drop::drop` may dereference any lifetime inside `W`, so every origin is `Full`.
+            Strict,
+        }
         enum Step {
-            Ty(PTy, bool),
+            Ty(PTy, DropMode),
             Pos(OriginLive),
         }
         let mut todo: Vec<Step, A> = Vec::new_in(self.alloc);
         if t.wrap.is_some() {
             // A reference itself never runs a destructor on its referent, while inner opaques
             // still respect their item outlives bounds.
-            todo.push(Step::Ty(t.ty, false));
+            todo.push(Step::Ty(t.ty, DropMode::None));
             todo.push(Step::Pos(OriginLive::NoDrop));
         } else {
-            todo.push(Step::Ty(t.ty, true));
+            todo.push(Step::Ty(t.ty, DropMode::Glue));
         }
         let mut steps = 0u32;
         while let Some(step) = todo.pop() {
@@ -2603,62 +2712,102 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             if steps > MOST_POSITIONS || out.len() as u32 > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
             }
-            let (ty, active) = match step {
+            let (ty, mode) = match step {
                 Step::Pos(m) => {
                     out.push(m);
                     continue;
                 }
-                Step::Ty(ty, active) => (ty, active),
+                Step::Ty(ty, mode) => (ty, mode),
             };
-            let live = if active { OriginLive::Full } else { OriginLive::NoDrop };
+            let live = match mode {
+                DropMode::None => OriginLive::NoDrop,
+                DropMode::Glue | DropMode::Strict => OriginLive::Full,
+            };
             match self.node(ty, e)? {
                 PNode::Ref(_, i) => {
-                    todo.push(Step::Ty(i, false));
-                    todo.push(Step::Pos(OriginLive::NoDrop));
-                }
-                PNode::Ptr(_, i) => todo.push(Step::Ty(i, false)),
-                PNode::FnPtr(l, _) => {
-                    let xs = self.list(l, e)?;
-                    for &x in xs.iter().rev() {
-                        todo.push(Step::Ty(x, false));
+                    if mode == DropMode::Strict {
+                        todo.push(Step::Ty(i, DropMode::Strict));
+                        todo.push(Step::Pos(OriginLive::Full));
+                    } else {
+                        todo.push(Step::Ty(i, DropMode::None));
+                        todo.push(Step::Pos(OriginLive::NoDrop));
                     }
                 }
-                PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => todo.push(Step::Ty(i, active)),
+                PNode::Ptr(_, i) => {
+                    todo.push(Step::Ty(i, if mode == DropMode::Strict { DropMode::Strict } else { DropMode::None }));
+                }
+                PNode::FnPtr(l, _) => {
+                    let next = if mode == DropMode::Strict { DropMode::Strict } else { DropMode::None };
+                    let xs = self.list(l, e)?;
+                    for &x in xs.iter().rev() {
+                        todo.push(Step::Ty(x, next));
+                    }
+                }
+                PNode::Slice(i) | PNode::Pat(i, _) | PNode::Array(i, _) => todo.push(Step::Ty(i, mode)),
                 PNode::Tuple(l) | PNode::Record(_, l) => {
                     for &x in self.list(l, e)?.iter().rev() {
-                        todo.push(Step::Ty(x, active));
+                        todo.push(Step::Ty(x, mode));
                     }
                 }
                 PNode::Union(l) => {
+                    let next = if mode == DropMode::Strict { DropMode::Strict } else { DropMode::None };
                     for &x in self.list(l, e)?.iter().rev() {
-                        todo.push(Step::Ty(x, false));
+                        todo.push(Step::Ty(x, next));
                     }
                 }
                 PNode::Adt(k, l) => {
                     let af = self.adt_facts(k, e)?;
                     let args = self.list(l, e)?;
-                    if af.drop_impl || af.needs_drop {
+                    if mode == DropMode::Strict {
                         for &x in args.iter().rev() {
-                            todo.push(Step::Ty(x, active));
+                            todo.push(Step::Ty(x, DropMode::Strict));
                         }
                         for _ in 0..af.lifetimes {
-                            todo.push(Step::Pos(live));
+                            todo.push(Step::Pos(OriginLive::Full));
                         }
-                    } else if af.union {
+                    } else if mode == DropMode::None || af.union {
                         for &x in args.iter().rev() {
-                            todo.push(Step::Ty(x, false));
+                            todo.push(Step::Ty(x, DropMode::None));
                         }
                         for _ in 0..af.lifetimes {
                             todo.push(Step::Pos(OriginLive::NoDrop));
                         }
-                    } else {
-                        let drop_args = self.facts.drop_args(k);
+                    } else if af.drop_impl || af.needs_drop {
+                        let strict = self.facts.drop_strict(k);
                         for (j, &x) in args.iter().enumerate().rev() {
-                            let arg_drops = active && match drop_args {
-                                Some(d) if d.len() == args.len() => d[j],
+                            let is_strict = match strict {
+                                Some(s) if s.len() == args.len() => s.get(j).copied().unwrap_or(true),
+                                _ => af.drop_impl && !(af.is_box && j == 0),
+                            };
+                            todo.push(Step::Ty(x, if is_strict { DropMode::Strict } else { DropMode::Glue }));
+                        }
+                        let drop_lts = self.facts.drop_lifetimes(k);
+                        for j in (0..af.lifetimes).rev() {
+                            let live_lt = match drop_lts {
+                                Some(d) if usize::try_from(af.lifetimes) == Ok(d.len()) => {
+                                    usize::try_from(j).ok().and_then(|ix| d.get(ix).copied()).unwrap_or(true)
+                                }
                                 _ => true,
                             };
-                            todo.push(Step::Ty(x, arg_drops));
+                            todo.push(Step::Pos(if live_lt { OriginLive::Full } else { OriginLive::NoDrop }));
+                        }
+                    } else {
+                        let drop_args = self.facts.drop_args(k);
+                        let strict = self.facts.drop_strict(k);
+                        for (j, &x) in args.iter().enumerate().rev() {
+                            let arg_drops = match drop_args {
+                                Some(d) if d.len() == args.len() => d.get(j).copied().unwrap_or(true),
+                                _ => true,
+                            };
+                            let arg_strict = strict.is_some_and(|s| s.len() == args.len() && s.get(j).copied().unwrap_or(false));
+                            let next = if !arg_drops {
+                                DropMode::None
+                            } else if arg_strict {
+                                DropMode::Strict
+                            } else {
+                                DropMode::Glue
+                            };
+                            todo.push(Step::Ty(x, next));
                         }
                         for _ in 0..af.lifetimes {
                             todo.push(Step::Pos(OriginLive::NoDrop));
@@ -2670,22 +2819,57 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         let ol = self.opaque_live(k);
                         let args = self.list(l, e)?;
                         for &x in args.iter().rev() {
-                            todo.push(Step::Ty(x, active));
+                            todo.push(Step::Ty(x, mode));
                         }
                         for j in (0..caps).rev() {
-                            let mode = match ol {
+                            let m = match ol {
                                 OpaqueLive::Nothing => OriginLive::None,
                                 OpaqueLive::Only(Region::Param(p)) if p < caps => {
                                     if j == p { live } else { OriginLive::None }
                                 }
                                 _ => live,
                             };
-                            todo.push(Step::Pos(mode));
+                            todo.push(Step::Pos(m));
                         }
                     } else {
                         let cnt = self.npos(ty, e)?;
                         for _ in 0..cnt {
                             out.push(live);
+                        }
+                    }
+                }
+                PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
+                    let Some(&ce) = self.ck.closures.column::<0>().get(usize::try_from(ordinal).unwrap_or(usize::MAX)) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    // Matches `npos` and `closure_value` pre-order: capture fields first, then
+                    // owner-bound signature positions. Under `DropMode::Strict` (non-`#[may_dangle]`
+                    // `Drop` impl), every origin is `Full`; under `DropMode::Glue`, only by-value
+                    // captures drop; reference captures and signature slots are `OriginLive::NoDrop`.
+                    let nsig = self.owner_sig_count(usize::try_from(ordinal).unwrap_or(usize::MAX), e)?;
+                    let sig_live = if mode == DropMode::Strict { OriginLive::Full } else { OriginLive::NoDrop };
+                    for _ in 0..nsig {
+                        todo.push(Step::Pos(sig_live));
+                    }
+                    let mut fields: Vec<blaze_typeck::EnvField, A> = Vec::new_in(self.alloc);
+                    for f in self.ck.env_fields_by::<blaze_typeck::Places>(ce) {
+                        fields.push(f);
+                    }
+                    for f in fields.iter().rev() {
+                        let Some(ft) = f.place_ty(self.ck) else {
+                            return self.refuse(Form::Malformed, e);
+                        };
+                        match f.how {
+                            blaze_typeck::CaptureKind::ByValue => todo.push(Step::Ty(ft, mode)),
+                            blaze_typeck::CaptureKind::ByRef | blaze_typeck::CaptureKind::ByMutRef => {
+                                if mode == DropMode::Strict {
+                                    todo.push(Step::Ty(ft, DropMode::Strict));
+                                    todo.push(Step::Pos(OriginLive::Full));
+                                } else {
+                                    todo.push(Step::Ty(ft, DropMode::None));
+                                    todo.push(Step::Pos(OriginLive::NoDrop));
+                                }
+                            }
                         }
                     }
                 }
@@ -2874,7 +3058,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// is its declared type at the value's arguments), so a loan into one reaches exactly the
     /// value's positions that type names, and a write of the field relates into them.
     fn field_slot(&mut self, of: PInfo, adt_ty: PTy, variant: u32, field: u32, field_ty: TyD, e: ExprId) -> Result<Option<(u32, u32)>, Refusal> {
-        if !of.exact {
+        // Region-erased witness lowering (`Erased`: `!R::RELATES`, `Positions` grain) never relates
+        // origins and counts in `Positions`, whereas `field_regions` is laid in `RegionSlots`.
+        if !R::RELATES || !<R::Grain as grain::Grain>::SLOTS || !of.exact {
             return Ok(None);
         }
         let PNode::Adt(k, l) = self.node(adt_ty, e)? else { return Ok(None) };
@@ -3335,6 +3521,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // tip20/mod.rs:147, tip403_registry/mod.rs:42, xtask check_abi.rs:43,
         // zones/check_abi.rs:147). A borrow that is no extending one (`g(&f())`) still dies at
         // the body's end, as rustc's does.
+        self.const_init = const_init;
         if const_init {
             self.mark_extended(root, STATIC_EXTENDED)?;
         }
@@ -3550,15 +3737,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// Reference, "Async functions": the future "holds its arguments"; "Impl trait",
     /// "Capturing"), and no relation between two captured lifetimes.
     fn signature(&mut self, sig: SigLife<'_>, nparams: u32, root: ExprId) -> Result<(), Refusal> {
-        if !sig.well_formed() || sig.inputs() != nparams || self.body.params.len() != nparams as usize {
-            return self.refuse(Form::SigPositionsUnaligned { positions: nparams as usize, regions: sig.inputs() as usize, site: SigSite::Arity }, root);
+        let facts: &'b F = self.facts;
+        let c_variadic = facts.callee(self.body.owner).is_some_and(|c| c.c_variadic);
+        let sig_inputs = sig.inputs();
+        let expected_params = if c_variadic { sig_inputs.saturating_add(1) } else { sig_inputs };
+        let nparams_usize = usize::try_from(nparams).unwrap_or(usize::MAX);
+        let sig_inputs_usize = usize::try_from(sig_inputs).unwrap_or(usize::MAX);
+        if !sig.well_formed() || expected_params != nparams || self.body.params.len() != nparams_usize {
+            return self.refuse(Form::SigPositionsUnaligned { positions: nparams_usize, regions: sig_inputs_usize, site: SigSite::Arity }, root);
         }
         // The signature is laid: its types' implied bounds on the type parameters are read
         // below (`sig_param_bounds` sets this again where it cannot read them).
         self.param_all_unsure = false;
         // The bounds the signature's and the impl header's types imply, whole (front2
         // adt_facts.rs): `'long: 'short` known, `T: 'r` taken by `param_origin`.
-        let facts: &'b F = self.facts;
         self.implied_given = false;
         if let Some((params, regions)) = facts.implied_bounds() {
             for &(long, short) in regions {
@@ -3577,20 +3769,77 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         for i in 0..=nparams {
             let is_out = i == nparams;
+            // The trailing `...` parameter of a C-variadic fn definition has type `VaList<'_>`
+            // inside the body but no slot in the external C signature column: give each of its
+            // lifetime positions a fresh placeholder unrelated to `'static` or other parameters.
+            if c_variadic && i == sig_inputs {
+                let p = match usize::try_from(i).ok().and_then(|idx| self.body.params.get(idx)) {
+                    Some(&p) => p,
+                    None => return self.refuse(Form::Malformed, root),
+                };
+                let pat_ty = match self.ck.pat_ty.get(p.ix()) {
+                    Some(&t) => t,
+                    None => return self.refuse_pat(Form::Malformed, p),
+                };
+                let t = TyD::of(pat_ty);
+                let l = Local(1 + i);
+                let n = self.npos_d(t, root)?;
+                let start = match u32::try_from(self.origs.len()) {
+                    Ok(s) => s,
+                    Err(_) => return self.refuse(Form::Bound, root),
+                };
+                let mut live_mask: Vec<OriginLive, A> = Vec::new_in(self.alloc);
+                if n > 0 {
+                    self.origin_live_mask(t, &mut live_mask, root)?;
+                }
+                for k in 0..n {
+                    let o = self.hidden_placeholder();
+                    match usize::try_from(k).ok().and_then(|ki| live_mask.get(ki)).copied().unwrap_or(OriginLive::Full) {
+                        OriginLive::Full => self.b.mentions(l.0, o),
+                        OriginLive::NoDrop => self.b.mentions_no_drop(l.0, o),
+                        OriginLive::None => {}
+                    }
+                    self.origs.push(o);
+                }
+                self.set_local(l, t, start, n);
+                self.vars.push(l);
+                continue;
+            }
+            let Some(regions) = (if is_out { sig.output() } else { sig.input(i) }) else {
+                let site = SigSite::NoChild { input: (!is_out).then_some(i) };
+                return self.refuse(Form::SigPositionsUnaligned { positions: nparams_usize, regions: sig_inputs_usize, site }, root);
+            };
+            let declared = self.sig_declared(sig, if is_out { sig_inputs } else { i }, root)?;
             let (l, t) = if is_out {
                 (Local(0), TyD::of(self.adjusted_ty(root)?))
             } else {
-                let p = self.body.params[i as usize];
-                match self.ck.pat_ty.get(p.ix()) {
-                    Some(&t) => (Local(1 + i), TyD::of(t)),
+                let p = match usize::try_from(i).ok().and_then(|idx| self.body.params.get(idx)) {
+                    Some(&p) => p,
+                    None => return self.refuse(Form::Malformed, root),
+                };
+                let pat_ty = match self.ck.pat_ty.get(p.ix()) {
+                    Some(&t) => t,
                     None => return self.refuse_pat(Form::Malformed, p),
-                }
+                };
+                // A parameter pattern that peels a reference via default binding modes
+                // (`fn f([a, b]: &[T; 2])`, `fn f((a, b): &(A, B))`): `pat_ty` holds the
+                // type AFTER peeling `&`/`&mut`, whereas the signature's declared input
+                // carries the outer reference. Restore that outer `&`/`&mut` via `TyD::wrap`
+                // so signature regions align and `bind_pattern` peels it properly.
+                let peels = matches!(
+                    self.body.pats.get(p.ix()),
+                    Some(Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. })
+                );
+                let ty = if peels
+                    && let PNode::Ref(dm, _) = self.head_node(declared, root)?
+                    && !matches!(self.node(pat_ty, root)?, PNode::Ref(..))
+                {
+                    TyD { wrap: Some(dm), ty: pat_ty }
+                } else {
+                    TyD::of(pat_ty)
+                };
+                (Local(1 + i), ty)
             };
-            let Some(regions) = (if is_out { sig.output() } else { sig.input(i) }) else {
-                let site = SigSite::NoChild { input: (!is_out).then_some(i) };
-                return self.refuse(Form::SigPositionsUnaligned { positions: nparams as usize, regions: sig.inputs() as usize, site }, root);
-            };
-            let declared = self.sig_declared(sig, i, root)?;
             let async_body = is_out && sig.body() != BodyOut::Output;
             if async_body {
                 self.async_body = true;
@@ -3616,6 +3865,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             let future = async_body || rpit_future;
             let input = (!is_out).then_some(i);
             let unaligned = |site| Form::SigPositionsUnaligned { positions: n as usize, regions: regions.len(), site };
+            let mut rpit_laid = grain::RpitLaid::new_in(self.alloc);
             if future {
                 if !matches!(self.head_node(declared, root)?, PNode::Opaque(..)) {
                     return self.refuse(unaligned(SigSite::FutureNotOpaque), root);
@@ -3624,16 +3874,41 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 if t.wrap.is_some() {
                     return self.refuse(unaligned(SigSite::Wrapped { input }), root);
                 }
-            } else if t.wrap.is_some() {
-                return self.refuse(unaligned(SigSite::Wrapped { input }), root);
-            } else if !self.lay_over(declared, t.ty, regions, &mut laid, root)? {
+            } else if let Some(wm) = t.wrap {
+                let PNode::Ref(dm, inner_declared) = self.head_node(declared, root)? else {
+                    return self.refuse(unaligned(SigSite::Wrapped { input }), root);
+                };
+                if dm != wm {
+                    return self.refuse(unaligned(SigSite::Wrapped { input }), root);
+                }
+                let Some((&first_r, rest_r)) = regions.split_first() else {
+                    return self.refuse(unaligned(SigSite::Unlaid { input }), root);
+                };
+                if !self.lay_over_rpit(inner_declared, t.ty, rest_r, &mut laid, None, root)? {
+                    return self.refuse(unaligned(SigSite::Unlaid { input }), root);
+                }
+                laid.insert(0, Some(first_r));
+                if u32::try_from(laid.len()) != Ok(n) {
+                    return self.refuse(unaligned(SigSite::Count { input }), root);
+                }
+            } else if !self.lay_over_rpit(declared, t.ty, regions, &mut laid, is_out.then_some(&mut rpit_laid), root)? {
                 return self.refuse(unaligned(SigSite::Unlaid { input }), root);
             } else if laid.len() != n as usize {
                 return self.refuse(unaligned(SigSite::Count { input }), root);
             }
             let start = self.origs.len() as u32;
             if rpit_opaque {
-                self.rpit_out = Some(self.future_region(regions));
+                let out_o = self.future_region(regions);
+                for k in 0..n {
+                    self.rpit_outs.push((k, out_o));
+                }
+            }
+            let mut rpit_group_origins: Vec<Origin, A> = Vec::new_in(self.alloc);
+            for &(cap_start, cap_len) in rpit_laid.groups.iter() {
+                let lo = usize::try_from(cap_start).unwrap_or(usize::MAX);
+                let hi = lo.saturating_add(usize::try_from(cap_len).unwrap_or(0));
+                let caps = rpit_laid.caps.get(lo..hi).unwrap_or(&[]);
+                rpit_group_origins.push(self.future_region(caps));
             }
             let mut live_mask: Vec<OriginLive, A> = Vec::new_in(self.alloc);
             if n > 0 && !async_body {
@@ -3647,7 +3922,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     // never one shared placeholder (that would relate independent captures or
                     // conflict with invariant positions like `&'static` in a closure). For
                     // `rpit_opaque`, each return constrains every position one-way into
-                    // `self.rpit_out` (`future_region(regions)`).
+                    // `self.rpit_outs` (`future_region(regions)`).
+                    self.b.origin(false)
+                } else if let Ok(k32) = u32::try_from(k)
+                    && let Some(&(_, gid)) = rpit_laid.slots.iter().find(|&&(slot, _)| slot == k32)
+                    && let Some(&out_o) = usize::try_from(gid).ok().and_then(|gi| rpit_group_origins.get(gi))
+                {
+                    self.rpit_outs.push((k32, out_o));
                     self.b.origin(false)
                 } else {
                     match laid.get(k) {
@@ -3710,16 +3991,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         match kids.get(k as usize) {
             Some(&t) => Ok(t),
             None => self.refuse(Form::SigPositionsUnaligned { positions: k as usize + 1, regions: kids.len(), site: SigSite::ColumnShort }, e),
-        }
-    }
-
-    /// [`Self::sig_declared`] with the destination's child (`k == sig.inputs()`) the call's
-    /// `value` ([`CallValue`]): an awaited `async fn`'s written return type, laid over its own
-    /// column's type (the head records' table, as the signature's).
-    fn value_declared(&self, sig: SigLife<'_>, value: CallValue<'_>, k: u32, e: ExprId) -> Result<PTy, Refusal> {
-        match value {
-            CallValue::Awaited { ty, .. } if k == sig.inputs() => Ok(ty),
-            _ => self.sig_declared(sig, k, e),
         }
     }
 
@@ -3918,7 +4189,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// In the rule's grain (grain.rs `Grain::lay`): this walk under the positions; under the
     /// slot grain grain.rs `lay_slots`, the same rule over every slot.
     fn lay_over(&self, declared: PTy, body_t: PTy, slots: &[Region], out: &mut Vec<Option<Region>, A>, e: ExprId) -> Result<bool, Refusal> {
-        <R::Grain as grain::Grain>::lay(self, declared, body_t, slots, out, e)
+        <R::Grain as grain::Grain>::lay(self, declared, body_t, slots, out, None, e)
+    }
+
+    fn lay_over_rpit(
+        &self,
+        declared: PTy,
+        body_t: PTy,
+        slots: &[Region],
+        out: &mut Vec<Option<Region>, A>,
+        rpit: Option<&mut grain::RpitLaid<A>>,
+        e: ExprId,
+    ) -> Result<bool, Refusal> {
+        <R::Grain as grain::Grain>::lay(self, declared, body_t, slots, out, rpit, e)
     }
 
     /// [`Lower::lay_over`]; `through_impls` false inside an impl's value (its projections are
@@ -4077,31 +4360,112 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// `trait_`'s `name`: its rows at the body's root (`Checked::selected_at(root)`, filed by
     /// the type check for the signature it normalized, D-sig-rows). Order-free: EVERY such row
     /// must name the same impl (`Ok(Some(imp))`), or every one be `Selected::Generic`
-    /// (`Ok(None)`: placeholders). Anything else, why by name: no row, a `NotImpl` or
-    /// `Unanswered` row, rows naming two impls or an impl and `Generic`.
-    fn sig_impl(&self, trait_: ItemKey, name: Name) -> Result<Option<ItemKey>, ProjectionUnbound> {
+    /// (`Ok(None)`: placeholders). When multiple rows for `(trait_, name)` exist for distinct
+    /// projected arguments (e.g. two concrete `SolType::Token` elements in one tuple), `key_args`
+    /// disambiguates by matching each argument's erased head/structure against `r.args`.
+    fn sig_impl(
+        &self,
+        heads: &blaze_borrow::Columns<'_>,
+        trait_: ItemKey,
+        name: Name,
+        key_args: Option<&[PTy]>,
+    ) -> Result<Option<ItemKey>, ProjectionUnbound> {
+        use blaze_borrow::RegionTypes;
         use blaze_typeck::Selected;
-        let mut found: Option<ItemKey> = None;
-        let (mut any, mut generic) = (false, false);
-        for r in self.ck.selected_at(self.body.root).iter().filter(|r| r.trait_ == trait_ && r.name == Some(name)) {
-            any = true;
-            match r.selected {
-                Selected::Impl { imp, .. } if found.is_none_or(|f| f == imp) => found = Some(imp),
-                Selected::Impl { .. } => return Err(ProjectionUnbound::RowsDisagree),
-                // FROZEN path (D190): the sources the record now names read as before they
-                // were named (`Generic`, `NotImpl`).
-                Selected::Generic | Selected::ParamEnv { .. } | Selected::OpaqueBound | Selected::ObjectBound => generic = true,
-                Selected::NotImpl | Selected::Builtin => return Err(ProjectionUnbound::RowNotImpl),
-                Selected::Unanswered => return Err(ProjectionUnbound::RowUnanswered),
+        let classify = |filter: bool| -> Result<Option<ItemKey>, ProjectionUnbound> {
+            let mut found: Option<ItemKey> = None;
+            let (mut any, mut generic) = (false, false);
+            for r in self.ck.selected_at(self.body.root).iter().filter(|r| r.trait_ == trait_ && r.name == Some(name)) {
+                if filter
+                    && let Some(want) = key_args
+                    && !self.sig_args_match(heads, want, r.args)
+                {
+                    continue;
+                }
+                any = true;
+                match r.selected {
+                    Selected::Impl { imp, .. } if found.is_none_or(|f| f == imp) => found = Some(imp),
+                    Selected::Impl { .. } => return Err(ProjectionUnbound::RowsDisagree),
+                    // FROZEN path (D190): the sources the record now names read as before they
+                    // were named (`Generic`, `NotImpl`).
+                    Selected::Generic | Selected::ParamEnv { .. } | Selected::OpaqueBound | Selected::ObjectBound => generic = true,
+                    Selected::NotImpl | Selected::Builtin => return Err(ProjectionUnbound::RowNotImpl),
+                    Selected::Unanswered => return Err(ProjectionUnbound::RowUnanswered),
+                }
+            }
+            match (any, generic, found) {
+                (true, true, Some(_)) => Err(ProjectionUnbound::RowsDisagree),
+                (true, true, None) => Ok(None),
+                (true, false, Some(imp)) => Ok(Some(imp)),
+                // No row (an `Impl` row always sets `found`).
+                (false, ..) | (true, false, None) => Err(ProjectionUnbound::NoRow),
+            }
+        };
+        match classify(false) {
+            Err(ProjectionUnbound::RowsDisagree) if key_args.is_some() => classify(true).or(Err(ProjectionUnbound::RowsDisagree)),
+            Err(ProjectionUnbound::NoRow) => {
+                if let Some(oti) = self.facts.owner_trait_impl(trait_) {
+                    let self_ok = match key_args.and_then(|ks| ks.first().copied()) {
+                        None => true,
+                        Some(st) => match (oti.self_shape, heads.node(st)) {
+                            (SelfShape::Adt(k), Ok(PNode::Adt(a, _))) => k == a,
+                            (SelfShape::Ref(m), Ok(PNode::Ref(n, _))) => m == n,
+                            (SelfShape::Tuple(n), Ok(PNode::Tuple(l))) => heads.kids(st).ok().is_some_and(|ks| ks.len() == n),
+                            _ => false,
+                        },
+                    };
+                    if self_ok {
+                        return Ok(Some(oti.imp));
+                    }
+                }
+                Err(ProjectionUnbound::NoRow)
+            }
+            other => other,
+        }
+    }
+
+    /// Whether erased argument list `want` (in `heads`) structurally matches `row_args` (in
+    /// `self.tys`). An unnormalized `Alias`, `Param`, or `Infer` on either side does not prove a
+    /// mismatch (returns `true` for that position so the caller falls back to `RowsDisagree` if
+    /// ambiguous).
+    fn sig_args_match(&self, heads: &blaze_borrow::Columns<'_>, want: &[PTy], row_args: List) -> bool {
+        use blaze_borrow::RegionTypes;
+        let Ok(rargs) = self.tys.list(row_args) else { return false };
+        if want.len() != rargs.len() {
+            return false;
+        }
+        let arity = crate::one_call::FactsArity { facts: self.facts };
+        let body_cols = blaze_borrow::Columns::new(self.tys, &arity, &arity);
+        let mut stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
+        for (&a, &b) in want.iter().zip(rargs.iter()) {
+            stack.push((a, b));
+        }
+        let mut steps = 0u32;
+        while let Some((a, b)) = stack.pop() {
+            steps += 1;
+            if steps > 128 {
+                return false;
+            }
+            let (Ok(na), Ok(nb)) = (heads.node(a), self.tys.node(b)) else { return false };
+            if matches!(na, PNode::Alias { .. } | PNode::Param(_) | PNode::Infer) || matches!(nb, PNode::Alias { .. } | PNode::Param(_) | PNode::Infer) {
+                continue;
+            }
+            if matches!(na, PNode::ConstValue { .. } | PNode::ConstParam(_)) && matches!(nb, PNode::ConstValue { .. } | PNode::ConstParam(_)) {
+                continue;
+            }
+            if !blaze_borrow::head_eq(na, nb) {
+                return false;
+            }
+            let (Ok(ka), Ok(kb)) = (heads.kids(a), body_cols.kids(b)) else { return false };
+            if ka.len() != kb.len() {
+                return false;
+            }
+            for k in 0..ka.len() {
+                let (Some(ca), Some(cb)) = (ka.get(k), kb.get(k)) else { return false };
+                stack.push((ca, cb));
             }
         }
-        match (any, generic, found) {
-            (true, true, Some(_)) => Err(ProjectionUnbound::RowsDisagree),
-            (true, true, None) => Ok(None),
-            (true, false, Some(imp)) => Ok(Some(imp)),
-            // No row (an `Impl` row always sets `found`).
-            (false, ..) | (true, false, None) => Err(ProjectionUnbound::NoRow),
-        }
+        true
     }
 
     /// One declared projection `<S as trait_>::name` (`alias`: its trait, name and arguments;
@@ -4146,32 +4510,44 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     ) -> Result<Through, Refusal> {
         use blaze_borrow::{Kids, RegionTypes};
         let (trait_, name, _) = alias;
-        let imp = match self.sig_impl(trait_, name) {
+        let key_args = match heads.kids(d) {
+            Ok(Kids::List(args)) => Some(args),
+            _ => None,
+        };
+        let imp = match self.sig_impl(heads, trait_, name, key_args) {
             Ok(Some(imp)) => imp,
             Ok(None) => return Ok(Through::Placeholders),
             Err(why) => return Ok(self.unbound(trait_, why, e)),
         };
         let regions = self.facts.regions();
-        let Ok((self_col, _)) = regions.impl_header(imp) else { return Ok(self.unbound(trait_, ProjectionUnbound::ImplHeaderUnread, e)) };
+        let Ok((self_col, trait_col)) = regions.impl_header(imp) else { return Ok(self.unbound(trait_, ProjectionUnbound::ImplHeaderUnread, e)) };
         let Ok(value) = regions.impl_assoc(imp, name) else { return Ok(self.unbound(trait_, ProjectionUnbound::ImplAssocUnread, e)) };
         let Ok(params) = regions.lifetime_params(imp) else { return Ok(self.unbound(trait_, ProjectionUnbound::ImplParamsUnread, e)) };
-        // The alias's own slots (the trait's lifetimes, always none; a GAT's own): a GAT's are
-        // not numbered in the impl's value here.
-        match heads.own(d) {
-            Ok(own) if own.get() == 0 => {}
-            _ => return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)),
+        let Ok(own) = heads.own(d) else { return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)) };
+        let own_len = own.len();
+        let trait_own: &[Region] = match trait_col {
+            Some(tc) => tc.own(),
+            None if own_len == 0 => &[],
+            None => return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)),
+        };
+        let tl = trait_own.len();
+        if own_len < tl {
+            return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e));
         }
+        let Some(decl_trait_lts) = mine.get(..tl) else { return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)) };
+        let Some(decl_gat_lts) = mine.get(tl..own_len) else { return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)) };
+        let Some(after_own) = mine.get(own_len..) else { return Ok(self.unbound(trait_, ProjectionUnbound::GatLifetimes, e)) };
         let Ok(Kids::List(args)) = heads.kids(d) else { return Ok(self.unbound(trait_, ProjectionUnbound::SelfTypeUnread, e)) };
         let Some(&self_ty) = args.first() else { return Ok(self.unbound(trait_, ProjectionUnbound::SelfTypeUnread, e)) };
         let Ok(self_n) = heads.count(self_ty) else { return Ok(self.unbound(trait_, ProjectionUnbound::SelfTypeUnread, e)) };
         let differ = ProjectionUnbound::SelfSlotsDiffer { imp: self_col.as_slice().len() as u32, declared: self_n.get() };
-        let Some(decl_self) = mine.get(..self_n.get() as usize) else { return Ok(self.unbound(trait_, differ, e)) };
+        let Some(decl_self) = after_own.get(..self_n.len()) else { return Ok(self.unbound(trait_, differ, e)) };
         if self_col.as_slice().len() != decl_self.len() {
             return Ok(self.unbound(trait_, differ, e));
         }
         let mut bind: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
         bind.resize(params.count() as usize, None);
-        for (&ir, &dr) in self_col.as_slice().iter().zip(decl_self.iter()) {
+        for (&ir, &dr) in trait_own.iter().zip(decl_trait_lts.iter()).chain(self_col.as_slice().iter().zip(decl_self.iter())) {
             match ir {
                 Region::Param(i) => {
                     let Some(slot) = bind.get_mut(i as usize) else { return Ok(self.unbound(trait_, ProjectionUnbound::SelfRegionUnnumbered, e)) };
@@ -4194,6 +4570,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             out.push(match v {
                 Some(Region::Param(i)) => bind.get(i as usize).copied().flatten(),
                 Some(Region::Static) => Some(Region::Static),
+                Some(Region::Late { binder: u32::MAX, var }) => usize::try_from(var).ok().and_then(|idx| decl_gat_lts.get(idx)).copied(),
                 Some(Region::Late { .. }) | None => None,
             });
         }
@@ -4256,61 +4633,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
 
     /// Relates a call's operands and destination through the callee's lifetime part, at the
     /// call statement just added: each operand's positions flow into the regions of its
-    /// parameter, the output's regions into the destination's positions (the first position of
-    /// a reference one way, every other both ways, as [`Self::relate`] does); the declared
-    /// bounds and the bounds implied by the parameter and output types hold among the regions.
-    /// `false`, relating nothing, when the positions do not line up one for one or a region is
-    /// hidden: the caller takes its older, coarser path.
-    /// `tie`: the callee and its type arguments, whose trait lifetimes are tied to the caller's
-    /// regions (trait_ties.rs); `None` for a value callee.
-    fn call_by_signature(&mut self, life: SigLife<'_>, tie: Option<(ItemKey, List)>, vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
-        self.call_by_signature_to(life, CallValue::Returned, tie, vs, dest, dest_ty, e)
-    }
-
-    /// [`Self::call_by_signature`] with the destination holding the call's `value`
-    /// ([`CallValue`]): the call's own output, or what an `.await` of an `async fn`'s call
-    /// yields (await_call.rs `relate_awaited`), the written return type's column taking the
-    /// output's place.
-    #[expect(clippy::too_many_arguments, reason = "call_by_signature's inputs and the value")]
-    fn call_by_signature_to<'s>(&mut self, life: SigLife<'s>, value: CallValue<'s>, tie: Option<(ItemKey, List)>, vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
-        // The column's positions, laid as the flow lays the call's: each input's then the
-        // output's, one region per position (`regions`), input `i`'s ending at `ends[i]`. A
-        // child the flow does not lay as the column does (`lay_positions`: an opaque type or a
-        // projection, two subtrees it does not descend into) is related per call or refused by
-        // the caller, never here by a guess.
-        if !life.well_formed() || life.inputs() as usize != vs.len() {
-            return Ok(false);
-        }
-        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc);
-        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
-        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
-        for k in 0..=life.inputs() {
-            let slots = if k < life.inputs() { life.input(k) } else { life.value(value) };
-            let Some(slots) = slots else { return Ok(false) };
-            let declared = self.value_declared(life, value, k, e)?;
-            if !self.lay_positions(declared, slots, &mut laid, e)? {
-                return Ok(false);
-            }
-            for &r in laid.iter() {
-                let Some(r) = r else { return Ok(false) };
-                regions.push(r);
-            }
-            if k < life.inputs() {
-                ends.push(regions.len() as u32);
-            }
-        }
-        let tie = tie.map(|(item, g)| (item, g, life));
-        self.call_laid(Laid { regions: &regions, ends: &ends, bounds: life.bounds() }, tie, &[], vs, dest, dest_ty, e)
-    }
-
     /// Relates a call through a signature already laid as the flow's positions ([`Laid`]),
     /// with some of the callee's regions already the caller's origins (`seed`): a call through
-    /// a fn-pointer parameter, whose free regions are that parameter's own positions
+    /// a fn-pointer or callable value, whose free regions are that value's own positions
     /// (`call_through_value`); every other `Param` and each `Late` is one fresh origin a call
-    /// ([`Lower::instance`]), `'static` the body's. `tie`: the callee, its type arguments and
-    /// its signature, for its trait lifetimes (trait_ties.rs).
-    #[expect(clippy::too_many_arguments, reason = "call_by_signature's inputs and the seed")]
-    fn call_laid(&mut self, laid: Laid<'_>, tie: Option<(ItemKey, List, SigLife<'_>)>, seed: &[(Region, Origin)], vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+    /// ([`Lower::instance`]), `'static` the body's.
+    fn call_laid(&mut self, laid: Laid<'_>, seed: &[(Region, Origin)], vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
         let Laid { regions, ends, bounds } = laid;
         if ends.len() != vs.len() {
             return Ok(false);
@@ -4343,14 +4671,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let out_at = lo;
         let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
         inst.extend_from_slice(seed);
-        if let Some((item, g, life)) = tie {
-            let args: &'c [PTy] = self.list(g, e)?;
-            let mut impl_ties = trait_ties::ImplTies::new_in(self.alloc);
-            self.tie_bounds(item, life, args, &mut inst, &mut impl_ties, e)?;
-            // No type argument here holds a position (the caller's condition for this path),
-            // so an impl's answer names none: a row that does is malformed.
-            self.tie_impl_relations(&impl_ties, &mut inst, |_, _, _| None, e)?;
-        }
         let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
         let mut vars: Vec<Variance, A> = Vec::new_in(self.alloc);
         lo = 0;
@@ -4424,30 +4744,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         Ok(true)
     }
 
-    /// Whether every child of `life`'s column is laid by the flow as the column lays it with
-    /// no opaque or projection position ([`Lower::lay_positions`] all `Some`): a head that is
-    /// not holds a hidden position, related per call (hidden_call.rs) or refused, never by its
-    /// column read as positions.
-    fn sig_laid(&self, life: SigLife<'_>, e: ExprId) -> Result<bool, Refusal> {
-        if !life.well_formed() {
-            return Ok(false);
-        }
-        let mut laid: Vec<Option<Region>, A> = Vec::new_in(self.alloc);
-        for k in 0..=life.inputs() {
-            let slots = if k < life.inputs() { life.input(k) } else { life.output() };
-            let Some(slots) = slots else { return Ok(false) };
-            let declared = self.sig_declared(life, k, e)?;
-            if !self.lay_positions(declared, slots, &mut laid, e)? || laid.iter().any(Option::is_none) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     fn step(&mut self, t: Task) -> Result<(), Refusal> {
         match t {
             Task::Eval(e, m) => self.eval(e, m),
-            Task::Adjust(e, m) => self.adjust(e, m),
+            Task::Adjust(e, m, skip) => self.adjust(e, m, skip),
             Task::Stmt(s) => self.stmt(s),
             Task::OpenTemps => {
                 self.temp_marks.push(self.temps.len() as u32);
@@ -4649,13 +4949,91 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     self.closure_sig_kept(v.ty.ty, e)?;
                 }
                 self.assign_val(rp, rt, v, e)?;
-                if let Some(out_o) = self.rpit_out {
+                if !self.rpit_outs.is_empty() {
                     let ri = self.info(rp);
-                    for k in ri.start..ri.start + ri.len {
-                        self.b.subset(self.origs[k as usize], out_o);
+                    for &(slot, out_o) in self.rpit_outs.iter() {
+                        if let Some(idx) = ri.start.checked_add(slot).and_then(|v| usize::try_from(v).ok())
+                            && let Some(&orig) = self.origs.get(idx)
+                        {
+                            self.b.subset(orig, out_o);
+                        }
                     }
                 }
                 self.exit_drops(0, 0, e)?;
+                self.b.goto(self.ret_block, self.span(e));
+                self.fresh();
+                let ty = TyD::of(self.expr_ty(e)?);
+                self.vals.push(Val { at: At::Const, ty });
+                Ok(())
+            }
+            Task::BecomeDrops(e, temp_mark, n_vals) => {
+                // Move/copy every evaluated callee and argument value (including those with
+                // lifetime positions, which `settle_operand` leaves in place) into a fresh temp
+                // above `temp_mark` BEFORE dropping all locals and pre-`become` temps.
+                let n = usize::try_from(n_vals).unwrap_or(0);
+                let Some(start) = self.vals.len().checked_sub(n) else {
+                    return self.refuse(Form::Malformed, e);
+                };
+                for idx in start..self.vals.len() {
+                    let Some(&v) = self.vals.get(idx) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    if let At::Place(p) = v.at {
+                        let pi = self.info(p);
+                        let mark = usize::try_from(temp_mark).unwrap_or(self.temps.len()).min(self.temps.len());
+                        let already_settled = pi.parent == u32::MAX
+                            && self.temps.get(mark..).is_some_and(|ts| ts.iter().any(|l| l.0 == pi.local));
+                        if !already_settled {
+                            let t = self.temp(v.ty, e)?;
+                            let tp = self.place_of(t);
+                            self.assign_val(tp, v.ty, v, e)?;
+                            if let Some(slot) = self.vals.get_mut(idx) {
+                                *slot = Val { at: At::Place(tp), ty: v.ty };
+                            }
+                        }
+                    }
+                }
+                let mark = usize::try_from(temp_mark).unwrap_or(self.temps.len()).min(self.temps.len());
+                let saved_len = self.temps.len() - mark;
+                let mut saved: Vec<Local, A> = Vec::with_capacity_in(saved_len, self.alloc);
+                if let Some(tail) = self.temps.get(mark..) {
+                    for &l in tail {
+                        saved.push(l);
+                    }
+                }
+                self.temps.truncate(mark);
+                let res = self.exit_drops(0, 0, e);
+                for l in saved {
+                    self.temps.push(l);
+                }
+                res
+            }
+            Task::BecomeReturnDone(e, temp_mark) => {
+                let v = self.pop(e)?;
+                let rp = self.place_of(Local(0));
+                let rt = self.local_ty[0];
+                if v.ty != rt {
+                    self.closure_sig_kept(v.ty.ty, e)?;
+                }
+                self.assign_val(rp, rt, v, e)?;
+                if !self.rpit_outs.is_empty() {
+                    let ri = self.info(rp);
+                    for &(slot, out_o) in self.rpit_outs.iter() {
+                        if let Some(idx) = ri.start.checked_add(slot).and_then(|v| usize::try_from(v).ok())
+                            && let Some(&orig) = self.origs.get(idx)
+                        {
+                            self.b.subset(orig, out_o);
+                        }
+                    }
+                }
+                let mark = usize::try_from(temp_mark).unwrap_or(self.temps.len()).min(self.temps.len());
+                let mut i = self.temps.len();
+                while i > mark {
+                    i -= 1;
+                    if let Some(&l) = self.temps.get(i) {
+                        self.drop_local(l, e)?;
+                    }
+                }
                 self.b.goto(self.ret_block, self.span(e));
                 self.fresh();
                 let ty = TyD::of(self.expr_ty(e)?);
@@ -4672,10 +5050,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     self.closure_sig_kept(v.ty.ty, e)?;
                 }
                 self.assign_val(rp, rt, v, e)?;
-                if let Some(out_o) = self.rpit_out {
+                if !self.rpit_outs.is_empty() {
                     let ri = self.info(rp);
-                    for k in ri.start..ri.start + ri.len {
-                        self.b.subset(self.origs[k as usize], out_o);
+                    for &(slot, out_o) in self.rpit_outs.iter() {
+                        if let Some(idx) = ri.start.checked_add(slot).and_then(|v| usize::try_from(v).ok())
+                            && let Some(&orig) = self.origs.get(idx)
+                        {
+                            self.b.subset(orig, out_o);
+                        }
                     }
                 }
                 self.exit_drops(0, 0, e)?;
@@ -4689,6 +5071,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Task::CtorDone(e, n) => self.aggregate(e, n, Agg::Ctor),
             Task::AggDone(e, n) => self.aggregate(e, n, Agg::Other),
             Task::FmtDone(e, n) => self.aggregate(e, n, Agg::Fmt),
+            Task::AsmDone(e, operands, options) => self.asm_done(e, operands, options),
             Task::OpDone(e) => self.aggregate(e, 1, Agg::Other),
             Task::BinDone(e, op) => self.bin_done(e, op),
             Task::AssignDone(e) => {
@@ -4705,8 +5088,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 Ok(())
             }
             Task::AssignOpDone(e) => {
-                let rhs = self.pop(e)?;
                 let lhs = self.pop(e)?;
+                let rhs = self.pop(e)?;
                 let lp = self.as_place(lhs, e)?;
                 let r = self.operand(rhs, e)?;
                 self.b.aggregate(lp, &[Operand::Copy(lp), r], self.span(e));
@@ -4872,10 +5255,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     fn eval(&mut self, e: ExprId, m: bool) -> Result<(), Refusal> {
-        self.tasks.push(Task::Adjust(e, m));
-        if self.place_capture_use(e)? {
+        if let Some(skip) = self.place_capture_use(e)? {
+            self.tasks.push(Task::Adjust(e, m, skip));
             return Ok(());
         }
+        self.tasks.push(Task::Adjust(e, m, 0));
         let ty = TyD::of(self.expr_ty(e)?);
         let body = self.body;
         match self.expr(e)? {
@@ -5031,6 +5415,87 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     self.tasks.push(Task::Eval(v, false));
                 }
             }
+            Expr::Become { value } => {
+                let mut call_e = value;
+                for _ in 0..16 {
+                    if let Expr::Paren(inner) = self.expr(call_e)? {
+                        call_e = inner;
+                    } else {
+                        break;
+                    }
+                }
+                match self.expr(call_e)? {
+                    Expr::Call { callee, args } => {
+                        let args = match body.expr_lists.get(args.range()) {
+                            Some(a) => a,
+                            None => return self.refuse(Form::Malformed, call_e),
+                        };
+                        let def = match self.expr(callee)? {
+                            Expr::Path(_) => self.expr_def(callee),
+                            _ => None,
+                        };
+                        if matches!(def, Some(Def::Ctor { .. })) {
+                            self.tasks.push(Task::ReturnDone(e, true));
+                            self.tasks.push(Task::Eval(value, false));
+                        } else {
+                            let value_callee = !matches!(def, Some(Def::Fn(_)));
+                            let mark = u32::try_from(self.two_phase.len()).unwrap_or(u32::MAX);
+                            let temp_mark = u32::try_from(self.temps.len()).unwrap_or(u32::MAX);
+                            let arg_count = u32::try_from(args.len()).unwrap_or(u32::MAX);
+                            let n_vals = arg_count + u32::from(value_callee);
+                            self.tasks.push(Task::BecomeReturnDone(e, temp_mark));
+                            if self.adjust_rows(call_e).0 < self.adjust_rows(call_e).1 {
+                                self.tasks.push(Task::Adjust(call_e, false, 0));
+                            }
+                            self.tasks.push(Task::CallDone(call_e, arg_count, value_callee, mark));
+                            self.tasks.push(Task::BecomeDrops(e, temp_mark, n_vals));
+                            for (j, &a) in args.iter().enumerate().rev() {
+                                if j + 1 < args.len() {
+                                    self.tasks.push(Task::Settle(a));
+                                }
+                                self.tasks.push(Task::Eval(a, false));
+                            }
+                            if value_callee {
+                                self.tasks.push(Task::Eval(callee, false));
+                            }
+                        }
+                    }
+                    Expr::MethodCall { receiver, args, .. } => {
+                        let args = match body.expr_lists.get(args.range()) {
+                            Some(a) => a,
+                            None => return self.refuse(Form::Malformed, call_e),
+                        };
+                        let mark = u32::try_from(self.two_phase.len()).unwrap_or(u32::MAX);
+                        let temp_mark = u32::try_from(self.temps.len()).unwrap_or(u32::MAX);
+                        let n_vals = 1 + u32::try_from(args.len()).unwrap_or(u32::MAX);
+                        self.tasks.push(Task::BecomeReturnDone(e, temp_mark));
+                        if self.adjust_rows(call_e).0 < self.adjust_rows(call_e).1 {
+                            self.tasks.push(Task::Adjust(call_e, false, 0));
+                        }
+                        self.tasks.push(Task::CallDone(call_e, n_vals, false, mark));
+                        self.tasks.push(Task::BecomeDrops(e, temp_mark, n_vals));
+                        for (j, &a) in args.iter().enumerate().rev() {
+                            if j + 1 < args.len() {
+                                self.tasks.push(Task::Settle(a));
+                            }
+                            self.tasks.push(Task::Eval(a, false));
+                        }
+                        if !args.is_empty() {
+                            self.tasks.push(Task::Settle(receiver));
+                        }
+                        let (lo, hi) = self.adjust_rows(receiver);
+                        let recv_mut = self.ck.adjusts.column::<1>().get(lo..hi).is_some_and(|ks| {
+                            ks.iter()
+                                .any(|k| matches!(k, AdjustKind::Borrow { mutbl: Mutbl::Mut, .. } | AdjustKind::Deref { overloaded: Some(Mutbl::Mut) }))
+                        });
+                        self.tasks.push(Task::Eval(receiver, recv_mut));
+                    }
+                    _ => {
+                        self.tasks.push(Task::ReturnDone(e, true));
+                        self.tasks.push(Task::Eval(value, false));
+                    }
+                }
+            }
             Expr::Call { callee, args } => {
                 let args = match body.expr_lists.get(args.range()) {
                     Some(a) => a,
@@ -5133,19 +5598,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 }
             }
             Expr::AssignOp { lhs, rhs, .. } => {
+                // The Reference, "Compound assignment expressions": "the right-hand operand is
+                // evaluated first, then the left-hand operand". Settle `rhs` before evaluating
+                // `lhs` so `starts[b + 1] += starts[b]` ends the shared borrow of `starts` before
+                // `IndexMut` borrows `starts` mutably.
                 self.tasks.push(Task::AssignOpDone(e));
-                self.tasks.push(Task::Eval(rhs, false));
                 self.tasks.push(Task::Eval(lhs, true));
-            }
-            // The Reference, "Constant promotion": a borrow the checker promoted
-            // (`Checked::promoted`) is of a `'static` slot: no loan of the body's, and the
-            // operand's code does not run here (the builder reads the evaluator's value).
-            Expr::Ref { mutbl: Mutbl::Not, .. } if self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok() => {
-                let ty = TyD::of(self.expr_ty(e)?);
-                let t = self.temp(ty, e)?;
-                let tp = self.place_of(t);
-                self.b.assign(tp, Operand::Const, self.span(e));
-                self.push_place(tp, ty);
+                self.tasks.push(Task::Settle(rhs));
+                self.tasks.push(Task::Eval(rhs, false));
             }
             // The Reference, "Constant promotion": a borrow the checker promoted
             // (`Checked::promoted`) is of a `'static` slot: no loan of the body's, and the
@@ -5268,7 +5728,35 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 self.tasks.push(Task::Eval(op, false));
             }
             Expr::Underscore => return self.refuse(Form::Malformed, e),
-            Expr::Asm { .. } => return self.refuse(Form::InlineAsm, e),
+            Expr::Asm { operands, options, .. } => {
+                let Some(ops) = body.asm_operands.get(operands.range()) else {
+                    return self.refuse(Form::Malformed, e);
+                };
+                if ops.iter().any(|o| o.kind == blaze_typeck::AsmKind::Label) {
+                    return self.refuse(Form::InlineAsm, e);
+                }
+                self.tasks.push(Task::AsmDone(e, operands, options));
+                for o in ops.iter().rev() {
+                    match (o.kind, o.out_expr) {
+                        (blaze_typeck::AsmKind::In, _) => self.tasks.push(Task::Eval(o.expr, false)),
+                        (blaze_typeck::AsmKind::Out | blaze_typeck::AsmKind::LateOut, _) => {
+                            if !matches!(self.expr(o.expr)?, Expr::Underscore) {
+                                self.tasks.push(Task::Eval(o.expr, true));
+                            }
+                        }
+                        (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, Some(out)) => {
+                            if !matches!(self.expr(out)?, Expr::Underscore) {
+                                self.tasks.push(Task::Eval(out, true));
+                            }
+                            self.tasks.push(Task::Eval(o.expr, false));
+                        }
+                        (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, None) => {
+                            self.tasks.push(Task::Eval(o.expr, true));
+                        }
+                        (blaze_typeck::AsmKind::Sym | blaze_typeck::AsmKind::Const | blaze_typeck::AsmKind::Label, _) => {}
+                    }
+                }
+            }
             Expr::FormatArgs { args, .. } => {
                 let es = match body.expr_lists.get(args.range()) {
                     Some(a) => a,
@@ -5410,8 +5898,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     /// The expression's adjustments, in order, on its value.
-    fn adjust(&mut self, e: ExprId, m: bool) -> Result<(), Refusal> {
+    fn adjust(&mut self, e: ExprId, m: bool, skip: u32) -> Result<(), Refusal> {
         let (lo, hi) = self.adjust_rows(e);
+        let lo = lo.saturating_add(usize::try_from(skip).unwrap_or(usize::MAX)).min(hi);
         if lo == hi {
             return Ok(());
         }
@@ -5462,6 +5951,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     if kind == BorrowKind::TwoPhase {
                         self.two_phase.push(loan);
                     }
+                    if self.const_init && mutbl == Mutbl::Not && i == lo {
+                        self.promote_const_init_temp(p, e, e)?;
+                    }
                     Val { at: At::Place(self.place_of(t)), ty: out }
                 }
                 AdjustKind::ReifyFnPointer
@@ -5469,17 +5961,27 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 | AdjustKind::UnsafeFnPointer
                 | AdjustKind::MutToConstPointer
                 | AdjustKind::Unsize => {
-                    if matches!(kind, AdjustKind::ClosureFnPointer | AdjustKind::Unsize) {
+                    if kind == AdjustKind::ClosureFnPointer {
                         self.closure_sig_kept(v.ty.ty, e)?;
                     }
                     let op = self.operand(v, e)?;
                     let t = self.temp(out, e)?;
                     let tp = self.place_of(t);
                     self.b.aggregate(tp, &[op], self.span(e));
-                    if let At::Place(p) = v.at
-                        && !(kind == AdjustKind::Unsize && self.unsize_to_object(p, v.ty, tp, out, e)?)
-                    {
-                        self.relate(p, tp, out, e)?;
+                    let mut closure_sig_tied = false;
+                    if let At::Place(p) = v.at {
+                        if kind == AdjustKind::Unsize {
+                            match self.unsize_to_object(p, v.ty, tp, out, e)? {
+                                UnsizeDone::ClosureSigTied => closure_sig_tied = true,
+                                UnsizeDone::Handled => {}
+                                UnsizeDone::Fallback => self.relate(p, tp, out, e)?,
+                            }
+                        } else {
+                            self.relate(p, tp, out, e)?;
+                        }
+                    }
+                    if kind == AdjustKind::Unsize && !closure_sig_tied {
+                        self.closure_sig_kept(v.ty.ty, e)?;
                     }
                     Val { at: At::Place(tp), ty: out }
                 }
@@ -5503,7 +6005,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// `Box`, or `Deref::deref(&v)` / `DerefMut::deref_mut(&mut v)` then the builtin deref of
     /// its result (whose lifetime is the receiver's, by elision).
     fn deref(&mut self, v: Val, out: TyD, m: bool, overloaded: Option<Mutbl>, e: ExprId) -> Result<Place, Refusal> {
-        let p = self.as_place(v, e)?;
         // `*b` of a `Box` is builtin whatever the type check recorded (it records the operand's
         // deref as overloaded, `Deref for Box`): the Reference, "Dereference expressions":
         // "On non-pointer types `*x` is equivalent to `*std::ops::Deref::deref(&x)`" except for
@@ -5513,26 +6014,42 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             && let PNode::Adt(k, _) = self.node(v.ty.ty, e)?
             && self.adt_facts(k, e)?.is_box
         {
+            let p = self.as_place(v, e)?;
             return self.project(p, v.ty, Proj::DerefBox, out, false, e);
         }
         if overloaded.is_none() {
             if v.ty.wrap.is_some() {
+                let p = self.as_place(v, e)?;
                 return self.project(p, v.ty, Proj::Deref, out, false, e);
             }
             match self.node(v.ty.ty, e)? {
-                PNode::Ref(..) | PNode::Ptr(..) => return self.project(p, v.ty, Proj::Deref, out, false, e),
-                PNode::Adt(k, _) if self.adt_facts(k, e)?.is_box => return self.project(p, v.ty, Proj::DerefBox, out, false, e),
+                PNode::Ref(..) | PNode::Ptr(..) => {
+                    let p = self.as_place(v, e)?;
+                    return self.project(p, v.ty, Proj::Deref, out, false, e);
+                }
+                PNode::Adt(k, _) if self.adt_facts(k, e)?.is_box => {
+                    let p = self.as_place(v, e)?;
+                    return self.project(p, v.ty, Proj::DerefBox, out, false, e);
+                }
                 _ => {}
             }
         }
-        // `*ET` of an extending borrow's operand: the overloaded deref borrows the temporary
-        // (`&mut *cell.borrow_mut()`'s `RefMut`), so it lives as the borrow's result does.
-        self.extend_root(p, e)?;
         let mutbl = if m { Mutbl::Mut } else { Mutbl::Not };
         let bt = self.temp(TyD { wrap: Some(mutbl), ty: v.ty.ty }, e)?;
         self.name_local(bt, Identity::Temp(e, Role::Borrow));
-        let kind = if m { BorrowKind::Mut } else { BorrowKind::Shared };
-        self.borrow(p, v.ty, kind, bt, e)?;
+        // An immutable `static` item (`static S: LazyLock<Mutex<T>>`) lives in `'static` storage
+        // directly: `Deref::deref(&S)` borrows the static item itself rather than materializing
+        // a stack temporary that would drop at statement end.
+        if matches!(v.at, At::Const) && !m && self.is_immutable_static(e)? {
+            self.b.assign(self.place_of(bt), Operand::Const, self.span(e));
+        } else {
+            let p = self.as_place(v, e)?;
+            // `*ET` of an extending borrow's operand: the overloaded deref borrows the temporary
+            // (`&mut *cell.borrow_mut()`'s `RefMut`), so it lives as the borrow's result does.
+            self.extend_root(p, e)?;
+            let kind = if m { BorrowKind::Mut } else { BorrowKind::Shared };
+            self.borrow(p, v.ty, kind, bt, e)?;
+        }
         let rt = self.temp(TyD { wrap: Some(mutbl), ty: out.ty }, e)?;
         self.name_local(rt, Identity::Temp(e, Role::Result));
         let (bp, rp) = (self.place_of(bt), self.place_of(rt));
@@ -5548,9 +6065,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             && let Some(slots) = self.map_impl_assoc_slots(imp, Name::of("Target"), v.ty.ty, bi.len - 1, ri.len - 1, e)?
         {
             for (k, slot) in slots.iter().enumerate() {
-                let to = self.origs[(ri.start + 1 + k as u32) as usize];
+                let to_idx = usize::try_from(ri.start).ok().and_then(|s| s.checked_add(1)).and_then(|s| s.checked_add(k));
+                let Some(&to) = to_idx.and_then(|i| self.origs.get(i)) else { continue };
                 let b = match *slot {
-                    generic_call::ImplAssocSlot::SelfPos(pos) => self.origs[(bi.start + 1 + pos) as usize],
+                    generic_call::ImplAssocSlot::SelfPos(pos) => {
+                        let b_idx = usize::try_from(bi.start)
+                            .ok()
+                            .and_then(|s| s.checked_add(1))
+                            .and_then(|s| usize::try_from(pos).ok().and_then(|p| s.checked_add(p)));
+                        let Some(&orig) = b_idx.and_then(|i| self.origs.get(i)) else { continue };
+                        orig
+                    }
                     generic_call::ImplAssocSlot::Static => self.universal(Region::Static),
                 };
                 self.b.subset(b, to);
@@ -5591,35 +6116,58 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// E, a derived `Debug`: E0597 and a placeholder error). `false`, relating nothing: not
     /// such a coercion, and `relate` applies (a trait with lifetimes keeps the object lifetime
     /// standing for them, every position equal).
-    fn unsize_to_object(&mut self, src: Place, from: TyD, dst: Place, to: TyD, e: ExprId) -> Result<bool, Refusal> {
+    fn unsize_to_object(&mut self, src: Place, from: TyD, dst: Place, to: TyD, e: ExprId) -> Result<UnsizeDone, Refusal> {
         let (s, d) = (self.info(src), self.info(dst));
-        if !s.exact || !d.exact || s.len == 0 || d.len < 2 {
-            return Ok(false);
+        if !s.exact || !d.exact {
+            return Ok(UnsizeDone::Fallback);
         }
-        if !(from.wrap.is_some() || matches!(self.node(from.ty, e)?, PNode::Ref(..))) {
-            return Ok(false);
-        }
-        let obj = match to.wrap {
-            Some(_) => to.ty,
-            None => match self.node(to.ty, e)? {
-                PNode::Ref(_, i) => i,
-                _ => return Ok(false),
-            },
+        let facts: &'b F = self.facts;
+        // Peel either `&T -> &dyn ...` (`ref_skip = 1`) or `Box<T> -> Box<dyn ...>` (`ref_skip = 0`,
+        // with zero lifetimes on `Box` and zero slots on its allocator parameter).
+        let (ref_skip, from_inner, obj) = if from.wrap.is_some() || matches!(self.node(from.ty, e)?, PNode::Ref(..)) {
+            if s.len == 0 || d.len < 2 {
+                return Ok(UnsizeDone::Fallback);
+            }
+            let obj = match to.wrap {
+                Some(_) => to.ty,
+                None => match self.node(to.ty, e)? {
+                    PNode::Ref(_, i) => i,
+                    _ => return Ok(UnsizeDone::Fallback),
+                },
+            };
+            let from_inner = match from.wrap {
+                Some(_) => from.ty,
+                None => match self.node(from.ty, e)? {
+                    PNode::Ref(_, i) => i,
+                    _ => return Ok(UnsizeDone::Fallback),
+                },
+            };
+            (1u32, from_inner, obj)
+        } else if to.wrap.is_none()
+            && let (PNode::Adt(fk, fl), PNode::Adt(tk, tl)) = (self.node(from.ty, e)?, self.node(to.ty, e)?)
+            && fk == tk
+            && facts.adt(fk).is_some_and(|a| a.is_box && a.lifetimes == 0)
+        {
+            if d.len < 1 {
+                return Ok(UnsizeDone::Fallback);
+            }
+            let (flist, tlist) = (self.list(fl, e)?, self.list(tl, e)?);
+            let (Some(&fi), Some(&ti)) = (flist.first(), tlist.first()) else {
+                return Ok(UnsizeDone::Fallback);
+            };
+            if flist.len() != tlist.len() || flist[1..].iter().any(|&a| self.npos(a, e).unwrap_or(1) != 0) {
+                return Ok(UnsizeDone::Fallback);
+            }
+            (0u32, fi, ti)
+        } else {
+            return Ok(UnsizeDone::Fallback);
         };
         let PNode::Dynamic(preds) = self.node(obj, e)? else {
-            return Ok(false);
-        };
-        let facts: &'b F = self.facts;
-        let from_inner = match from.wrap {
-            Some(_) => from.ty,
-            None => match self.node(from.ty, e)? {
-                PNode::Ref(_, i) => i,
-                _ => return Ok(false),
-            },
+            return Ok(UnsizeDone::Fallback);
         };
         // Exact closure-to-`dyn Fn*(Args) -> Ret + 'q` unsizing (both HRTB and non-HRTB):
-        // `'r_src: 'r_dst`, every capture slot outlives `'q` (one-way), and every `dyn`
-        // `Fn*` / `FnOnce::Output` predicate slot equates with the closure's corresponding
+        // `'r_src: 'r_dst` (when `&`/`&mut`), every capture slot outlives `'q` (one-way), and every
+        // `dyn` `Fn*` / `FnOnce::Output` predicate slot equates with the closure's corresponding
         // signature slot (`SigSlot::Owner` / `SigSlot::Static`).
         if let PNode::Closure { owner, ordinal, .. } = self.node(from_inner, e)?
             && owner == self.body.owner
@@ -5628,12 +6176,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             let mut sig_slots: Vec<closure::SigSlot, A> = Vec::new_in(self.alloc);
             if self.sig_slots(ordinal as usize, ce, &mut sig_slots).is_ok() {
                 let nsig = self.owner_sig_count(ordinal as usize, e)?;
-                if s.len >= 1 + nsig {
-                    let ncap = s.len - 1 - nsig;
+                if s.len >= ref_skip + nsig {
+                    let ncap = s.len - ref_skip - nsig;
                     let out_name = Name::of("Output");
                     // `(dyn_off, sig_base, count)` pairs to equate after validating every predicate.
                     let mut ties: Vec<(u32, usize, u32), A> = Vec::new_in(self.alloc);
-                    let mut dyn_at = 2u32;
+                    let mut dyn_at = ref_skip + 1;
                     let mut ok = true;
                     for &p in self.list(preds, e)? {
                         let pn = self.npos(p, e)?;
@@ -5670,64 +6218,76 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         dyn_at += pn;
                     }
                     if ok && dyn_at == d.len {
-                        let (d0, q) = (self.origs[d.start as usize], self.origs[(d.start + 1) as usize]);
-                        self.b.subset(self.origs[s.start as usize], d0);
-                        for j in 0..ncap {
-                            self.b.subset(self.origs[(s.start + 1 + j) as usize], q);
+                        if ref_skip == 1 {
+                            let d0 = self.origs[d.start as usize];
+                            self.b.subset(self.origs[s.start as usize], d0);
                         }
+                        let q = self.origs[(d.start + ref_skip) as usize];
+                        for j in 0..ncap {
+                            self.b.subset(self.origs[(s.start + ref_skip + j) as usize], q);
+                        }
+                        let nsig_usize = usize::try_from(nsig).unwrap_or(0);
+                        let mut tied: Vec<bool, A> = Vec::with_capacity_in(nsig_usize, self.alloc);
+                        tied.resize(nsig_usize, false);
                         for &(dyn_off, sig_base, count) in ties.iter() {
                             for i in 0..count {
                                 let d_orig = self.origs[(d.start + dyn_off + i) as usize];
                                 match sig_slots[sig_base + i as usize] {
                                     closure::SigSlot::Owner(k) if k < nsig => {
-                                        let c_orig = self.origs[(s.start + 1 + ncap + k) as usize];
+                                        let c_orig = self.origs[(s.start + ref_skip + ncap + k) as usize];
                                         self.b.subset(c_orig, d_orig);
                                         self.b.subset(d_orig, c_orig);
+                                        if let Some(slot) = usize::try_from(k).ok().and_then(|ki| tied.get_mut(ki)) {
+                                            *slot = true;
+                                        }
                                     }
                                     closure::SigSlot::Static => {
                                         let st = self.universal(Region::Static);
                                         self.b.subset(st, d_orig);
                                         self.b.subset(d_orig, st);
                                     }
-                                    closure::SigSlot::Late(_) => {}
+                                    closure::SigSlot::Late(_) | closure::SigSlot::InnerBound(..) => {}
                                     closure::SigSlot::Owner(_) => {}
                                 }
                             }
                         }
-                        return Ok(true);
+                        return Ok(if tied.iter().all(|&b| b) { UnsizeDone::ClosureSigTied } else { UnsizeDone::Handled });
                     }
                 }
             }
         }
-        if d.len != 2 {
-            return Ok(false);
+        if d.len != ref_skip + 1 {
+            return Ok(UnsizeDone::Fallback);
         }
         let mut held: Vec<u32, A> = Vec::new_in(self.alloc);
         for &p in self.list(preds, e)? {
             let (args, term) = match self.node(p, e)? {
                 PNode::ExTrait(k, args) => {
                     if facts.object_trait_lifetimes(k) != Some(false) {
-                        return Ok(false);
+                        return Ok(UnsizeDone::Fallback);
                     }
                     (args, None)
                 }
                 PNode::ExProj { args, term, .. } => (args, Some(term)),
                 PNode::ExAuto(_) => continue,
-                _ => return Ok(false),
+                _ => return Ok(UnsizeDone::Fallback),
             };
             for &t in self.list(args, e)?.iter().chain(term.as_ref()) {
                 held.clear();
                 if self.npos(t, e)? > 0 || self.unplaced(t, e, &mut held)? || !held.is_empty() {
-                    return Ok(false);
+                    return Ok(UnsizeDone::Fallback);
                 }
             }
         }
-        let (d0, q) = (self.origs[d.start as usize], self.origs[(d.start + 1) as usize]);
-        self.b.subset(self.origs[s.start as usize], d0);
-        for j in s.start + 1..s.start + s.len {
+        if ref_skip == 1 {
+            let d0 = self.origs[d.start as usize];
+            self.b.subset(self.origs[s.start as usize], d0);
+        }
+        let q = self.origs[(d.start + ref_skip) as usize];
+        for j in s.start + ref_skip..s.start + s.len {
             self.b.subset(self.origs[j as usize], q);
         }
-        Ok(true)
+        Ok(UnsizeDone::Handled)
     }
 
     fn target_flow(&mut self, from: PInfo, skip: u32, r: PInfo, m: bool) {
@@ -5764,6 +6324,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 // &mk().f;` extends `mk()`; an arm's `&mk().f` died at the arm's end otherwise).
                 if let Expr::Ref { operand, .. } = self.expr(e)? {
                     self.extend_root(p, operand)?;
+                    if self.const_init && m == Mutbl::Not {
+                        self.promote_const_init_temp(p, operand, e)?;
+                    }
                 }
             }
         }
@@ -5829,6 +6392,279 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             None => self.vars.push(l),
         }
         Ok(())
+    }
+
+    /// Whether `e` (unwrapping parens and explicit `*` derefs) names an immutable `static` item.
+    fn is_immutable_static(&self, e: ExprId) -> Result<bool, Refusal> {
+        let mut cur = e;
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > self.body.exprs.len() + 1 {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.expr(cur)? {
+                Expr::Paren(inner) => cur = inner,
+                Expr::Unary { op: UnOp::Deref, operand } => cur = operand,
+                Expr::Path(_) => return Ok(matches!(self.expr_def(cur), Some(Def::Static(_, Mutbl::Not)))),
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    /// Implicit promotion in a `const` or `static` initializer (RFC 3027): promotes a shared
+    /// borrow's temporary `p` to `'static` (`STATIC_EXTENDED`) when the temporary's type is
+    /// `Freeze` with no drop glue and `operand` contains no free outer locals or disallowed
+    /// runtime/mutable constructs. Because `operand` was already lowered, any invalid inner
+    /// borrow (e.g. `&{ let y = 1; &y }`) is still caught.
+    fn promote_const_init_temp(&mut self, p: Place, operand: ExprId, e: ExprId) -> Result<(), Refusal> {
+        let pi = self.info(p);
+        let Some(at) = self.temps.iter().rposition(|l| l.0 == pi.local) else {
+            return Ok(());
+        };
+        let Ok(local_ix) = usize::try_from(pi.local) else {
+            return Ok(());
+        };
+        let Some(&root_ty) = self.local_ty.get(local_ix) else {
+            return Ok(());
+        };
+        if !self.const_init_freeze_no_drop(root_ty, e)? {
+            return Ok(());
+        }
+        if !self.no_free_locals(operand, e)? {
+            return Ok(());
+        }
+        self.extend_temp(at, STATIC_EXTENDED, e)
+    }
+
+    /// Whether a value of `ty` has no drop glue and is guaranteed `Freeze` (no interior
+    /// mutability). Conservative `false` for non-`Copy` ADTs and unresolved/opaque types.
+    fn const_init_freeze_no_drop(&self, ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        if self.needs_drop(ty, e)? {
+            return Ok(false);
+        }
+        if let Some(m) = ty.wrap {
+            return Ok(m == Mutbl::Not);
+        }
+        let mut stack = TyStack::new(ty.ty, self.alloc);
+        let mut steps = 0u32;
+        while let Some(t) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.node(t, e)? {
+                PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Str
+                | PNode::Never
+                | PNode::FnDef(..)
+                | PNode::FnPtr(..)
+                | PNode::Ptr(..)
+                | PNode::Ref(Mutbl::Not, _)
+                | PNode::ConstValue { .. }
+                | PNode::ConstParam(_) => {}
+                PNode::Tuple(l) | PNode::Record(_, l) => stack.extend_from_slice(self.list(l, e)?),
+                PNode::Array(elem, _) | PNode::Slice(elem) | PNode::Pat(elem, _) => stack.push(elem),
+                // In Rust, `Copy` structurally requires every field to be `Copy` (E0204), and
+                // `UnsafeCell<T>` is `!Copy`, so any `Copy` ADT is guaranteed `Freeze` + no-drop.
+                PNode::Adt(..) => {
+                    if !self.is_copy_pty(t, e)? {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether `root` contains no free local variables (locals bound outside `root`) and no
+    /// mutable borrows / `static mut` / runtime-only constructs.
+    fn no_free_locals(&self, root: ExprId, e: ExprId) -> Result<bool, Refusal> {
+        let bound = self.body.exprs.len() + self.body.stmts.len() + self.body.pats.len() + 1;
+        let mut exprs: Vec<ExprId, A> = Vec::new_in(self.alloc);
+        let mut pats: Vec<PatId, A> = Vec::new_in(self.alloc);
+        let mut bound_pats: Vec<PatId, A> = Vec::new_in(self.alloc);
+        let mut used_locals: Vec<PatId, A> = Vec::new_in(self.alloc);
+        exprs.push(root);
+        let mut steps = 0usize;
+        while let Some(cur) = exprs.pop() {
+            steps += 1;
+            if steps > bound {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.expr(cur)? {
+                Expr::Lit(_) | Expr::OffsetOf { .. } | Expr::ConstBlock { .. } => {}
+                Expr::Local(p) => used_locals.push(p),
+                Expr::Path(_) => {
+                    if matches!(self.expr_def(cur), Some(Def::Static(_, Mutbl::Mut))) {
+                        return Ok(false);
+                    }
+                }
+                Expr::Paren(i)
+                | Expr::Field { base: i, .. }
+                | Expr::TupleField { base: i, .. }
+                | Expr::Unary { operand: i, .. }
+                | Expr::Cast { operand: i, .. }
+                | Expr::Loop { body: i } => exprs.push(i),
+                Expr::Ref { mutbl: Mutbl::Not, operand } | Expr::RawRef { mutbl: Mutbl::Not, operand } => {
+                    exprs.push(operand);
+                }
+                Expr::Binary { lhs, rhs, .. } | Expr::Index { base: lhs, index: rhs } => {
+                    exprs.push(lhs);
+                    exprs.push(rhs);
+                }
+                Expr::Repeat { elem, count, .. } => {
+                    exprs.push(elem);
+                    if let Some(c) = count {
+                        exprs.push(c);
+                    }
+                }
+                Expr::Tuple { elems } | Expr::Array { elems } => {
+                    let Some(es) = self.body.expr_lists.get(elems.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    exprs.extend_from_slice(es);
+                }
+                Expr::Struct { fields, base, .. } | Expr::Record { fields, base } => {
+                    let Some(fs) = self.body.field_inits.get(fields.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    for f in fs {
+                        exprs.push(f.expr);
+                    }
+                    if let Some(b) = base.expr() {
+                        exprs.push(b);
+                    }
+                }
+                Expr::Call { callee, args } => {
+                    exprs.push(callee);
+                    let Some(es) = self.body.expr_lists.get(args.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    exprs.extend_from_slice(es);
+                }
+                Expr::MethodCall { receiver, args, .. } => {
+                    exprs.push(receiver);
+                    let Some(es) = self.body.expr_lists.get(args.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    exprs.extend_from_slice(es);
+                }
+                Expr::FormatArgs { args, .. } => {
+                    let Some(es) = self.body.expr_lists.get(args.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    exprs.extend_from_slice(es);
+                }
+                Expr::If { cond, then, else_ } => {
+                    exprs.push(cond);
+                    exprs.push(then);
+                    if let Some(el) = else_ {
+                        exprs.push(el);
+                    }
+                }
+                Expr::Let { pat, init } => {
+                    pats.push(pat);
+                    exprs.push(init);
+                }
+                Expr::Match { scrutinee, arms } => {
+                    exprs.push(scrutinee);
+                    let Some(as_) = self.body.arms.get(arms.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    for arm in as_ {
+                        pats.push(arm.pat);
+                        if let Some(g) = arm.guard {
+                            exprs.push(g);
+                        }
+                        exprs.push(arm.body);
+                    }
+                }
+                Expr::Block { stmts, tail, .. } => {
+                    let Some(ss) = self.body.stmt_lists.get(stmts.range()) else {
+                        return self.refuse(Form::Malformed, cur);
+                    };
+                    for &s in ss {
+                        let Some(st) = self.body.stmts.get(s.ix()) else {
+                            return self.refuse(Form::Malformed, cur);
+                        };
+                        match *st {
+                            TStmt::Let { pat, init, else_, .. } => {
+                                pats.push(pat);
+                                if let Some(i) = init {
+                                    exprs.push(i);
+                                }
+                                if let Some(el) = else_ {
+                                    exprs.push(el);
+                                }
+                            }
+                            TStmt::Expr { expr, .. } => exprs.push(expr),
+                            TStmt::Item => {}
+                        }
+                    }
+                    if let Some(t) = tail {
+                        exprs.push(t);
+                    }
+                }
+                Expr::Missing
+                | Expr::Ref { mutbl: Mutbl::Mut, .. }
+                | Expr::RawRef { mutbl: Mutbl::Mut, .. }
+                | Expr::Assign { .. }
+                | Expr::AssignOp { .. }
+                | Expr::Break { .. }
+                | Expr::Continue { .. }
+                | Expr::Return { .. }
+                | Expr::Become { .. }
+                | Expr::Closure { .. }
+                | Expr::Await(_)
+                | Expr::AsyncBlock { .. }
+                | Expr::Underscore
+                | Expr::Asm { .. } => return Ok(false),
+            }
+        }
+        let mut psteps = 0usize;
+        while let Some(p) = pats.pop() {
+            psteps += 1;
+            if psteps > bound {
+                return self.refuse(Form::Bound, e);
+            }
+            let Some(pat) = self.body.pats.get(p.ix()) else {
+                return self.refuse_pat(Form::Malformed, p);
+            };
+            match *pat {
+                Pat::Bind { sub, .. } => {
+                    bound_pats.push(p);
+                    if let Some(s) = sub {
+                        pats.push(s);
+                    }
+                }
+                Pat::Ref { inner, .. } => pats.push(inner),
+                Pat::Tuple { elems, .. }
+                | Pat::TupleStruct { elems, .. }
+                | Pat::Slice { elems, .. }
+                | Pat::Or { alts: elems } => {
+                    let Some(ps) = self.body.pat_lists.get(elems.range()) else {
+                        return self.refuse_pat(Form::Malformed, p);
+                    };
+                    pats.extend_from_slice(ps);
+                }
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                    let Some(fs) = self.body.field_pats.get(fields.range()) else {
+                        return self.refuse_pat(Form::Malformed, p);
+                    };
+                    for f in fs {
+                        pats.push(f.pat);
+                    }
+                }
+                Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => {}
+            }
+        }
+        Ok(used_locals.iter().all(|p| bound_pats.scan_for(p).is_some()))
     }
 
     fn field_done(&mut self, e: ExprId) -> Result<(), Refusal> {
@@ -5921,7 +6757,15 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let idx = self.pop(e)?;
         let base = self.pop(e)?;
         let ty = TyD::of(self.expr_ty(e)?);
-        let bp = self.as_place(base, e)?;
+        let static_base = if !m && matches!(base.at, At::Const)
+            && let Expr::Index { base: be, .. } = self.expr(e)?
+        {
+            self.is_immutable_static(be)?
+                || matches!(self.expr(be)?, Expr::Array { elems } if elems.len == 0)
+                || self.const_init_freeze_no_drop(base.ty, e)?
+        } else {
+            false
+        };
         let builtin = base.ty.wrap.is_none() && matches!(self.node(base.ty.ty, e)?, PNode::Array(..) | PNode::Slice(_));
         if builtin {
             if let At::Place(ip) = idx.at {
@@ -5930,6 +6774,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 let tp = self.place_of(t);
                 self.b.assign(tp, Operand::Copy(ip), self.span(e));
             }
+            // Indexing an immutable `static` (e.g. `&INFO[self as usize]`) or a promotable
+            // `Freeze` constant array borrows `'static` storage directly rather than a stack
+            // temporary that would die with the fn.
+            if static_base {
+                self.vals.push(Val { at: At::Const, ty });
+                return Ok(());
+            }
+            let bp = self.as_place(base, e)?;
             let p = self.project(bp, base.ty, Proj::Index, ty, false, e)?;
             self.push_place(p, ty);
             return Ok(());
@@ -5937,14 +6789,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         // `Index::index(&base, i)` / `IndexMut::index_mut(&mut base, i)`, then `*` of the result,
         // whose lifetime is the receiver's (elision, `&self`). `ET[..]` of an extending borrow's
         // operand: the base temporary it borrows lives as the result does (`mark_extended`).
-        if let Expr::Index { base: be, .. } = self.expr(e)? {
-            self.extend_root(bp, be)?;
-        }
         let mutbl = if m { Mutbl::Mut } else { Mutbl::Not };
         let bt = self.temp(TyD { wrap: Some(mutbl), ty: base.ty.ty }, e)?;
         self.name_local(bt, Identity::Temp(e, Role::Borrow));
-        let kind = if m { BorrowKind::Mut } else { BorrowKind::Shared };
-        self.borrow(bp, base.ty, kind, bt, e)?;
+        if static_base {
+            // Shared indexing of an immutable `static` or promotable constant (e.g. `&[][..]`)
+            // borrows `'static` storage directly, as `deref_done` does for `Deref::deref(&S)`.
+            self.b.assign(self.place_of(bt), Operand::Const, self.span(e));
+        } else {
+            let bp = self.as_place(base, e)?;
+            if let Expr::Index { base: be, .. } = self.expr(e)? {
+                self.extend_root(bp, be)?;
+            }
+            let kind = if m { BorrowKind::Mut } else { BorrowKind::Shared };
+            self.borrow(bp, base.ty, kind, bt, e)?;
+        }
         let iop = self.operand(idx, e)?;
         let rt = self.temp(TyD { wrap: Some(mutbl), ty: ty.ty }, e)?;
         self.name_local(rt, Identity::Temp(e, Role::Result));
@@ -5954,15 +6813,49 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let (bi, ri) = (self.info(btp), self.info(rp));
         let (ob, or) = (self.origs[bi.start as usize], self.origs[ri.start as usize]);
         self.b.subset(ob, or);
-        self.target_flow(bi, 1, ri, m);
-        let mut inputs = bi.len.saturating_sub(1);
-        if let At::Place(ip) = idx.at {
-            let ii = self.info(ip);
-            inputs += ii.len;
-            self.target_flow(ii, 0, ri, m);
-        }
-        if inputs > 1 && ri.len > 1 {
-            self.coarse_step(Form::Unified { why: Unified::DerefTarget }, e);
+        let idx_len = match idx.at {
+            At::Place(ip) => self.info(ip).len,
+            At::Const => 0,
+        };
+        let mapped_index = if idx_len == 0
+            && ri.len > 1
+            && bi.len > 1
+            && let Some(slots) = self.map_index_output_slots(e, base.ty.ty, idx.ty.ty, bi.len - 1, ri.len - 1)?
+        {
+            for (k, slot) in slots.iter().enumerate() {
+                let to_idx = usize::try_from(ri.start).ok().and_then(|s| s.checked_add(1)).and_then(|s| s.checked_add(k));
+                let Some(&to) = to_idx.and_then(|i| self.origs.get(i)) else { continue };
+                let b = match *slot {
+                    generic_call::ImplAssocSlot::SelfPos(pos) => {
+                        let b_idx = usize::try_from(bi.start)
+                            .ok()
+                            .and_then(|s| s.checked_add(1))
+                            .and_then(|s| usize::try_from(pos).ok().and_then(|p| s.checked_add(p)));
+                        let Some(&orig) = b_idx.and_then(|i| self.origs.get(i)) else { continue };
+                        orig
+                    }
+                    generic_call::ImplAssocSlot::Static => self.universal(Region::Static),
+                };
+                self.b.subset(b, to);
+                if m {
+                    self.b.subset(to, b);
+                }
+            }
+            true
+        } else {
+            false
+        };
+        if !mapped_index {
+            self.target_flow(bi, 1, ri, m);
+            let mut inputs = bi.len.saturating_sub(1);
+            if let At::Place(ip) = idx.at {
+                let ii = self.info(ip);
+                inputs += ii.len;
+                self.target_flow(ii, 0, ri, m);
+            }
+            if inputs > 1 && ri.len > 1 {
+                self.coarse_step(Form::Unified { why: Unified::DerefTarget }, e);
+            }
         }
         let p = self.project(rp, self.local_ty[rt.0 as usize], Proj::Deref, ty, false, e)?;
         self.push_place(p, ty);
@@ -6026,6 +6919,98 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
         }
         self.refuse(Form::Bound, e)
+    }
+
+    /// Lowers an `asm!` expression after its runtime operands have been evaluated onto `vals`:
+    /// reads/moves input operands into a temporary (checking borrow conflicts and moves), writes
+    /// output places (dropping if needed and checking mutable access), and diverges on `noreturn`.
+    fn asm_done(&mut self, e: ExprId, operands: List, options: u16) -> Result<(), Refusal> {
+        let Some(ops) = self.body.asm_operands.get(operands.range()) else {
+            return self.refuse(Form::Malformed, e);
+        };
+        let mut count = 0usize;
+        for o in ops.iter() {
+            match (o.kind, o.out_expr) {
+                (blaze_typeck::AsmKind::In, _) => count += 1,
+                (blaze_typeck::AsmKind::Out | blaze_typeck::AsmKind::LateOut, _) => {
+                    if !matches!(self.expr(o.expr)?, Expr::Underscore) {
+                        count += 1;
+                    }
+                }
+                (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, Some(out)) => {
+                    count += 1;
+                    if !matches!(self.expr(out)?, Expr::Underscore) {
+                        count += 1;
+                    }
+                }
+                (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, None) => count += 1,
+                (blaze_typeck::AsmKind::Sym | blaze_typeck::AsmKind::Const | blaze_typeck::AsmKind::Label, _) => {}
+            }
+        }
+        let at = match self.vals.len().checked_sub(count) {
+            Some(a) => a,
+            None => return self.refuse(Form::Malformed, e),
+        };
+        let mut vs: Vec<Val, A> = Vec::new_in(self.alloc);
+        vs.extend_from_slice(&self.vals[at..]);
+        self.vals.truncate(at);
+        let mut idx = 0usize;
+        let span = self.span(e);
+        let mut in_ops: Vec<Operand, A> = Vec::new_in(self.alloc);
+        for o in ops.iter() {
+            match (o.kind, o.out_expr) {
+                (blaze_typeck::AsmKind::In, _) => {
+                    let Some(&v) = vs.get(idx) else { return self.refuse(Form::Malformed, e) };
+                    idx += 1;
+                    in_ops.push(self.operand(v, o.expr)?);
+                }
+                (blaze_typeck::AsmKind::Out | blaze_typeck::AsmKind::LateOut, _) => {
+                    if !matches!(self.expr(o.expr)?, Expr::Underscore) {
+                        let Some(&v) = vs.get(idx) else { return self.refuse(Form::Malformed, e) };
+                        idx += 1;
+                        let p = self.as_place(v, o.expr)?;
+                        if self.needs_drop(v.ty, o.expr)? {
+                            self.b.stmt(StmtKind::Drop(p), span);
+                        }
+                        self.b.assign(p, Operand::Const, span);
+                    }
+                }
+                (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, Some(out)) => {
+                    let Some(&vin) = vs.get(idx) else { return self.refuse(Form::Malformed, e) };
+                    idx += 1;
+                    in_ops.push(self.operand(vin, o.expr)?);
+                    if !matches!(self.expr(out)?, Expr::Underscore) {
+                        let Some(&vout) = vs.get(idx) else { return self.refuse(Form::Malformed, e) };
+                        idx += 1;
+                        let p = self.as_place(vout, out)?;
+                        if self.needs_drop(vout.ty, out)? {
+                            self.b.stmt(StmtKind::Drop(p), span);
+                        }
+                        self.b.assign(p, Operand::Const, span);
+                    }
+                }
+                (blaze_typeck::AsmKind::InOut | blaze_typeck::AsmKind::InLateOut, None) => {
+                    let Some(&v) = vs.get(idx) else { return self.refuse(Form::Malformed, e) };
+                    idx += 1;
+                    let p = self.as_place(v, o.expr)?;
+                    let op = self.operand(v, o.expr)?;
+                    self.b.assign(p, op, span);
+                }
+                (blaze_typeck::AsmKind::Sym | blaze_typeck::AsmKind::Const | blaze_typeck::AsmKind::Label, _) => {}
+            }
+        }
+        let ty = TyD::of(self.expr_ty(e)?);
+        if !in_ops.is_empty() {
+            let t = self.temp(ty, e)?;
+            let tp = self.place_of(t);
+            self.b.aggregate(tp, &in_ops, span);
+        }
+        if options & blaze_typeck::ASM_NORETURN != 0 {
+            self.b.stmt(StmtKind::Unreachable, span);
+            self.fresh();
+        }
+        self.vals.push(Val { at: At::Const, ty });
+        Ok(())
     }
 
     /// An aggregate (a constructor, tuple, array, struct, cast, unary op or `format_args!`): its
@@ -6166,7 +7151,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             && parts.len() == 1
             && matches!(self.expr(e)?, Expr::Cast { .. })
             && let At::Place(p) = parts[0].at
-            && self.unsize_to_object(p, parts[0].ty, tp, ty, e)?
+            && self.unsize_to_object(p, parts[0].ty, tp, ty, e)? != UnsizeDone::Fallback
         {
             self.push_place(tp, ty);
             return Ok(());
@@ -6522,51 +7507,32 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             self.stats.calls_by_signature += 1;
             return Ok(());
         }
+        // A callable loaded from a static/const, an indexed slice/array (`DECODE_SHIMS[idx](..)`),
+        // a struct/tuple field holding `dyn Fn*` (`(self.0)(parent)`), or a local initialized from
+        // a call returning a callable (`let prev = take_hook(); prev(info)`).
+        if let Some(&v0) = vs.first()
+            && self.call_through_source_callable(c, v0, args, dest, dest_ty, e)?
+        {
+            self.stats.calls_by_signature += 1;
+            return Ok(());
+        }
+        // An immutable local fn pointer initialized from a bounded tree of `FnDef` leaves (e.g.
+        // `let fun = const { if ... { f1 } else { f2 } }; fun(self)` in `core::iter::Filter::next_chunk`).
+        if self.call_through_fndef_local(c, args, dest, dest_ty, e)? {
+            return Ok(());
+        }
+        // A fn-pointer parameter of a closure (e.g. `|label: &str, edit: fn(&mut Tx)| { edit(&mut tx); }`)
+        // whose output carries no lifetime slots and whose inputs are higher-ranked (`for<..>`).
+        if self.call_through_closure_fn_ptr_param(c, args, dest, dest_ty, e)? {
+            self.stats.calls_by_signature += 1;
+            return Ok(());
+        }
         let param = match self.expr(c)? {
             Expr::Local(p) => self.body.params.iter().position(|x| *x == p),
             _ => None,
         };
         let facts: &'b F = self.facts;
         let Some(param) = param else {
-            if let Expr::Local(p) = self.expr(c)?
-                && let Some(&(_, adt, variant, field)) = self.local_field_source.iter().find(|&&(pat, ..)| pat == p)
-                && let Ok(col) = facts.regions().field(adt, variant, field)
-                && dest_ty.wrap.is_none()
-                && !args.iter().any(|v| v.ty.wrap.is_some())
-            {
-                let mut declared = col.ty();
-                let mut slots = col.as_slice();
-                for _ in 0..16 {
-                    match self.head_node(declared, e)? {
-                        PNode::Ref(_, inner) => {
-                            let Some(rest) = slots.get(1..) else { break };
-                            declared = inner;
-                            slots = rest;
-                        }
-                        PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.lifetimes == 0) => {
-                            let list = self.head_list(l, e)?;
-                            let Some(&inner) = list.first() else { break };
-                            if list.len() > 2 {
-                                break;
-                            }
-                            let arity = crate::one_call::FactsArity { facts };
-                            let heads = blaze_borrow::Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
-                            let Ok(ic) = blaze_borrow::RegionTypes::count(&heads, inner) else { break };
-                            let Some(inner_slots) = slots.get(..ic.get() as usize) else { break };
-                            declared = inner;
-                            slots = inner_slots;
-                        }
-                        _ => break,
-                    }
-                }
-                if let PNode::Dynamic(list) = self.head_node(declared, e)?
-                    && !slots.iter().any(|r| matches!(r, Region::Param(_)))
-                    && self.call_through_dyn_fn(list, slots, args, dest, dest_ty, e)?
-                {
-                    self.stats.calls_by_signature += 1;
-                    return Ok(());
-                }
-            }
             return self.refuse(Form::CalleeValueUnknown, e);
         };
         // The parameter's regions are the body's own signature column's input `param` (D148):
@@ -6708,7 +7674,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 return self.refuse(Form::CalleeValueUnknown, e);
             }
             let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
-            if !self.call_laid(laid, None, &[], args, dest, dest_ty, e)? {
+            if !self.call_laid(laid, &[], args, dest, dest_ty, e)? {
                 return self.refuse(Form::CalleeValueUnknown, e);
             }
             self.stats.calls_by_signature += 1;
@@ -6767,7 +7733,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
         }
         let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
-        if !self.call_laid(laid, None, &seed, args, dest, dest_ty, e)? {
+        if !self.call_laid(laid, &seed, args, dest, dest_ty, e)? {
             return self.refuse(Form::CalleeValueUnknown, e);
         }
         self.stats.calls_by_signature += 1;
@@ -6990,7 +7956,556 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
         }
         let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
-        self.call_laid(laid, None, &seed, args, dest, dest_ty, e)
+        self.call_laid(laid, &seed, args, dest, dest_ty, e)
+    }
+
+    /// Resolves a callable expression `c` whose declared region column lives in a static/const,
+    /// an indexed slice/array (`DECODE_SHIMS[idx](data, config)`), a struct/tuple field holding
+    /// `dyn Fn*` (`(self.0)(parent)`), or a local initialized from a call returning a callable
+    /// (`let prev = take_hook(); prev(info)`), and relates the call through its declared column.
+    fn call_through_source_callable(&mut self, mut c: ExprId, callee_val: Val, args: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        if dest_ty.wrap.is_some() || args.iter().any(|v| v.ty.wrap.is_some()) {
+            return Ok(false);
+        }
+        let mut peel_index = false;
+        for _ in 0..16 {
+            match self.expr(c)? {
+                Expr::Paren(i) | Expr::Unary { op: UnOp::Deref, operand: i } => c = i,
+                Expr::Index { base, .. } => {
+                    peel_index = true;
+                    c = base;
+                }
+                _ => break,
+            }
+        }
+        let facts: &'b F = self.facts;
+        let place_info = match callee_val.at {
+            At::Place(p) => Some(self.info(p)),
+            At::Const => None,
+        };
+        let mut traced_container = false;
+        let mut resolved: Option<(PTy, &'b [Region], bool)> = match self.expr(c)? {
+            Expr::Path(_) => match self.expr_def(c) {
+                Some(Def::Static(item, _) | Def::Const(item)) => {
+                    if let Ok(sig) = facts.sig(item)
+                        && let Some(out_slots) = sig.output()
+                        && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                    {
+                        Some((out_ty, out_slots, false))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                let field_idx = match self.expr(c)? {
+                    Expr::Field { .. } => self.field_of(c),
+                    Expr::TupleField { index, .. } => Some(index),
+                    _ => None,
+                };
+                if let Some(fi) = field_idx
+                    && let Some(adt) = self.peel_field_adt(base, e)?
+                    && let Ok(col) = facts.regions().field(adt, 0, fi)
+                {
+                    Some((col.ty(), col.as_slice(), false))
+                } else {
+                    None
+                }
+            }
+            Expr::Local(p) => {
+                if let Some(&(_, adt, variant, field)) = self.local_field_source.iter().find(|&&(pat, ..)| pat == p)
+                    && let Ok(col) = facts.regions().field(adt, variant, field)
+                {
+                    Some((col.ty(), col.as_slice(), false))
+                } else if peel_index
+                    && !self.in_nested
+                    && let Some(param) = self.body.params.iter().position(|x| *x == p)
+                    && let Ok(param32) = u32::try_from(param)
+                    && let Ok(own_sig) = facts.sig(self.body.owner)
+                    && let Some(in_slots) = own_sig.input(param32)
+                    && let Ok(in_ty) = self.sig_declared(own_sig, param32, e)
+                {
+                    Some((in_ty, in_slots, true))
+                } else if let Some(callee) = self.local_call_init(p)
+                    && let Ok(sig) = facts.sig(callee)
+                    && let Some(out_slots) = sig.output()
+                    && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                {
+                    Some((out_ty, out_slots, false))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if resolved.is_none()
+            && let Some(r) = self.trace_container_callable_root(c, e)?
+        {
+            resolved = Some(r);
+            traced_container = true;
+        }
+        let Some((mut declared, mut slots, owner_numbered)) = resolved else {
+            return Ok(false);
+        };
+        let arity = crate::one_call::FactsArity { facts };
+        let heads = blaze_borrow::Columns::new(facts.region_tys().unwrap_or(self.tys), &arity, &arity);
+        if !traced_container {
+            for _ in 0..16 {
+                match self.head_node(declared, e)? {
+                    PNode::Ref(_, inner) => {
+                        let Some(rest) = slots.get(1..) else { break };
+                        declared = inner;
+                        slots = rest;
+                    }
+                    PNode::Slice(inner) | PNode::Array(inner, _) if peel_index => {
+                        declared = inner;
+                    }
+                    PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.lifetimes == 0) => {
+                        let list = self.head_list(l, e)?;
+                        let Some(&inner) = list.first() else { break };
+                        if list.len() > 2 {
+                            break;
+                        }
+                        let Ok(ic) = blaze_borrow::RegionTypes::count(&heads, inner) else { break };
+                        let Some(inner_slots) = slots.get(..ic.len()) else { break };
+                        declared = inner;
+                        slots = inner_slots;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        if !matches!(self.head_node(declared, e)?, PNode::Dynamic(_) | PNode::FnPtr(..))
+            && let Some(want_dyn) = self.peel_body_dyn(callee_val.ty.ty, e)?
+            && let Some((found_ty, found_slots)) = self.find_unique_dyn_in_head(declared, slots, &heads, want_dyn, e)?
+        {
+            declared = found_ty;
+            slots = found_slots;
+        }
+        match self.head_node(declared, e)? {
+            PNode::Dynamic(list) => {
+                if !owner_numbered && slots.iter().any(|r| matches!(r, Region::Param(_))) {
+                    return Ok(false);
+                }
+                self.call_through_dyn_fn(list, slots, args, dest, dest_ty, e)
+            }
+            PNode::FnPtr(fn_list, _) => {
+                if callee_val.ty.wrap.is_some() {
+                    return Ok(false);
+                }
+                let fn_kids = self.head_list(fn_list, e)?;
+                if fn_kids.len() != args.len() + 1 {
+                    return Ok(false);
+                }
+                let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
+                let mut at = 0u32;
+                for v in args.iter() {
+                    at += self.npos_d(v.ty, e)?;
+                    ends.push(at);
+                }
+                let dlen = self.npos_d(dest_ty, e)?;
+                let Some(total) = at.checked_add(dlen) else { return Ok(false) };
+                if usize::try_from(total).ok() != Some(slots.len()) {
+                    return Ok(false);
+                }
+                let mut prev = 0u32;
+                for (i, &kid) in fn_kids.iter().take(args.len()).enumerate() {
+                    let Some(&end_i) = ends.get(i) else { return Ok(false) };
+                    let want = end_i - prev;
+                    prev = end_i;
+                    if blaze_borrow::RegionTypes::count(&heads, kid).ok().map(|c| c.get()) != Some(want) {
+                        return Ok(false);
+                    }
+                }
+                let Some(&ret_kid) = fn_kids.get(args.len()) else { return Ok(false) };
+                if blaze_borrow::RegionTypes::count(&heads, ret_kid).ok().map(|c| c.get()) != Some(dlen) {
+                    return Ok(false);
+                }
+                let binders = facts.fn_binders();
+                let mut seed: Vec<(Region, Origin), A> = Vec::new_in(self.alloc);
+                for (j, &r) in slots.iter().enumerate() {
+                    let free = matches!(r, Region::Param(_)) || (!binders && matches!(r, Region::Late { .. }));
+                    if free && !seed.iter().any(|(x, _)| *x == r) {
+                        if owner_numbered && matches!(r, Region::Param(_)) && !self.in_nested {
+                            seed.push((r, self.universal(r)));
+                            continue;
+                        }
+                        let Some(pi) = place_info else { return Ok(false) };
+                        if !pi.exact || usize::try_from(pi.len).ok() != Some(slots.len()) {
+                            return Ok(false);
+                        }
+                        let Some(idx) = usize::try_from(pi.start).ok().and_then(|s| s.checked_add(j)) else { return Ok(false) };
+                        let Some(&orig) = self.origs.get(idx) else { return Ok(false) };
+                        seed.push((r, orig));
+                    }
+                }
+                let laid = Laid { regions: slots, ends: &ends, bounds: &[] };
+                self.call_laid(laid, &seed, args, dest, dest_ty, e)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Traces a callable expression `c` (including a closure parameter in `map`/`and_then`, e.g.
+    /// `ERROR_REGISTRY.get(&selector).and_then(|decoder| decoder(data))`, or a local extracted
+    /// from a container via method calls/indexing) back to a root static/const, field, owner
+    /// parameter, or call whose declared head type+column can supply the `dyn Fn*` regions.
+    fn trace_container_callable_root(&self, start: ExprId, e: ExprId) -> Result<Option<(PTy, &'b [Region], bool)>, Refusal> {
+        let facts: &'b F = self.facts;
+        let mut cur = start;
+        for _ in 0..16 {
+            match self.expr(cur)? {
+                Expr::Paren(i) | Expr::Unary { op: UnOp::Deref, operand: i } | Expr::Ref { operand: i, .. } => cur = i,
+                Expr::MethodCall { receiver, .. } => cur = receiver,
+                Expr::Index { base, .. } => cur = base,
+                Expr::Path(_) => match self.expr_def(cur) {
+                    Some(Def::Static(item, _) | Def::Const(item)) => {
+                        if let Ok(sig) = facts.sig(item)
+                            && let Some(out_slots) = sig.output()
+                            && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                        {
+                            return Ok(Some((out_ty, out_slots, false)));
+                        }
+                        return Ok(None);
+                    }
+                    _ => return Ok(None),
+                },
+                Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                    let field_idx = match self.expr(cur)? {
+                        Expr::Field { .. } => self.field_of(cur),
+                        Expr::TupleField { index, .. } => Some(index),
+                        _ => None,
+                    };
+                    if let Some(fi) = field_idx
+                        && let Some(adt) = self.peel_field_adt(base, e)?
+                        && let Ok(col) = facts.regions().field(adt, 0, fi)
+                    {
+                        return Ok(Some((col.ty(), col.as_slice(), false)));
+                    }
+                    cur = base;
+                }
+                Expr::Local(p) => {
+                    if let Some(&(_, adt, variant, field)) = self.local_field_source.iter().find(|&&(pat, ..)| pat == p)
+                        && let Ok(col) = facts.regions().field(adt, variant, field)
+                    {
+                        return Ok(Some((col.ty(), col.as_slice(), false)));
+                    }
+                    if let Some(param) = self.body.params.iter().position(|x| *x == p)
+                        && let Ok(param32) = u32::try_from(param)
+                        && let Ok(own_sig) = facts.sig(self.body.owner)
+                        && let Some(in_slots) = own_sig.input(param32)
+                        && let Ok(in_ty) = self.sig_declared(own_sig, param32, e)
+                    {
+                        return Ok(Some((in_ty, in_slots, true)));
+                    }
+                    // Local initialized by a `let p = expr;` statement in the body.
+                    let mut init_expr: Option<ExprId> = None;
+                    for stmt in self.body.stmts.iter() {
+                        if let blaze_typeck::Stmt::Let { pat, init: Some(i), .. } = *stmt
+                            && pat == p
+                        {
+                            if init_expr.is_some() {
+                                return Ok(None);
+                            }
+                            init_expr = Some(i);
+                        }
+                    }
+                    if let Some(i) = init_expr {
+                        cur = i;
+                        continue;
+                    }
+                    // Parameter of a closure passed to a method call (e.g. `opt.and_then(|d| d(x))`).
+                    if self.in_nested
+                        && let Some(next) = self.closure_param_call_receiver(p)
+                    {
+                        cur = next;
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// If `p` is a parameter of a closure expression `ce` passed as an argument to a method call
+    /// `recv.method(..., ce, ...)`, returns `Some(recv)`.
+    fn closure_param_call_receiver(&self, p: PatId) -> Option<ExprId> {
+        let mut closure_expr: Option<ExprId> = None;
+        for (i, expr) in self.body.exprs.iter().enumerate() {
+            let Expr::Closure { params, .. } = *expr else { continue };
+            let Some(plist) = self.body.pat_lists.get(params.range()) else { continue };
+            if plist.contains(&p) {
+                let Ok(idx) = u32::try_from(i) else { return None };
+                closure_expr = Some(ExprId(idx));
+                break;
+            }
+        }
+        let ce = closure_expr?;
+        for expr in self.body.exprs.iter() {
+            if let Expr::MethodCall { receiver, args, .. } = *expr
+                && let Some(alist) = self.body.expr_lists.get(args.range())
+                && alist.contains(&ce)
+            {
+                return Some(receiver);
+            }
+        }
+        None
+    }
+
+    /// Peels `&`/`&mut`/`Box` off a body-table type `t` to find an underlying `PNode::Dynamic`.
+    fn peel_body_dyn(&self, mut t: PTy, e: ExprId) -> Result<Option<PTy>, Refusal> {
+        let facts: &'b F = self.facts;
+        for _ in 0..16 {
+            match self.node(t, e)? {
+                PNode::Ref(_, inner) => t = inner,
+                PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.is_box) => {
+                    let Some(&inner) = self.list(l, e)?.first() else { return Ok(None) };
+                    t = inner;
+                }
+                PNode::Dynamic(_) => return Ok(Some(t)),
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Searches a head-table container type `(root, slots)` for `PNode::Dynamic` subtrees whose
+    /// erased predicates match `want_dyn` (in `self.tys`). Returns `Some((ty, sub_slots))` only
+    /// when every matching subtree agrees on the exact region slice (never guesses across two
+    /// distinct `dyn Fn*` signatures in one container).
+    fn find_unique_dyn_in_head(
+        &self,
+        root: PTy,
+        slots: &'b [Region],
+        heads: &blaze_borrow::Columns<'_>,
+        want_dyn: PTy,
+        e: ExprId,
+    ) -> Result<Option<(PTy, &'b [Region])>, Refusal> {
+        let want_slots = self.npos(want_dyn, e)?;
+        let PNode::Dynamic(want_preds) = self.node(want_dyn, e)? else { return Ok(None) };
+        let want_list = self.list(want_preds, e)?;
+        let mut stack: Vec<(PTy, &'b [Region]), A> = Vec::new_in(self.alloc);
+        stack.push((root, slots));
+        let mut found: Option<(PTy, &'b [Region])> = None;
+        let mut steps = 0u32;
+        while let Some((cur, cur_slots)) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return Ok(None);
+            }
+            if let Ok(PNode::Dynamic(h_preds)) = self.head_node(cur, e)
+                && usize::try_from(want_slots).ok() == Some(cur_slots.len())
+                && self.dyn_preds_match(h_preds, want_list, e)?
+            {
+                match found {
+                    None => found = Some((cur, cur_slots)),
+                    Some((_, prev_slots)) if prev_slots == cur_slots => {}
+                    Some(_) => return Ok(None),
+                }
+                continue;
+            }
+            // Do not descend into fn pointers (e.g. `LazyLock<T, fn() -> T>`'s initializer `F`
+            // carries a binder-shifted duplicate of `T`'s `dyn Fn*` that is never the extracted value).
+            if matches!(self.head_node(cur, e), Ok(PNode::FnPtr(..))) {
+                continue;
+            }
+            let Ok(own) = blaze_borrow::RegionTypes::own(heads, cur) else { continue };
+            let Ok(kids) = blaze_borrow::RegionTypes::kids(heads, cur) else { continue };
+            let Some((_, mut rest)) = cur_slots.split_at_checked(own.len()) else { continue };
+            for k in 0..kids.len() {
+                let Some(kid) = kids.get(k) else { break };
+                let Ok(kc) = blaze_borrow::RegionTypes::count(heads, kid) else { break };
+                let Some((kslots, next_rest)) = rest.split_at_checked(kc.len()) else { break };
+                rest = next_rest;
+                stack.push((kid, kslots));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Whether a head-table `Dynamic` predicate list `h_preds` has the same trait/projection/auto
+    /// items (ignoring regions) as a body-table `Dynamic` predicate list `want_list`.
+    fn dyn_preds_match(&self, h_preds: List, want_list: &[PTy], e: ExprId) -> Result<bool, Refusal> {
+        let h_list = self.head_list(h_preds, e)?;
+        if h_list.len() != want_list.len() {
+            return Ok(false);
+        }
+        for (&hp, &wp) in h_list.iter().zip(want_list.iter()) {
+            match (self.head_node(hp, e)?, self.node(wp, e)?) {
+                (PNode::ExAuto(ha), PNode::ExAuto(wa)) if ha == wa => {}
+                (PNode::ExTrait(ht, ha), PNode::ExTrait(wt, wa)) if ht == wt => {
+                    if self.head_list(ha, e)?.len() != self.list(wa, e)?.len() {
+                        return Ok(false);
+                    }
+                }
+                (PNode::ExProj { trait_: ht, name: hn, args: ha, .. }, PNode::ExProj { trait_: wt, name: wn, args: wa, .. })
+                    if ht == wt && hn == wn =>
+                {
+                    if self.head_list(ha, e)?.len() != self.list(wa, e)?.len() {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Peels `&`/`&mut`/`Box` off a field expression's base to find its `PNode::Adt` key.
+    fn peel_field_adt(&self, base: ExprId, e: ExprId) -> Result<Option<ItemKey>, Refusal> {
+        let facts: &'b F = self.facts;
+        let mut bt = self.adjusted_ty(base)?;
+        for _ in 0..16 {
+            match self.node(bt, e)? {
+                PNode::Ref(_, inner) => bt = inner,
+                PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.is_box) => {
+                    let Some(&inner) = self.list(l, e)?.first() else { return Ok(None) };
+                    bt = inner;
+                }
+                PNode::Adt(adt, _) => return Ok(Some(adt)),
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// If local binding `p` was introduced by `let p = callee(..);` where `callee` is a known
+    /// item key, return that callee so a callable returned by it (e.g. `std::panic::take_hook()`)
+    /// can read its declared output region column even when captured into a nested closure.
+    /// An immutable local fn pointer initialized from a bounded tree of `FnDef` expressions
+    /// (`let fun = const { if ... { f1 } else { f2 } }; fun(x)`): enforces the call contract of
+    /// every leaf `FnDef`, which is sound because the runtime target is one of them.
+    fn call_through_fndef_local(&mut self, c: ExprId, args: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        let Expr::Local(p) = self.expr(c)? else { return Ok(false) };
+        let Ok(c_ty) = self.expr_ty(c) else { return Ok(false) };
+        if !matches!(self.node(c_ty, c), Ok(PNode::FnPtr(..))) {
+            return Ok(false);
+        }
+        // Reject if `p` is ever assigned or mutably borrowed anywhere in the body.
+        for expr in self.body.exprs.iter() {
+            match *expr {
+                Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } if matches!(self.body.exprs.get(lhs.ix()), Some(&Expr::Local(q)) if q == p) => {
+                    return Ok(false);
+                }
+                Expr::Ref { mutbl: Mutbl::Mut, operand } if matches!(self.body.exprs.get(operand.ix()), Some(&Expr::Local(q)) if q == p) => {
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+        let mut init = None;
+        for stmt in self.body.stmts.iter() {
+            if let blaze_typeck::Stmt::Let { pat, init: Some(i), .. } = *stmt
+                && pat == p
+            {
+                if init.is_some() {
+                    return Ok(false);
+                }
+                init = Some(i);
+            }
+        }
+        let Some(init) = init else { return Ok(false) };
+        let mut stack: Vec<ExprId, _> = Vec::new_in(self.alloc);
+        let mut leaves: Vec<(ItemKey, List), _> = Vec::new_in(self.alloc);
+        stack.push(init);
+        let mut steps = 0u32;
+        while let Some(cur) = stack.pop() {
+            steps += 1;
+            if steps > 64 {
+                return Ok(false);
+            }
+            match self.expr(cur)? {
+                Expr::Paren(inner) => stack.push(inner),
+                Expr::Block { tail: Some(t), .. } | Expr::ConstBlock { tail: Some(t), .. } => stack.push(t),
+                Expr::If { then, else_: Some(el), .. } => {
+                    stack.push(el);
+                    stack.push(then);
+                }
+                _ => {
+                    let Ok(ty) = self.expr_ty(cur) else { return Ok(false) };
+                    let Ok(PNode::FnDef(item, ty_args)) = self.node(ty, cur) else { return Ok(false) };
+                    leaves.push((item, ty_args));
+                }
+            }
+        }
+        if leaves.is_empty() {
+            return Ok(false);
+        }
+        let out = self.info(dest);
+        for &(item, ty_args) in leaves.iter() {
+            self.call_by_rule(&crate::one_call::CallSite { e, vs: args, ins: &[], tp: dest, ty: dest_ty, out, callee: Some((item, ty_args)) })?;
+        }
+        Ok(true)
+    }
+
+    /// Calls a fn-pointer parameter of an enclosing closure (e.g. `|edit: fn(&mut Tx)| edit(&mut tx)`)
+    /// when its return type carries zero lifetime slots and its written parameter type carries no
+    /// explicit `'static`/named lifetime annotations (so every input lifetime is higher-ranked).
+    fn call_through_closure_fn_ptr_param(&mut self, c: ExprId, args: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        let Expr::Local(p) = self.expr(c)? else { return Ok(false) };
+        if dest_ty.wrap.is_some() || args.iter().any(|v| v.ty.wrap.is_some()) || self.npos_d(dest_ty, e)? != 0 {
+            return Ok(false);
+        }
+        let Ok(c_ty) = self.expr_ty(c) else { return Ok(false) };
+        let Ok(PNode::FnPtr(fn_list, _)) = self.node(c_ty, c) else { return Ok(false) };
+        if self.list(fn_list, e)?.len() != args.len() + 1 {
+            return Ok(false);
+        }
+        let mut found: Option<(ExprId, u32)> = None;
+        for (ix, expr) in self.body.exprs.iter().enumerate() {
+            let Expr::Closure { params, param_tys, .. } = *expr else { continue };
+            let Some(ps) = self.body.pat_lists.get(params.range()) else { continue };
+            let Some(pi) = ps.iter().position(|&q| q == p) else { continue };
+            let Some(ce_u32) = u32::try_from(ix).ok() else { return Ok(false) };
+            let Some(pi_u32) = u32::try_from(pi).ok() else { return Ok(false) };
+            let written = self.body.opt_types.get(param_tys.range()).and_then(|l| l.get(pi)).is_some_and(Option::is_some);
+            if !written {
+                return Ok(false);
+            }
+            found = Some((ExprId(ce_u32), pi_u32));
+            break;
+        }
+        let Some((ce, pi)) = found else { return Ok(false) };
+        // If any explicit `'static` or named lifetime was written inside this fn-pointer param,
+        // do not assume all input lifetimes are independent higher-ranked binders.
+        if self.body.closure_param_regions.iter().any(|r| r.closure == ce && r.param == pi) {
+            return Ok(false);
+        }
+        let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
+        let mut at = 0u32;
+        for v in args.iter() {
+            at += self.npos_d(v.ty, e)?;
+            ends.push(at);
+        }
+        let mut regions: Vec<Region, A> = Vec::new_in(self.alloc);
+        for k in 0..at {
+            regions.push(Region::Late { binder: 0, var: k });
+        }
+        let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
+        self.call_laid(laid, &[], args, dest, dest_ty, e)
+    }
+
+    fn local_call_init(&self, p: PatId) -> Option<ItemKey> {
+        for stmt in self.body.stmts.iter() {
+            if let blaze_typeck::Stmt::Let { pat, init: Some(init), .. } = *stmt
+                && pat == p
+            {
+                let mut cur = init;
+                for _ in 0..8 {
+                    match self.body.exprs.get(cur.ix()) {
+                        Some(&Expr::Paren(i)) => cur = i,
+                        _ => break,
+                    }
+                }
+                if let Some((callee, _)) = self.callee_of(cur) {
+                    return Some(callee);
+                }
+            }
+        }
+        None
     }
 
     /// Calls a fn pointer loaded from a struct field (`(self.cb)(args)`, or extracted via a
@@ -7016,9 +8531,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         }
         let facts: &'b F = self.facts;
         let (adt, variant, field_idx, adt_args) = match self.expr(c)? {
-            Expr::Field { base, .. } => {
-                let Some(field_idx) = self.field_of(c) else {
-                    return Ok(false);
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                let field_idx = match self.expr(c)? {
+                    Expr::Field { .. } => {
+                        let Some(fi) = self.field_of(c) else { return Ok(false) };
+                        fi
+                    }
+                    Expr::TupleField { index, .. } => index,
+                    _ => return Ok(false),
                 };
                 let mut bt = self.adjusted_ty(base)?;
                 let mut bsteps = 0u32;
@@ -7121,7 +8641,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         }
                         if seed_ok {
                             let laid = Laid { regions: slots, ends: &ends, bounds: &[] };
-                            if self.call_laid(laid, None, &seed, args, dest, dest_ty, e)? {
+                            if self.call_laid(laid, &seed, args, dest, dest_ty, e)? {
                                 return Ok(true);
                             }
                         }
@@ -7171,7 +8691,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return Ok(false);
         }
         let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
-        self.call_laid(laid, None, &seed, args, dest, dest_ty, e)
+        self.call_laid(laid, &seed, args, dest, dest_ty, e)
     }
 
     fn break_done(&mut self, e: ExprId, has: bool) -> Result<(), Refusal> {
@@ -7541,7 +9061,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     self.b.stmt(StmtKind::StorageLive(l), self.pat_span(p));
                     match by_ref {
                         None => {
-                            if !is_residual && (ty.wrap.is_some() || ty.ty != lt.ty) {
+                            if !is_residual && (ty.wrap.is_some() || !self.same_up_to_alias(ty.ty, lt.ty, root)?) {
                                 return self.refuse_pat(Form::BindingMode, p);
                             }
                             let op = self.operand(Val { at: At::Place(place), ty }, root)?;
@@ -7555,7 +9075,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         Some(m) => {
                             if !is_residual {
                                 match self.node(lt.ty, root)? {
-                                    PNode::Ref(rm, inner) if rm == m && ty.wrap.is_none() && inner == ty.ty => {}
+                                    PNode::Ref(rm, inner) if rm == m && ty.wrap.is_none() && self.same_up_to_alias(inner, ty.ty, root)? => {}
                                     _ => return self.refuse_pat(Form::BindingMode, p),
                                 }
                             }
@@ -7706,7 +9226,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 Some(&t) => t,
                 None => return self.refuse_pat(Form::Malformed, sp),
             };
-            let ft = if peels { self.peeled_field_ty(ty, adt, variant, fi, sp, own)? } else { TyD::of(own) };
+            let ft = if peels { self.peeled_field_ty(ty, adt, variant, fi, sp, own, mode)? } else { TyD::of(own) };
             let q = self.project(base, ty, Proj::Field(fi), ft, f.drop_impl, root)?;
             stack.push(BindItem::Pat(sp, q, ft, mode));
         }
@@ -7728,7 +9248,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     /// there (`mut x` before edition 2024) moves out of the deref: E0507 (blaze-flow
     /// `MoveOut::Deref`). Checked, not assumed: the peels must land on `own`, else the
     /// binding modes the check took are not the ones rebuilt here (`Form::BindingMode`).
-    fn peeled_field_ty(&self, ty: TyD, adt: ItemKey, variant: u32, fi: u32, sp: PatId, own: PTy) -> Result<TyD, Refusal> {
+    fn peeled_field_ty(&self, ty: TyD, adt: ItemKey, variant: u32, fi: u32, sp: PatId, own: PTy, mode: u8) -> Result<TyD, Refusal> {
         let root = self.body.root;
         let args: &'c [PTy] = match (ty.wrap, self.node(ty.ty, root)?) {
             (None, PNode::Adt(k, l)) if k == adt => self.list(l, root)?,
@@ -7745,21 +9265,196 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Some(FieldLead::Plain) => TyD::of(own),
             Some(FieldLead::Unread) | None => match self.facts.field_param(adt, variant, fi) {
                 Some(p) => TyD::of(arg(p)?),
+                None if mode == 0 && self.pat_proves_no_peel(sp)? => TyD::of(own),
                 None => return self.refuse_pat(Form::PeelUnderAdtField, sp),
             },
         };
         let mut t = field;
+        let mut peels = 0u32;
+        let mut first_mutbl = None;
         for _ in 0..MOST_POSITIONS {
             t = match (t.wrap, self.node(t.ty, root)?) {
-                (Some(_), _) => TyD::of(t.ty),
-                (None, PNode::Ref(_, i)) => TyD::of(i),
+                (Some(m), _) => {
+                    if peels == 0 {
+                        first_mutbl = Some(m);
+                    }
+                    peels += 1;
+                    TyD::of(t.ty)
+                }
+                (None, PNode::Ref(m, i)) => {
+                    if peels == 0 {
+                        first_mutbl = Some(m);
+                    }
+                    peels += 1;
+                    TyD::of(i)
+                }
                 _ => break,
             };
         }
-        if t.wrap.is_some() || t.ty != own {
+        if t.wrap.is_some() {
             return self.refuse_pat(Form::BindingMode, sp);
         }
-        Ok(field)
+        if t.ty == own {
+            return Ok(field);
+        }
+        // `field` and `own` may differ only because the type checker normalized an associated
+        // projection inside a compound type (e.g. `(<Pin<&mut Fut> as Future>::Output, ..)` vs
+        // `(<Fut as Future>::Output, ..)` in `Either::Right((output, mut panicked))`). Require
+        // matching concrete non-ref outer heads so a hidden peel inside a top-level alias cannot
+        // slip past.
+        if self.same_concrete_head_up_to_alias(t.ty, own, root)? {
+            return Ok(match (peels, first_mutbl) {
+                (0, _) => TyD::of(own),
+                (1, Some(m)) => TyD { wrap: Some(m), ty: own },
+                _ => field,
+            });
+        }
+        self.refuse_pat(Form::BindingMode, sp)
+    }
+
+    /// Returns `true` when `a` and `b` share the same concrete non-ref, non-alias outer head and
+    /// all of their child subtrees match up to associated-type / opaque normalization.
+    fn same_concrete_head_up_to_alias(&self, a: PTy, b: PTy, e: ExprId) -> Result<bool, Refusal> {
+        if a == b {
+            return Ok(true);
+        }
+        let (na, nb) = (self.node(a, e)?, self.node(b, e)?);
+        if matches!(na, PNode::Alias { .. } | PNode::Opaque(..) | PNode::Ref(..))
+            || matches!(nb, PNode::Alias { .. } | PNode::Opaque(..) | PNode::Ref(..))
+        {
+            return Ok(false);
+        }
+        self.same_up_to_alias(a, b, e)
+    }
+
+    /// Structural type equality on `self.tys` modulo associated-type / opaque normalization, while
+    /// strictly preserving reference heads (`&` / `&mut` never matches a non-reference so a
+    /// binding-mode mismatch is never masked).
+    pub(crate) fn same_up_to_alias(&self, a: PTy, b: PTy, e: ExprId) -> Result<bool, Refusal> {
+        const MAX_STACK: usize = 32;
+        const MAX_STEPS: u32 = 64;
+        if a == b {
+            return Ok(true);
+        }
+        let mut stack = [(a, b); MAX_STACK];
+        let mut len = 1usize;
+        let mut steps = 0u32;
+        while len > 0 {
+            len -= 1;
+            steps += 1;
+            if steps > MAX_STEPS {
+                return Ok(false);
+            }
+            let (xa, xb) = stack[len];
+            if xa == xb {
+                continue;
+            }
+            let (na, nb) = (self.node(xa, e)?, self.node(xb, e)?);
+            if matches!(na, PNode::ConstValue { .. } | PNode::ConstParam(_))
+                && matches!(nb, PNode::ConstValue { .. } | PNode::ConstParam(_))
+            {
+                continue;
+            }
+            if matches!(na, PNode::Ref(..)) != matches!(nb, PNode::Ref(..)) {
+                return Ok(false);
+            }
+            if matches!(na, PNode::Alias { .. } | PNode::Opaque(..))
+                || matches!(nb, PNode::Alias { .. } | PNode::Opaque(..))
+            {
+                continue;
+            }
+            if !blaze_borrow::head_eq(na, nb) {
+                return Ok(false);
+            }
+            let mut push_pair = |x: PTy, y: PTy| -> bool {
+                if len >= MAX_STACK {
+                    return false;
+                }
+                stack[len] = (x, y);
+                len += 1;
+                true
+            };
+            match (na, nb) {
+                (PNode::Ref(_, pa), PNode::Ref(_, pb))
+                | (PNode::Ptr(_, pa), PNode::Ptr(_, pb))
+                | (PNode::Slice(pa), PNode::Slice(pb)) => {
+                    if !push_pair(pa, pb) {
+                        return Ok(false);
+                    }
+                }
+                (PNode::Array(ea, na), PNode::Array(eb, nb)) => {
+                    if !push_pair(ea, eb) || !push_pair(na, nb) {
+                        return Ok(false);
+                    }
+                }
+                (PNode::Tuple(la), PNode::Tuple(lb))
+                | (PNode::Union(la), PNode::Union(lb))
+                | (PNode::Adt(_, la), PNode::Adt(_, lb))
+                | (PNode::Record(_, la), PNode::Record(_, lb))
+                | (PNode::FnDef(_, la), PNode::FnDef(_, lb))
+                | (PNode::FnPtr(la, _), PNode::FnPtr(lb, _))
+                | (PNode::Dynamic(la), PNode::Dynamic(lb)) => {
+                    let (sa, sb) = (self.list(la, e)?, self.list(lb, e)?);
+                    if sa.len() != sb.len() {
+                        return Ok(false);
+                    }
+                    for (&x, &y) in sa.iter().zip(sb.iter()) {
+                        if !push_pair(x, y) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                (PNode::Pat(ba, la), PNode::Pat(bb, lb)) => {
+                    let (sa, sb) = (self.list(la, e)?, self.list(lb, e)?);
+                    if sa.len() != sb.len() || !push_pair(ba, bb) {
+                        return Ok(false);
+                    }
+                    for (&x, &y) in sa.iter().zip(sb.iter()) {
+                        if !push_pair(x, y) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(true)
+    }
+
+    /// When entering a peeling subpattern `sp` in `Move` mode (`mode == 0`), any direct immutable
+    /// by-value binding `x` (`by_ref.is_none() && !mutable`) whose checked binding type
+    /// (`local_ty[x]`) equals its pattern type (`pat_ty[x]`) proves `sp` peeled zero references:
+    /// peeling `&` or `&mut` under match ergonomics changes the default binding mode to `ref` or
+    /// `ref mut`, making `local_ty[x] == &pat_ty[x] != pat_ty[x]`.
+    fn pat_proves_no_peel(&self, sp: PatId) -> Result<bool, Refusal> {
+        let Some(&pat) = self.body.pats.get(sp.ix()) else {
+            return self.refuse_pat(Form::Malformed, sp);
+        };
+        let check_bind = |p: PatId| -> bool {
+            let Some(Pat::Bind { ann, .. }) = self.body.pats.get(p.ix()) else { return false };
+            ann.by_ref.is_none()
+                && !ann.mutable
+                && self.ck.pat_ty.get(p.ix()).is_some()
+                && self.ck.local_ty.get(p.ix()) == self.ck.pat_ty.get(p.ix())
+        };
+        match pat {
+            Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                for f in self.body.field_pats.get(fields.range()).unwrap_or(&[]) {
+                    if check_bind(f.pat) {
+                        return Ok(true);
+                    }
+                }
+            }
+            Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => {
+                for &ep in self.body.pat_lists.get(elems.range()).unwrap_or(&[]) {
+                    if check_bind(ep) {
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
     }
 
     fn stmt(&mut self, s: StmtId) -> Result<(), Refusal> {
@@ -8063,7 +9758,7 @@ mod region_record_tests {
             None
         }
         fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
-            if self.refused.contains(&k) { None } else { Some(CalleeFacts { writes_lifetimes: true, self_ref: false }) }
+            if self.refused.contains(&k) { None } else { Some(CalleeFacts { writes_lifetimes: true, self_ref: false, c_variadic: false }) }
         }
         fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
             None
@@ -8483,7 +10178,7 @@ mod region_record_tests {
                 None
             }
             fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
-                Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
+                Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
             }
             fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
                 None

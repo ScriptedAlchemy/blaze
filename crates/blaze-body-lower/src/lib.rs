@@ -28,6 +28,7 @@ extern crate std;
 
 mod closure;
 mod control;
+mod coroutine;
 mod expr;
 mod pat;
 mod scope;
@@ -50,6 +51,7 @@ use blaze_typeck::{
 };
 
 pub use closure::lower_closure;
+pub use coroutine::{AsyncBodyItems, lower_coroutine};
 
 use scope::{Entry, Pending, Target};
 
@@ -182,6 +184,15 @@ pub trait BodyFacts: Facts {
     fn int_pat(&self, _p: PatId) -> Option<u128> {
         None
     }
+    /// The magnitude bits of float literal pattern `p` in its type's format (`Pat::NegLit` flips
+    /// the sign bit during lowering).
+    fn float_pat(&self, _p: PatId) -> Option<u128> {
+        None
+    }
+    /// The bytes of string or byte-string literal pattern `p`.
+    fn str_pat(&self, _p: PatId) -> Option<&[u8]> {
+        None
+    }
     /// The discriminant of `variant` of enum `adt`.
     fn discr(&self, _adt: ItemKey, _variant: u32) -> Option<Discr> {
         None
@@ -193,6 +204,31 @@ pub trait BodyFacts: Facts {
     /// Whether `item` is a trait's method (its call is `Callee::Method`, resolved per
     /// instance) or not (`Callee::FnItem`).
     fn trait_item(&self, item: ItemKey) -> Option<bool>;
+    /// The `Deref::deref` (`Mutbl::Not`) or `DerefMut::deref_mut` (`Mutbl::Mut`) trait method item.
+    fn deref_fn(&self, _mutbl: Mutbl) -> Option<ItemKey> {
+        None
+    }
+    /// The `Index::index` (`Mutbl::Not`) or `IndexMut::index_mut` (`Mutbl::Mut`) trait method item.
+    fn index_fn(&self, _mutbl: Mutbl) -> Option<ItemKey> {
+        None
+    }
+    /// The `Fn::call` / `FnMut::call_mut` / `FnOnce::call_once` trait method item for `kind`.
+    fn fn_trait_method(&self, _kind: blaze_typeck::ClosureKind) -> Option<ItemKey> {
+        None
+    }
+    /// The `ClosureKind` of closure `(owner, ordinal)` when defined in another body.
+    fn closure_kind(&self, _owner: ItemKey, _ordinal: u32) -> Option<blaze_typeck::ClosureKind> {
+        None
+    }
+    /// Library items needed to lower `.await` inside a coroutine body (`Future::poll`, `Poll`, `Pin`).
+    fn async_items(&self) -> Option<AsyncBodyItems> {
+        None
+    }
+    /// Generic parameter count of the owner item (used to construct `PNode::Coroutine` args).
+    /// When `None`, inferred from the highest `Param`/`ConstParam` in the checked type table.
+    fn owner_generics(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Lowers the body of a fn (`body`, checked as `ck`) to a [`Body`] in `alloc`.
@@ -206,7 +242,9 @@ pub fn lower<A: Allocator + Copy, F: BodyFacts>(
     facts: &F,
     alloc: A,
 ) -> Result<Body<A>, LowerError> {
-    if body.coroutine.is_some() {
+    if body.coroutine.is_some()
+        && !matches!(body.exprs.get(body.root.ix()), Some(Expr::AsyncBlock { .. }))
+    {
         return Err(LowerError { construct: Construct::Coroutine, at: At::Body, range: range_of(body, body.root) });
     }
     let mut l = Lower::new(body, ck, facts, alloc);
@@ -284,11 +322,19 @@ pub(crate) struct Lower<'b, 'v, 'c, F, A: Allocator + Copy> {
     /// The one `resume` block, made when first needed.
     pub(crate) resume: Option<Block>,
     /// The operands of extending borrows of the `let` being lowered (the Reference, "Temporary
-    /// lifetime extension"), and the index in `marks` of its statement's scope.
+    /// lifetime extension"), extending blocks (for `super let`), and the index in `marks` of its
+    /// statement's scope.
     pub(crate) extended: Vec<ExprId, A>,
+    pub(crate) extended_blocks: Vec<ExprId, A>,
     pub(crate) ext_mark: Option<usize>,
     /// Two-phase loans made for the call being lowered, activated at the call.
     pub(crate) activate: Vec<Loan, A>,
+    /// Whether this body contains any `Expr::AsyncBlock` (gates `PNode::Future` canonicalization).
+    pub(crate) has_async_blocks: bool,
+    /// Whether we are currently lowering a coroutine's own body (`.await` is allowed).
+    pub(crate) in_coroutine: bool,
+    /// Cached `[Param(0), .., Param(n - 1)]` list for canonical `PNode::Coroutine` types.
+    pub(crate) owner_params: Option<List>,
     pub(crate) depth: u32,
 }
 
@@ -311,6 +357,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         let pat_def_row = index_rows(ck.pat_defs.column::<0>(), n_pats, PatId::ix, alloc);
         let callee_row = index_rows(ck.callees.column::<0>(), n_exprs, ExprId::ix, alloc);
         let field_row = index_rows(ck.fields.column::<0>(), n_exprs, ExprId::ix, alloc);
+        let has_async_blocks = body.exprs.iter().any(|x| matches!(x, Expr::AsyncBlock { .. }));
         Lower {
             body,
             ck,
@@ -333,8 +380,12 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
             pending: Vec::new_in(alloc),
             resume: None,
             extended: Vec::new_in(alloc),
+            extended_blocks: Vec::new_in(alloc),
             ext_mark: None,
             activate: Vec::new_in(alloc),
+            has_async_blocks,
+            in_coroutine: false,
+            owner_params: None,
             depth: 0,
             alloc,
         }
@@ -344,18 +395,20 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     fn fn_frame(&mut self) -> Result<(), LowerError> {
         let root = self.body.root;
         let ret_ty = self.adjusted_ty(root)?;
+        let ret_ty = self.canonical_ty(ret_ty, At::Expr(root))?;
         self.return_place(ret_ty);
         let params = self.body.params;
         let mut args: Vec<(PatId, Local, Place, PTy), A> = Vec::new_in(self.alloc);
         for (i, &p) in params.iter().enumerate() {
-            let ty = self.pat_ty(p)?;
+            let raw_ty = self.pat_ty(p)?;
+            let ty = self.canonical_ty(raw_ty, At::Pat(p))?;
             let mutbl = match self.pat(p)? {
                 Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none() && ann.mutable => Mutbl::Mut,
                 _ => Mutbl::Not,
             };
             let local = self.b.new_local(LocalDecl { ty, kind: LocalKind::Arg(i as u32), mutbl });
             let place = self.b.local_place(local);
-            args.push((p, local, place, ty));
+            args.push((p, local, place, raw_ty));
         }
         // The Reference, "Destructors", function parameters: each parameter's scope holds the
         // ones after it, and its pattern's bindings are dropped before it.

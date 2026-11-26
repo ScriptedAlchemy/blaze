@@ -26,7 +26,7 @@ blaze-body-flow	6	1	0	7	0	0	0	0	0	0
 blaze-body-lower	13	0	0	24	0	0	0	0	0	0
 blaze-borrow	3	0	0	5	0	0	0	0	0	0
 blaze-bstd-convert	13	0	0	9	8	0	0	0	0	0
-blaze-build	139	2	2	438	0	0	6	3	0	0
+blaze-build	138	2	2	437	0	0	6	3	0	0
 blaze-build-script	132	0	0	111	3	0	0	0	0	0
 blaze-bytes	9	0	0	20	0	0	1	0	0	0
 blaze-c	2	0	0	0	0	0	0	0	0	0
@@ -41,7 +41,7 @@ blaze-cbor	3	0	0	0	0	0	1	0	0	0
 blaze-cc	6	0	0	1	0	0	0	0	0	0
 blaze-cert	7	0	0	2	0	0	0	0	0	2
 blaze-check	7	0	0	31	0	0	48	0	0	0
-blaze-cli	1047	29	3	641	214	91	3	6	0	0
+blaze-cli	1045	29	3	641	213	91	3	6	0	0
 blaze-code	1	0	0	1	0	0	0	0	0	0
 blaze-columns	27	0	0	35	0	0	0	0	0	0
 blaze-comptime	2	0	0	26	0	0	0	0	0	0
@@ -55,7 +55,7 @@ blaze-dbsp	1	0	0	43	0	0	0	0	0	0
 blaze-deflate	10	0	0	3	0	0	0	0	0	0
 blaze-drive	24	0	0	37	0	0	0	0	0	0
 blaze-ed25519	5	3	0	16	0	0	0	0	0	0
-blaze-emit	167	0	0	111	6	15	7	2	0	0
+blaze-emit	153	0	0	111	6	15	7	2	0	0
 blaze-engine	66	0	0	219	0	2	1	0	0	0
 blaze-expand	40	8	0	78	0	0	0	0	0	0
 blaze-export	28	5	0	6	12	6	0	1	0	0
@@ -83,7 +83,7 @@ blaze-int	4	0	0	1	0	0	0	0	0	0
 blaze-json	3	0	0	0	0	0	1	0	0	0
 blaze-keyed	6	0	1	124	0	0	0	0	0	0
 blaze-kit	2	0	0	0	0	0	0	0	0	0
-blaze-ladder	735	285	0	2315	62	53	8	250	0	86
+blaze-ladder	733	284	0	2315	62	53	8	250	0	86
 blaze-launch	19	0	0	158	0	0	0	0	0	1
 blaze-launch-rt	114	2	0	99	7	5	17	1	0	0
 blaze-launcher	20	1	0	17	8	0	0	1	0	0
@@ -100,8 +100,6 @@ blaze-mem	67	3	6	201	3	3	37	0	0	0
 blaze-memchr	2	0	0	7	0	0	0	0	0	0
 blaze-memo	25	7	2	198	0	0	3	0	0	1
 blaze-meter	12	0	0	4	0	0	2	0	0	0
-blaze-names-demand	8	0	0	0	0	0	0	0	0	0
-blaze-names-source	8	2	0	0	0	0	0	0	0	0
 blaze-native	10	3	0	6	0	0	0	0	0	0
 blaze-own	38	0	5	163	0	0	9	0	0	0
 blaze-pack	3	0	0	39	0	0	0	0	0	0
@@ -159,7 +157,7 @@ blaze-units	2	0	0	0	0	0	0	0	0	0
 blaze-url	3	0	0	3	0	0	0	0	0	0
 blaze-v2-proof	5	0	0	11	0	0	0	0	0	0
 blaze-wasi	0	0	0	4	0	0	0	0	0	0
-blaze-watch	40	0	0	31	0	1	0	0	0	0
+blaze-watch	36	0	0	29	0	1	0	0	0	0
 blaze-world	53	0	0	11	5	0	0	0	0	0
 blaze-world-api	1	0	0	0	0	0	0	0	0	0
 const-ast	12	0	0	41	7	0	0	1	0	1

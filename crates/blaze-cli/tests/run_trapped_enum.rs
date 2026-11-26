@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use support::fresh_home;
 
 /// A trap is milliseconds after the start; a hang is a bug (rule 18), named, never waited out.
-const DEADLINE: Duration = Duration::from_secs(60);
+/// Cold shelf indexing in a fresh home on CI can take ~60s under parallel load (cf. run_output.rs).
+const DEADLINE: Duration = Duration::from_secs(120);
 
 /// tests/run_trapped/enum_value: 3 transmuted into `Two` (discriminants 1 and 2) and passed in
 /// a struct by value. The program ends by SIGTRAP (128 + 5 = 133); the named line says the

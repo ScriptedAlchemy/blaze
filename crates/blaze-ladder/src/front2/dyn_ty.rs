@@ -11,12 +11,13 @@ use std::vec::Vec;
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::View;
 use blaze_lower::form as lf;
+use blaze_own::Alloc;
 use blaze_surface::Range;
 use blaze_typeck::dyn_compat::{FnFacts, MemberShape, Receiver, Unread};
 use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PathIdx, PortableTys};
 
 use super::preds::{lifetimes_only, segment_args};
-use super::types::{Bounded, Builder, Env, Heads, Why, children, children_of, intern, intern_list, path_texts, path_texts_of, subst_clause};
+use super::types::{Bounded, Builder, Env, Heads, Why, children, children_of, intern, intern_list, path_texts, path_texts_of, subst, subst_clause};
 use super::source::NamesSource;
 use crate::resolve::{Ns, Paths};
 
@@ -25,7 +26,16 @@ use crate::resolve::{Ns, Paths};
 /// `Arc` and `Pin` a typed receiver (`self: Pin<&mut Self>`) is read against
 /// ([`super::receiver::classify`]). The checker decides from them
 /// (`blaze_typeck::dyn_compat`, the rule's one home), through `TraitDef.members`.
-pub fn member<'n, S: NamesSource<'n>>(resolver: &Paths<S>, module: LibKey, sized: Option<LibKey>, pointers: &super::receiver::Pointers, detail: Member, v: &View<'_>) -> Result<MemberShape, Why> {
+pub fn member<'n, S: NamesSource<'n>>(
+    resolver: &Paths<S>,
+    module: LibKey,
+    sized: Option<LibKey>,
+    pointers: &super::receiver::Pointers,
+    marks: Option<blaze_scope::crate_roots::TextMarks<'_>>,
+    alloc: Alloc<'_>,
+    detail: Member,
+    v: &View<'_>,
+) -> Result<MemberShape, Why> {
     use blaze_lower::head;
     match detail {
         Member::Const => return Ok(MemberShape::Const),
@@ -110,6 +120,43 @@ pub fn member<'n, S: NamesSource<'n>>(resolver: &Paths<S>, module: LibKey, sized
             }
             continue;
         }
+        // A type macro in a trait method's signature (e.g. alloy's `-> impl_future!(<Output = T>)`
+        // expanding to `impl Send + Future<Output = T>`): expand it once to inspect its real
+        // `impl Trait` / `Self` occurrences for both dyn compatibility and RPITIT detection
+        // (`rpitit::may_have_rows`). Without expanding, `children` sees zero children and leaves
+        // `opaque_return = false`, hiding the trait fn's RPITIT from `rpitit::trait_rows`.
+        if let lf::TypeRef::Macro(_) = v.ty(t)? {
+            let r = v.site(v.type_range(t)?)?;
+            let text = v.text_at(v.type_range(t)?)?;
+            let Ok(x) = super::type_expand::expand_type_text(resolver.names, module, text, marks, r, alloc) else {
+                return Ok(MemberShape::Unread(Unread::SignatureType));
+            };
+            let xv = x.view();
+            let mut inner = Vec::new_in(Global);
+            inner.push(x.root);
+            while let Some(xt) = inner.pop() {
+                if is_self(&xv, xt)? {
+                    f.self_outside_receiver = true;
+                    continue;
+                }
+                if let lf::TypeRef::Impl(_) = xv.ty(xt)? {
+                    match in_return {
+                        true => f.opaque_return = true,
+                        false => f.own_non_lifetime_params += 1,
+                    }
+                    continue;
+                }
+                if matches!(xv.ty(xt)?, lf::TypeRef::Macro(_)) {
+                    return Ok(MemberShape::Unread(Unread::SignatureType));
+                }
+                kids.clear();
+                if children(&xv, xt, &mut kids).is_err() {
+                    return Ok(MemberShape::Unread(Unread::SignatureType));
+                }
+                inner.extend(kids.iter().copied());
+            }
+            continue;
+        }
         kids.clear();
         if children(v, t, &mut kids).is_err() {
             return Ok(MemberShape::Unread(Unread::SignatureType));
@@ -155,20 +202,22 @@ pub(super) fn dyn_bound(v: &View<'_>, b: lf::Bound, r: Range) -> Result<Option<(
 
 /// The written types of a `dyn` bound's last segment, in the order [`Builder::dyn_ty`] reads
 /// them: `Fn(A, B) -> C` its inputs then `C`; else each type argument and each `Name = T`'s `T`.
-pub(super) fn dyn_arg_types(v: &View<'_>, s: &lf::Segment, r: Range, out: &mut Vec<lf::TypeId, Global>) -> Result<(), Why> {
+pub(super) fn dyn_arg_types_into(v: &View<'_>, s: &lf::Segment, r: Range, out: &mut impl FnMut(lf::TypeId)) -> Result<(), Why> {
     if s.return_notation {
         return Err(Why::Unsupported("return type notation (`Tr(..)`)", r));
     }
     for &n in v.rows(s.args)? {
         match lf::GenericArg::decode(n)? {
-            lf::GenericArg::Type(t) => out.push(t),
+            lf::GenericArg::Type(t) => out(t),
             lf::GenericArg::Lifetime(_) if !s.parenthesized => {}
-            lf::GenericArg::AssocType { args, ty, .. } if !s.parenthesized && args.len == 0 => out.push(ty),
+            lf::GenericArg::AssocType { args, ty, .. } if !s.parenthesized && args.len == 0 => out(ty),
             _ => return Err(Why::Unsupported("this generic argument in a trait object type", r)),
         }
     }
     if s.parenthesized {
-        out.extend(s.ty);
+        if let Some(ret) = s.ty {
+            out(ret);
+        }
     }
     Ok(())
 }
@@ -201,7 +250,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             kids.get(at - 1).copied().ok_or_else(|| Why::Program("a trait object's argument types are not all made".into(), r))
         };
         let mut preds = Vec::new_in(Global);
-        let mut principal: Option<LibKey> = None;
+        let mut principal: Option<(LibKey, List)> = None;
         for &b in v.rows(bounds)? {
             let Some((p, seg)) = dyn_bound(v, lf::Bound::decode(b)?, r)? else { continue };
             // Its argument types are made already (`kids`, in `dyn_arg_types`'s order).
@@ -272,10 +321,10 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     preds.push(intern(tys, PNode::ExAuto(self.heads.checker(key)))?);
                     continue;
                 }
-                if let Some(prev) = principal {
+                if let Some((prev, _)) = principal {
                     return Err(Why::TwoPrincipals(prev, key, r));
                 }
-                principal = Some(key);
+                principal = Some((key, args));
                 let rest = after_self(tys, args, erased, pr)?;
                 preds.push(intern(tys, PNode::ExTrait(self.heads.checker(key), rest))?);
             }
@@ -286,6 +335,65 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         }
         if at != kids.len() {
             return Err(Why::Program("a trait object's argument types are not all read".into(), r));
+        }
+        // Materialize associated-type equalities implied by the principal's supertraits
+        // (`trait IterTrait<'a, T>: Iterator<Item = &'a T>`, `trait Transport: Service<..,
+        // Response = ..>`): rustc's `lower_trait_object_ty` includes these in `ty::Dynamic`'s
+        // existential projections, and blaze-solve (`step_object`, `push_object_bounds`,
+        // `step_upcast`) relies on them being present on the object type.
+        if let Some((p_key, p_args)) = principal {
+            const MOST_SUPERS: usize = 256;
+            let alloc = tys.alloc();
+            let mut todo: blaze_own::Vec<(LibKey, List), _> = blaze_own::Vec::new_in(alloc);
+            let mut seen: blaze_own::Vec<(LibKey, List), _> = blaze_own::Vec::new_in(alloc);
+            todo.push((p_key, p_args));
+            for _ in 0..MOST_SUPERS {
+                let Some((t, a)) = todo.pop() else { break };
+                if seen.scan_for(&(t, a)).is_some() {
+                    continue;
+                }
+                seen.push((t, a));
+                let given_slice = tys.view().list(a).map_err(|_| Why::Program("a list outside the table".into(), r))?;
+                let mut given = blaze_own::Vec::with_capacity_in(given_slice.len(), alloc);
+                given.extend_from_slice(given_slice);
+                let sps_slice = self.heads.trait_super_projs(t).ok_or(Why::Need(t))?;
+                let mut sps = blaze_own::Vec::with_capacity_in(sps_slice.len(), alloc);
+                sps.extend_from_slice(sps_slice);
+                for sp in sps {
+                    let PClause::Projection { trait_: owner, name, args: oargs, term } =
+                        subst_clause(tys, PClause::Projection { trait_: sp.trait_, name: sp.name, args: sp.args, term: sp.term }, &given)?
+                    else {
+                        continue;
+                    };
+                    let ol = tys.view().list(oargs).map_err(|_| Why::Program("a list outside the table".into(), r))?;
+                    let mut rest_v = blaze_own::Vec::with_capacity_in(ol.len().saturating_sub(1), alloc);
+                    rest_v.extend_from_slice(ol.get(1..).unwrap_or(&[]));
+                    if mentions(tys, &rest_v, erased, r)? || mentions(tys, &[term], erased, r)? {
+                        continue;
+                    }
+                    let rest = intern_list(tys, &rest_v)?;
+                    let ex = intern(tys, PNode::ExProj { trait_: owner, name, args: rest, term })?;
+                    if !preds.iter().any(|x| *x == ex) {
+                        preds.push(ex);
+                    }
+                }
+                let supers_slice = self.heads.trait_supers(t).ok_or(Why::Need(t))?;
+                let mut supers = blaze_own::Vec::with_capacity_in(supers_slice.len(), alloc);
+                supers.extend_from_slice(supers_slice);
+                for (st, sargs) in supers {
+                    let written_slice = tys.view().list(sargs).map_err(|_| Why::Program("a list outside the table".into(), r))?;
+                    let mut written = blaze_own::Vec::with_capacity_in(written_slice.len(), alloc);
+                    written.extend_from_slice(written_slice);
+                    let mut out = blaze_own::Vec::with_capacity_in(written.len(), alloc);
+                    for &w in &written {
+                        out.push(subst(tys, w, &given)?);
+                    }
+                    todo.push((st, intern_list(tys, &out)?));
+                }
+            }
+            if !todo.is_empty() {
+                return Err(Why::Unsupported("a supertrait tree past 256 traits", r));
+            }
         }
         tys.dynamic(&preds).map_err(|e| Why::Program(format!("the trait object's rows: {e:?}").into_boxed_str(), r))
     }

@@ -91,9 +91,20 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         };
         let n = reprs.len();
         let base = self.vals.len().checked_sub(n).ok_or(malformed("a call's arguments missing from the value stack (a build bug)"))?;
+        let mut arg_temps: blaze_own::Vec<blaze_lir::func::SlotId, A> = blaze_own::Vec::new_in(self.alloc);
         for i in 0..n {
-            let v = self.vals[base + i];
-            self.pass_arg(v, reprs[i], passes[i], &mut values)?;
+            let (&v, &repr, &pass) = match (self.vals.get(base + i), reprs.get(i), passes.get(i)) {
+                (Some(v), Some(r), Some(p)) => (v, r, p),
+                _ => return Err(malformed("a call's arguments missing from the value stack (a build bug)")),
+            };
+            if let super::V::Place(p, off) = v
+                && let Some(slot) = self.whole_slot((p, off))
+            {
+                arg_temps.push(slot);
+            }
+            if let Some(slot) = self.pass_arg(v, repr, pass, &mut values)? {
+                arg_temps.push(slot);
+            }
         }
         self.truncate_vals(base);
         let r = match declared {
@@ -119,6 +130,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
             }
         };
+        for slot in arg_temps {
+            self.end_temp_slot(slot);
+        }
         let v = match (result, rets.len()) {
             (Some(at), _) => V::Place(at.0, at.1),
             (None, 0) => self.take_passed(rrepr, rpass, &mut core::iter::empty())?,

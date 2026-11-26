@@ -90,7 +90,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 
 ### Runtime code (skill `runtime-code`)
 - **3. no-fallback**: No fallback, no retry, nothing quietly ignored: stop with an error naming what and where.
-- **12. standard-structures**: One per need: named `blaze_core::lock` locks, papaya and blaze_hash maps, crossbeam, atomics.
+- **12. standard-structures**: One per need: blaze_core::lock, papaya/blaze_hash maps, blaze_own::soa!, crossbeam, atomics.
 - **14. sans-io-cores**: All logic is a sans-IO state machine (`#![blaze::sans_io]`) under thin drivers; convert what is not.
 - **15. every-wait-says-what**: Every blocking wait opens a span naming what it waits for.
 - **18. bounded-progress**: Every wait has a deadline, a retry a count, a table a cap, memory a frame; a hang is a bug.
@@ -141,7 +141,7 @@ covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it
 - **85. newtypes-and-named-returns**: Use newtypes, enums and named return structs instead of bare primitives or `(Option<T>, bool)`.
 
 ### Building, lanes and machines (skill `build-and-test`)
-- **2. blaze-builds-blaze**: Run apps, demos and Blaze-edition code with blaze, never rustc; dogfood and fix any gap you hit.
+- **2. blaze-builds-blaze**: Dogfood blaze (check/test/export) for inner loops, never cold cargo; fix any self-hosting gap.
 - **7. verify-on-real-projects**: Judge blaze by real projects it builds passing their own tests, never against cargo.
 - **8. own-nightly**: Each project builds with `pins/toolchain`; toolchain files, rustup and `RUSTC` are ignored.
 - **22. measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the tree and binary it ran on.
