@@ -94,11 +94,12 @@ jobs:
           def records(store):
               heads = set()
               states = set()
+              run_ids = set()
               for path in store.rglob("*"):
                   if not path.is_file() or path.is_symlink():
                       continue
                   raw = path.read_bytes()
-                  for magic in [b"BZTH", b"BZTS"]:
+                  for magic in [b"BZTH", b"BZTS", b"BZRI"]:
                       cursor = 0
                       while (at := raw.find(magic, cursor)) != -1:
                           cursor = at + len(magic)
@@ -111,6 +112,13 @@ jobs:
                                   start = 24 + 88*i + 72
                                   blob[start:start+8] = bytes(8)
                               heads.add(bytes(blob))
+                          if magic == b"BZRI" and len(raw) >= at + 96:
+                              ver, nc, nb, nr, ne = struct.unpack_from("<IIIII", raw, at + 4)
+                              if ver != 5 or not 0 < nc < 200 or not 0 < nb < 200 or nr > 1000 or ne > 1000:
+                                  continue
+                              end = at + 96 + 112*nc + 192*nb + 72*ne + 64*nr
+                              if end <= len(raw) and not any(raw[at+24:at+32]):
+                                  run_ids.add(raw[at:end])
                           if magic == b"BZTS" and len(raw) >= at + 184:
                               version = struct.unpack_from("<I", raw, at + 4)[0]
                               count, results, crates, pad = struct.unpack_from("<IIII", raw, at + 168)
@@ -127,11 +135,11 @@ jobs:
                               if len(rows) == count:
                                   states.add(tuple(rows))
               assert len(heads) == 1, f"expected one normalized five-test head, got {len(heads)}"
-              return heads.pop(), states
+              return heads.pop(), states, run_ids
 
           captured = {label: records(root / label / ".blaze/v2/store") for label, _, _ in modes}
-          serial, serial_states = captured["serial-a"]
-          for label, (head, states) in captured.items():
+          serial, serial_states, _ = captured["serial-a"]
+          for label, (head, states, tables) in captured.items():
               addresses = [head[24+i*88+40:24+i*88+72].hex()[:12] for i in range(5)]
               print(label, "head matches serial-a:", head == serial,
                     "addresses:", addresses, "suite states:", len(states), flush=True)
@@ -142,6 +150,21 @@ jobs:
                   for sym in moved:
                       print(label, "changed code identity", sym, old_rows[sym], new_rows[sym])
                   print(label, "symbol sets equal:", old_rows.keys() == new_rows.keys(), "moved:", len(moved))
+                  targets = [bytes.fromhex(row[1])[::-1] for row in new_rows.values() if row[1] in [
+                      "fcfd138d1faffa46bb0f359347d7d939", "6258445410a0f012bb0f359347d7d939"]]
+                  print(label, "run ids tables:", len(tables))
+                  for table in sorted(tables):
+                      nc, nb = struct.unpack_from("<II", table, 8)
+                      for i in range(nc):
+                          off = 96 + i*112
+                          if any(item.startswith(table[off:off+8]) for item in targets):
+                              print(label, "crate scope", table[off+80:off+112].hex()[:24])
+                      for i in range(nb):
+                          off = 96 + nc*112 + i*192
+                          if table[off:off+16] in targets:
+                              print(label, "body tabled:", table[off:off+16].hex(),
+                                    "body key:", table[off+16:off+48].hex()[:24], "kind:", table[off+48],
+                                    "name:", table[off+96:off+128].hex()[:24], "text:", table[off+128:off+160].hex()[:24])
           PY
       - uses: actions/upload-artifact@v7
         if: always()
