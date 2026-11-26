@@ -12,7 +12,8 @@
 //!   with `std/src/sys/process/unsupported.rs` replaced by
 //!   `crates/blaze-proc-macro/guest/script_process.rs` (a spawn is one host call) and
 //!   `std/src/rt.rs` patched to enter `CARGO_MANIFEST_DIR` before `main`, as Cargo runs a
-//!   script in its package's folder. The patch's anchor must be found exactly once, else the
+//!   script in its package's folder. The WASI dispatcher takes lexical path-list operations
+//!   from the pinned Unix std. Each patch's anchor must be found exactly once, else the
 //!   tool stops naming it. `-Zbuild-std=std,panic_abort` builds that copy
 //!   (`__CARGO_TESTS_ONLY_SRC_ROOT`).
 //! - **The script as a binary.** A workspace per package whose member has the package's name
@@ -25,41 +26,12 @@
 //!
 //! The record: `<store>/build-script/modules/<key>/{identity,module.wasm,wasm-sha256}`, `<key>`
 //! the SHA-256 of `identity` (name, version, origin, the lock's closure, the toolchain, the
-//! shim's and the patched `rt.rs`'s digests, the builder). Write-once: other bytes under a held
+//! shim and patched std digests, the builder). Write-once: other bytes under a held
 //! key are a refusal naming it.
 
 use super::*;
 
-/// The patched `rt.rs`'s anchor: std's start-up, after which the folder is entered.
-const RT_ANCHOR: &str = "        sys::init(argc, argv, sigpipe)\n    };\n";
-
-/// What follows the anchor.
-const RT_PATCH: &str = "    // blaze: a build script runs in its package's folder, as Cargo runs it; wasi-libc starts
-    // in `/`. A script with no `CARGO_MANIFEST_DIR` is not one blaze runs.
-    #[cfg(target_os = \"wasi\")]
-    {
-        match crate::env::var_os(\"CARGO_MANIFEST_DIR\") {
-            Some(dir) if crate::env::set_current_dir(&dir).is_ok() => {}
-            _ => rtabort!(\"blaze: CARGO_MANIFEST_DIR could not be entered\"),
-        }
-    }
-";
-
-/// The unix fs layer's permissions, which wasip1's std uses over wasi-libc.
-const PERM_ANCHOR: &str = "    pub fn perm(&self) -> FilePermissions {\n        FilePermissions { mode: (self.stat.st_mode as mode_t) }\n    }\n";
-
-/// What replaces it: on WASI the owner's write bit is reported.
-const PERM_PATCH: &str = "    pub fn perm(&self) -> FilePermissions {
-        // blaze: WASI preview 1 has rights per descriptor and no modes, so wasi-libc's `st_mode`
-        // is the file type alone and every path would read as read-only: `autocfg::new()`
-        // refuses `OUT_DIR` as \"not a writable directory\". The sandbox decides each write at
-        // the call, so the mode says writable.
-        #[cfg(target_os = \"wasi\")]
-        return FilePermissions { mode: (self.stat.st_mode as mode_t) | 0o200 };
-        #[cfg(not(target_os = \"wasi\"))]
-        FilePermissions { mode: (self.stat.st_mode as mode_t) }
-    }
-";
+use blaze_build_script::wasi_std::{self, PERM_ANCHOR, PERM_PATCH, RT_ANCHOR, RT_PATCH, UNIX_PATH_LIST_END, UNIX_PATH_LIST_START, WASI_PATHS_ANCHOR, WASI_PATHS_PATCH, WASI_PATH_LIST_HEADER};
 
 /// The input: the proc-macro mode's fields under `build_scripts`, and `native` for scripts
 /// built for the host (D65, D69).
@@ -135,8 +107,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-/// The toolchain's library with the shim and the `rt.rs` patch, at
-/// `/tmp/blaze-script-std-<digest>/library`; the digests of the shim and the patched `rt.rs`.
+/// The toolchain's library with the shim and std patches at
+/// `/tmp/blaze-script-std-<digest>/library`, with the digests of the shim and patched files.
 ///
 /// The path is fixed by content, not under `<work>`: cargo hashes a build-std package's path as
 /// given into its crates' `-C metadata`, so into every mangled symbol of the module (a path
@@ -164,9 +136,33 @@ fn library(tool: &Toolchain, tree: &Path, _work: &Path) -> Result<(PathBuf, Stri
         });
     }
     let fs_patched = fs.replacen(PERM_ANCHOR, PERM_PATCH, 1);
-    // `rt_digest` names every patched file of std: rt.rs, then the fs layer.
-    let (shim_digest, rt_digest) = (sha256(shim.as_bytes()), sha256(format!("{patched}\0{fs_patched}").as_bytes()));
-    let digest = sha256(format!("blaze script std 2\ntoolchain {}\nshim {shim_digest}\npatches {rt_digest}\n", tool.name).as_bytes());
+    let paths_mod = "std/src/sys/paths/mod.rs";
+    let paths_path = tool.library().join(paths_mod);
+    let paths = read(&paths_path)?;
+    if paths.matches(WASI_PATHS_ANCHOR).count() != 1 {
+        return Err(Failure::Manifest { path: paths_path, why: "std's WASI path dispatcher moved: the path-list patch needs a new anchor".to_owned() });
+    }
+    let path_dispatch = paths.replacen(WASI_PATHS_ANCHOR, WASI_PATHS_PATCH, 1);
+    let unix_path = tool.library().join("std/src/sys/paths/unix.rs");
+    let unix = read(&unix_path)?;
+    let path_list = unix
+        .split_once(UNIX_PATH_LIST_START)
+        .and_then(|(_, rest)| rest.split_once(UNIX_PATH_LIST_END))
+        .filter(|_| unix.matches(UNIX_PATH_LIST_START).count() == 1 && unix.matches(UNIX_PATH_LIST_END).count() == 1)
+        .map(|(section, _)| format!("{WASI_PATH_LIST_HEADER}{UNIX_PATH_LIST_START}{section}"))
+        .ok_or_else(|| Failure::Manifest { path: unix_path, why: "std's Unix path-list operations moved: the WASI patch needs new anchors".to_owned() })?;
+    let patched_files = [
+        ("std/src/rt.rs", patched.as_str()),
+        ("std/src/sys/fs/unix.rs", fs_patched.as_str()),
+        (paths_mod, path_dispatch.as_str()),
+        ("std/src/sys/paths/wasi_path_list.rs", path_list.as_str()),
+    ];
+    let mut patches_hash = blaze_sha256::Sha256::new();
+    for (path, source) in patched_files {
+        patches_hash.update(path.as_bytes()).update(b"\0").update(source.as_bytes()).update(b"\0");
+    }
+    let (shim_digest, patches_digest) = (sha256(shim.as_bytes()), hex(&patches_hash.finish()));
+    let digest = sha256(format!("blaze script std 3\ntoolchain {}\nshim {shim_digest}\npatches {patches_digest}\n", tool.name).as_bytes());
     let home = PathBuf::from(format!("/tmp/blaze-script-std-{}", &digest[..32]));
     let to = home.join("library");
     if !home.exists() {
@@ -176,21 +172,21 @@ fn library(tool: &Toolchain, tree: &Path, _work: &Path) -> Result<(PathBuf, Stri
         }
         copy_tree(&tool.library(), &partial.join("library"))?;
         write(&partial.join("library/std/src/sys/process/unsupported.rs"), &shim)?;
-        write(&partial.join("library/std/src/rt.rs"), &patched)?;
-        write(&partial.join("library/std/src/sys/fs/unix.rs"), &fs_patched)?;
+        for (path, source) in patched_files {
+            write(&partial.join("library").join(path), source)?;
+        }
         if std::fs::rename(&partial, &home).is_err() && home.exists() {
             std::fs::remove_dir_all(&partial).map_err(io(&partial))?;
         }
     }
-    // A copy made by an earlier build is checked, not trusted: its two changed files hold
-    // exactly what this build would write.
-    if read(&to.join("std/src/sys/process/unsupported.rs"))? != shim
-        || read(&to.join("std/src/rt.rs"))? != patched
-        || read(&to.join("std/src/sys/fs/unix.rs"))? != fs_patched
-    {
-        return Err(Failure::Manifest { path: to, why: "the library copy at this content's path holds other bytes: remove the folder".to_owned() });
+    // Verify each patched file when reusing an existing copy.
+    for (path, source) in patched_files.into_iter().chain([("std/src/sys/process/unsupported.rs", shim.as_str())]) {
+        let path = to.join(path);
+        if read(&path)? != source {
+            return Err(Failure::Manifest { path, why: "the library copy at this content's path holds other bytes: remove the folder".to_owned() });
+        }
     }
-    Ok((to, shim_digest, rt_digest))
+    Ok((to, shim_digest, patches_digest))
 }
 
 /// The member's manifest: the package's name, version and edition, the unit's `features` (so
@@ -442,7 +438,7 @@ impl Plan<'_> {
         at: usize,
         library: &Path,
         shim_digest: &str,
-        rt_digest: &str,
+        patches_digest: &str,
         native: Option<&Native>,
         alloc: blaze_own::Alloc<'_>,
     ) -> Result<BuiltScript, Failure> {
@@ -457,10 +453,9 @@ impl Plan<'_> {
         })?;
         features.sort();
         features.dedup();
-        // A wasm module's identity is unchanged (its records stand); a native one names the
-        // host target, the linking clang and the SDK instead of the shim and the patches.
+        // The host matches a wasm module by the process shim and std patch recipe.
         let runner = match native {
-            None => format!("shim {shim_digest}\npatches {rt_digest}\n"),
+            None => format!("shim {shim_digest}\n{} {}\npatches {patches_digest}\n", wasi_std::IDENTITY_FIELD, sha256(wasi_std::PATCH_RECIPE)),
             Some(native) => native.identity()?,
         };
         let identity = format!(
@@ -651,7 +646,7 @@ pub(super) fn main_with(text: &str, heap: &blaze_own::Heap) -> i32 {
     let work = canon(&args.work);
     let tree = canon(&args.tree);
     let tool = toolchain(&tree, &home).unwrap_or_else(|failure| fail(failure));
-    let (library, shim_digest, rt_digest) = library(&tool, &tree, &work).unwrap_or_else(|failure| fail(failure));
+    let (library, shim_digest, patches_digest) = library(&tool, &tree, &work).unwrap_or_else(|failure| fail(failure));
     let lock = read(&args.checkout.join("Cargo.lock")).unwrap_or_else(|failure| fail(failure));
     let me = std::env::current_exe().unwrap_or_else(|error| fail(Failure::Io { path: PathBuf::from("current_exe"), error })).into_os_string();
     // A workspace or git member's script needs only its build-dependencies: the fetch and the
@@ -691,7 +686,7 @@ pub(super) fn main_with(text: &str, heap: &blaze_own::Heap) -> i32 {
     let mut failed = 0;
     for (at, wanted) in args.crates.iter().enumerate() {
         let started = Instant::now();
-        match plan.build_script(at, &library, &shim_digest, &rt_digest, native, heap.alloc()) {
+        match plan.build_script(at, &library, &shim_digest, &patches_digest, native, heap.alloc()) {
             Ok(built) => println!(
                 "{} {} [{}]: script module {} wasm-sha256 {} {} bytes{} in {:.1}s",
                 wanted.name,

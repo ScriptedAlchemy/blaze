@@ -281,10 +281,14 @@ driver's successor runs the build-script task kind (unit in, record out).
   unresolved imports from 10306 to 9810.
 - **The bootstrap's build-script mode**
   (`scripts/src/bin/proc_macro_modules/build_scripts.rs`, input `{"build_scripts": {...}}`).
-  It compiles std with the process shim and two patches: `rt.rs` enters
+  It compiles std with the process shim and three patches. `rt.rs` enters
   `CARGO_MANIFEST_DIR`, and the fs layer's `perm()` reports the owner-write bit, because
   wasi-libc's `st_mode` has no permission bits and `autocfg::new()` would otherwise refuse
-  every `OUT_DIR`. The std copy lives at `/tmp/blaze-script-std-<content digest>`: cargo hashes
+  every `OUT_DIR`. WASI uses the pinned Unix implementation for lexical path lists, so
+  `split_paths` and `join_paths` work on bytes, including empty entries. This change adds no
+  filesystem or process grants. WASM lookup requires the std patch recipe's digest as well
+  as the process shim's digest. Rebuild older script modules with the bootstrap producer.
+  The std copy lives at `/tmp/blaze-script-std-<content digest>`: cargo hashes
   a build-std path into every symbol, so a path under the work folder gave other bytes per
   folder. With it, all 8 class C modules came out byte-equal from two work folders and stores.
   A workspace member's manifest is cut to its build-dependencies. A module is per feature set:

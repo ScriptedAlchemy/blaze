@@ -50,6 +50,7 @@ pub mod served;
 mod served_ban_tests;
 pub mod shelf_pins;
 pub mod toolchain;
+pub mod wasi_std;
 
 #[cfg(test)]
 mod c_request_tests;

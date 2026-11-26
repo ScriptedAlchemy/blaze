@@ -211,28 +211,30 @@ pub fn records_named(store: &Path, name: &str, version: &str) -> Result<Vec<(Pat
 /// (scripts proc_macro_modules build_scripts.rs `library`), the same digest of the same file.
 const SHIM: &[u8] = include_bytes!("../guest/script_process.rs");
 
-/// The identity line a wasm module must carry to be run by this host: `shim <sha256 hex>`.
-pub fn shim_line() -> String {
-    format!("shim {}", crate::module::sha256_hex(SHIM))
+/// The identity lines a wasm module must carry: the process shim and WASI std patch recipe.
+pub fn wasm_runner_lines() -> [String; 2] {
+    use blaze_build_script::wasi_std;
+    [
+        format!("shim {}", crate::module::sha256_hex(SHIM)),
+        format!("{} {}", wasi_std::IDENTITY_FIELD, crate::module::sha256_hex(wasi_std::PATCH_RECIPE)),
+    ]
 }
 
 /// The record whose identity names `name`, `version`, `features` and, for `host`, `target
-/// <host>`; for `None`, one with no `target` line and this host's [`shim_line`] (a wasm module).
+/// <host>`; for `None`, one with no `target` line and this host's [`wasm_runner_lines`].
 /// Two such records are a typed refusal, never the first in the listing's order.
 fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>) -> Result<Option<PathBuf>, ModuleLookupError> {
     let mut sorted = features.to_vec();
     sorted.sort_unstable();
     let lines = [format!("name {name}"), format!("version {version}"), format!("features {}", sorted.join(","))];
     let target = host.map(|host| format!("target {host}"));
-    let shim = shim_line();
+    let wasm = wasm_runner_lines();
     let mut fits = records(store)?.into_iter().filter(|(_, identity)| {
-        // A wasm module answers only with the shim this host speaks to: one built with another
-        // is not this ask's record, so a stale module is a named miss (`NoModule`, whose words
-        // show the differing `shim` line), never a run that misreads a reply, and never a second
-        // record beside its rebuild (`Ambiguous`).
+        // A stale WASM module may sit beside its rebuild. Only the compatible record answers
+        // the ask, and the lookup diagnostic names a missing or differing identity line.
         let runner_fits = match &target {
             Some(want) => identity.lines().any(|l| l == want),
-            None => !identity.lines().any(|l| l.starts_with("target ")) && identity.lines().any(|l| l == shim),
+            None => !identity.lines().any(|l| l.starts_with("target ")) && wasm.iter().all(|want| identity.lines().any(|l| l == want)),
         };
         runner_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
     });

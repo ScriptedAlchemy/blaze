@@ -127,8 +127,8 @@ fn module(line: &[u8]) -> Vec<u8> {
 fn put_module(home: &Path) {
     let record = home.join(".blaze/v2/build-script/modules/app-0.1.0-test");
     std::fs::create_dir_all(&record).unwrap_or_else(|error| panic!("making {}: {error}", record.display()));
-    // A wasm module names the process shim it was built with; the host runs only its own.
-    let identity = format!("name app\nversion 0.1.0\nfeatures \n{}\n", blaze_proc_macro::script_unit::shim_line());
+    let runner = blaze_proc_macro::script_unit::wasm_runner_lines().join("\n");
+    let identity = format!("name app\nversion 0.1.0\nfeatures \n{runner}\n");
     std::fs::write(record.join("identity"), identity).expect("the module's identity");
     let bytes = module(LINE);
     // The record's digest (script_modules.rs reads it as the lookup's out): the module's SHA-256.
