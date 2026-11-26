@@ -8,21 +8,21 @@ use blaze_lir::{
 /// Give each argument-bearing edge its own predecessor. Two arms of the same
 /// terminator can branch to the same block with different arguments.
 pub(super) struct Edges<'a, 'v> {
-    incoming: AVec<'a, AVec<'a, (usize, usize, Values<'v>)>>,
+    incoming: blaze_own::ABTreeMap<'a, u32, AVec<'a, (usize, usize, Values<'v>)>>,
 }
 
 impl<'a, 'v> Edges<'a, 'v> {
     pub(super) fn new(view: View<'v>, alloc: Alloc<'a>) -> Self {
-        let mut incoming = Vec::with_capacity_in(view.blocks(), alloc);
-        for _ in 0..view.blocks() {
-            incoming.push(Vec::new_in(alloc));
-        }
-        for b in 0..view.blocks() {
-            let i = view.terminator(Block(b as u32));
+        let mut incoming = blaze_own::ABTreeMap::new_in(alloc);
+        for (b, _) in (0u32..).zip(view.block_starts) {
+            let i = view.terminator(Block(b));
             let mut o = view.operands(i);
             let mut edge = |k, t: Branch<'v>| {
                 if !t.args.0.is_empty() {
-                    incoming[t.block.index()].push((i, k, t.args));
+                    incoming
+                        .entry(t.block.0)
+                        .or_insert_with(|| AVec::new_in(alloc))
+                        .push((i, k, t.args));
                 }
             };
             match view.op(i) {
@@ -45,7 +45,7 @@ impl<'a, 'v> Edges<'a, 'v> {
         Self { incoming }
     }
     pub(super) fn write(&self, ir: &mut AString<'_>) {
-        for (b, incoming) in self.incoming.iter().enumerate() {
+        for (b, incoming) in &self.incoming {
             for &(i, k, _) in incoming.iter() {
                 format_into!(ir, "e{i}_{k}:\n  br label %b{b}\n");
             }
@@ -62,6 +62,26 @@ fn label(out: &mut AString<'_>, i: usize, k: usize, target: Branch<'_>) {
 }
 
 impl Lower<'_, '_> {
+    /// The native record ABI uses the BRK immediate even after LTO. The Wasm
+    /// module ABI traps without an immediate and retains the LIR code as metadata.
+    pub(super) fn trap(&mut self, code: u32) -> Result<(), LowerError> {
+        let (name, params) = if self.view.head.ptr_bits == 64 {
+            ("@llvm.aarch64.break", "i32")
+        } else {
+            ("@llvm.trap", "")
+        };
+        self.declaration(
+            AString::from_str_in(name, self.alloc),
+            format_in!(self.alloc, "declare void {name}({params})"),
+        )?;
+        format_into!(&mut self.ir, "  call void {name}(");
+        if !params.is_empty() {
+            format_into!(&mut self.ir, "i32 {code}");
+        }
+        format_into!(&mut self.ir, "), !blaze.trap !{{i32 {code}}}\n  unreachable\n");
+        Ok(())
+    }
+
     pub(super) fn block_params(&mut self, block: Block) -> Result<(), LowerError> {
         if block.0 == 0 {
             return Ok(());
@@ -69,7 +89,13 @@ impl Lower<'_, '_> {
         let params = self.view.params(block);
         let kind = self.view.block_kind(block);
         if kind.is_landing() {
-            let clause = if kind == BlockKind::Cleanup { "cleanup" } else { "catch ptr null" };
+            let clause = match kind {
+                BlockKind::Cleanup => "cleanup",
+                BlockKind::Catch => "catch ptr null",
+                // blaze-code's LSDA gives Terminate the empty exception specification (-1).
+                BlockKind::Terminate => "filter [0 x ptr] zeroinitializer",
+                _ => return Err(self.error("unknown LIR landing block")),
+            };
             format_into!(
                 &mut self.ir,
                 "  %pad{} = landingpad {{ ptr, i32 }} {clause}\n  %v{} = extractvalue {{ ptr, i32 }} %pad{}, 0\n",
@@ -80,12 +106,11 @@ impl Lower<'_, '_> {
             return Ok(());
         }
         for (k, i) in params.enumerate() {
-            let ty = LlType(self.view, Ty(self.view.tys[i]));
-            let incoming = &self.edges.incoming[block.index()];
-            if incoming.is_empty() {
+            let ty = LlType(self.view, self.result_type(i)?);
+            let Some(incoming) = self.edges.incoming.get(&block.0) else {
                 format_into!(&mut self.ir, "  %v{i} = freeze {ty} poison\n");
                 continue;
-            }
+            };
             format_into!(&mut self.ir, "  %v{i} = phi {ty} ");
             for (n, &(from, arm, args)) in incoming.iter().enumerate() {
                 if n != 0 {
@@ -133,7 +158,11 @@ impl Lower<'_, '_> {
                     [v] => format_into!(ir, "  ret {} %v{v}", LlType(view, view.ty(Value(*v)))),
                     _ => {
                         let sig = Signature::new(view, SigId(view.head.sig)).map_err(|reason| {
-                            LowerError { symbol: self.symbol, instruction: Some(i), reason }
+                            LowerError {
+                                symbol: self.symbol,
+                                instruction: Some(i),
+                                reason: reason.reason(),
+                            }
                         })?;
                         let ty = sig.result();
                         for (k, v) in values.iter().enumerate() {
@@ -150,18 +179,16 @@ impl Lower<'_, '_> {
                 }
             }
             Op::Unreachable | Op::Trap => {
-                let code = if op == Op::Trap { o.imm() } else { 0xff02 };
-                // The AArch64 emitter uses BRK's 16-bit immediate as the trap identity.
-                // This module can target wasm too: llvm.trap is portable but cannot
-                // carry a trap code. Keep the code in the intrinsic's metadata.
-                format_into!(
-                    ir,
-                    "  call void @llvm.trap(), !blaze.trap !{{i32 {code}}}\n  unreachable"
-                );
-                self.declaration(
-                    String::from_str_in("@llvm.trap", self.alloc),
-                    String::from_str_in("declare void @llvm.trap()", self.alloc),
-                )?;
+                let code = if op == Op::Trap {
+                    let code = o.imm();
+                    if code >= blaze_code::trap::DIV_ZERO {
+                        return Err(self.error("a LIR trap in the emitter's reserved BRK range"));
+                    }
+                    code
+                } else {
+                    blaze_code::trap::UNREACHABLE
+                };
+                return self.trap(code);
             }
             Op::Resume => {
                 format_into!(
@@ -170,9 +197,13 @@ impl Lower<'_, '_> {
                     o.value().0
                 );
                 self.declaration(
-                    String::from_str_in("@_Unwind_Resume", self.alloc),
-                    String::from_str_in("declare void @_Unwind_Resume(ptr)", self.alloc),
+                    AString::from_str_in("@_Unwind_Resume", self.alloc),
+                    AString::from_str_in("declare void @_Unwind_Resume(ptr)", self.alloc),
                 )?;
+                self.implicit(Target {
+                    space: Space::Outside,
+                    symbol: Symbol::of_name("_Unwind_Resume"),
+                });
             }
             _ => return Err(self.error(op.name())),
         }
@@ -187,26 +218,37 @@ impl Lower<'_, '_> {
             Op::Call | Op::Invoke | Op::TailCall => Some(o.reference()),
             _ => None,
         };
-        let callee = if let Some(id) = id {
-            self.names[id.index()].clone()
-        } else {
-            format_in!(self.alloc, "%v{}", o.value().0)
-        };
+        let indirect = id.is_none().then(|| o.value());
         let sig_id = o.sig();
-        let signature = Signature::new(view, sig_id).map_err(|e| self.error(e))?;
+        let signature = Signature::new(view, sig_id).map_err(|e| self.error(e.reason()))?;
         let unwind = matches!(op, Op::Invoke | Op::InvokeIndirect).then(|| (o.block(), o.block()));
         let args = o.values();
         let tail = matches!(op, Op::TailCall | Op::TailCallIndirect);
         if tail && view.sig(sig_id).bits & SigRec::VARIADIC != 0 {
             return Err(self.error("variadic musttail call"));
         }
+        if tail {
+            let own =
+                Signature::new(view, SigId(view.head.sig)).map_err(|e| self.error(e.reason()))?;
+            if !signature.tail_compatible(own) {
+                return Err(
+                    self.error("musttail needs matching LLVM prototypes and ABI attributes")
+                );
+            }
+        }
+        self.copy_arguments(signature, args, i, tail)?;
         if let Some(id) = id {
-            let target = self.references[id.index()]
+            let target = self
+                .references
+                .get(id.index())
+                .copied()
+                .flatten()
                 .ok_or_else(|| self.error("a direct call names local data"))?;
             if target.space != Space::Func || target.symbol != self.symbol {
+                let callee = self.ref_name(id)?;
                 let mut decl = format_in!(self.alloc, "declare {} {callee}", signature.prefix());
                 signature.parameters(&mut decl, abi::Args::Declaration);
-                self.declaration(callee.clone(), decl)?;
+                self.declaration(AString::from_str_in(callee, self.alloc), decl)?;
                 if target.space == Space::Func && !self.calls.contains(&target.symbol) {
                     self.calls.push(target.symbol);
                 }
@@ -225,8 +267,18 @@ impl Lower<'_, '_> {
         };
         format_into!(&mut self.ir, "{mnemonic} {}", signature.prefix());
         signature.call_type(&mut self.ir);
-        format_into!(&mut self.ir, " {callee}");
-        signature.parameters(&mut self.ir, abi::Args::Call(args));
+        match (id, indirect) {
+            (Some(id), None) => {
+                let name = self
+                    .names
+                    .get(id.index())
+                    .ok_or_else(|| self.error("missing LLVM callee link name"))?;
+                format_into!(&mut self.ir, " {name}");
+            }
+            (None, Some(v)) => format_into!(&mut self.ir, " %v{}", v.0),
+            _ => return Err(self.error("a call has no unique callee")),
+        }
+        signature.parameters(&mut self.ir, abi::Args::Call { values: args, instruction: i });
         if let Some((normal, landing)) = unwind {
             format_into!(&mut self.ir, " to label %b{} unwind label %b{}", normal.0, landing.0);
         }

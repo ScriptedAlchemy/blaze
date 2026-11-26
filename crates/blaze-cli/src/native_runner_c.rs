@@ -10,10 +10,10 @@
 //!
 //! 1. ONE GET: the BUILT record's key (blaze-build-script c_tasks_built.rs `built_key`) is the
 //!    script's out, the toolchain (the shelf's digest, the SDK's identity, the target), the
-//!    package's pinned files (the sources store's key and the files' BLAKE3,
-//!    run_ids.rs `Place::Fetched`) and the archives the crate asks for. A hit is the outputs the
+//!    package's pinned files (its fetch pack or its checked checkout snapshot)
+//!    and the archives the crate asks for. A hit is the outputs the
 //!    link takes, read in place: nothing is laid, planned or compiled.
-//! 2. On a miss, the package is laid from its pack (`<work>/pkg/<digest>`, made once and
+//! 2. On a miss, the package is laid from those files (`<work>/pkg/<digest>`, made once and
 //!    renamed into place) and blaze-proc-macro native_c_tasks.rs `run_tasks` plans, looks up,
 //!    compiles in parallel (one worker per command worker, each compile under the Seatbelt
 //!    grant of a native C task with its own deadline), records and archives. Its assumptions
@@ -23,17 +23,15 @@
 //! image's key (engine_native.rs `image_key`) moves with every input above, and a deferred
 //! record never reaches the link.
 //!
-//! Not yet, each refused by name ([`CTaskWhy`]):
-//! - a crate whose files can change (a workspace member, a path dependency): it has no pinned
-//!   key (c_tasks_built.rs), and its package would be the checkout's folder, not a pack;
-//! - a request that names a `links` dependency that is a workspace member (its `/deps/<links>`
-//!   tree is the checkout's folder, not a pack).
+//! A checkout package uses the committed package-files leaf from the check that produced this
+//! command's answer. A miss lays the captured bytes after verifying the leaf. The compiler
+//! reads that immutable directory, and individual objects retain their source and header keys.
 //!
 //! A `links` dependency's trees a request names (c_tasks.rs `dep_roots`: librocksdb-sys reads
 //! lz4-sys's and zstd-sys's) are laid read-only beside the package: a producer's `OUT_DIR` as its
 //! own C step left it (its process tree's headers included; its C runs first, [`Producers`]),
 //! by the content of its files (`<work>/dep/<digest>`, [`dep_out`]), its served tree
-//! (`/deps/<links>`) from its pack; each joins the built key by its digest.
+//! (`/deps/<links>`) from its pinned files; each joins the built key by its digest.
 //!
 //! Process-tree requests (tikv-jemalloc-sys's `sh configure`, `make`) run as one task before
 //! the compiles (native_c_tasks.rs `ShelfTree`, blaze-build-script c_tasks_tree.rs): the host
@@ -157,6 +155,8 @@ pub(crate) struct CTasks<'e> {
     home: Option<&'e str>,
     sdk: blaze_apple_sdk::Sdk<'e>,
     fs: &'e bstd::fs::Fs,
+    checkout: Option<&'e str>,
+    leaves: &'e crate::sweep::Leaves<'e>,
     workers: u32,
     heap: &'static blaze_own::Heap,
     setup: Option<Setup>,
@@ -164,8 +164,8 @@ pub(crate) struct CTasks<'e> {
 }
 
 impl<'e> CTasks<'e> {
-    pub(crate) fn new(home: Option<&'e str>, sdk: blaze_apple_sdk::Sdk<'e>, fs: &'e bstd::fs::Fs, workers: u32, heap: &'static blaze_own::Heap) -> CTasks<'e> {
-        CTasks { home, sdk, fs, workers, heap, setup: None, dirs: PackDirs::default() }
+    pub(crate) fn new(home: Option<&'e str>, sdk: blaze_apple_sdk::Sdk<'e>, fs: &'e bstd::fs::Fs, workers: u32, heap: &'static blaze_own::Heap, checkout: Option<&'e str>, leaves: &'e crate::sweep::Leaves<'e>) -> CTasks<'e> {
+        CTasks { home, sdk, fs, workers, heap, checkout, leaves, setup: None, dirs: PackDirs::default() }
     }
 
     /// The toolchain, set up once.
@@ -282,12 +282,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
     if requests == 0 {
         return Ok((script, None));
     }
-    let (source, files) = match <CrateList<'_> as CrateTable<'_>>::place(list, r) {
-        Place::Fetched { source, files } => (source, files),
-        Place::Checkout => return Err(CTaskWhy::NotPinned { why: "a workspace member's files can change; its objects are not found by a pinned key yet" }),
-        Place::Toolchain => return Err(CTaskWhy::NotPinned { why: "a toolchain crate with C requests" }),
-        Place::Unplaced { why } => return Err(CTaskWhy::NotPinned { why }),
-    };
+    let package_source = PackageSource::read(list, r, c.leaves, scratch)?;
     let alloc = c.heap.alloc();
     let demand = c_tasks::script_demand(&outputs, alloc);
     let mut demand_text: AVec<'_, &str> = Vec::with_capacity_in(demand.len(), alloc);
@@ -316,18 +311,19 @@ pub(crate) fn built_for<'s, 'm: 's>(
         }
     };
     let tree_digest = trees.as_ref().map(native_c_tasks::tree_tools_digest);
-    let roots = GuestRoots { package: blaze_expand::seen::PACKAGE_ROOT, out: outputs.out_dir(), builds: GUEST_BUILDS, deps: DEPS_ROOT, sysroot: GUEST_SDK };
+    let guest_package = bstd::mem::format_in!(scratch, "{}", list.env_facts(r).seen);
+    let roots = GuestRoots { package: guest_package.as_str(), out: outputs.out_dir(), builds: GUEST_BUILDS, deps: DEPS_ROOT, sysroot: GUEST_SDK };
     // Each `links` dependency's tree the requests name (librocksdb-sys: zstd-sys's `OUT_DIR`,
     // `/deps/zstd`), found and keyed before anything is laid: a hit lays nothing.
     let named = c_tasks::dep_roots(&outputs, &roots, alloc);
     let mut graph_links: Option<AVec<'_, (AString<'_>, AString<'_>, AString<'_>)>> = None;
     let mut deps: AVec<'_, DepTree<'_>> = Vec::with_capacity_in(named.len(), alloc);
     for guest in named.iter().copied() {
-        deps.push(dep_tree(list, producers, guest, &mut graph_links, alloc, scratch)?);
+        deps.push(dep_tree(list, producers, guest, &mut graph_links, c.leaves, alloc, scratch)?);
     }
     let mut dep_keys: AVec<'_, (&str, [u8; 32])> = Vec::with_capacity_in(deps.len(), alloc);
     dep_keys.extend(deps.iter().map(|dep| (dep.guest, dep.digest)));
-    let key = c_tasks_built::built_key(script.out, &toolchain, Pinned { source: source.0, files }, &demand_text, &dep_keys, tree_digest);
+    let key = c_tasks_built::built_key(script.out, &toolchain, package_source.pin(), &demand_text, &dep_keys, tree_digest);
 
     // One get: the built record, read in place.
     let held = store.get(&cx, Key(key)).map_err(|e| CTaskWhy::Built { words: kept(scratch, format_args!("the store: {e}")) })?;
@@ -340,15 +336,15 @@ pub(crate) fn built_for<'s, 'm: 's>(
     }
 
     // A miss: the package laid, the tasks run, the built record put.
-    let (package_dir, package_digest) = lay_package(&cx, c, list, r, files, scratch)?;
+    let (package_dir, package_digest) = lay_package(&cx, c, list, r, package_source, scratch)?;
     let mut sources: AVec<'_, Laid<'_>> = Vec::with_capacity_in(1 + deps.len(), alloc);
-    sources.push(Laid { guest: blaze_expand::seen::PACKAGE_ROOT, host: package_dir, digest: package_digest, name: "the package" });
+    sources.push(Laid { guest: roots.package, host: package_dir, digest: package_digest, name: "the package" });
     // Each read-only: granted read, never written (native_c.rs `Laid`).
     for dep in deps.iter() {
         let (host, name) = match dep.source {
             DepSource::Out { script } => (lay_dep_out(c, script, dep.digest, scratch)?, "a `links` dependency's OUT_DIR"),
-            DepSource::Tree { r: producer, files } => {
-                let (host, digest) = lay_package(&cx, c, list, producer, files, scratch)?;
+            DepSource::Tree { r: producer, package } => {
+                let (host, digest) = lay_package(&cx, c, list, producer, package, scratch)?;
                 if digest != dep.digest {
                     return Err(CTaskWhy::Lay { words: kept(scratch, format_args!("{}: its package laid under another digest than it was keyed by", dep.guest)) });
                 }
@@ -434,7 +430,7 @@ enum DepSource<'d> {
     /// record's files (what its process tree made: configure's and make's headers among them).
     Out { script: ScriptIn<'d> },
     /// The tree a producer was served (`/deps/<links>`): crate `r`'s package, by its files.
-    Tree { r: usize, files: [u8; 32] },
+    Tree { r: usize, package: PackageSource },
 }
 
 /// Why no producer's `OUT_DIR` is found for a reader's spelling ([`dep_out`]).
@@ -473,12 +469,13 @@ pub(crate) fn dep_out<'p>(producers: &Producers<'p>, guest: &str) -> Result<(Scr
 /// The producer of `guest` (c_tasks.rs `dep_roots`), keyed: an `OUT_DIR` by the script record
 /// whose `OUT_DIR` it is (one per package and config), a `/deps/<links>` tree by the package
 /// whose `links` it is (one per graph, the cargo book's "links"). None, or a producer whose
-/// files can change, is refused naming the spelling (rule 3); nothing is guessed.
+/// sources have no snapshot, is refused naming the spelling (rule 3).
 fn dep_tree<'d, 's, 'a>(
     list: &CrateList<'_>,
     producers: &Producers<'d>,
     guest: &'d str,
     graph_links: &mut Option<AVec<'a, (AString<'a>, AString<'a>, AString<'a>)>>,
+    leaves: &crate::sweep::Leaves<'_>,
     alloc: Alloc<'a>,
     scratch: &'s Frame,
 ) -> Result<DepTree<'d>, CTaskWhy<'s>> {
@@ -509,23 +506,11 @@ fn dep_tree<'d, 's, 'a>(
     let Some((_, name, version)) = rows.iter().find(|(of, _, _)| of.as_str() == links) else {
         return Err(lay(format_args!("a request names `{guest}`, and no package of the graph has `links = \"{links}\"`")));
     };
-    let fetched = (0..list.len()).find_map(|at| {
-        if list.package(at) != name.as_str() || list.version(at) != version.as_str() {
-            return None;
-        }
-        match <CrateList<'_> as CrateTable<'_>>::place(list, at) {
-            Place::Fetched { files, .. } => Some((at, files)),
-            _ => None,
-        }
-    });
-    let Some((at, files)) = fetched else {
-        return Err(lay(format_args!(
-            "a request names `{guest}`, and `{} {}` (`links = \"{links}\"`) is no fetched package of this program: a workspace member's tree is not laid for a C task yet",
-            name.as_str(),
-            version.as_str()
-        )));
+    let Some(at) = (0..list.len()).find(|&at| list.package(at) == name.as_str() && list.version(at) == version.as_str()) else {
+        return Err(lay(format_args!("a request names `{guest}`, but the crate list lacks {} {}", name.as_str(), version.as_str())));
     };
-    Ok(DepTree { guest, digest: package_digest(list, at, files).0, source: DepSource::Tree { r: at, files } })
+    let package = PackageSource::read(list, at, leaves, scratch)?;
+    Ok(DepTree { guest, digest: package.digest(list, at).0, source: DepSource::Tree { r: at, package } })
 }
 
 /// A producer's `OUT_DIR` laid read-only from the record its C step left ([`dep_out`]:
@@ -572,6 +557,57 @@ fn lay_dep_out<'s>(c: &CTasks<'_>, script: ScriptIn<'_>, key: [u8; 32], scratch:
     Ok(crate::work::held_str(real, scratch))
 }
 
+#[derive(Clone, Copy)]
+enum PackageSource {
+    Fetched(Pinned),
+    Checkout(ContentId),
+}
+
+impl PackageSource {
+    fn read<'s>(list: &CrateList<'_>, r: usize, leaves: &crate::sweep::Leaves<'_>, scratch: &'s Frame) -> Result<Self, CTaskWhy<'s>> {
+        match <CrateList<'_> as CrateTable<'_>>::place(list, r) {
+            Place::Fetched { source, files } => Ok(Self::Fetched(Pinned { source: source.0, files })),
+            Place::Checkout => {
+                let shown = list.shown_from(r);
+                let dir = shown.strip_prefix("/0/").ok_or_else(|| CTaskWhy::Lay { words: kept(scratch, format_args!("checkout package folder `{shown}` is outside tree 0")) })?.trim_end_matches('/');
+                let digest = checkout_digest(leaves, dir).ok_or_else(|| CTaskWhy::Lay { words: kept(scratch, format_args!("no checked package-files snapshot for `{shown}`")) })?;
+                Ok(Self::Checkout(digest))
+            }
+            Place::Toolchain => Err(CTaskWhy::NotPinned { why: "a toolchain crate with C requests" }),
+            Place::Unplaced { why } => Err(CTaskWhy::NotPinned { why }),
+        }
+    }
+
+    fn pin(self) -> Pinned {
+        match self {
+            Self::Fetched(pin) => pin,
+            Self::Checkout(files) => Pinned { source: ContentId::of("blaze-cli native C checkout package 1", &files.0).0, files: files.0 },
+        }
+    }
+
+    fn digest(self, list: &CrateList<'_>, r: usize) -> ContentId {
+        match self {
+            Self::Fetched(pin) => package_digest(list, r, pin.files),
+            Self::Checkout(_) => ContentId(self.pin().source),
+        }
+    }
+}
+
+/// The committed leaf table is sorted by (kind, checkout-relative path).
+fn checkout_digest(leaves: &crate::sweep::Leaves<'_>, dir: &str) -> Option<ContentId> {
+    let mut range = 0..leaves.len();
+    while !range.is_empty() {
+        let at = range.start + (range.end - range.start) / 2;
+        let row = leaves.row(at);
+        match (row.kind, leaves.path(at)).cmp(&(crate::sweep::LeafKind::MacroFiles, dir)) {
+            core::cmp::Ordering::Less => range.start = at + 1,
+            core::cmp::Ordering::Greater => range.end = at,
+            core::cmp::Ordering::Equal => return (!row.absent()).then_some(row.id),
+        }
+    }
+    None
+}
+
 /// What names crate `r`'s laid package: the pack's files and the package's folder in it.
 fn package_digest(list: &CrateList<'_>, r: usize, files: [u8; 32]) -> ContentId {
     let shown = list.shown_from(r);
@@ -581,18 +617,14 @@ fn package_digest(list: &CrateList<'_>, r: usize, files: [u8; 32]) -> ContentId 
     digest.finish()
 }
 
-/// Crate `r`'s package laid from its pack under the work folder (made once: written beside and
-/// renamed into place, so a folder there is whole), and its digest (the pack's files and the
-/// package's folder in it).
-fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, files: [u8; 32], scratch: &'s Frame) -> Result<(&'s str, [u8; 32]), CTaskWhy<'s>> {
+/// Crate `r`'s immutable package under the work folder, published by rename after writing the
+/// fetched files or the verified checkout bytes.
+fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, package: PackageSource, scratch: &'s Frame) -> Result<(&'s str, [u8; 32]), CTaskWhy<'s>> {
     let lay = |what: fmt::Arguments<'_>| CTaskWhy::Lay { words: kept(scratch, what) };
-    let root = list.root(r);
-    let k: usize = root.strip_prefix('/').and_then(|rest| rest.split('/').next()).and_then(|k| k.parse().ok()).ok_or_else(|| lay(format_args!("its root `{root}` names no tree")))?;
-    let Some(row) = list.tree(k) else { return Err(lay(format_args!("the crate list names no tree {k}"))) };
     // The package's folder in its pack: `/<k>/<dir>/` (a git commit's), `/<k>/` (a crate's).
     let shown = list.shown_from(r);
     let dir = shown.strip_prefix('/').and_then(|rest| rest.split_once('/')).map_or("", |(_, dir)| dir.trim_end_matches('/'));
-    let digest = package_digest(list, r, files);
+    let digest = package.digest(list, r);
     let hex = crate::fetch::key_hex(&digest);
     let hex = core::str::from_utf8(&hex).map_err(|_| lay(format_args!("a digest's hex is not text")))?;
     let setup = c.setup.as_ref().expect("native_runner_c: set up before a package is laid");
@@ -601,39 +633,58 @@ fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, 
     if std::fs::metadata(folder).is_ok_and(|m| m.is_dir()) {
         return Ok((folder, digest.0));
     }
-    let from = PackHome { home: c.home, fs: c.fs, heap: c.heap };
-    let view = open_row(cx, from, row, k, &mut c.dirs, scratch).map_err(|words| lay(format_args!("{words}")))?;
-    if view.tree().0 != files {
-        return Err(lay(format_args!("its pack holds other files than its crate list row names")));
-    }
     let part = bstd::mem::format_in!(scratch, "{folder}.part-{}", std::process::id());
     match std::fs::remove_dir_all(part.as_str()) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(lay(format_args!("{}: {error}", part.as_str()))),
     }
-    let prefix = if dir.is_empty() { None } else { Some(dir) };
     let mut laid = 0u32;
-    for file in view.files() {
-        let rest = match prefix {
-            None => file.path,
-            Some(dir) => match file.path.strip_prefix(dir).and_then(|rest| rest.strip_prefix('/')) {
-                Some(rest) => rest,
-                None => continue,
-            },
-        };
+    let mut write = |rest: &str, bytes: &[u8]| -> Result<(), CTaskWhy<'s>> {
         if rest.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
-            return Err(lay(format_args!("its pack names `{}`, which is not a path in a folder", file.path)));
+            return Err(lay(format_args!("its package names `{rest}`, which is not a path in a folder")));
         }
         let path = bstd::mem::format_in!(scratch, "{}/{rest}", part.as_str());
         if let Some((parent, _)) = path.as_str().rsplit_once('/') {
             std::fs::create_dir_all(parent).map_err(|e| lay(format_args!("{parent}: {e}")))?;
         }
-        std::fs::write(path.as_str(), file.bytes).map_err(|e| lay(format_args!("{}: {e}", path.as_str())))?;
+        std::fs::write(path.as_str(), bytes).map_err(|e| lay(format_args!("{}: {e}", path.as_str())))?;
         laid += 1;
+        Ok(())
+    };
+    match package {
+        PackageSource::Fetched(pin) => {
+            let root = list.root(r);
+            let k: usize = root.strip_prefix('/').and_then(|rest| rest.split('/').next()).and_then(|k| k.parse().ok()).ok_or_else(|| lay(format_args!("its root `{root}` names no tree")))?;
+            let row = list.tree(k).ok_or_else(|| lay(format_args!("the crate list names no tree {k}")))?;
+            let from = PackHome { home: c.home, fs: c.fs, heap: c.heap };
+            let view = open_row(cx, from, row, k, &mut c.dirs, scratch).map_err(|words| lay(format_args!("{words}")))?;
+            if view.tree().0 != pin.files {
+                return Err(lay(format_args!("its pack holds other files than its crate list row names")));
+            }
+            for file in view.files() {
+                let rest = if dir.is_empty() { file.path } else if let Some(rest) = file.path.strip_prefix(dir).and_then(|s| s.strip_prefix('/')) { rest } else { continue };
+                write(rest, file.bytes)?;
+            }
+        }
+        PackageSource::Checkout(expected) => {
+            let checkout = c.checkout.ok_or_else(|| lay(format_args!("no served checkout folder for `{shown}`")))?;
+            if !dir.is_empty() && dir.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+                return Err(lay(format_args!("invalid checkout-relative package folder `{dir}`")));
+            }
+            let host = bstd::mem::format_in!(scratch, "{}/{dir}", checkout.trim_end_matches('/'));
+            let mut files = blaze_proc_macro::module::package_files(host.as_str().as_ref()).map_err(|e| lay(format_args!("{}: {e}", host.as_str())))?;
+            let found = blaze_proc_macro::module::files_digest(&mut files);
+            if hex32(&found) != Some(expected.0) {
+                return Err(lay(format_args!("checkout package `{shown}` changed after the check: expected {expected:?}, found {found}")));
+            }
+            for (path, bytes) in &files {
+                write(path, bytes)?;
+            }
+        }
     }
     if laid == 0 {
-        return Err(lay(format_args!("its pack holds no file under `{dir}`")));
+        return Err(lay(format_args!("its package holds no file under `{dir}`")));
     }
     match std::fs::rename(part.as_str(), folder) {
         Ok(()) => {}
@@ -659,6 +710,33 @@ mod dep_out_tests {
     use super::*;
 
     const OUT: &str = "/target/debug/build/zstd-sys-1/out";
+
+    #[test]
+    fn checkout_built_records_use_the_selected_packages_committed_files() {
+        use crate::sweep::{ABSENT, LeafKind, Leaves, Rows};
+
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the leaf table's frame");
+        let mut rows = Rows::new_in(&frame);
+        let root = ContentId([1; 32]);
+        let member = ContentId([2; 32]);
+        let path_dep = ContentId([3; 32]);
+        rows.push(LeafKind::MacroFiles, 0, "sys", None, member);
+        rows.push(LeafKind::MacroFile, 0, "sys", None, root);
+        rows.push(LeafKind::MacroFiles, 0, "", None, root);
+        rows.push(LeafKind::MacroFiles, 0, "deps/sys", None, path_dep);
+        rows.push(LeafKind::MacroFiles, ABSENT, "removed", None, root);
+        let bytes = Leaves::bytes_in(&rows, &frame).unwrap();
+        let (leaves, _) = Leaves::of(&bytes).unwrap();
+        assert_eq!(checkout_digest(&leaves, ""), Some(root));
+        assert_eq!(checkout_digest(&leaves, "sys"), Some(member));
+        assert_eq!(checkout_digest(&leaves, "deps/sys"), Some(path_dep));
+        assert_eq!(checkout_digest(&leaves, "removed"), None);
+        assert_eq!(checkout_digest(&leaves, "deps"), None);
+
+        let tools = Toolchain { kind: CompilerKind::ShelfClang, compiler: [4; 32], sdk: b"sdk", target: "aarch64-apple-darwin" };
+        let built = |files| c_tasks_built::built_key(root, &tools, PackageSource::Checkout(files).pin(), &["smoketwo"], &[], None);
+        assert_ne!(built(member), built(path_dep), "an unchanged deferred script cannot reuse an archive made from different C inputs");
+    }
 
     /// A `Script` payload (scripts.rs `payload_parts`) of a run with `OUT_DIR` [`OUT`] holding
     /// `files`.

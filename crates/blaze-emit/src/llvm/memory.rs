@@ -1,17 +1,6 @@
 use super::*;
 use blaze_lir::{Flags, Ordering, func::DataId};
 
-fn order(o: Option<Ordering>) -> &'static str {
-    match o {
-        Some(Ordering::Relaxed) => "monotonic",
-        Some(Ordering::Acquire) => "acquire",
-        Some(Ordering::Release) => "release",
-        Some(Ordering::AcqRel) => "acq_rel",
-        Some(Ordering::SeqCst) => "seq_cst",
-        None => unreachable!("verified atomic ordering"),
-    }
-}
-
 fn bytes(out: &mut AString<'_>, data: &[u8]) {
     format_into!(out, "[{} x i8] c\"", data.len());
     for b in data {
@@ -23,25 +12,21 @@ fn bytes(out: &mut AString<'_>, data: &[u8]) {
 impl Lower<'_, '_> {
     pub(super) fn globals(&mut self, own: &str) -> Result<(), LowerError> {
         let view = self.view;
-        for (i, row) in view.refs.iter().enumerate() {
-            let name = &self.names[i];
+        for (row, name) in view.refs.iter().zip(&self.names) {
             if name == own || self.declarations.contains_key(name) {
                 continue;
             }
-            match RefKind::from_word(row.kind) {
-                Some(RefKind::Static | RefKind::Vtable) => self.declaration(
-                    name.clone(),
-                    format_in!(self.alloc, "{name} = external global i8"),
-                )?,
-                Some(RefKind::Func) => self.declaration(
-                    name.clone(),
-                    format_in!(self.alloc, "declare void {name}(...)"),
-                )?,
-                _ => {}
-            }
+            let declaration = match RefKind::from_word(row.kind) {
+                Some(RefKind::Static | RefKind::Vtable) => {
+                    format_in!(self.alloc, "{name} = external global i8")
+                }
+                Some(RefKind::Func) => format_in!(self.alloc, "declare void {name}(...)"),
+                _ => continue,
+            };
+            self.declarations.insert(AString::from_str_in(name, self.alloc), declaration);
         }
-        for (k, row) in view.datas.iter().enumerate() {
-            let id = DataId(k as u32);
+        for (k, row) in (0u32..).zip(view.datas) {
+            let id = DataId(k);
             let data = view.data_bytes_of(id);
             let relocs = view.data_relocs_of(id);
             let positions = view.data_positions_of(id);
@@ -66,11 +51,12 @@ impl Lower<'_, '_> {
             if relocs.is_empty() {
                 bytes(&mut self.ir, data);
             } else {
-                let mut layout = String::from_str_in("<{ ", self.alloc);
-                let mut value = String::from_str_in("<{ ", self.alloc);
+                let mut layout = AString::from_str_in("<{ ", self.alloc);
+                let mut value = AString::from_str_in("<{ ", self.alloc);
                 let mut at = 0;
                 for rel in relocs {
-                    let offset = rel.offset as usize;
+                    let offset = usize::try_from(rel.offset)
+                        .map_err(|_| self.error("data offset exceeds address space"))?;
                     let chunk = data
                         .get(at..offset)
                         .ok_or_else(|| self.error("overlapping data relocations"))?;
@@ -83,17 +69,19 @@ impl Lower<'_, '_> {
                         bytes(&mut value, chunk);
                         value.push_str(", ");
                     }
-                    if view.reference(RefId(rel.target)).kind == RefKind::Tls as u32 {
+                    if RefKind::from_word(view.reference(RefId(rel.target)).kind)
+                        == Some(RefKind::Tls)
+                    {
                         return Err(self.error("a data relocation to a Blaze thread-local index"));
                     }
                     layout.push_str("ptr");
                     format_into!(
                         &mut value,
                         "ptr getelementptr (i8, ptr {}, i64 {})",
-                        self.names[rel.target as usize],
+                        self.ref_name(RefId(rel.target))?,
                         rel.addend
                     );
-                    at = offset + (view.head.ptr_bits / 8) as usize;
+                    at = offset + if view.head.ptr_bits == 64 { 8 } else { 4 };
                 }
                 let tail =
                     data.get(at..).ok_or_else(|| self.error("out-of-bounds data relocation"))?;
@@ -115,13 +103,33 @@ impl Lower<'_, '_> {
     pub(super) fn memory(&mut self, i: usize, op: Op) -> Result<(), LowerError> {
         let view = self.view;
         let mut o = view.operands(i);
-        let ty = Ty(view.tys[i]);
+        let ty = self.result_type(i)?;
         let t = LlType(view, ty);
         let flags = view.flags(i);
         let volatile = if flags.contains(Flags::VOLATILE) { " volatile" } else { "" };
-        let align = 1u64
-            .checked_shl(view.mem_attrs(i).map_or(0, |a| u32::from(a.align)))
-            .ok_or_else(|| self.error("memory alignment exceeds LLVM limit"))?;
+        // A stronger LIR alignment guarantees LLVM's largest representable alignment.
+        let align = 1u64 << view.mem_attrs(i).map_or(0, |a| a.align.min(32));
+        let byte_atomic = |ty| {
+            if ty == Ty::I1 {
+                Err(LowerError {
+                    symbol: self.symbol,
+                    instruction: Some(i),
+                    reason: "an atomic of an i1 (memory holds whole bytes)",
+                })
+            } else {
+                Ok(())
+            }
+        };
+        let symbol = self.symbol;
+        let order = |value: Option<Ordering>| match value {
+            Some(Ordering::Relaxed) => Ok("monotonic"),
+            Some(other) => Ok(other.name()),
+            None => Err(LowerError {
+                symbol,
+                instruction: Some(i),
+                reason: "invalid LLVM atomic ordering",
+            }),
+        };
         let ir = &mut self.ir;
         match op {
             Op::SlotLive | Op::SlotDead => return Ok(()),
@@ -131,7 +139,11 @@ impl Lower<'_, '_> {
             Op::DataAddr | Op::FuncAddr => format_into!(
                 ir,
                 "  %v{i} = getelementptr i8, ptr {}, i32 0",
-                self.names[o.reference().index()]
+                self.names.get(o.reference().index()).ok_or(LowerError {
+                    symbol,
+                    instruction: Some(i),
+                    reason: "missing LLVM address reference"
+                })?
             ),
             Op::Load | Op::Store => {
                 let stored = (op == Op::Store).then(|| o.value());
@@ -164,7 +176,7 @@ impl Lower<'_, '_> {
                 );
                 let value =
                     |v: Value| (LlType(view, view.ty(v)), format_in!(self.alloc, "%v{}", v.0));
-                let flag = String::from_str_in(
+                let flag = AString::from_str_in(
                     if volatile.is_empty() { "false" } else { "true" },
                     self.alloc,
                 );
@@ -176,47 +188,57 @@ impl Lower<'_, '_> {
                 );
             }
             Op::Memcmp => {
+                self.implicit(Target { space: Space::Outside, symbol: Symbol::of_name("memcmp") });
                 let (a, b, len) = (o.value(), o.value(), o.value());
                 if view.ty(len).elem().bits(view.head.ptr_bits) != view.head.ptr_bits {
                     return Err(self.error("memcmp length differs from size_t"));
                 }
-                let name = String::from_str_in("memcmp", self.alloc);
+                let name = AString::from_str_in("memcmp", self.alloc);
                 let value =
                     |v: Value| (LlType(view, view.ty(v)), format_in!(self.alloc, "%v{}", v.0));
                 return self.intrinsic(i, name, t, &[value(a), value(b), value(len)]);
             }
-            Op::AtomicLoad => format_into!(
-                ir,
-                "  %v{i} = load atomic{volatile} {t}, ptr %v{} {}, align {align}",
-                o.value().0,
-                order(flags.ordering())
-            ),
+            Op::AtomicLoad => {
+                byte_atomic(ty)?;
+                format_into!(
+                    ir,
+                    "  %v{i} = load atomic{volatile} {t}, ptr %v{} {}, align {align}",
+                    o.value().0,
+                    order(flags.ordering())?
+                );
+            }
             Op::AtomicStore => {
                 let v = o.value();
+                byte_atomic(view.ty(v))?;
                 format_into!(
                     ir,
                     "  store atomic{volatile} {} %v{}, ptr %v{} {}, align {align}",
                     LlType(view, view.ty(v)),
                     v.0,
                     o.value().0,
-                    order(flags.ordering())
+                    order(flags.ordering())?
                 );
             }
             Op::AtomicRmw => {
                 let op = o.rmw();
                 let ptr = o.value();
                 let val = o.value();
+                byte_atomic(ty)?;
+                if ty == Ty::PTR && op != blaze_lir::AtomicRmw::Xchg {
+                    return Err(self.error("a pointer atomicrmw other than exchange"));
+                }
                 format_into!(
                     ir,
                     "  %v{i} = atomicrmw{volatile} {} ptr %v{}, {t} %v{} {}, align {align}",
                     op.name(),
                     ptr.0,
                     val.0,
-                    order(flags.ordering())
+                    order(flags.ordering())?
                 );
             }
             Op::Cmpxchg => {
                 let (ptr, expected, new) = (o.value(), o.value(), o.value());
+                byte_atomic(view.ty(expected))?;
                 let ty = LlType(view, view.ty(expected));
                 let weak = if flags.contains(Flags::WEAK) { " weak" } else { "" };
                 format_into!(
@@ -225,8 +247,8 @@ impl Lower<'_, '_> {
                     ptr.0,
                     expected.0,
                     new.0,
-                    order(flags.ordering()),
-                    order(flags.failure())
+                    order(flags.ordering())?,
+                    order(flags.failure())?
                 );
             }
             Op::Fence => {
@@ -235,7 +257,7 @@ impl Lower<'_, '_> {
                 } else {
                     ""
                 };
-                format_into!(ir, "  fence{scope} {}", order(flags.ordering()));
+                format_into!(ir, "  fence{scope} {}", order(flags.ordering())?);
             }
             _ => return Err(self.error(op.name())),
         }

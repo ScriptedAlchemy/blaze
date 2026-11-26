@@ -31,6 +31,8 @@ pub trait Clock {
     fn sleep(&self, d: u32) -> impl Sized + use<Self>;
     fn keep(&self, d: u32) -> impl Sized + 'static;
     fn hold(&self, d: u32) -> impl Sized;
+    fn default_sleep(&self, d: u32) -> impl Sized + use<Self> { d }
+    fn default_hold(&self, d: u32) -> impl Sized { d }
 }
 pub struct Ctx { n: u32 }
 impl Ctx {
@@ -47,6 +49,8 @@ fn uses_sleep(mut c: Ctx) { let f = c.sleep(1); c.bump(); drop(f); }
 fn uses_keep(mut c: Ctx) { let f = c.keep(1); c.bump(); drop(f); }
 // TWIN: the opaque holds `c`'s borrow while `c.bump()` borrows it mutably (rustc: E0502).
 fn uses_hold(mut c: Ctx) { let f = c.hold(1); c.bump(); drop(f); }
+fn uses_default_sleep(mut c: Ctx) { let f = c.default_sleep(1); c.bump(); drop(f); }
+fn uses_default_hold(mut c: Ctx) { let f = c.default_hold(1); c.bump(); drop(f); }
 // `+ '_` (here `&self`'s lifetime): the opaque captures `y`'s lifetime too (Rust 2024), but
 // only the bound's region is live, so `y` may change while `f` lives.
 fn uses_tag(c: Ctx, mut y: u32) { let f = c.tag(&y); y += 1; drop(f); drop(y); }
@@ -74,18 +78,20 @@ fn a_callers_borrows_follow_the_opaques_captures() {
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("body checker");
     let key_of = |name: &str| names.items(0).find_map(|(key, _, _)| (names.item_text(key)?.name == Some(name)).then_some(key)).expect(name);
-    for name in ["uses_sleep", "uses_keep"] {
+    for name in ["uses_sleep", "uses_keep", "uses_default_sleep"] {
         let (types, v) = world.check_borrows(BodyRef::Free(key_of(name)), alloc);
         assert!(types.is_clean(), "`{name}`'s types: {types:?}");
         assert!(v.refused.is_none(), "ORACLE: `{name}`'s borrows are checked (the callee's head regions are laid): {v:?}");
         assert!(v.findings.is_empty(), "ORACLE: `{name}` has no borrow finding (rustc accepts it): {v:?}");
         println!("{name}: borrows clean");
     }
-    let (types, v) = world.check_borrows(BodyRef::Free(key_of("uses_hold")), alloc);
-    assert!(types.is_clean(), "`uses_hold`'s types: {types:?}");
-    assert!(v.refused.is_none(), "TWIN: `uses_hold`'s borrows are checked: {v:?}");
-    assert!(v.findings.iter().any(|d| d.code == "E0502"), "TWIN: `uses_hold` must be E0502 (`f` keeps `c` borrowed across `c.bump()`): {v:?}");
-    println!("uses_hold: E0502");
+    for name in ["uses_hold", "uses_default_hold"] {
+        let (types, v) = world.check_borrows(BodyRef::Free(key_of(name)), alloc);
+        assert!(types.is_clean(), "`{name}`'s types: {types:?}");
+        assert!(v.refused.is_none(), "TWIN: `{name}`'s borrows are checked: {v:?}");
+        assert!(v.findings.iter().any(|d| d.code == "E0502"), "TWIN: `{name}` must be E0502 (`f` keeps `c` borrowed across `c.bump()`): {v:?}");
+        println!("{name}: E0502");
+    }
 }
 
 /// `+ 'a` on an opaque (here `+ '_`, `&self`'s): only `'a` is kept live by the result

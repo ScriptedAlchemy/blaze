@@ -37,7 +37,7 @@ fn encoding(name: &[u8]) -> Option<Encoding> {
 }
 
 /// The word of the target intrinsic named `name` with immediate `imm`.
-fn word(name: &[u8], imm: u64) -> Result<u32, &'static str> {
+pub(crate) fn word(name: &[u8], imm: u64) -> Result<u32, &'static str> {
     let Some(e) = encoding(name) else { return Err("a target intrinsic blaze has no encoding for") };
     if imm > e.most {
         return Err("a target intrinsic's immediate past its field (4 bits for `isb`, `dmb`, `dsb`; 7 for `hint`)");

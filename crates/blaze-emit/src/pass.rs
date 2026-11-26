@@ -30,7 +30,7 @@ mod reach;
 mod runtime;
 pub(crate) mod sites;
 pub(crate) mod stack;
-mod target;
+pub(crate) mod target;
 /// The indexed thread-local access; its offsets are the Fast tier's template's too.
 pub(crate) mod tls_index;
 pub(crate) mod unwind;

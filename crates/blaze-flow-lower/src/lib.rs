@@ -232,6 +232,19 @@ pub struct OwnerTraitImpl {
     pub self_shape: SelfShape,
 }
 
+/// Metadata for a trait fn's RPITIT opaque (`-> impl Trait` or `async fn` in a trait, RFC 3425):
+/// maps the opaque back to its trait, synthetic associated type name, trait fn, method name,
+/// trait generic count (including `Self`), and optional default `Twin` opaque key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpititOpaque {
+    pub trait_: ItemKey,
+    pub name: Name,
+    pub trait_fn: ItemKey,
+    pub fn_name: Name,
+    pub trait_types: u32,
+    pub default_twin: Option<ItemKey>,
+}
+
 /// What the lowering needs to know about a callee's signature (flow.md section 7, heads).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CalleeFacts {
@@ -406,6 +419,14 @@ pub trait Facts {
     }
     /// The `future_trait` lang item, when present.
     fn future_trait(&self) -> Option<ItemKey> {
+        None
+    }
+    /// The synthetic associated type and its declaring method for a trait return opaque.
+    fn rpitit_opaque(&self, _: ItemKey) -> Option<RpititOpaque> {
+        None
+    }
+    /// The method overriding `fn_name` in the selected trait implementation.
+    fn impl_fn(&self, _: ItemKey, _: Name) -> Option<ItemKey> {
         None
     }
     /// The trait bounds with lifetime arguments of fn `item` ([`Ties`]): a callee's tie its

@@ -5,7 +5,65 @@ pub(super) fn bits(words: &[u32]) -> u128 {
     words.iter().rev().fold(0u128, |value, &word| (value << 32) | u128::from(word))
 }
 
+fn suffix(ty: Ty) -> impl fmt::Display {
+    fmt::from_fn(move |f| {
+        match ty.form() {
+            Form::Vector => write!(f, "v{}", ty.lanes())?,
+            Form::Scalable => write!(f, "nxv{}", ty.lanes())?,
+            _ => {}
+        }
+        f.write_str(match ty.elem() {
+            blaze_lir::Scalar::Ptr => "p0",
+            elem => elem.name(),
+        })
+    })
+}
+
+fn constant(view: View<'_>, i: usize, width: u32) -> u128 {
+    let mut o = view.operands(i);
+    let value = match view.op(i) {
+        Op::Iconst if width > 32 => {
+            u128::from_ne_bytes(i128::from(i32::from_ne_bytes(o.imm().to_ne_bytes())).to_ne_bytes())
+        }
+        Op::Iconst | Op::Fconst => u128::from(o.imm()),
+        _ => bits(o.constant()),
+    };
+    value & (u128::MAX >> (128 - width))
+}
+
 impl<'a> Lower<'a, '_> {
+    fn system_intrinsic(&mut self, i: usize) -> Result<(), LowerError> {
+        let view = self.view;
+        let mut operands = view.operands(i);
+        let id = operands.intrinsic();
+        let name = view.intrinsic_name(id);
+        let values = operands.values();
+        let &[v] = values.0 else {
+            return Err(self.error("an ARM64 system intrinsic requires one immediate"));
+        };
+        let v = Value(v);
+        if view.ty(v) != Ty::I32
+            || view.op(v.index()) != Op::Iconst
+            || self.result_type(i)? != Ty::NONE
+        {
+            return Err(
+                self.error("an ARM64 system intrinsic requires a constant i32 and no result")
+            );
+        }
+        let imm = view.operands(v.index()).imm();
+        crate::pass::target::word(name, u64::from(imm)).map_err(|e| self.error(e))?;
+        let name =
+            core::str::from_utf8(name).map_err(|_| self.error("invalid ARM64 intrinsic name"))?;
+        // LLVM requires an immediate at the call itself. Keeping the value here also
+        // prevents the fold planner from parameterizing a hardware instruction field.
+        self.intrinsic(
+            i,
+            AString::from_str_in(name, self.alloc),
+            LlType(view, Ty::NONE),
+            &[(LlType(view, Ty::I32), format_in!(self.alloc, "{imm}"))],
+        )
+    }
+
     pub(super) fn intrinsic(
         &mut self,
         i: usize,
@@ -37,9 +95,15 @@ impl<'a> Lower<'a, '_> {
         let mut o = view.operands(i);
         let a = o.value();
         let ty = view.ty(a);
-        let ret = Ty(view.tys[i]);
-        if ty.form() != Form::Scalar {
-            return Err(self.error("vector overloaded LLVM intrinsic"));
+        let ret = self.result_type(i)?;
+        if op == Op::Bswap && ty.elem().bits(view.head.ptr_bits) < 16 {
+            format_into!(
+                &mut self.ir,
+                "  %v{i} = or {} %v{}, zeroinitializer\n",
+                LlType(view, ty),
+                a.0
+            );
+            return Ok(());
         }
         let name = match op {
             Op::Rotl => "fshl",
@@ -73,12 +137,12 @@ impl<'a> Lower<'a, '_> {
             _ => op.name(),
         };
         let name = if matches!(op, Op::FptoUi | Op::FptoSi) {
-            format_in!(self.alloc, "llvm.{name}.{}.{}", ret.elem().name(), ty.elem().name())
+            format_in!(self.alloc, "llvm.{name}.{}.{}", suffix(ret), suffix(ty))
         } else {
-            format_in!(self.alloc, "llvm.{name}.{}", ty.elem().name())
+            format_in!(self.alloc, "llvm.{name}.{}", suffix(ty))
         };
         let operand = |v: Value| (LlType(view, view.ty(v)), format_in!(self.alloc, "%v{}", v.0));
-        let mut args = Vec::with_capacity_in(3, self.alloc);
+        let mut args = AVec::with_capacity_in(3, self.alloc);
         args.push(operand(a));
         match op {
             Op::Rotl | Op::Rotr => {
@@ -86,7 +150,7 @@ impl<'a> Lower<'a, '_> {
                 args.push(operand(o.value()));
             }
             Op::Clz | Op::Ctz => {
-                args.push((LlType(view, Ty::I1), String::from_str_in("false", self.alloc)));
+                args.push((LlType(view, Ty::I1), AString::from_str_in("false", self.alloc)));
             }
             _ => {
                 for _ in op.info().layout.fields().iter().skip(1) {
@@ -101,26 +165,26 @@ impl<'a> Lower<'a, '_> {
         let view = self.view;
         let mut operands = view.operands(i);
         let (a, b) = (operands.value().0, operands.value().0);
-        let ty = Ty(view.tys[i]);
+        let ty = self.result_type(i)?;
         if ty.form() != Form::Scalar {
             return Err(self.error("vector division with trapping lanes"));
         }
         let width = ty.elem().bits(view.head.ptr_bits);
         let t = LlType(view, ty);
-        self.declaration(
-            String::from_str_in("@llvm.trap", self.alloc),
-            String::from_str_in("declare void @llvm.trap()", self.alloc),
-        )?;
         format_into!(
             &mut self.ir,
-            "  %zero{i} = icmp eq {t} %v{b}, 0\n  br i1 %zero{i}, label %divzero{i}, label %nonzero{i}\ndivzero{i}:\n  call void @llvm.trap(), !blaze.trap !{{i32 65280}}\n  unreachable\nnonzero{i}:\n"
+            "  %zero{i} = icmp eq {t} %v{b}, 0\n  br i1 %zero{i}, label %divzero{i}, label %nonzero{i}\ndivzero{i}:\n"
         );
+        self.trap(blaze_code::trap::DIV_ZERO)?;
+        format_into!(&mut self.ir, "nonzero{i}:\n");
         if op == Op::Sdiv {
             format_into!(
                 &mut self.ir,
-                "  %min{i} = icmp eq {t} %v{a}, {}\n  %neg{i} = icmp eq {t} %v{b}, -1\n  %over{i} = and i1 %min{i}, %neg{i}\n  br i1 %over{i}, label %divover{i}, label %divok{i}\ndivover{i}:\n  call void @llvm.trap(), !blaze.trap !{{i32 65281}}\n  unreachable\ndivok{i}:\n",
+                "  %min{i} = icmp eq {t} %v{a}, {}\n  %neg{i} = icmp eq {t} %v{b}, -1\n  %over{i} = and i1 %min{i}, %neg{i}\n  br i1 %over{i}, label %divover{i}, label %divok{i}\ndivover{i}:\n",
                 1u128 << (width - 1)
             );
+            self.trap(blaze_code::trap::DIV_OVERFLOW)?;
+            format_into!(&mut self.ir, "divok{i}:\n");
         }
         if op == Op::Srem {
             format_into!(
@@ -137,7 +201,7 @@ impl<'a> Lower<'a, '_> {
         let view = self.view;
         let op = view.op(i);
         let mut o = view.operands(i);
-        let ty = Ty(view.tys[i]);
+        let ty = self.result_type(i)?;
         let t = LlType(view, ty);
         let typed =
             |v: Value| fmt::from_fn(move |f| write!(f, "{} %v{}", LlType(view, view.ty(v)), v.0));
@@ -145,11 +209,7 @@ impl<'a> Lower<'a, '_> {
         match op {
             Op::Iconst | Op::IconstWide | Op::Fconst | Op::FconstWide => {
                 let width = ty.elem().bits(view.head.ptr_bits);
-                let value = match op {
-                    Op::Iconst if width > 32 => (o.imm() as i32 as i128) as u128,
-                    Op::Iconst | Op::Fconst => u128::from(o.imm()),
-                    _ => bits(o.constant()),
-                } & (u128::MAX >> (128 - width));
+                let value = constant(view, i, width);
                 if ty.elem().is_float() {
                     format_into!(out, "  %v{i} = bitcast i{width} ");
                 } else {
@@ -303,6 +363,21 @@ impl<'a> Lower<'a, '_> {
                 o.imm()
             ),
             Op::Assume => return Ok(()),
+            Op::TargetIntrinsic => return self.system_intrinsic(i),
+            Op::TlsAddr => return self.tls(i, o.reference()),
+            Op::FrameAddress | Op::ReturnAddress => {
+                let name = if op == Op::FrameAddress {
+                    "llvm.frameaddress.p0"
+                } else {
+                    "llvm.returnaddress"
+                };
+                return self.intrinsic(
+                    i,
+                    AString::from_str_in(name, self.alloc),
+                    t,
+                    &[(LlType(view, Ty::I32), AString::from_str_in("0", self.alloc))],
+                );
+            }
             Op::Call
             | Op::CallIndirect
             | Op::Invoke

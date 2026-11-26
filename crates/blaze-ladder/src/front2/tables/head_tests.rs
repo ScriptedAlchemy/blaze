@@ -624,6 +624,27 @@ fn the_two_sources_answer_alike() {
     std::println!("sources: {} cells alike; {reads} reads, `total` reads `Area`", cells.len());
 }
 
+/// A body reads an associated type's region clauses through the trait's head cell.
+#[test]
+fn a_frozen_trait_restores_its_associated_types_borrow_read() {
+    use crate::front2::borrow_reads::clauses_read;
+    let (names, sized, frame) = world();
+    let area = cells(names).into_iter().find(|w| matches!(w, Want::Members(k) if NamesSource::name_of(names, *k) == Some("Area"))).expect("Area's members");
+    let mut lowered = Store::new(sized, frame, a());
+    lowered.ensure(names, &mut Keys::new(), area).expect("lower Area");
+    let members = lowered.trait_defs.get(&checker_of(area.key())).expect("Area's members");
+    let unit = members.assoc.iter().find(|ty| ty.name == blaze_typeck::Name::of("Unit")).expect("Area::Unit").item;
+    assert!(lowered.regions.made(unit).is_some(), "Area::Unit must have a laid region row");
+    let expected = clauses_read(unit.0, &lowered.regions.reader(a()));
+
+    let restored = Store::new(sized, frame, a());
+    assert_ne!(clauses_read(unit.0, &restored.regions.reader(a())), expected, "an absent associated-type row gave the lowered answer");
+    let cell = freeze(names, sized, crate::front2::receiver::Pointers::NOT_LOOKED_UP, area, frame, a(), a()).expect("freeze Area");
+    let frozen = FrozenHead::read(&cell.bytes).expect("read Area");
+    super::head::file_frozen(names, area, frozen, &restored, &Keys::new(), a()).expect("restore Area");
+    assert_eq!(clauses_read(unit.0, &restored.regions.reader(a())), expected, "Area::Unit's stored clauses changed its borrow read");
+}
+
 /// A body's store filed from frozen heads alone (`seed` with no own cell, as a body's world
 /// would build it): no lowering, and each cell exports the bytes a lowering store does.
 /// Expected line: `filed: N cells from frozen heads, 0 lowered, bytes equal`.

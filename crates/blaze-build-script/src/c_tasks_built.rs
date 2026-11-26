@@ -11,8 +11,8 @@
 //!   left in `OUT_DIR`, and each dependency's `links` values it was given);
 //! - the toolchain ([`Toolchain`]: the strategy, the compiler's digest, the SDK's identity, the
 //!   target);
-//! - the package's files, by the sources store's key and the BLAKE3 of the files' listing
-//!   ([`Pinned`]): a registry `.crate` the lock's checksum pins, or a git commit;
+//! - the package's source and its files ([`Pinned`]): the sources store's key and file listing
+//!   for a registry or Git pack, or the checkout's checked package-files snapshot;
 //! - the archives asked for (the demand), in order.
 //!
 //! - each `links` dependency's tree the requests name ([`crate::c_tasks::dep_roots`]), by its
@@ -22,8 +22,9 @@
 //!   spellings, so a producer bumped under equal text is another built record (rule 21), and one
 //!   whose C reran to equal files is the same one.
 //!
-//! A crate whose files can change (a workspace member, a path dependency) has no pinned key and
-//! no built record: its objects are found through their path sets, against today's files.
+//! For a checkout package, a changed file selects a new snapshot. An object whose source,
+//! compiler arguments, headers and searched directory listings still match its recorded path
+//! set can be reused across snapshots.
 //!
 //! Nothing here reads a clock, a path of the host or the environment (rule 75).
 
@@ -34,8 +35,7 @@ use blaze_own::AVec;
 
 use crate::c_tasks::{FORM, Toolchain};
 
-/// A package whose files cannot change while these are the same: the sources store's key and
-/// the BLAKE3 of its files' listing (blaze-fetch tree.rs: every file by its BLAKE3).
+/// The identity of an immutable package and the digest of the files the C compiler can read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Pinned {
     pub source: [u8; 32],

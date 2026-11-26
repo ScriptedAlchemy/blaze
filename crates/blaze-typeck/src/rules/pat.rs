@@ -17,9 +17,8 @@
 //! pattern's type needs no result of theirs.
 //!
 //! Omitted for now: recording the peeled references (`pat_adjustments`, which MIR building
-//! reads), `box` and deref patterns, the
-//! or-pattern check that every alternative binds a name at one type, and the 2024 rule's exact
-//! diagnostic split (one code here).
+//! reads), `box` and deref patterns, checking that every alternative binds the exact same set of
+//! names (E0408), and the 2024 rule's exact diagnostic split (one code here).
 
 use blaze_own::{Alloc, Vec};
 
@@ -43,7 +42,15 @@ fn peeled_mode(mode: u32, m: Mutbl) -> u32 {
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// One pattern. `f.expect` holds the expected type, `f.a` the default binding mode.
     pub(crate) fn step_pat(&mut self, f: Frame, p: PatId) -> Result<(), Stop> {
+        if f.state == 1 {
+            return self.unify_or_bindings(p);
+        }
         let pat = self.body.pat(p)?;
+        if let Pat::Or { alts } = pat
+            && self.body.pat_list(alts)?.len() >= 2
+        {
+            self.resume(f, 1)?;
+        }
         let mut expected = f.expect.to_option().unwrap_or(self.common.err);
         let mut mode = f.a;
         // A path pattern's type is known before it meets the expected type, and a constant of
@@ -489,6 +496,60 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         Ok(false)
+    }
+
+    /// Unifies the binding types of every alternative of `Pat::Or` `p` against the first
+    /// alternative's bindings of the same name (rustc E0308 / inference across `(Err(e), _) |
+    /// (_, Err(e))`). Iterative worklist, bounded by `self.body.pats.len()`.
+    fn unify_or_bindings(&mut self, p: PatId) -> Result<(), Stop> {
+        let Pat::Or { alts } = self.body.pat(p)? else {
+            return Ok(());
+        };
+        let alternatives = self.body.pat_list(alts)?;
+        if alternatives.len() < 2 {
+            return Ok(());
+        }
+        let mut bindings = blaze_hash::HashMap::new_in(self.alloc);
+        let mut work = Vec::new_in(self.alloc);
+        let mut remaining = self.body.pats.len();
+        for (index, &alt) in alternatives.iter().enumerate() {
+            work.push(alt);
+            while let Some(cur) = work.pop() {
+                remaining = remaining.checked_sub(1).ok_or(crate::error::CheckError::Limit(crate::error::Limit::Steps))?;
+                if let Pat::Bind { name, .. } = self.body.pat(cur)? {
+                    let &ty = self.local_ty.get(cur.ix()).ok_or(crate::error::CheckError::Malformed(crate::error::Malformed::Pat(cur)))?;
+                    if index == 0 {
+                        bindings.entry(name).or_insert(ty);
+                    } else if let Some(&expected) = bindings.get(&name) {
+                        self.demand_eq(At::Pat(cur), expected, ty)?;
+                    }
+                }
+                self.pat_children(cur, &mut work)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The direct sub-patterns of `p` into `pats`.
+    pub(super) fn pat_children(&self, p: PatId, pats: &mut Vec<PatId, Alloc<'a>>) -> Result<(), Stop> {
+        let b = self.body;
+        match b.pat(p)? {
+            Pat::Missing | Pat::Wild | Pat::Bind { sub: None, .. } | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) => {}
+            Pat::Bind { sub: Some(s), .. } | Pat::Ref { inner: s, .. } => pats.push(s),
+            Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Or { alts: elems } | Pat::Slice { elems, .. } => {
+                pats.extend_from_slice(b.pat_list(elems)?);
+            }
+            Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                for fp in b.field_pat_list(fields)? {
+                    pats.push(fp.pat);
+                }
+            }
+            Pat::Range { lo, hi, .. } => {
+                pats.extend(lo);
+                pats.extend(hi);
+            }
+        }
+        Ok(())
     }
 
     /// Pushes `pats` against the element types `tys`, `..` at `rest` skipping the middle

@@ -1711,6 +1711,8 @@ dependencies = [
  "edition",
  "libc",
  "tracing",
+ "wasm-encoder",
+ "wasmparser",
  "wasmtime",
 ]
 

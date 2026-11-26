@@ -135,13 +135,18 @@ pub struct Grant {
 /// output can identify its kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Emission {
+    /// The key of the value emitted while the worker held its grant.
     pub key: Digest,
+    /// The compiler backend that produced this value, when it was a code output.
     pub backend: Option<BackendKind>,
 }
 
+/// The compiler operation that produced a distributed code output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendKind {
+    /// Optimized machine code for a release compilation.
     ReleaseBlob,
+    /// Code produced by folding related functions.
     FoldedOutput,
 }
 

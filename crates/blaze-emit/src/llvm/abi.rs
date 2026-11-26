@@ -61,28 +61,84 @@ fn extension(param: &ParamRec) -> &'static str {
 pub(super) enum Args<'v> {
     Definition,
     Declaration,
-    Call(Values<'v>),
+    Call { values: Values<'v>, instruction: usize },
+}
+
+pub(super) enum AbiError {
+    CallingConvention,
+    PointeeLayout,
+    ReturnAttributes,
+}
+
+impl AbiError {
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            Self::CallingConvention => "LLVM cannot express the LIR calling convention",
+            Self::PointeeLayout => "an indirect ABI parameter has no pointee layout",
+            Self::ReturnAttributes => {
+                "unsupported attributes on a multi-register or indirect return"
+            }
+        }
+    }
 }
 
 impl<'v> Signature<'v> {
-    pub(super) fn new(view: View<'v>, id: SigId) -> Result<Self, &'static str> {
+    /// LLVM's ordinary musttail convention requires congruent prototypes and ABI
+    /// attributes. LIR only requires the tail callee's result types to match.
+    pub(super) fn tail_compatible(self, caller: Self) -> bool {
+        let fields = |p: &ParamRec| {
+            let indirect = self
+                .view
+                .facts(p)
+                .filter(|_| ParamKind::from_byte(p.kind) != Some(ParamKind::Value))
+                .map(|f| (f.size, f.align));
+            (p.ty, p.kind, p.ext, indirect)
+        };
+        self.conv == caller.conv
+            && self.row.bits == caller.row.bits
+            && self.row.params.iter().map(fields).eq(caller.row.params.iter().map(fields))
+            && self.row.rets.iter().map(fields).eq(caller.row.rets.iter().map(fields))
+    }
+
+    fn caller_copy(&self, p: &ParamRec) -> bool {
+        // The current native LIR builder classifies AAPCS64 C aggregates over
+        // 16 bytes as the address of a private caller copy (blaze-build/abi.rs).
+        // LLVM's byval on arm64 instead passes the bytes on the argument stack.
+        matches!(Conv::from_byte(self.row.conv), Some(Conv::C | Conv::Aapcs))
+            && ParamKind::from_byte(p.kind) == Some(ParamKind::Byval)
+    }
+
+    fn copies(self) -> impl Iterator<Item = (usize, u32, u64)> + 'v {
+        self.row.params.iter().enumerate().filter_map(move |(k, p)| {
+            if !self.caller_copy(p) {
+                return None;
+            }
+            let facts = self.view.facts(p)?;
+            Some((k, facts.size, 1u64 << facts.align))
+        })
+    }
+
+    pub(super) fn new(view: View<'v>, id: SigId) -> Result<Self, AbiError> {
         let row = view.sig(id);
         let conv = match Conv::from_byte(row.conv) {
             Some(Conv::C | Conv::Wasm | Conv::Aapcs) => "",
             Some(Conv::Win64) => "win64cc ",
             Some(Conv::SysV64) => "x86_64_sysvcc ",
             Some(Conv::PreserveMost) => "preserve_mostcc ",
-            _ => return Err("LLVM cannot express the LIR calling convention"),
+            _ => return Err(AbiError::CallingConvention),
         };
         for param in row.params {
-            if param.kind != ParamKind::Value as u8 && view.facts(param).is_none() {
-                return Err("an indirect ABI parameter has no pointee layout");
+            if ParamKind::from_byte(param.kind) != Some(ParamKind::Value)
+                && view.facts(param).is_none_or(|facts| facts.align > 32)
+            {
+                return Err(AbiError::PointeeLayout);
             }
         }
-        if row.rets.iter().any(|p| p.kind != ParamKind::Value as u8)
-            || (row.rets.len() > 1 && row.rets.iter().any(|p| p.ext != Ext::None as u8))
+        if row.rets.iter().any(|p| ParamKind::from_byte(p.kind) != Some(ParamKind::Value))
+            || (row.rets.len() > 1
+                && row.rets.iter().any(|p| Ext::from_byte(p.ext) != Some(Ext::None)))
         {
-            return Err("unsupported attributes on a multi-register or indirect return");
+            return Err(AbiError::ReturnAttributes);
         }
         Ok(Self { view, row, conv })
     }
@@ -137,21 +193,21 @@ impl<'v> Signature<'v> {
                 && let Some(kind @ (ParamKind::Sret | ParamKind::Byval)) =
                     ParamKind::from_byte(p.kind)
             {
-                format_into!(
-                    out,
-                    " {}([{} x i8]) align {}",
-                    kind.name(),
-                    facts.size,
-                    1u64 << facts.align
-                );
+                if !self.caller_copy(p) {
+                    format_into!(out, " {}([{} x i8])", kind.name(), facts.size);
+                }
+                format_into!(out, " align {}", 1u64 << facts.align);
             }
             match args {
                 Args::Definition => format_into!(out, " %v{i}"),
-                Args::Call(v) => format_into!(out, " %v{}", v.get(i).0),
+                Args::Call { instruction, .. } if self.caller_copy(p) => {
+                    format_into!(out, " %copy{instruction}_{i}")
+                }
+                Args::Call { values, .. } => format_into!(out, " %v{}", values.get(i).0),
                 Args::Declaration => {}
             }
         }
-        if let Args::Call(values) = args {
+        if let Args::Call { values, .. } = args {
             for (i, v) in values.iter().enumerate().skip(self.row.params.len()) {
                 if i != 0 {
                     out.push_str(", ");
@@ -165,6 +221,68 @@ impl<'v> Signature<'v> {
             out.push_str("...");
         }
         out.push(')');
+    }
+}
+
+impl Lower<'_, '_> {
+    /// Reserve call-site copies in the entry block, including for calls inside loops.
+    pub(super) fn copy_slots(&mut self) -> Result<(), LowerError> {
+        let view = self.view;
+        if !view.sig_params.iter().any(|p| ParamKind::from_byte(p.kind) == Some(ParamKind::Byval)) {
+            return Ok(());
+        }
+        for i in 0..view.len() {
+            let mut o = view.operands(i);
+            match view.op(i) {
+                Op::Call | Op::Invoke | Op::TailCall => {
+                    o.reference();
+                }
+                Op::CallIndirect | Op::InvokeIndirect | Op::TailCallIndirect => {
+                    o.value();
+                }
+                _ => continue,
+            }
+            let sig = Signature::new(view, o.sig()).map_err(|e| LowerError {
+                symbol: self.symbol,
+                instruction: Some(i),
+                reason: e.reason(),
+            })?;
+            for (k, size, align) in sig.copies() {
+                format_into!(
+                    &mut self.ir,
+                    "  %copy{i}_{k} = alloca [{size} x i8], align {align}\n"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn copy_arguments(
+        &mut self,
+        sig: Signature<'_>,
+        values: Values<'_>,
+        i: usize,
+        tail: bool,
+    ) -> Result<(), LowerError> {
+        for (k, size, align) in sig.copies() {
+            if tail {
+                return Err(self.error("musttail with a caller-owned aggregate copy"));
+            }
+            let v = values.get(k);
+            format_into!(
+                &mut self.ir,
+                "  call void @llvm.memcpy.p0.p0.i32(ptr align {align} %copy{i}_{k}, ptr %v{}, i32 {size}, i1 false)\n",
+                v.0
+            );
+            self.declaration(
+                AString::from_str_in("@llvm.memcpy.p0.p0.i32", self.alloc),
+                AString::from_str_in(
+                    "declare void @llvm.memcpy.p0.p0.i32(ptr, ptr, i32, i1)",
+                    self.alloc,
+                ),
+            )?;
+        }
+        Ok(())
     }
 }
 

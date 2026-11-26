@@ -675,25 +675,4 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(())
     }
 
-    /// The direct sub-patterns of `p` into `pats`.
-    fn pat_children(&self, p: PatId, pats: &mut Vec<PatId, Alloc<'a>>) -> Result<(), Stop> {
-        let b = self.body;
-        match b.pat(p)? {
-            Pat::Missing | Pat::Wild | Pat::Bind { sub: None, .. } | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) => {}
-            Pat::Bind { sub: Some(s), .. } | Pat::Ref { inner: s, .. } => pats.push(s),
-            Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Or { alts: elems } | Pat::Slice { elems, .. } => {
-                pats.extend_from_slice(b.pat_list(elems)?);
-            }
-            Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
-                for fp in b.field_pat_list(fields)? {
-                    pats.push(fp.pat);
-                }
-            }
-            Pat::Range { lo, hi, .. } => {
-                pats.extend(lo);
-                pats.extend(hi);
-            }
-        }
-        Ok(())
-    }
 }

@@ -265,6 +265,12 @@ impl Facts for NestedFacts<'_, '_> {
     fn future_trait(&self) -> Option<tc::ItemKey> {
         self.facts.future_trait()
     }
+    fn rpitit_opaque(&self, opaque: tc::ItemKey) -> Option<blaze_flow_lower::RpititOpaque> {
+        self.facts.rpitit_opaque(opaque)
+    }
+    fn impl_fn(&self, imp: tc::ItemKey, fn_name: tc::Name) -> Option<tc::ItemKey> {
+        self.facts.impl_fn(imp, fn_name)
+    }
     // Every fact the body's facts answer, forwarded (a nested flow asks what the owner's does).
     fn ties(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Ties<'_>> {
         self.facts.ties(item)

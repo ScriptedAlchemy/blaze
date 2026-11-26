@@ -7,7 +7,7 @@ use blaze_lir::{
     Block, Op, Ty, Value, Verified, View,
     func::{RefId, RefKind, SigId},
 };
-use blaze_own::{AString, AVec, Alloc, BTreeMap, String, Vec, format_in, format_into};
+use blaze_own::{AString, AVec, Alloc, BTreeMap, format_in, format_into};
 use core::{fmt, ops::Range};
 
 mod abi;
@@ -16,6 +16,7 @@ mod instruction;
 mod memory;
 #[cfg(test)]
 mod tests;
+mod tls;
 use abi::{LlType, Signature};
 
 /// The byte range is the LLVM operand of the constant-producing instruction. Float
@@ -33,6 +34,8 @@ pub struct LlvmModule<'a> {
     pub definition_name: Range<usize>,
     /// One entry per LIR ref, including local data, whose identity is inside this module.
     pub references: AVec<'a, Option<Target>>,
+    /// Additional targets introduced by lowering, in first-use order (indexed TLS and libc).
+    pub implicit_references: AVec<'a, Target>,
     /// Rust direct callees in first-use order, excluding recursive calls.
     pub calls: AVec<'a, Symbol>,
     pub literals: AVec<'a, Literal>,
@@ -85,6 +88,8 @@ struct Lower<'a, 'v> {
     symbol: Symbol,
     ir: AString<'a>,
     references: AVec<'a, Option<Target>>,
+    implicit_references: AVec<'a, Target>,
+    resolver: &'v dyn Names,
     names: AVec<'a, AString<'a>>,
     calls: AVec<'a, Symbol>,
     literals: AVec<'a, Literal>,
@@ -94,6 +99,47 @@ struct Lower<'a, 'v> {
 }
 
 impl<'a> Lower<'a, '_> {
+    fn implicit(&mut self, target: Target) {
+        if !self.implicit_references.contains(&target) {
+            self.implicit_references.push(target);
+        }
+    }
+
+    fn link(&self, outside: Outside, space: Space) -> Result<(Target, AString<'a>), LowerError> {
+        match self.resolver.name(outside) {
+            Some(Named::Symbol(symbol)) => {
+                let target = Target { space, symbol };
+                Ok((target, format_in!(self.alloc, "@{}", LinkName(target))))
+            }
+            Some(Named::C(name)) => {
+                if name.is_empty() || name.as_bytes().contains(&0) {
+                    return Err(self.error("empty or NUL-containing C link name"));
+                }
+                if !matches!(space, Space::Func | Space::Static) {
+                    return Err(self.error("a C name for a vtable or thread-local"));
+                }
+                Ok((
+                    Target { space: Space::Outside, symbol: Symbol::of_name(name) },
+                    external(name, self.alloc),
+                ))
+            }
+            None => Err(self.error("unresolved outside reference in verified LIR")),
+        }
+    }
+    fn result_type(&self, i: usize) -> Result<Ty, LowerError> {
+        self.view
+            .tys
+            .get(i)
+            .copied()
+            .map(Ty)
+            .ok_or_else(|| self.error("instruction missing its LIR type"))
+    }
+    fn ref_name(&self, id: RefId) -> Result<&str, LowerError> {
+        self.names
+            .get(id.index())
+            .map(AString::as_str)
+            .ok_or_else(|| self.error("missing LLVM link name"))
+    }
     fn error(&self, reason: &'static str) -> LowerError {
         LowerError { symbol: self.symbol, instruction: self.at, reason }
     }
@@ -124,11 +170,13 @@ pub fn prepare<'a>(
         alloc,
         symbol,
         view,
-        ir: String::new_in(alloc),
-        names: Vec::new_in(alloc),
-        references: Vec::new_in(alloc),
-        calls: Vec::new_in(alloc),
-        literals: Vec::new_in(alloc),
+        ir: AString::new_in(alloc),
+        names: AVec::new_in(alloc),
+        references: AVec::new_in(alloc),
+        implicit_references: AVec::new_in(alloc),
+        resolver: names,
+        calls: AVec::new_in(alloc),
+        literals: AVec::new_in(alloc),
         declarations: BTreeMap::new_in(alloc),
         edges: control::Edges::new(view, alloc),
         at: None,
@@ -146,26 +194,11 @@ pub fn prepare<'a>(
             }
             None => return Err(lower.error("unknown LIR reference kind")),
         };
-        let (target, name) = match names.name(outside) {
-            Some(Named::Symbol(symbol)) => {
-                let target = Target { space, symbol };
-                (target, format_in!(alloc, "@{}", LinkName(target)))
-            }
-            Some(Named::C(name)) => {
-                if name.is_empty() || name.as_bytes().contains(&0) {
-                    return Err(lower.error("empty or NUL-containing C link name"));
-                }
-                let mut quoted = String::from_str_in("@\"", alloc);
-                escape(&mut quoted, name.as_bytes());
-                quoted.push('"');
-                (Target { space: Space::Outside, symbol: Symbol::of_name(name) }, quoted)
-            }
-            None => return Err(lower.error("unresolved outside reference in verified LIR")),
-        };
+        let (target, name) = lower.link(outside, space)?;
         lower.references.push(Some(target));
         lower.names.push(name);
     }
-    let own = Signature::new(view, SigId(view.head.sig)).map_err(|e| lower.error(e))?;
+    let own = Signature::new(view, SigId(view.head.sig)).map_err(|e| lower.error(e.reason()))?;
     let llvm_name = format_in!(alloc, "@{}", LinkName(Target { space: Space::Func, symbol }));
     format_into!(&mut lower.ir, "define {} ", own.prefix());
     let start = lower.ir.len();
@@ -179,19 +212,25 @@ pub fn prepare<'a>(
         lower.ir.push('"');
     }
     lower.ir.push_str(" uwtable");
-    if (0..view.blocks()).any(|b| view.block_kind(Block(b as u32)).is_landing()) {
+    if view
+        .block_kinds
+        .iter()
+        .filter_map(|&k| blaze_lir::BlockKind::from_byte(k))
+        .any(|k| k.is_landing())
+    {
         lower.ir.push_str(" personality ptr @rust_eh_personality");
         lower.declaration(
-            String::from_str_in("@rust_eh_personality", alloc),
-            String::from_str_in("declare i32 @rust_eh_personality(...)", alloc),
+            AString::from_str_in("@rust_eh_personality", alloc),
+            AString::from_str_in("declare i32 @rust_eh_personality(...)", alloc),
         )?;
     }
     lower.ir.push_str(" {\n");
-    for b in 0..view.blocks() {
-        let block = Block(b as u32);
+    for (b, _) in (0u32..).zip(view.block_starts) {
+        let block = Block(b);
         format_into!(&mut lower.ir, "b{b}:\n");
         lower.block_params(block)?;
         if b == 0 {
+            lower.copy_slots()?;
             for (i, slot) in view.slots.iter().enumerate() {
                 let align = 1u64
                     .checked_shl(slot.align.into())
@@ -216,10 +255,10 @@ pub fn prepare<'a>(
         lower.ir.push_str(decl);
         lower.ir.push('\n');
     }
-    let mut positions = Vec::with_capacity_in(view.data_positions.len(), alloc);
-    for k in 0..view.datas.len() {
-        for &p in view.data_positions_of(blaze_lir::func::DataId(k as u32)) {
-            positions.push((k as u32, p));
+    let mut positions = AVec::with_capacity_in(view.data_positions.len(), alloc);
+    for (k, _) in (0u32..).zip(view.datas) {
+        for &p in view.data_positions_of(blaze_lir::func::DataId(k)) {
+            positions.push((k, p));
         }
     }
     Ok(LlvmModule {
@@ -227,6 +266,7 @@ pub fn prepare<'a>(
         ir: lower.ir.into_bytes(),
         definition_name,
         references: lower.references,
+        implicit_references: lower.implicit_references,
         positions,
         calls: lower.calls,
         literals: lower.literals,
@@ -241,4 +281,17 @@ fn escape(out: &mut AString<'_>, bytes: &[u8]) {
             _ => format_into!(out, "\\{byte:02X}"),
         }
     }
+}
+
+fn external<'a>(name: &str, alloc: Alloc<'a>) -> AString<'a> {
+    // Use a single spelling for libc names also emitted by LIR operations such as memcmp.
+    if name.bytes().next().is_some_and(|b| !b.is_ascii_digit())
+        && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"-.$_".contains(&c))
+    {
+        return format_in!(alloc, "@{name}");
+    }
+    let mut quoted = AString::from_str_in("@\"", alloc);
+    escape(&mut quoted, name.as_bytes());
+    quoted.push('"');
+    quoted
 }
