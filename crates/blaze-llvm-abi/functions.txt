@@ -14,6 +14,7 @@ LLVMInitializeAArch64Target
 LLVMInitializeAArch64TargetInfo
 LLVMInitializeAArch64TargetMC
 LLVMInitializeAArch64AsmPrinter
+LLVMInitializeAArch64AsmParser
 LLVMCreateTargetMachine
 LLVMDisposeTargetMachine
 LLVMGetTargetFromTriple
@@ -23,6 +24,7 @@ LLVMCreateTargetDataLayout
 LLVMCopyStringRepOfTargetData
 LLVMSetDataLayout
 LLVMDisposeTargetData
+LLVMBlazeInitializeAArch64
 LLVMBlazeCreatePasses
 LLVMBlazeDisposePasses
 LLVMBlazeRequireDwarfUnwind

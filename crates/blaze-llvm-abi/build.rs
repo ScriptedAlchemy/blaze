@@ -67,11 +67,13 @@ fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("cargo manifest"));
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("cargo output"));
     let wrapper = root.join("../../vendor/llvm-sys/wrappers/passes.cpp");
+    let target_wrapper = root.join("target.cpp");
     for file in [
         root.join("abi.h"),
         root.join("abi-checks.cpp"),
         root.join("src/lib.rs"),
         wrapper.clone(),
+        target_wrapper.clone(),
         root.join("../../vendor/llvm-sys/pin.rs"),
     ] {
         println!("cargo::rerun-if-changed={}", file.display());
@@ -81,12 +83,14 @@ fn main() {
     let ar = tool("AR", "ar", &host, &target);
     let flags = query(&["--cxxflags"]);
     let flags: Vec<_> = flags.split_whitespace().collect();
-    // Include the owned declarations before the existing implementation, so a wrapper ABI
-    // change fails compilation. abi-checks.cpp also holds every selected header signature.
+    // Compile both wrappers with the owned declarations and checks for all selected signatures.
     let unit = out.join("passes.cpp");
     fs::write(
         &unit,
-        format!("#include {:?}\n#include {:?}\n", root.join("abi-checks.cpp"), wrapper),
+        format!(
+            "#include {:?}\n#include {target_wrapper:?}\n#include {wrapper:?}\n",
+            root.join("abi-checks.cpp"),
+        ),
     )
     .expect("write wrapper translation unit");
     let object = out.join("passes.o");

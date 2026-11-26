@@ -175,7 +175,11 @@ fn terminate_landing_uses_exception_filter_and_preserves_the_trap_code() {
 }
 
 #[test]
-fn indexed_tls_preserves_zero_and_resolves_its_runtime_targets() {
+fn release_record_indexed_tls_preserves_zero_and_assembles_the_register_read() {
+    use super::emit::{ReleaseTask, emit_release};
+    use blaze_code::record::CodeView;
+    use blaze_tier::{Arch, Machine, Os};
+
     struct Indexed;
     impl Names for Indexed {
         fn name(&self, outside: Outside) -> Option<Named<'_>> {
@@ -219,6 +223,19 @@ fn indexed_tls_preserves_zero_and_resolves_its_runtime_targets() {
     assert!(ir.contains("icmp ult i64 %tlsindex0, %tlsn0"));
     assert!(ir.contains("getelementptr i8, ptr %tlstable0, i32 32"));
     println!("BEGIN BLAZE LLVM TLS\n{ir}END BLAZE LLVM TLS");
+
+    for os in [Os::Linux, Os::MacOs] {
+        let machine = Machine { arch: Arch::Arm64, os, features: 0 };
+        let made = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine }, alloc)
+            .unwrap_or_else(|error| panic!("{os:?}: {error}"));
+        let view = CodeView::read(&made.record).unwrap();
+        assert_eq!(view.targets(), 3, "{os:?}");
+        assert!((0..view.targets()).any(|i| view.target(i) == index), "{os:?}");
+        // MRS Xt, TPIDRRO_EL0. LLVM must parse the inline assembly to emit it.
+        assert!(view.code().as_chunks::<4>().0.iter().any(|&word| {
+            u32::from_le_bytes(word) & !0x1f == 0xd53b_d060
+        }), "{os:?}: no TPIDRRO_EL0 read in the sealed code");
+    }
 }
 
 #[test]

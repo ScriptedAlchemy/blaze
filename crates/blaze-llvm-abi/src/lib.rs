@@ -102,6 +102,7 @@ unsafe extern "C" {
     pub fn LLVMInitializeAArch64TargetInfo();
     pub fn LLVMInitializeAArch64TargetMC();
     pub fn LLVMInitializeAArch64AsmPrinter();
+    pub fn LLVMInitializeAArch64AsmParser();
     pub fn LLVMCreateTargetMachine(arg0: LLVMTargetRef, arg1: *const core::ffi::c_char, arg2: *const core::ffi::c_char, arg3: *const core::ffi::c_char, arg4: LLVMCodeGenOptLevel, arg5: LLVMRelocMode, arg6: LLVMCodeModel) -> LLVMTargetMachineRef;
     pub fn LLVMDisposeTargetMachine(arg0: LLVMTargetMachineRef);
     pub fn LLVMGetTargetFromTriple(arg0: *const core::ffi::c_char, arg1: *mut LLVMTargetRef, arg2: *mut *mut core::ffi::c_char) -> LLVMBool;
@@ -111,6 +112,7 @@ unsafe extern "C" {
     pub fn LLVMCopyStringRepOfTargetData(arg0: LLVMTargetDataRef) -> *mut core::ffi::c_char;
     pub fn LLVMSetDataLayout(arg0: LLVMModuleRef, arg1: *const core::ffi::c_char);
     pub fn LLVMDisposeTargetData(arg0: LLVMTargetDataRef);
+    pub fn LLVMBlazeInitializeAArch64();
     pub fn LLVMBlazeCreatePasses(arg0: LLVMTargetMachineRef) -> LLVMBlazePassesRef;
     pub fn LLVMBlazeDisposePasses(arg0: LLVMBlazePassesRef);
     pub fn LLVMBlazeRequireDwarfUnwind(arg0: LLVMTargetMachineRef);

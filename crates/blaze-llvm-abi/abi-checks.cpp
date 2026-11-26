@@ -17,6 +17,7 @@ static_assert(std::is_same_v<decltype(&LLVMInitializeAArch64Target), void (*)()>
 static_assert(std::is_same_v<decltype(&LLVMInitializeAArch64TargetInfo), void (*)()>);
 static_assert(std::is_same_v<decltype(&LLVMInitializeAArch64TargetMC), void (*)()>);
 static_assert(std::is_same_v<decltype(&LLVMInitializeAArch64AsmPrinter), void (*)()>);
+static_assert(std::is_same_v<decltype(&LLVMInitializeAArch64AsmParser), void (*)()>);
 static_assert(std::is_same_v<decltype(&LLVMCreateTargetMachine), LLVMTargetMachineRef (*)(LLVMTargetRef, const char *, const char *, const char *, LLVMCodeGenOptLevel, LLVMRelocMode, LLVMCodeModel)>);
 static_assert(std::is_same_v<decltype(&LLVMDisposeTargetMachine), void (*)(LLVMTargetMachineRef)>);
 static_assert(std::is_same_v<decltype(&LLVMGetTargetFromTriple), LLVMBool (*)(const char *, LLVMTargetRef *, char **)>);
@@ -26,6 +27,7 @@ static_assert(std::is_same_v<decltype(&LLVMCreateTargetDataLayout), LLVMTargetDa
 static_assert(std::is_same_v<decltype(&LLVMCopyStringRepOfTargetData), char * (*)(LLVMTargetDataRef)>);
 static_assert(std::is_same_v<decltype(&LLVMSetDataLayout), void (*)(LLVMModuleRef, const char *)>);
 static_assert(std::is_same_v<decltype(&LLVMDisposeTargetData), void (*)(LLVMTargetDataRef)>);
+static_assert(std::is_same_v<decltype(&LLVMBlazeInitializeAArch64), void (*)()>);
 static_assert(std::is_same_v<decltype(&LLVMBlazeCreatePasses), LLVMBlazePassesRef (*)(LLVMTargetMachineRef)>);
 static_assert(std::is_same_v<decltype(&LLVMBlazeDisposePasses), void (*)(LLVMBlazePassesRef)>);
 static_assert(std::is_same_v<decltype(&LLVMBlazeRequireDwarfUnwind), void (*)(LLVMTargetMachineRef)>);

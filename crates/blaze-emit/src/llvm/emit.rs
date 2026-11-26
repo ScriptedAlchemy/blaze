@@ -26,14 +26,13 @@ use blaze_own::{AVec, Alloc, CollectIn, FixedString};
 use blaze_pins::{LLVM_COMMIT, LLVM_VERSION};
 use blaze_tier::{Arch, Machine, Os};
 use blaze_llvm_abi::{
-    LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazePassesRef, LLVMBlazeRequireDwarfUnwind, LLVMBlazeRunPasses,
+    LLVMBlazeCreatePasses, LLVMBlazeDisposePasses, LLVMBlazeInitializeAArch64, LLVMBlazePassesRef, LLVMBlazeRequireDwarfUnwind, LLVMBlazeRunPasses,
     LLVMCodeGenFileType, LLVMCodeGenOptLevel, LLVMCodeModel, LLVMContextCreate, LLVMContextDispose,
     LLVMContextRef, LLVMCopyStringRepOfTargetData, LLVMCreateMemoryBufferWithMemoryRangeCopy,
     LLVMCreateTargetDataLayout, LLVMCreateTargetMachine, LLVMDisposeErrorMessage,
     LLVMDisposeMemoryBuffer, LLVMDisposeMessage, LLVMDisposeModule, LLVMDisposeTargetData,
     LLVMDisposeTargetMachine, LLVMErrorRef, LLVMGetBufferSize, LLVMGetBufferStart,
-    LLVMGetErrorMessage, LLVMGetTargetFromTriple, LLVMInitializeAArch64AsmPrinter,
-    LLVMInitializeAArch64Target, LLVMInitializeAArch64TargetInfo, LLVMInitializeAArch64TargetMC,
+    LLVMGetErrorMessage, LLVMGetTargetFromTriple,
     LLVMLinkModules2, LLVMModuleRef, LLVMParseIRInContext2, LLVMRelocMode, LLVMSetDataLayout,
     LLVMSetTarget, LLVMTargetMachineEmitToMemoryBuffer, LLVMTargetMachineRef,
 };
@@ -236,16 +235,9 @@ impl Session {
     /// as one module and can inline across it), and makes the target machine and passes for
     /// `machine`.
     fn new(ir: &[u8], imports: &[&[u8]], machine: Machine) -> Result<Session, EmitError> {
-        // SAFETY: the AArch64 target is registered once per process; LLVM's own guards make
-        // a second call a no-op. The AsmPrinter is registered too: `LLVMTargetMachineEmitToMemoryBuffer`
-        // writes the object file through it, and a target without one has no object to emit
-        // (the pipeline then succeeds and the emission fails).
-        unsafe {
-            LLVMInitializeAArch64TargetInfo();
-            LLVMInitializeAArch64Target();
-            LLVMInitializeAArch64TargetMC();
-            LLVMInitializeAArch64AsmPrinter();
-        }
+        // SAFETY: the wrapper registers the target, object printer, and inline assembler
+        // before it returns, once for all concurrent sessions in this process.
+        unsafe { LLVMBlazeInitializeAArch64() };
         // SAFETY: a new context, disposed in `Drop`.
         let context = unsafe { LLVMContextCreate() };
         // SAFETY: `ir` is copied into the buffer, which outlives the parse and is disposed below.

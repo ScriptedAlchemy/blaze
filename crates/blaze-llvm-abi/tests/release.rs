@@ -5,20 +5,17 @@ use std::{ffi::CStr, ptr, slice};
 
 #[test]
 fn release_pipeline_emits_both_arm64_object_formats() {
-    // SAFETY: one test initializes LLVM's global target registry before creating machines.
+    // SAFETY: the wrapper initializes LLVM's global registry before creating machines.
     // Every input C string is static; all returned LLVM objects stay live until disposed
     // below, with passes destroyed before their target machine and context.
     unsafe {
-        LLVMInitializeAArch64TargetInfo();
-        LLVMInitializeAArch64Target();
-        LLVMInitializeAArch64TargetMC();
-        LLVMInitializeAArch64AsmPrinter();
+        LLVMBlazeInitializeAArch64();
         for (triple, magic) in [
             (c"aarch64-apple-darwin", &[0xcf, 0xfa, 0xed, 0xfe]),
             (c"aarch64-unknown-linux-gnu", b"\x7fELF"),
         ] {
             let context = LLVMContextCreate();
-            let ir = c"define i32 @answer(i32 %x) { %sum = add i32 %x, 42 ret i32 %sum }";
+            let ir = c"define i32 @answer(i32 %x) { call void asm sideeffect \"yield\", \"\"() %sum = add i32 %x, 42 ret i32 %sum }";
             let buffer = LLVMCreateMemoryBufferWithMemoryRangeCopy(
                 ir.as_ptr(),
                 ir.to_bytes().len(),
@@ -77,6 +74,8 @@ fn release_pipeline_emits_both_arm64_object_formats() {
                 triple.to_string_lossy()
             );
             assert!(bytes.windows(6).any(|name| name == b"answer"));
+            let yield_instruction = 0xd503_203fu32.to_le_bytes();
+            assert!(bytes.windows(4).any(|word| word == yield_instruction.as_slice()));
             println!("{}: {} bytes from pinned LLVM O2", triple.to_string_lossy(), bytes.len());
             LLVMDisposeMemoryBuffer(object);
             LLVMBlazeDisposePasses(passes);

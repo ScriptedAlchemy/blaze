@@ -38,6 +38,7 @@ const NATIVE: &[(&str, &str)] = &[
     ("../blaze-llvm-abi/abi.h", include_str!("../blaze-llvm-abi/abi.h")),
     ("../blaze-llvm-abi/build.rs", include_str!("../blaze-llvm-abi/build.rs")),
     ("../blaze-llvm-abi/src/lib.rs", include_str!("../blaze-llvm-abi/src/lib.rs")),
+    ("../blaze-llvm-abi/target.cpp", include_str!("../blaze-llvm-abi/target.cpp")),
     ("../../vendor/llvm-sys/pin.rs", include_str!("../../vendor/llvm-sys/pin.rs")),
     ("../../vendor/llvm-sys/wrappers/passes.cpp", include_str!("../../vendor/llvm-sys/wrappers/passes.cpp")),
 ];
