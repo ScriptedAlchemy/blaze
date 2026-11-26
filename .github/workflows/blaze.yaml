@@ -1,13 +1,9 @@
-name: PR 81 shared publish staging proof
+name: PR 81 cut the canonical source shelf
 on:
   workflow_dispatch:
     inputs:
       source:
-        description: Exact compiler commit containing the regression
-        type: string
-        required: true
-      baseline:
-        description: Test-only control containing the original publisher
+        description: Exact compiler commit
         type: string
         required: true
 permissions:
@@ -15,44 +11,40 @@ permissions:
 defaults:
   run:
     shell: bash
+env:
+  CARGO_BUILD_JOBS: "2"
 jobs:
-  publish:
+  shelf:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source }}
-          fetch-depth: 2
           persist-credentials: false
       - uses: ./.github/actions/toolchain
-      - name: Reproduce the staging conflict and execute the repaired bstd suite
-        env:
-          BASELINE: ${{ inputs.baseline }}
-          CARGO_TARGET_DIR: ${{ runner.temp }}/publish-target
+      - uses: ./.github/actions/script
+        with:
+          job: source-compiler
+      - name: Cut and verify the canonical shelf
         run: |
-          timeout 20 git fetch --depth=2 origin "$BASELINE"
-          test "$(timeout 10 git rev-parse HEAD^)" = "$(timeout 10 git rev-parse "$BASELINE^")"
-          tc=$(timeout 10 cat pins/toolchain)
-          test_name=fs::overlapping_publishes_from_two_worlds_keep_their_bytes
-          mkdir -p "$RUNNER_TEMP/publish-proof"
-          timeout 10 git rev-parse HEAD HEAD^{tree} "$BASELINE" > "$RUNNER_TEMP/publish-proof/revisions"
-          timeout 15 git restore --source="$BASELINE" -- crates/blaze-std/src/{fs,io}.rs
-          status=0
-          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-std --lib "$test_name" -- --exact \
-            > "$RUNNER_TEMP/publish-proof/baseline.log" 2>&1 || status=$?
-          timeout 10 tail -45 "$RUNNER_TEMP/publish-proof/baseline.log"
-          test "$status" -eq 101
-          timeout 10 grep -F 'the second world overwrote the first stage' "$RUNNER_TEMP/publish-proof/baseline.log"
-          timeout 15 git restore -- crates/blaze-std/src/{fs,io}.rs
-          timeout 10 git diff --exit-code
-          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-std --lib "$test_name" -- --exact \
-            2>&1 | tee "$RUNNER_TEMP/publish-proof/focused.log"
-          timeout 10 grep -F '1 passed; 0 failed' "$RUNNER_TEMP/publish-proof/focused.log"
-          timeout -k 15s 720s cargo +"$tc" test --locked -p blaze-std --lib \
-            2>&1 | tee "$RUNNER_TEMP/publish-proof/suite.log"
+          evidence="$RUNNER_TEMP/canonical-shelf"
+          mkdir -p "$evidence"
+          timeout 10 git rev-parse HEAD HEAD^{tree} > "$evidence/source.txt"
+          timeout -k 20 600 cargo +"$(cat pins/toolchain)" fetch --locked --quiet
+          shopt -s nullglob
+          registries=("${CARGO_HOME:-$HOME/.cargo}"/registry/cache/index.crates.io-*)
+          test "${#registries[@]}" -eq 1
+          # shellcheck disable=SC2016
+          input=$(timeout 10 jq -nc --arg reg "${registries[0]}" --arg shelf "$RUNNER_TEMP/shelf" '{tree:".",targets:["aarch64-apple-darwin","aarch64-unknown-linux-gnu"],registry:$reg,shelf:$shelf,write_pin:true,check:false,macro_side:true}')
+          timeout -k 20 600 "$BLAZE_SCRIPTS/toolchain_cut" "$input" | tee "$evidence/cut.log"
+          verify=$(timeout 10 jq -c '.write_pin=false | .check=true' <<< "$input")
+          timeout -k 20 600 "$BLAZE_SCRIPTS/toolchain_cut" "$verify" | tee "$evidence/verify.log"
+          timeout 10 cp crates/blaze-toolchain/PINNED "$evidence/PINNED"
+          timeout 10 git diff --exit-code -- . ':!crates/blaze-toolchain/PINNED'
+          timeout 10 cat "$evidence/PINNED"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: shared-publish-staging-evidence
-          path: ${{ runner.temp }}/publish-proof
+          name: canonical-shelf-pin
+          path: ${{ runner.temp }}/canonical-shelf
