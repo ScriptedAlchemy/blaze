@@ -134,12 +134,9 @@ before building stage 1. Set `release_fold` to true, `args` to `["--release"]`, 
 The proc macro executes 64 non-inlined wasm bodies with distinct constants against an independent
 loop oracle; the application and native dependencies exercise LLVM at release settings.
 
-`backend_work` events name the real daemon pid, unit digest, granted protocol WorkNames, raw compiled keys,
-and the intersection of those emissions with the canonical release and fold output keys. The
-oracle joins them to real accepted grant/lease events and final reports. Each backend kind must
-have two distinct emitting daemons within one successful unit/execution/attempt; merely planning
-work, cached hits, another unit, or stale refused results cannot satisfy it. The existing raw-key,
-manifest, tail nonduplication, cold-cache, edit and executable-byte oracles still run. Missing
-folding opportunities or unsupported LLVM are failures, never skips or alternate backends.
-
-The extension has not run in the implementation lane. Root owns preflight, build and acceptance.
+`backend_work` events tie each native receipt to the daemon, grant and machine record that
+produced it. The oracle opens the accepted full manifests, rehashes the receipt and machine
+record, and reconstructs the granted WorkName from the recipe binding. A fold includes a
+shared body and every member thunk. Each backend kind requires two distinct emitting daemons
+within one accepted unit execution and attempt. The tail nonduplication, cold-cache, edit and
+executable-byte checks run on the same outputs.

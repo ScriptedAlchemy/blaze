@@ -707,6 +707,11 @@ jobs:
       - uses: ./.github/actions/script
         with:
           job: production-acceptance
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 # uv-aarch64-unknown-linux-gnu
+          enable-cache: false
       - name: user namespaces for source test sandboxes
         run: |
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
@@ -735,7 +740,7 @@ jobs:
               > "$RUNNER_TEMP/dist-evidence/$profile-input.json"
             python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
             status=0
-            timeout -k 30 7200 python3 harness/distv2.py "$RUNNER_TEMP/dist-evidence/$profile-input.json" \
+            timeout -k 30 7200 uv run --frozen --no-dev python harness/distv2.py "$RUNNER_TEMP/dist-evidence/$profile-input.json" \
               2>&1 | tee "$RUNNER_TEMP/dist-evidence/$profile.log" || status=$?
             python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
             if [ "$status" != 0 ] && [ "$first_failure" = 0 ]; then

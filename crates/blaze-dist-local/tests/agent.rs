@@ -13,7 +13,7 @@ use blaze_dist::holder::HolderConfig;
 use blaze_dist::jobs::{CompletionMode, ExecutionConfig, Jobs};
 use blaze_dist::work::WorkConfig;
 use blaze_dist_local::Error;
-use blaze_dist_local::agent::{self, Grant, Granted, NEED, Source, Unit};
+use blaze_dist_local::agent::{self, Emission, Grant, Granted, NEED, Source, Unit};
 use blaze_dist_local::blobs::Blobs;
 use blaze_dist_local::client::Client;
 use blaze_dist_local::coordinator::Config as CarrierConfig;
@@ -229,16 +229,16 @@ impl Granted for Compiler {
             assert!(log.insert(*at, self.who).is_none(), "{at} was compiled twice");
         }
         let mut values = Vec::with_capacity_in(names.len(), alloc);
-        let mut compiled_keys = Vec::with_capacity_in(names.len(), alloc);
+        let mut emissions = Vec::with_capacity_in(names.len(), alloc);
         for at in names {
             values.push(value_of(&self.names[*at], alloc));
-            compiled_keys.push(self.names[*at]);
+            emissions.push(Emission::plain(self.names[*at]));
         }
         Ok(Grant {
             values,
             compiled: u64::try_from(names.len()).unwrap(),
             stored: 0,
-            compiled_keys,
+            emissions,
         })
     }
 }
@@ -548,15 +548,15 @@ fn a_first_writer_accepts_equal_outputs_in_a_different_pack_partition() {
             for name in &self.0 {
                 values.push(value_of(name, alloc));
             }
-            let mut compiled_keys = Vec::with_capacity_in(names.len(), alloc);
+            let mut emissions = Vec::with_capacity_in(names.len(), alloc);
             for at in names {
-                compiled_keys.push(self.0[*at]);
+                emissions.push(Emission::plain(self.0[*at]));
             }
             Ok(Grant {
                 values,
                 compiled: u64::try_from(names.len()).unwrap(),
                 stored: 0,
-                compiled_keys,
+                emissions,
             })
         }
     }
@@ -668,16 +668,16 @@ impl Granted for Holding {
             self.release.take().unwrap().recv_timeout(Duration::from_secs(20)).unwrap();
         }
         let mut values = Vec::with_capacity_in(names.len(), alloc);
-        let mut compiled_keys = Vec::with_capacity_in(names.len(), alloc);
+        let mut emissions = Vec::with_capacity_in(names.len(), alloc);
         for at in names {
             values.push(value_of(&self.names[*at], alloc));
-            compiled_keys.push(self.names[*at]);
+            emissions.push(Emission::plain(self.names[*at]));
         }
         Ok(Grant {
             values,
             compiled: u64::try_from(names.len()).unwrap(),
             stored: 0,
-            compiled_keys,
+            emissions,
         })
     }
 }
