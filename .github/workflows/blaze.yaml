@@ -78,6 +78,13 @@ jobs:
           timeout -k 30 1400 cargo +"$tc" check --locked --release --keep-going -p blaze-cli --bin blaze --features llvm \
             2>&1 | tee "$evidence/check-llvm.log" || status=$?
           exit "$status"
+      - name: Verify the generated LLVM declarations
+        run: |
+          evidence="$RUNNER_TEMP/plan-evidence"
+          mkdir -p "$evidence"
+          # shellcheck disable=SC2016
+          input=$(timeout 10 jq -nc --arg prefix "$LLVM_SYS_231_PREFIX" --arg clang "$(command -v clang)" '{prefix:$prefix,clang:$clang,check:true}')
+          timeout -k 10 120 "$BLAZE_SCRIPTS/llvm_abi" "$input" 2>&1 | tee "$evidence/llvm-generator.log"
       - name: Build and seal the exact source binaries
         id: binaries
         run: |
@@ -100,6 +107,9 @@ jobs:
           timeout -k 30 1200 cargo +"$tc" test --locked --release -p blaze-emit --features llvm --lib \
             release_record 2>&1 | tee "$evidence/llvm-records.log"
           grep -Fq 'release_record_stores_a_splat_to_every_lane ... ok' "$evidence/llvm-records.log"
+          timeout -k 20 600 cargo +"$tc" test --locked --release -p blaze-llvm-abi --features native --test release \
+            2>&1 | tee "$evidence/llvm-abi.log"
+          grep -Fq 'release_pipeline_emits_both_arm64_object_formats ... ok' "$evidence/llvm-abi.log"
       - name: Free build space for the release-only fault run
         if: ${{ !cancelled() && steps.binaries.outcome == 'success' && inputs.profile == 'release' }}
         run: |
@@ -130,14 +140,6 @@ jobs:
             python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$bin\",\"services\":true}"
           done
           exit "$failed"
-      - name: Verify LLVM binding regeneration
-        if: ${{ !cancelled() && inputs.profile == 'both' && env.LLVM_SYS_231_PREFIX != '' }}
-        run: |
-          prefix="$LLVM_SYS_231_PREFIX"
-          # shellcheck disable=SC2016
-          input=$(timeout 10 jq -nc --arg prefix "$prefix" --arg clang "$(command -v clang)" '{prefix:$prefix,clang:$clang,check:true}')
-          timeout -k 20 1200 cargo +"$(cat pins/toolchain)" run --release --locked -p scripts --bin llvm_abi -- "$input" \
-            2>&1 | tee "$RUNNER_TEMP/plan-evidence/llvm-generator.log"
       - name: Verify focused compiler regressions
         if: ${{ !cancelled() && inputs.profile == 'both' && steps.source_check.outcome == 'success' }}
         run: |
