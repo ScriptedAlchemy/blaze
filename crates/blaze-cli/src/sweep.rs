@@ -592,8 +592,7 @@ pub fn read_manifest(
 }
 
 /// The names in directory `dir` the layout may read: each subdirectory, `lib.rs` and `main.rs`,
-/// and in a directory named `bin` each `.rs` file; in a directory named `src`, only `lib.rs`,
-/// `main.rs` and `bin`. What blaze-manifest's layout reads of a listing (member globs match
+/// and in a directory named `bin` each `.rs` file. What blaze-manifest's layout reads of a listing (member globs match
 /// directories; targets are `src/lib.rs`, `src/main.rs`, `src/bin/*.rs`, `src/bin/*/main.rs`),
 /// and all it is handed: a file that is none of these never reaches it, so adding one moves
 /// nothing. `None` when no directory is there.
@@ -687,7 +686,6 @@ pub(crate) fn wanted(last: &str, name: &str, is_dir: bool, target_tagged: bool) 
         // under either: a member glob that matched one named a missing manifest. A `target`
         // without cargo's tag is a package's folder and listed (rule 4).
         ("", _) if not_the_checkouts(name, target_tagged) => false,
-        ("src", true) => name == "bin",
         ("src", false) => name == "lib.rs" || name == "main.rs",
         ("bin", false) => name.ends_with(".rs"),
         // A member's test, example and bench targets are found by their files

@@ -43,7 +43,7 @@
 //! share one (rule 21).
 
 use blaze_drive::Name;
-use blaze_manifest::layout::{Entry, Layout, Member, Need, Pass, Target, Units};
+use blaze_manifest::layout::{Layout, Member, Need, Pass, Target, Units};
 use blaze_own::Vec;
 use bstd::Cx;
 use bstd::fs::{AncestorError, AncestorKind, Dir, Fs, ReadWrite};
@@ -757,16 +757,8 @@ fn with_layout<'f, T>(
                     layout.manifest(path.as_str(), text).map_err(|e| refused(&e))?;
                 }
                 Need::Listing(dir) => {
-                    // `Dir::list` gives no entries for a directory that is not there.
-                    let listed = match dir.as_str() {
-                        "" => root.list(cx, frame)?,
-                        named => root.subdir(&Path::new(named)?).list(cx, frame)?,
-                    };
-                    let mut entries: Vec<Entry<'_>, &Frame> = Vec::with_capacity_in(listed.len(), frame);
-                    for (path, meta) in listed.iter() {
-                        entries.push(Entry { name: path.as_str(), is_dir: meta.dir });
-                    }
-                    layout.listing(dir.as_str(), Some(&entries));
+                    let listing = crate::sweep::list_dir(cx, root, dir.as_str(), frame)?;
+                    crate::units::supply_listing(&mut layout, dir.as_str(), listing.as_ref(), frame);
                 }
             }
         }
@@ -805,6 +797,33 @@ mod tests {
 
     fn package(name: &str) -> std::string::String {
         std::format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+    }
+
+    #[test]
+    fn selects_glob_members_and_their_directory_binary_targets() {
+        let dist = package("blaze-dist");
+        let app = package("app");
+        let tool = package("tool");
+        let files = [
+            ("Cargo.toml", "[workspace]\nmembers=['crates/*','src/*','tools/explicit']\nexclude=['crates/skipped']\n"),
+            ("crates/dist/Cargo.toml", dist.as_str()),
+            ("crates/dist/src/bin/probe/main.rs", "fn main() {}"),
+            ("crates/dist/nested/Cargo.toml", "invalid TOML: this is not a direct glob match"),
+            ("crates/skipped/Cargo.toml", "invalid TOML: this member is excluded"),
+            ("crates/notes.txt", "a file cannot match a member directory"),
+            ("src/app/Cargo.toml", app.as_str()),
+            ("src/app/src/lib.rs", ""),
+            ("tools/explicit/Cargo.toml", tool.as_str()),
+            ("tools/explicit/src/lib.rs", ""),
+        ];
+        checkout(&files, |cx, root| {
+            let named = test_packages(cx, root, asked(&["blaze-dist"]), cx.frame()).expect("the glob member by package name");
+            assert_eq!(named.as_slice(), ["blaze-dist"]);
+            let all = test_packages(cx, root, Select::NONE, cx.frame()).expect("all declared members");
+            assert_eq!(all.as_slice(), ["app", "blaze-dist", "tool"]);
+            let program = pick(cx, root, Select { bin: Some("probe"), ..asked(&["blaze-dist"]) }, cx.frame()).expect("directory binary target");
+            assert_eq!(program.root, "crates/dist/src/bin/probe/main.rs");
+        });
     }
 
     fn strings(items: &[&str]) -> Owneds {

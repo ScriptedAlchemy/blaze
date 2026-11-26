@@ -48,6 +48,16 @@ const MEMBER_SOURCE_DOMAIN: &str = "blaze-cli member source 1";
 /// target directories), far under this on any workspace (rule 18).
 const MOST_PASSES: usize = 64;
 
+/// Answer a layout listing with the immediate entries of the requested directory.
+pub(crate) fn supply_listing(layout: &mut Layout<'_>, dir: &str, listing: Option<&sweep::Listing<'_>>, frame: &Frame) {
+    let entries = listing.map(|listing| {
+        let mut entries = Vec::with_capacity_in(listing.dirs.len(), frame);
+        entries.extend(listing.entries().map(|(name, is_dir)| Entry { name, is_dir }));
+        entries
+    });
+    layout.listing(dir, entries.as_deref());
+}
+
 /// The layout's answer, as the units records it makes: the root's, and each member's by its
 /// manifest's units name.
 pub struct Laid<'f> {
@@ -153,12 +163,7 @@ pub fn lay<'f, 'l>(
                     Need::Listing(dir) => {
                         let dir = dir.as_str();
                         let listing = sweep::read_listing(&cx, root, stamps, dir, rows, frame)?;
-                        let entries: Option<Vec<Entry<'_>, &Frame>> = listing.as_ref().map(|listing| {
-                            let mut entries = Vec::with_capacity_in(listing.dirs.len(), frame);
-                            entries.extend(listing.entries().map(|(name, is_dir)| Entry { name, is_dir }));
-                            entries
-                        });
-                        layout.listing(dir, entries.as_deref());
+                        supply_listing(&mut layout, dir, listing.as_ref(), frame);
                     }
                 }
             }

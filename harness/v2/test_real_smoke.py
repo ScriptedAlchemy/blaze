@@ -13,6 +13,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -97,7 +98,7 @@ class RealSmokeTests(unittest.TestCase):
         requests, environments, builder = self.fake_builder(
             {"proc-macro": len(rs.MACROS), "build-script": len(rs.SCRIPTS)}
         )
-        rows: list[tuple[str, dict[str, str]]] = []
+        rows: list[tuple[str, Mapping[str, str]]] = []
 
         def ran(command: rs.Command, proof: rs.Proof) -> rs.ran.Ran:
             rows.append((command.args[3], command.env))
@@ -136,7 +137,7 @@ class RealSmokeTests(unittest.TestCase):
     def test_a_failed_or_short_module_build_is_invalid_and_nothing_is_copied(self) -> None:
         for made, code in (({"proc-macro": len(rs.MACROS), "build-script": len(rs.SCRIPTS) - 1}, 1),):
             with self.subTest(made=made):
-                requests, environments, builder = self.fake_builder(made)
+                _, _, builder = self.fake_builder(made)
                 out = io.StringIO()
                 with builder, contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as ended:
                     rs.main(
@@ -161,7 +162,7 @@ class RealSmokeTests(unittest.TestCase):
                 )
 
     def test_without_a_builder_no_module_is_asked_for(self) -> None:
-        requests, environments, builder = self.fake_builder({})
+        requests, _, builder = self.fake_builder({})
         with (
             builder,
             patch.object(
