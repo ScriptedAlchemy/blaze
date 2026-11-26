@@ -63,6 +63,10 @@ pub trait Types {
     /// The portable type of the written type `t` of `view` (its text read through
     /// [`View::text_at`]).
     fn ty(&mut self, view: &View<'_>, t: TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused>;
+    /// Lower an annotated local function pointer, retaining its region slots when available.
+    fn fn_pointer_ty(&mut self, view: &View<'_>, t: TypeId, tys: &mut PortableTys<'_>, _slots: &mut AVec<'_, tc::regions::Region>) -> Result<PTy, Refused> {
+        self.ty(view, t, tys)
+    }
     /// The value of the repeat length `len` (an expression of `view`).
     fn repeat_len(&mut self, view: &View<'_>, len: ExprId) -> Result<u64, Refused>;
     /// The value of the const argument `c` of `view` that is no literal (the Reference,
@@ -414,6 +418,9 @@ pub struct TypeckBody<'a> {
     /// Canonical lexicographically-sorted [`tc::RecordSchema`] for each anonymous `Expr::Record`,
     /// ascending by [`ExprId`].
     pub record_expr_schemas: AVec<'a, (ExprId, tc::RecordSchema)>,
+    /// Pattern-to-column index and region slots for annotated local function pointers.
+    pub local_fn_pointers: AVec<'a, (PatId, List)>,
+    pub local_fn_regions: AVec<'a, tc::regions::Region>,
     /// Closure parameter annotations whose outer reference explicitly writes `'static`
     /// (`|lock: &'static str|`): `(closure_expr, param_index)`, ascending.
     pub closure_static_params: AVec<'a, (ExprId, u32)>,
@@ -482,6 +489,7 @@ impl<'a> TypeckBody<'a> {
             expr_editions: &self.expr_editions,
             pat_editions: &self.pat_editions,
             record_expr_schemas: &self.record_expr_schemas,
+            local_fn_pointers: (&self.local_fn_pointers, &self.local_fn_regions),
             closure_static_params: &self.closure_static_params,
         }
     }
@@ -1428,7 +1436,21 @@ impl Conv<'_, '_, '_, '_, '_> {
 
     fn stmt(&mut self, s: StmtId) -> Result<tc::Stmt, Refused> {
         Ok(match self.v.stmt(s)? {
-            Stmt::Let { pat, ty, init, else_ } => tc::Stmt::Let { pat, ty: self.opt_ty(ty)?, init, else_ },
+            Stmt::Let { pat, ty, init, else_ } => {
+                let ty = match ty {
+                    Some(t) if matches!(self.v.ty(t)?, TypeRef::FnPtr { .. } | TypeRef::For { .. }) => {
+                        let start = len(self.out.local_fn_regions.len());
+                        let made = self.types.fn_pointer_ty(self.v, t, self.tys, &mut self.out.local_fn_regions)?;
+                        let count = len(self.out.local_fn_regions.len()) - start;
+                        if count != 0 {
+                            self.out.local_fn_pointers.push((pat, List { start, len: count }));
+                        }
+                        Some(made)
+                    }
+                    _ => self.opt_ty(ty)?,
+                };
+                tc::Stmt::Let { pat, ty, init, else_ }
+            }
             Stmt::Expr { expr, semi } => tc::Stmt::Expr { expr, semi },
             Stmt::Item { .. } => tc::Stmt::Item,
         })
@@ -1505,6 +1527,8 @@ pub fn to_typeck<'a>(
         super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),
         record_expr_schemas: Vec::new_in(alloc),
+        local_fn_pointers: Vec::new_in(alloc),
+        local_fn_regions: Vec::new_in(alloc),
         closure_static_params: Vec::new_in(alloc),
         inline_fors: Vec::new_in(alloc),
     };

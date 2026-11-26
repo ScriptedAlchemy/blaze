@@ -589,6 +589,13 @@ pub trait Adts {
         None
     }
 
+    /// Whether the trait declaration gives its vtable slot the hidden caller-location
+    /// parameter. A concrete implementation can require it even when its slot does not.
+    fn declared_track_caller(&self, item: ItemKey) -> Option<bool> {
+        let _ = item;
+        None
+    }
+
     /// Where expression `expr` of the body of `owner` is, in the form a code record may hold
     /// ([`CallerSite`]: the file's name as the program observes it, the item, and the
     /// expression's byte offset from the item's start), never a line and column: those are

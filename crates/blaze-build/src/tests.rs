@@ -247,6 +247,7 @@ impl BodyBuf {
             expr_editions: &[],
             pat_editions: &[],
             record_expr_schemas: &[],
+            local_fn_pointers: (&[], &[]),
             closure_static_params: &[],
         }
     }
@@ -959,7 +960,10 @@ impl Adts for TestAdts<'_> {
     }
 
     fn track_caller(&self, instance: Instance, _: &mut PortableTys<'_>) -> Option<bool> {
-        let item = instance.item;
+        self.declared_track_caller(instance.item)
+    }
+
+    fn declared_track_caller(&self, item: ItemKey) -> Option<bool> {
         self.world.fns.iter().any(|f| f.key == item).then(|| self.world.tracked.contains(&item))
     }
 

@@ -68,3 +68,21 @@ pub(crate) fn shim_self_resolved_by<'g>(
     let list = ground.intern_list(&[callee, shim.tuple]).map_err(ResolveError::Check)?;
     Ok(Instance { item: called.item, args: list })
 }
+
+/// A tracked implementation of an untracked trait method occupies a plain-ABI slot.
+/// Its reification shim supplies the implementation's definition site.
+pub(crate) fn vtable_target(adts: &dyn Adts, declaration: blaze_typeck::ItemKey, implementation: Instance, ground: &mut PortableTys<'_>) -> Result<Instance, blaze_build::BuildError> {
+    if implementation.item == declaration || adts.track_caller(implementation, ground) != Some(true) {
+        return Ok(implementation);
+    }
+    match adts.declared_track_caller(declaration) {
+        Some(true) => Ok(implementation),
+        Some(false) => blaze_build::reify_shim_instance(implementation, ground),
+        None => Err(blaze_build::BuildError::TrackCaller {
+            expr: None,
+            item: declaration,
+            why: "the caller-location ABI of the trait method's vtable slot is unknown",
+            gap: None,
+        }),
+    }
+}

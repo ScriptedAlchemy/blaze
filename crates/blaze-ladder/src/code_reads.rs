@@ -1034,6 +1034,12 @@ impl Adts for Recorded<'_> {
         answer
     }
 
+    fn declared_track_caller(&self, item: ItemKey) -> Option<bool> {
+        let answer = self.world.declared_track_caller(item);
+        self.log.ask(ReadKind::TrackCaller, item, 1, &[], Ok(small(answer)));
+        answer
+    }
+
     fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
         self.world.caller_site(owner, expr)
     }
@@ -1302,6 +1308,9 @@ pub fn verify_today(
             }
             ReadKind::Nounwind => {
                 recorded.nounwind(item);
+            }
+            ReadKind::TrackCaller if extra == 1 && args.is_empty() => {
+                recorded.declared_track_caller(item);
             }
             ReadKind::TrackCaller => {
                 recorded.track_caller(Instance { item, args: list }, ground);
