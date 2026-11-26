@@ -194,6 +194,21 @@ impl<'a> Lower<'a, '_> {
             return Err(self.error("vector division with trapping lanes"));
         }
         let width = ty.elem().bits(view.head.ptr_bits);
+        if width == 128 {
+            // AArch64 legalization may call this routine for a dynamic divisor. Keep the
+            // arithmetic in LLVM IR so constants and narrowed operands still optimize.
+            let routine = crate::Routine::wide_division(op)
+                .ok_or_else(|| self.error("unknown i128 division routine"))?;
+            // InstCombine may rewrite a signed operation when its operands are nonnegative.
+            let unsigned = match op {
+                Op::Sdiv => Some(crate::Routine::Udivti3),
+                Op::Srem => Some(crate::Routine::Umodti3),
+                _ => None,
+            };
+            for helper in core::iter::once(routine).chain(unsigned) {
+                self.implicit(Target { space: Space::Outside, symbol: Symbol::of_name(helper.symbol()) });
+            }
+        }
         let t = LlType(view, ty);
         format_into!(
             &mut self.ir,

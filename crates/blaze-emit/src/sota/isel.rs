@@ -34,7 +34,7 @@ use super::release_opts::{
 use crate::enc::{
     self, Barrier, Cond, FP, Ftype, LR, Lse, Reg, SP, Size, X0, X1, X2, X8, X9, X10, X11, X12, X13, X14, X16, ZR,
 };
-use crate::{enc_probe, enc_tls};
+use crate::{Routine, enc_probe, enc_tls};
 use crate::pass::{
     BRK_DIV_OVERFLOW, BRK_DIV_ZERO, BRK_UNREACHABLE, Loc, Regs,
     probe::PROBE_STEP,
@@ -9476,13 +9476,10 @@ pub(crate) fn emit_sota_a64_with_abi<'a>(
                             let ok_at = words.len();
                             set_at(&mut words, w_ok, enc::b_cond(Cond::Ne, i32_of(ok_at - w_ok)));
                         }
-                        let rname = match op {
-                            Op::Udiv => "__udivti3",
-                            Op::Urem => "__umodti3",
-                            Op::Sdiv => "__divti3",
-                            _ => "__modti3",
-                        };
-                        let target = resolve_c_routine(rname, &mut out);
+                        let routine = Routine::wide_division(op).ok_or(TierError::Refused {
+                            tier: TIER, inst: Some(u32_of(inst)), what: "unknown i128 division routine",
+                        })?;
+                        let target = resolve_c_routine(routine.symbol(), &mut out);
                         emit_routine_call(&mut words, target, call_mode, &mut out);
                         if let Some((s0, s1)) = sp_pair {
                             emit_st_spill_gpr(&mut words, X0, spill_base, s0);

@@ -858,6 +858,72 @@ fn release_record_names_synthesized_libcalls_and_requires_metadata_for_input_ext
     assert!(matches!(error, EmitError::Read(ReadError::UnknownSymbol { name }) if matches!(name.as_str(), "fmodl" | "fmodf128")));
 }
 
+#[test]
+fn release_record_binds_the_runtime_helpers_for_wide_division() {
+    use super::{emit::EmitError, object::ReadError};
+    use blaze_lir::Op;
+
+    #[cfg(target_arch = "aarch64")]
+    extern "C" fn divide(a: u128, b: u128) -> u128 {
+        a / b
+    }
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let host = machine();
+    for (op, mask, name) in [
+        (Op::Udiv, None, "__udivti3"), (Op::Urem, None, "__umodti3"),
+        (Op::Sdiv, None, "__divti3"), (Op::Srem, None, "__modti3"),
+        (Op::Sdiv, Some((1u128 << 127) - 1), "__udivti3"),
+    ] {
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let p = Param::of(Ty::I128);
+        let sig = b.sig(Conv::C, Variadic::No, &[p, p], &[p]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let mut a = b.param(Ty::I128);
+        let mut divisor = b.param(Ty::I128);
+        if let Some(mask) = mask {
+            let nonnegative = b.iconst(Ty::I128, mask);
+            a = b.binary(Op::And, Flags::NONE, a, nonnegative);
+            divisor = b.binary(Op::And, Flags::NONE, divisor, nonnegative);
+        }
+        let result = b.binary(op, Flags::NONE, a, divisor);
+        b.ret(&[result]);
+        let body = b.finish_verified().unwrap();
+        let mut module = prepare(Symbol([21; 32]), body.verified(), &ByPlace, alloc).unwrap();
+        let target = Target { space: Space::Outside, symbol: Symbol::of_name(name) };
+        assert!(module.implicit_references.contains(&target));
+
+        for os in [blaze_tier::Os::Linux, blaze_tier::Os::MacOs] {
+            let machine = blaze_tier::Machine { os, ..host };
+            let made = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine }, alloc)
+                .unwrap_or_else(|error| panic!("{os:?}, {name}: {error}"));
+            let view = CodeView::read(&made.record).unwrap();
+            assert_eq!(view.targets(), 1, "{os:?}, {name}");
+            assert_eq!(view.target(0), target, "{os:?}, {name}");
+            assert_eq!(view.name(target.symbol), Some(name));
+
+            #[cfg(target_arch = "aarch64")]
+            if os == host.os && op == Op::Udiv {
+                let placed = place_with_callable(&view, module.symbol, target, divide as *const () as u64);
+                // SAFETY: the emitted C ABI and bound helper both take and return u128.
+                let quotient: unsafe extern "C" fn(u128, u128) -> u128 = unsafe { placed.as_fn() };
+                let numerator = (1u128 << 127) + (3u128 << 64) + 123;
+                for divisor in [3, (1u128 << 65) + 17] {
+                    // SAFETY: the executable is live and both divisors are nonzero.
+                    assert_eq!(unsafe { quotient(numerator, divisor) }, numerator / divisor);
+                }
+            }
+        }
+
+        module.implicit_references.clear();
+        let error = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: host }, alloc)
+            .err().expect("compiler-runtime calls require typed input metadata");
+        assert!(matches!(error, EmitError::Read(ReadError::UnknownSymbol { name: actual }) if actual.as_str() == name));
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 fn place_with_callable(
     view: &CodeView<'_>,
@@ -1083,7 +1149,9 @@ fn release_record_returns_the_address_of_zero_sized_data() {
         let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine }, alloc)
             .unwrap_or_else(|error| panic!("{os:?}: {error}"));
         let view = CodeView::read(&emission.record).unwrap();
-        assert!(view.relro().is_empty(), "{os:?}");
+        // LLVM's Mach-O printer emits one byte so two symbols cannot share this atom's address.
+        let expected: &[u8] = if os == blaze_tier::Os::MacOs { &[0] } else { &[] };
+        assert_eq!(view.relro(), expected, "{os:?}");
         assert!(view.relro_align() >= 6, "{os:?}");
         assert_eq!(view.sites(), 2, "{os:?}");
         assert_eq!([view.site(0).kind, view.site(1).kind], [SiteKind::Page21, SiteKind::AddLo12], "{os:?}");

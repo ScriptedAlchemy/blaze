@@ -1088,35 +1088,37 @@ fn elf_native_merge_refusals_are_named() {
 
 /// ELF export resolves `__dso_handle` internally via a self-referential RELRO slot (never as an
 /// undefined `.dynsym` import) and automatically emits `DT_NEEDED` for `libgcc_s.so.1` and
-/// `libm.so.6` when program imports reference `_Unwind_*` or libm functions.
+/// `libm.so.6` when program imports reference an unwind routine, wide arithmetic, or libm.
 #[test]
 fn elf_synthesizes_dso_handle_and_auto_needed_libs() {
     let alloc = blaze_own::testing::heap().alloc();
-    let main_rec = rec(
-        &[ADRP_X16, LDR_X16, BLR_X16, ADRP_X16, LDR_X16, BLR_X16, ADRP_X16, LDR_X16, BLR_X16, RET],
-        &[],
-        &[(0, "__dso_handle"), (12, "_Unwind_RaiseException"), (24, "sin")],
-    );
-    let fs = [Function { symbol: sym("main"), record: CodeView::read(&main_rec).unwrap(), tier: Tier::Fast }];
-    let prog = ProgramIn {
-        name: "dso-and-libs",
-        functions: &fs,
-        data: &[],
-        entry: Entry::CMain { main: sym("main") },
-        panic: Panic::Unwind,
-        personality: None,
-        tls: None,
-        profile: None,
-        natives: None,
-        exports: &[],
-    };
-    let mut out = Vec::new_in(alloc);
-    let summary = export(&prog, Platform::LinuxArm64, &mut out, alloc).unwrap();
-    let facts = check::elf(&out).unwrap();
-    assert_eq!(facts.needed, 3, "DT_NEEDED: libc.so.6, libm.so.6, libgcc_s.so.1");
-    assert_eq!(facts.relative, 2, "GOT slot for __dso_handle + self-referential __dso_handle slot");
-    assert_eq!(facts.binds, 3, "__libc_start_main, _Unwind_RaiseException, sin (not __dso_handle)");
-    assert_eq!(summary.imports, 3, "Exported::imports excludes internal __dso_handle");
+    for routine in ["_Unwind_RaiseException", "__udivti3"] {
+        let main_rec = rec(
+            &[ADRP_X16, LDR_X16, BLR_X16, ADRP_X16, LDR_X16, BLR_X16, ADRP_X16, LDR_X16, BLR_X16, RET],
+            &[],
+            &[(0, "__dso_handle"), (12, routine), (24, "sin")],
+        );
+        let fs = [Function { symbol: sym("main"), record: CodeView::read(&main_rec).unwrap(), tier: Tier::Fast }];
+        let prog = ProgramIn {
+            name: "dso-and-libs",
+            functions: &fs,
+            data: &[],
+            entry: Entry::CMain { main: sym("main") },
+            panic: Panic::Abort,
+            personality: None,
+            tls: None,
+            profile: None,
+            natives: None,
+            exports: &[],
+        };
+        let mut out = Vec::new_in(alloc);
+        let summary = export(&prog, Platform::LinuxArm64, &mut out, alloc).unwrap();
+        let facts = check::elf(&out).unwrap();
+        assert_eq!(facts.needed, 3, "{routine}: DT_NEEDED for libc.so.6, libm.so.6, libgcc_s.so.1");
+        assert_eq!(facts.relative, 2, "GOT slot for __dso_handle + self-referential __dso_handle slot");
+        assert_eq!(facts.binds, 3, "__libc_start_main, {routine}, sin (excluding __dso_handle)");
+        assert_eq!(summary.imports, 3, "Exported::imports excludes internal __dso_handle");
+    }
 }
 
 /// ELF export strips the `\x02` extern_weak marker from program imports and emits `STB_WEAK`

@@ -89,13 +89,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
             self.put(enc::brk(BRK_DIV_OVERFLOW));
             self.land(not_minus_one)?;
         }
-        self.call_routine(match op {
-            Op::Udiv => Routine::Udivti3,
-            Op::Urem => Routine::Umodti3,
-            Op::Sdiv => Routine::Divti3,
-            Op::Srem => Routine::Modti3,
-            _ => return Err(unsupported(inst, op, "a 128-bit division routine for other than `udiv`, `urem`, `sdiv`, `srem`")),
-        });
+        let routine = Routine::wide_division(op)
+            .ok_or(unsupported(inst, op, "a 128-bit division routine for other than `udiv`, `urem`, `sdiv`, `srem`"))?;
+        self.call_routine(routine);
         self.st2(X0, X1, inst);
         Ok(())
     }

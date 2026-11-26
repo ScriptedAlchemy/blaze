@@ -93,7 +93,7 @@ const DF_1: u64 = DF_1_NOW | DF_1_PIE;
 /// The base dynamic section's entries (excluding extra native `DT_NEEDED` and `DT_INIT_ARRAY`).
 const DYN_COUNT: u64 = 14;
 /// Room for auto-added standard Linux libraries (`libgcc_s.so.1`, `libm.so.6`) when program
-/// imports reference `_Unwind_*` or libm math functions without a native image already listing them.
+/// imports name their routines without a native image already listing those libraries.
 const AUTO_NEEDED_ROOM: u64 = 2;
 /// 16-byte reserved tail in `const_head` right before the GOT holding the self-referential
 /// 8-byte `__dso_handle` word (at `got_at - 8`, relocated via `R_AARCH64_RELATIVE` so both
@@ -129,7 +129,6 @@ const LIBM: &str = "libm.so.6";
 const DSO_HANDLE: &str = "__dso_handle";
 const ID_DOMAIN: &str = "blaze-export elf build id 1";
 
-/// Returns true if `name` is a standard C math symbol provided by `libm.so.6` on glibc Linux.
 /// Leading marker placed on `Space::Outside` names declared with `#[linkage = "extern_weak"]`.
 const WEAK_MARK: char = '\x02';
 
@@ -140,6 +139,18 @@ fn split_weak(name: &str) -> (&str, bool) {
     }
 }
 
+/// The unwind and wide-arithmetic symbols provided by the AArch64 Linux runtime.
+fn is_libgcc_symbol(name: &str) -> bool {
+    name.starts_with("_Unwind_")
+        || matches!(
+            name,
+            "__udivti3" | "__umodti3" | "__divti3" | "__modti3" | "__udivmodti4" | "__divmodti4"
+            | "__floattidf" | "__floatuntidf" | "__floattisf" | "__floatuntisf"
+            | "__fixdfti" | "__fixunsdfti" | "__fixsfti" | "__fixunssfti"
+        )
+}
+
+/// Whether glibc's standard math library provides this symbol.
 fn is_libm_symbol(name: &str) -> bool {
     matches!(
         name,
@@ -407,7 +418,7 @@ fn write_image<'a>(
             kept.push(idx);
             if let Some(imp) = laid.imports.get(k) {
                 let (sym_name, _) = split_weak(imp.name);
-                if sym_name.starts_with("_Unwind_") {
+                if is_libgcc_symbol(sym_name) {
                     needs_gcc_s = true;
                 } else if is_libm_symbol(sym_name) {
                     needs_libm = true;

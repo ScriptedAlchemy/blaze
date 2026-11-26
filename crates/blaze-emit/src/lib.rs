@@ -408,6 +408,17 @@ pub enum Routine {
 }
 
 impl Routine {
+    /// The system C ABI helper for an integer division or remainder at 128 bits.
+    pub(crate) fn wide_division(op: Op) -> Option<Self> {
+        match op {
+            Op::Udiv => Some(Self::Udivti3),
+            Op::Urem => Some(Self::Umodti3),
+            Op::Sdiv => Some(Self::Divti3),
+            Op::Srem => Some(Self::Modti3),
+            _ => None,
+        }
+    }
+
     /// The symbol placement binds, as C writes it (`dlsym` adds Mach-O's leading underscore).
     /// macOS: libSystem (`libsystem_m` for `fmod`/`fmodf`, `libcompiler_rt` for the `__*ti*`
     /// family); Linux: libc, libm (`fmod`, `fmodf`) and libgcc_s (the `__*ti*` family).
