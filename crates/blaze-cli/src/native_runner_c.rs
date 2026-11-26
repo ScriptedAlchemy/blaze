@@ -23,9 +23,10 @@
 //! image's key (engine_native.rs `image_key`) moves with every input above, and a deferred
 //! record never reaches the link.
 //!
-//! A checkout package uses the committed package-files leaf from the check that produced this
-//! command's answer. A miss lays the captured bytes after verifying the leaf. The compiler
-//! reads that immutable directory, and individual objects retain their source and header keys.
+//! A checkout package is captured from the command's open checkout when its C requests need it.
+//! Its files must agree with the check's overlapping file reads. A miss lays the exact captured
+//! bytes named by the digest, and the compiler reads that immutable directory. The check's
+//! layout does not read this snapshot, and objects keep their own source and header keys.
 //!
 //! A `links` dependency's trees a request names (c_tasks.rs `dep_roots`: librocksdb-sys reads
 //! lz4-sys's and zstd-sys's) are laid read-only beside the package: a producer's `OUT_DIR` as its
@@ -49,7 +50,7 @@ use blaze_build_script::dep_paths::DEPS_ROOT;
 use blaze_build_script::outputs::OutputsRef;
 use blaze_drive::Key;
 use blaze_ids::{ContentId, Hasher};
-use blaze_own::{AString, AVec, Alloc, String, Vec};
+use blaze_own::{AString, AVec, Alloc, BTreeMap, String, Vec};
 use blaze_proc_macro::native_c::Laid;
 use blaze_proc_macro::native_c_tasks::{self, COMPILE_DEADLINE, CTasksSetting};
 use blaze_proc_macro::native_setting::{OwnedNativeSetting, command_native_setting};
@@ -172,6 +173,8 @@ pub(crate) struct CTasks<'e> {
     sdk: Option<blaze_apple_sdk::Sdk<'e>>,
     fs: &'e bstd::fs::Fs,
     checkout: CheckedCheckout<'e>,
+    /// One source identity for a checkout package across this image's requests.
+    checkout_digests: BTreeMap<AString<'static>, ContentId, Alloc<'static>>,
     workers: u32,
     heap: &'static blaze_own::Heap,
     setup: Option<Setup>,
@@ -179,13 +182,13 @@ pub(crate) struct CTasks<'e> {
 }
 
 pub(crate) struct CheckedCheckout<'e> {
-    pub(crate) root: Option<&'e str>,
+    pub(crate) root: &'e bstd::fs::Dir<bstd::fs::ReadWrite>,
     pub(crate) leaves: &'e crate::sweep::Leaves<'e>,
 }
 
 impl<'e> CTasks<'e> {
     pub(crate) fn new(home: Option<&'e str>, sdk: Option<blaze_apple_sdk::Sdk<'e>>, fs: &'e bstd::fs::Fs, workers: u32, heap: &'static blaze_own::Heap, checkout: CheckedCheckout<'e>) -> CTasks<'e> {
-        CTasks { home, sdk, fs, workers, heap, checkout, setup: None, dirs: PackDirs::default() }
+        CTasks { home, sdk, fs, workers, heap, checkout, checkout_digests: BTreeMap::new_in(heap.alloc()), setup: None, dirs: PackDirs::default() }
     }
 
     /// The toolchain, set up once.
@@ -310,7 +313,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
     if requests == 0 {
         return Ok((script, None));
     }
-    let package_source = PackageSource::read(list, r, c.checkout.leaves, scratch)?;
+    let package_source = PackageSource::read(&cx, list, r, c, scratch)?;
     let alloc = c.heap.alloc();
     let demand = c_tasks::script_demand(&outputs, alloc);
     let mut demand_text: AVec<'_, &str> = Vec::with_capacity_in(demand.len(), alloc);
@@ -350,7 +353,7 @@ pub(crate) fn built_for<'s, 'm: 's>(
     let mut graph_links: Option<AVec<'_, (AString<'_>, AString<'_>, AString<'_>)>> = None;
     let mut deps: AVec<'_, DepTree<'_>> = Vec::with_capacity_in(named.len(), alloc);
     for guest in named.iter().copied() {
-        deps.push(dep_tree(list, producers, guest, &mut graph_links, c.checkout.leaves, alloc, scratch)?);
+        deps.push(dep_tree(&cx, list, producers, guest, &mut graph_links, c, alloc, scratch)?);
     }
     let mut dep_keys: AVec<'_, (&str, [u8; 32])> = Vec::with_capacity_in(deps.len(), alloc);
     dep_keys.extend(deps.iter().map(|dep| (dep.guest, dep.digest)));
@@ -367,15 +370,15 @@ pub(crate) fn built_for<'s, 'm: 's>(
     }
 
     // A miss: the package laid, the tasks run, the built record put.
-    let (package_dir, package_digest) = lay_package(&cx, c, list, r, package_source, scratch)?;
+    let (package_dir, package_digest) = lay_package(&cx, c, list, r, &package_source, scratch)?;
     let mut sources: AVec<'_, Laid<'_>> = Vec::with_capacity_in(1 + deps.len(), alloc);
     sources.push(Laid { guest: roots.package, host: package_dir, digest: package_digest, name: "the package" });
     // Each read-only: granted read, never written (native_c.rs `Laid`).
     for dep in deps.iter() {
-        let (host, name) = match dep.source {
-            DepSource::Out { script } => (lay_dep_out(c, script, dep.digest, scratch)?, "a `links` dependency's OUT_DIR"),
+        let (host, name) = match &dep.source {
+            DepSource::Out { script } => (lay_dep_out(c, *script, dep.digest, scratch)?, "a `links` dependency's OUT_DIR"),
             DepSource::Tree { r: producer, package } => {
-                let (host, digest) = lay_package(&cx, c, list, producer, package, scratch)?;
+                let (host, digest) = lay_package(&cx, c, list, *producer, package, scratch)?;
                 if digest != dep.digest {
                     return Err(CTaskWhy::Lay { words: kept(scratch, format_args!("{}: its package laid under another digest than it was keyed by", dep.guest)) });
                 }
@@ -455,7 +458,6 @@ struct DepTree<'d> {
     source: DepSource<'d>,
 }
 
-#[derive(Clone, Copy)]
 enum DepSource<'d> {
     /// A producer's `OUT_DIR` (`<builds>/<name>-<config>/out`) as its C step left it: its built
     /// record's files (what its process tree made: configure's and make's headers among them).
@@ -502,11 +504,12 @@ pub(crate) fn dep_out<'p>(producers: &Producers<'p>, guest: &str) -> Result<(Scr
 /// whose `links` it is (one per graph, the cargo book's "links"). None, or a producer whose
 /// sources have no snapshot, is refused naming the spelling (rule 3).
 fn dep_tree<'d, 's, 'a>(
+    cx: &Cx,
     list: &CrateList<'_>,
     producers: &Producers<'d>,
     guest: &'d str,
     graph_links: &mut Option<AVec<'a, (AString<'a>, AString<'a>, AString<'a>)>>,
-    leaves: &crate::sweep::Leaves<'_>,
+    c: &mut CTasks<'_>,
     alloc: Alloc<'a>,
     scratch: &'s Frame,
 ) -> Result<DepTree<'d>, CTaskWhy<'s>> {
@@ -540,7 +543,7 @@ fn dep_tree<'d, 's, 'a>(
     let Some(at) = (0..list.len()).find(|&at| list.package(at) == name.as_str() && list.version(at) == version.as_str()) else {
         return Err(lay(format_args!("a request names {}, but the crate list lacks {} {}", Code(guest), name.as_str(), version.as_str())));
     };
-    let package = PackageSource::read(list, at, leaves, scratch)?;
+    let package = PackageSource::read(cx, list, at, c, scratch)?;
     Ok(DepTree { guest, digest: package.digest(list, at).0, source: DepSource::Tree { r: at, package } })
 }
 
@@ -588,14 +591,13 @@ fn lay_dep_out<'s>(c: &CTasks<'_>, script: ScriptIn<'_>, key: [u8; 32], scratch:
     Ok(crate::work::held_str(real, scratch))
 }
 
-#[derive(Clone, Copy)]
 enum PackageSource {
     Fetched(Pinned),
-    Checkout(ContentId),
+    Checkout(crate::macro_files::NativePackage<'static>),
 }
 
 impl PackageSource {
-    fn read<'s>(list: &CrateList<'_>, r: usize, leaves: &crate::sweep::Leaves<'_>, scratch: &'s Frame) -> Result<Self, CTaskWhy<'s>> {
+    fn read<'s>(cx: &Cx, list: &CrateList<'_>, r: usize, c: &mut CTasks<'_>, scratch: &'s Frame) -> Result<Self, CTaskWhy<'s>> {
         match <CrateList<'_> as CrateTable<'_>>::place(list, r) {
             Place::Fetched { source, files } => Ok(Self::Fetched(Pinned { source: source.0, files })),
             Place::Checkout | Place::CheckoutDep => {
@@ -604,28 +606,110 @@ impl PackageSource {
                     .strip_prefix("/0/")
                     .ok_or_else(|| CTaskWhy::Lay { words: kept(scratch, format_args!("checkout package folder {} is outside tree 0", Code(shown))) })?
                     .trim_end_matches('/');
-                let digest = checkout_digest(leaves, dir)
-                    .ok_or_else(|| CTaskWhy::Lay { words: kept(scratch, format_args!("no checked package-files snapshot for {}", Code(shown))) })?;
-                Ok(Self::Checkout(digest))
+                let lay = |what: fmt::Arguments<'_>| CTaskWhy::Lay { words: kept(scratch, what) };
+                if !dir.is_empty() && dir.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+                    return Err(lay(format_args!("invalid checkout-relative package folder {}", Code(dir))));
+                }
+                let alloc = c.heap.alloc();
+                let package = crate::macro_files::native_package(cx, c.checkout.root, dir, scratch, alloc)
+                    .map_err(|error| lay(format_args!("checkout package {}: {error}", Code(shown))))?;
+                if checkout_digest(c.checkout.leaves, dir).is_some_and(|expected| expected != package.digest) {
+                    return Err(lay(format_args!("checkout package {} no longer matches its checked source tree", Code(shown))));
+                }
+                if let Err(PackageReadMismatch(path)) = check_package_reads(&package, dir, c.checkout.leaves, scratch) {
+                    return Err(lay(format_args!("checkout package {} changed after the check at {}", Code(shown), Code(path))));
+                }
+                match c.checkout_digests.get(dir) {
+                    Some(&expected) if expected != package.digest => return Err(lay(format_args!("checkout package {} changed between this image's C requests", Code(shown)))),
+                    Some(_) => {}
+                    None => {
+                        c.checkout_digests.insert(AString::from_str_in(dir, alloc), package.digest);
+                    }
+                }
+                Ok(Self::Checkout(package))
             }
             Place::Toolchain => Err(CTaskWhy::NotPinned { why: "a toolchain crate with C requests" }),
             Place::Unplaced { why } => Err(CTaskWhy::NotPinned { why }),
         }
     }
 
-    fn pin(self) -> Pinned {
+    fn pin(&self) -> Pinned {
         match self {
-            Self::Fetched(pin) => pin,
-            Self::Checkout(files) => Pinned { source: ContentId::of("blaze-cli native C checkout package 1", &files.0).0, files: files.0 },
+            Self::Fetched(pin) => *pin,
+            Self::Checkout(package) => checkout_pin(package.digest),
         }
     }
 
-    fn digest(self, list: &CrateList<'_>, r: usize) -> ContentId {
+    fn digest(&self, list: &CrateList<'_>, r: usize) -> ContentId {
         match self {
             Self::Fetched(pin) => package_digest(list, r, pin.files),
             Self::Checkout(_) => ContentId(self.pin().source),
         }
     }
+}
+
+fn checkout_pin(files: ContentId) -> Pinned {
+    Pinned { source: ContentId::of("blaze-cli native C checkout package 1", &files.0).0, files: files.0 }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PackageReadMismatch<'a>(&'a str);
+
+/// Compare the files both stages consumed. The copied package excludes the same paths as a
+/// package digest, so a checked file under an excluded subtree has no bytes in this snapshot.
+fn check_package_reads<'l>(package: &crate::macro_files::NativePackage<'_>, dir: &str, leaves: &crate::sweep::Leaves<'l>, scratch: &Frame) -> Result<(), PackageReadMismatch<'l>> {
+    use crate::sweep::{AT_MOD_RS, BOTH, FILE_DOMAIN, LeafKind, MODULE};
+    use crate::engine_script_reads::{DENIED, NONE, NOT_A_FILE};
+    use blaze_proc_macro::script_sandbox::{file_answer, stat_answer};
+
+    let relative = |path: &'l str| {
+        if dir.is_empty() {
+            (!path.starts_with('/')).then_some(path)
+        } else {
+            path.strip_prefix(dir).and_then(|rest| rest.strip_prefix('/'))
+        }
+    };
+    for at in 0..leaves.len() {
+        let path = leaves.path(at);
+        let Some(rel) = relative(path) else { continue };
+        if package.excluded(rel) {
+            continue;
+        }
+        let leaf = leaves.row(at);
+        let file = package.file(rel);
+        let matches_bytes = |bytes: Option<&[u8]>| match bytes {
+            Some(bytes) => !leaf.absent() && ContentId::of(FILE_DOMAIN, bytes) == leaf.id,
+            None => leaf.absent(),
+        };
+        let matches = match leaf.kind {
+            LeafKind::Slot if leaf.flags & MODULE != 0 => {
+                let alternate = crate::sweep::mod_rs_of(rel, scratch);
+                let alternate = core::str::from_utf8(alternate.as_slice()).map_err(|_| PackageReadMismatch(path))?;
+                if package.excluded(alternate) {
+                    continue;
+                }
+                let via_dir = package.file(alternate);
+                if leaf.flags & BOTH != 0 {
+                    file.is_some() && via_dir.is_some()
+                } else if leaf.flags & AT_MOD_RS != 0 {
+                    file.is_none() && matches_bytes(via_dir)
+                } else {
+                    via_dir.is_none() && matches_bytes(file)
+                }
+            }
+            LeafKind::Slot | LeafKind::Manifest | LeafKind::MacroFile => matches_bytes(file),
+            LeafKind::ScriptFile => match file {
+                Some(bytes) => file_answer(bytes) == leaf.id,
+                None => matches!(leaf.id, NONE | NOT_A_FILE | DENIED),
+            },
+            LeafKind::ScriptStat if file.is_some() => file.is_some_and(|bytes| stat_answer(false, bytes.len() as u64) == leaf.id),
+            _ => true,
+        };
+        if !matches {
+            return Err(PackageReadMismatch(path));
+        }
+    }
+    Ok(())
 }
 
 /// The committed leaf table is sorted by (kind, checkout-relative path).
@@ -654,7 +738,7 @@ fn package_digest(list: &CrateList<'_>, r: usize, files: [u8; 32]) -> ContentId 
 
 /// Crate `r`'s immutable package under the work folder, published by rename after writing the
 /// fetched files or the verified checkout bytes.
-fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, package: PackageSource, scratch: &'s Frame) -> Result<(&'s str, [u8; 32]), CTaskWhy<'s>> {
+fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, package: &PackageSource, scratch: &'s Frame) -> Result<(&'s str, [u8; 32]), CTaskWhy<'s>> {
     let lay = |what: fmt::Arguments<'_>| CTaskWhy::Lay { words: kept(scratch, what) };
     // The package's folder in its pack: `/<k>/<dir>/` (a git commit's), `/<k>/` (a crate's).
     let shown = list.shown_from(r);
@@ -710,18 +794,8 @@ fn lay_package<'s>(cx: &Cx, c: &mut CTasks<'_>, list: &CrateList<'_>, r: usize, 
                 write(rest, bytes.as_slice())?;
             }
         }
-        PackageSource::Checkout(expected) => {
-            let checkout = c.checkout.root.ok_or_else(|| lay(format_args!("no served checkout folder for {}", Code(shown))))?;
-            if !dir.is_empty() && dir.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
-                return Err(lay(format_args!("invalid checkout-relative package folder {}", Code(dir))));
-            }
-            let host = bstd::mem::format_in!(scratch, "{}/{dir}", checkout.trim_end_matches('/'));
-            let mut files = blaze_proc_macro::module::package_files(host.as_str().as_ref()).map_err(|e| lay(format_args!("{}: {e}", host.as_str())))?;
-            let found = blaze_proc_macro::module::files_digest(&mut files);
-            if hex32(&found) != Some(expected.0) {
-                return Err(lay(format_args!("checkout package {} changed after the check: expected {expected:?}, found {found}", Code(shown))));
-            }
-            for (path, bytes) in &files {
+        PackageSource::Checkout(package) => {
+            for (path, bytes) in &package.files {
                 write(path, bytes)?;
             }
         }
@@ -777,8 +851,53 @@ mod dep_out_tests {
         assert_eq!(checkout_digest(&leaves, "deps"), None);
 
         let tools = Toolchain { kind: CompilerKind::ShelfClang, compiler: [4; 32], sdk: b"sdk", target: "aarch64-apple-darwin" };
-        let built = |files| c_tasks_built::built_key(root, &tools, PackageSource::Checkout(files).pin(), &["smoketwo"], &[], None);
+        let built = |files| c_tasks_built::built_key(root, &tools, checkout_pin(files), &["smoketwo"], &[], None);
         assert_ne!(built(member), built(path_dep), "an unchanged deferred script cannot reuse an archive made from different C inputs");
+    }
+
+    #[test]
+    fn a_checkout_c_edit_moves_the_archive_key_while_checked_reads_must_still_match() {
+        use bstd::fs::{Content, Durable};
+        use bstd::io::{Io, Limits, SimWorld};
+        use bstd::path::Path;
+        use crate::sweep::{FILE_DOMAIN, LeafKind, Leaves, Rows};
+
+        let io = Io::simulated(SimWorld::new(80, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("data").expect("a path")).expect("the checkout");
+        let frame = cx.frame();
+        let alloc = blaze_own::testing::heap().alloc();
+        let rust = b"pub fn marker() {}\n";
+        let header = b"#define SEEN 1\n";
+        let before = b"int value(void) { return 1; }\n";
+        let after = b"int value(void) { return 2; }\n";
+        let write = |path: &str, bytes: &[u8]| root.publish(&cx, &Path::new(path).expect("a path"), Content::bytes(bytes), Durable::No).expect("write a package file");
+        write("pkg/src/lib.rs", rust);
+        write("pkg/watched.h", header);
+        write("pkg/value.c", before);
+        write("pkg/target/ignored", b"not a package input");
+        let mut rows = Rows::new_in(frame);
+        rows.push(LeafKind::Slot, 0, "pkg/src/lib.rs", None, ContentId::of(FILE_DOMAIN, rust));
+        rows.push(LeafKind::ScriptFile, 0, "pkg/watched.h", None, blaze_proc_macro::script_sandbox::file_answer(header));
+        let bytes = Leaves::bytes_in(&rows, frame).unwrap();
+        let (leaves, _) = Leaves::of(&bytes).unwrap();
+
+        let capture = || crate::macro_files::native_package(&cx, &root, "pkg", frame, alloc).expect("capture the checkout package");
+        let tools = Toolchain { kind: CompilerKind::ShelfClang, compiler: [4; 32], sdk: b"sdk", target: "aarch64-apple-darwin" };
+        let key = |digest| c_tasks_built::built_key(ContentId([1; 32]), &tools, checkout_pin(digest), &["fixture"], &[], None);
+        let original = capture();
+        assert_eq!(check_package_reads(&original, "pkg", &leaves, frame), Ok(()));
+        assert_eq!(original.file("target/ignored"), None);
+        write("pkg/value.c", after);
+        let edited = capture();
+        assert_eq!(check_package_reads(&edited, "pkg", &leaves, frame), Ok(()));
+        assert_eq!(original.file("value.c"), Some(&before[..]));
+        assert_eq!(edited.file("value.c"), Some(&after[..]));
+        assert_ne!(key(original.digest), key(edited.digest));
+        assert_eq!(key(edited.digest), key(capture().digest));
+
+        write("pkg/watched.h", b"#define SEEN 2\n");
+        assert_eq!(check_package_reads(&capture(), "pkg", &leaves, frame), Err(PackageReadMismatch("pkg/watched.h")));
     }
 
     /// A `Script` payload (scripts.rs `payload_parts`) of a run with `OUT_DIR` [`OUT`] holding

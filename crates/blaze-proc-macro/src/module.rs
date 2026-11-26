@@ -154,15 +154,18 @@ impl<'l, 'a> LockedPackages<'l, 'a> {
 /// blaze walk it alike (`examples/tempo_derives.rs` computes it from the checkout and finds the
 /// builder's module by it).
 pub fn files_digest(files: &mut [(String, Vec<u8>)]) -> String {
-    files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    let mut all = Vec::new();
+    hex(&files_id(files))
+}
+
+/// The binary package digest, over the same sorted bytes as [`files_digest`].
+pub fn files_id<P: AsRef<str>, B: AsRef<[u8]>>(files: &mut [(P, B)]) -> [u8; 32] {
+    files.sort_by(|a, b| a.0.as_ref().as_bytes().cmp(b.0.as_ref().as_bytes()));
+    let mut digest = blaze_sha256::Sha256::new();
     for (path, bytes) in files.iter() {
-        all.extend_from_slice(path.as_bytes());
-        all.push(0);
-        all.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        all.extend_from_slice(bytes);
+        let bytes = bytes.as_ref();
+        digest.update(path.as_ref().as_bytes()).update(&[0]).update(&(bytes.len() as u64).to_le_bytes()).update(bytes);
     }
-    sha256_hex(&all)
+    digest.finish()
 }
 
 /// The files of the package at `dir` that [`files_digest`] covers, by their paths relative to

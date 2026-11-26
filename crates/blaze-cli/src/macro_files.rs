@@ -35,7 +35,7 @@ use bstd::fs::{Dir, EntryKind, ReadWrite};
 use bstd::mem::{Bytes, Frame};
 use bstd::path::Path;
 
-use blaze_own::{Texts, Vec};
+use blaze_own::{AString, AVec, Alloc, Texts, Vec};
 
 use crate::CliError;
 use crate::sweep::{ABSENT, Leaf, LeafKind, Listing, Plant, Rows, Stamp, Stamps, dir_stamp, listing_id, look};
@@ -86,6 +86,10 @@ pub(crate) fn walked<'f>(cx: &Cx, root: &Dir<ReadWrite>, at: &str, place: InPack
             None => return Ok(None),
         },
     };
+    package_listing(&listed, at, place, frame, |_| {}).map(Some)
+}
+
+fn package_listing<'f>(listed: &bstd::fs::Entries, at: &str, place: InPackage, frame: &'f Frame, mut skipped: impl FnMut(&str)) -> Result<Listing<'f>, CliError> {
     let mut names: Texts<&'f Frame> = Texts::new_in(frame);
     let mut dirs: Vec<bool, &'f Frame> = Vec::new_in(frame);
     for i in 0..listed.len() {
@@ -93,16 +97,69 @@ pub(crate) fn walked<'f>(cx: &Cx, root: &Dir<ReadWrite>, at: &str, place: InPack
         let is_dir = match listed.kind(i) {
             EntryKind::Dir => true,
             EntryKind::File => false,
-            EntryKind::Link | EntryKind::Other => continue,
+            EntryKind::Link | EntryKind::Other => {
+                skipped(name);
+                continue;
+            }
             EntryKind::Unknown | EntryKind::Gone => return Err(CliError::MacroFiles(MacroFilesError::Kind { at: under(at, name) })),
         };
         if !in_package(name.as_bytes(), is_dir, place) {
+            skipped(name);
             continue;
         }
         names.push(name);
         dirs.push(is_dir);
     }
-    Ok(Some(Listing { names, dirs }))
+    Ok(Listing { names, dirs })
+}
+
+/// The exact bytes of one checkout package, taken from the command's open directory.
+pub(crate) struct NativePackage<'a> {
+    pub(crate) digest: ContentId,
+    pub(crate) files: AVec<'a, (AString<'a>, AVec<'a, u8>)>,
+    skipped: AVec<'a, AString<'a>>,
+}
+
+impl NativePackage<'_> {
+    /// The snapshot omits VCS metadata, out-of-package build directories, and symbolic links.
+    pub(crate) fn excluded(&self, path: &str) -> bool {
+        self.skipped.iter().any(|prefix| beneath(prefix, path))
+    }
+
+    /// Captured file bytes, in the same order the package digest used.
+    pub(crate) fn file(&self, path: &str) -> Option<&[u8]> {
+        self.files.binary_search_by(|(name, _)| name.as_str().cmp(path)).ok().map(|at| self.files[at].1.as_slice())
+    }
+}
+
+/// Capture a package only when native work needs it. Keep the bytes used by the package digest
+/// so a cache miss can lay them without reopening the checkout.
+pub(crate) fn native_package<'a>(cx: &Cx, root: &Dir<ReadWrite>, dir: &str, frame: &Frame, alloc: Alloc<'a>) -> Result<NativePackage<'a>, CliError> {
+    let cx = cx.span("native package: capture files beneath the opened checkout");
+    let mut files = AVec::new_in(alloc);
+    let mut skipped = AVec::new_in(alloc);
+    let mut folders = AVec::new_in(alloc);
+    let mut bytes = Bytes::new_in(frame, "a checkout native package file");
+    folders.push(String::new());
+    while let Some(rel) = folders.pop() {
+        let at = under(dir, &rel);
+        let listed = if at.is_empty() { Some(root.own_entries(&cx)?) } else { root.entries_confined(&cx, &Path::new(&at)?)? };
+        let listed = listed.ok_or_else(|| CliError::MacroFiles(MacroFilesError::Gone { at: String::from(at.as_str()) }))?;
+        let place = if rel.is_empty() { InPackage::Root } else { InPackage::Beneath };
+        let listing = package_listing(&listed, &at, place, frame, |name| skipped.push(AString::from_str_in(&under(&rel, name), alloc)))?;
+        for (name, is_dir) in listing.entries() {
+            let entry = under(&rel, name);
+            if is_dir {
+                folders.push(entry);
+            } else {
+                bytes.truncate(0);
+                root.read_all_confined(&cx, &Path::new(&under(dir, &entry))?, &mut bytes)?;
+                files.push((AString::from_str_in(&entry, alloc), AVec::from_slice_in(bytes.as_slice(), alloc)));
+            }
+        }
+    }
+    let digest = ContentId(blaze_proc_macro::module::files_id(&mut files));
+    Ok(NativePackage { digest, files, skipped })
 }
 
 /// A [`LeafKind::MacroFolder`] row today: `old`'s id kept, no listing, when the folder's settled

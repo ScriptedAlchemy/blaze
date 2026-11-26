@@ -767,7 +767,7 @@ fn prepare_crates<'r, 'm: 's, 's>(
         standing.workers.get(),
         standing.heap,
         crate::native_runner_c::CheckedCheckout {
-            root: standing.place.served.root_text(),
+            root: standing.checkout,
             leaves: standing.leaves,
         },
     );
