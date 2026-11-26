@@ -6,7 +6,7 @@
 //! literals) are laid out in its relro part, so the record is one piece of code that
 //! refers to nothing but what the function asked for. What the code says about where they are is
 //! filled in here; what it says about the outside is a [`Site`] naming its target by
-//! (space, symbol), which the lowering lane's `references` resolves from the symbol's name.
+//! (space, symbol), resolved against the references of the root and the imports linked into it.
 //!
 //! Ported from the fork's `hir-ty-codegen/llvm/emitted.rs` (`ccb0b95cf7`), onto `CodeRecord`.
 
@@ -14,12 +14,12 @@
 use blaze_code::record::{CodeRecord, Held, RecordError, Site, SiteKind, Space, Target, TrapRow, Word, PositionRow, PositionPart, PositionField, OWN_CODE, OWN_RELRO};
 use core::fmt;
 
-use blaze_own::{AVec, Alloc, FixedString, String, Vec};
+use blaze_own::{ABTreeSet, AVec, Alloc, BTreeSet, FixedString, String, Vec};
 use object::{
     BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionIndex, SectionKind, SymbolSection, elf, macho,
 };
 
-use super::{LlvmModule, object_unwind, traps::{Tag, Tags}};
+use super::{LinkName, LlvmModule, object_unwind, traps::{Tag, Tags}};
 
 /// Why an object file could not be read back as a record.
 #[derive(Debug, PartialEq, Eq)]
@@ -32,8 +32,10 @@ pub enum ReadError {
     NoSection,
     /// The function's code is not where its section says.
     CodeOutside,
-    /// A relocation names a symbol the lowering lane's `references` does not.
+    /// A relocation names a symbol the linked modules' references do not.
     UnknownSymbol { name: FixedString<80> },
+    /// The LLVM spelling names both a Blaze target and a C symbol in the linked modules.
+    AmbiguousSymbol { name: FixedString<80> },
     /// A relocation of a kind this reader does not map.
     Relocation { at: u64, kind: u32 },
     /// A relocation against a section the code does not lay out.
@@ -63,7 +65,8 @@ impl fmt::Display for ReadError {
             ReadError::NoFunction => write!(f, "the function's symbol is not in the object"),
             ReadError::NoSection => write!(f, "the function's symbol is in no section"),
             ReadError::CodeOutside => write!(f, "the function's code is not where its section says"),
-            ReadError::UnknownSymbol { name } => write!(f, "a relocation names {name}, which the module does not"),
+            ReadError::UnknownSymbol { name } => write!(f, "a relocation names {name}, which the linked modules do not"),
+            ReadError::AmbiguousSymbol { name } => write!(f, "a relocation names {name}, which the linked modules use for both a Blaze target and a C symbol"),
             ReadError::Relocation { at, kind } => write!(f, "a relocation of kind {kind} at {at}"),
             ReadError::Section { at } => write!(f, "a relocation at {at} against a section the code does not lay out"),
             ReadError::UnpairedLoad { at, target } => write!(f, "a load at {at} of {target:?} whose `adrp` is not the instruction before it"),
@@ -88,13 +91,28 @@ fn function_name<'a>(module: &LlvmModule<'_>, alloc: Alloc<'a>) -> Result<String
 }
 
 /// Where a relocation leads: a named symbol (an import, or the function's own) or a section.
-enum Destination {
-    Named(Target),
+enum Destination<'n> {
+    Named(Named<'n>),
     Section { index: SectionIndex, offset: i64 },
 }
 
+struct Named<'n> {
+    target: Target,
+    name: &'n str,
+}
+
+impl Named<'_> {
+    fn store(self, record: &mut CodeRecord<'_>) -> u32 {
+        if self.target.space == Space::Outside {
+            record.outside(self.name)
+        } else {
+            record.target(self.target)
+        }
+    }
+}
+
 /// Reads `object` (what LLVM wrote for `module`) as a sealed code record in `alloc`.
-pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, tags: &Tags<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ReadError> {
+pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, imports: &[&LlvmModule<'_>], tags: &Tags<'_>, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, ReadError> {
     let file = object::File::parse(object).map_err(|_| ReadError::Object)?;
     if file.kind() != object::ObjectKind::Relocatable {
         return Err(ReadError::Unwind { at: 0, what: "unwind input must be a relocatable object" });
@@ -143,11 +161,9 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, tags: &Tags<'_>, 
     record.code_align = align_of(section.align()).max(blaze_code::record::LEAST_CODE_ALIGN);
     record.relro_align = blaze_code::record::LEAST_RELRO_ALIGN;
     unwind.write(&file, &mut record, alloc)?;
-    for symbol in file.symbols().filter(|symbol| symbol.is_undefined()) {
-        let symbol_name = plain(macho, symbol.name().map_err(|_| ReadError::Object)?);
-        if module.references.iter().flatten().chain(module.implicit_references.iter()).any(|target| target.space == Space::Outside && target.symbol == blaze_code::record::Symbol::of_name(symbol_name)) {
-            record.outside(symbol_name);
-        }
+    let mut references = BTreeSet::new_in(alloc);
+    for linked in core::iter::once(module).chain(imports.iter().copied()) {
+        references.extend(linked.references.iter().flatten().chain(&linked.implicit_references).copied());
     }
 
     // Reach every local data section through both instruction and data relocations. Data
@@ -199,7 +215,7 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, tags: &Tags<'_>, 
         }
         for (at, relocation) in section.relocations() {
             if index == text && !range.contains(&at) { continue; }
-            if let Destination::Section { index: target, .. } = destination(&file, &relocation, at, module, alloc)? {
+            if let Destination::Section { index: target, .. } = destination(&file, &relocation, at, &name, &references)? {
                 pending.push(target);
             }
         }
@@ -208,7 +224,7 @@ pub(super) fn read<'a>(object: &[u8], module: &LlvmModule<'_>, tags: &Tags<'_>, 
         let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
         for (offset, relocation) in section.relocations() {
             if index == text && !range.contains(&offset) { continue; }
-            let dest = destination(&file, &relocation, offset, module, alloc)?;
+            let dest = destination(&file, &relocation, offset, &name, &references)?;
             if index == text {
                 instruction(&file, &relocation, offset - range.start, dest, &placed, text, range.start, &mut record)?;
             } else {
@@ -268,23 +284,24 @@ fn atom(file: &object::File<'_>, section: &object::Section<'_, '_>, address: u64
     Ok(start..end)
 }
 
-/// A defined symbol carries its offset even if it is global. Undefined symbols alone name
-/// other records. This also makes recursive calls refer to this atom, not an absent import.
-fn destination(file: &object::File<'_>, relocation: &object::Relocation, at: u64, module: &LlvmModule<'_>, alloc: Alloc<'_>) -> Result<Destination, ReadError> {
+/// A global function outside the root atom names its own record even if LLVM emitted its
+/// definition into this object. Other defined symbols carry section offsets, including the
+/// root function itself for a recursive call.
+fn destination<'o>(file: &object::File<'o>, relocation: &object::Relocation, at: u64, root: &str, references: &ABTreeSet<'_, Target>) -> Result<Destination<'o>, ReadError> {
     match relocation.target() {
         RelocationTarget::Section(index) => Ok(Destination::Section { index, offset: 0 }),
         RelocationTarget::Symbol(index) => {
             let symbol = file.symbol_by_index(index).map_err(|_| ReadError::Object)?;
             let name = plain(file.format() == BinaryFormat::MachO, symbol.name().map_err(|_| ReadError::Object)?);
-            if symbol.kind() == object::SymbolKind::Text && symbol.is_global() && name != function_name(module, alloc)? {
-                return Ok(Destination::Named(target_of(module, name, alloc)?));
+            if symbol.kind() == object::SymbolKind::Text && symbol.is_global() && name != root {
+                return target_of(references, name).map(Destination::Named);
             }
             if let SymbolSection::Section(index) = symbol.section() {
                 let section = file.section_by_index(index).map_err(|_| ReadError::NoSection)?;
                 let offset = symbol.address().checked_sub(section.address()).and_then(|n| i64::try_from(n).ok()).ok_or(ReadError::CodeOutside)?;
                 Ok(Destination::Section { index, offset })
             } else {
-                Ok(Destination::Named(target_of(module, name, alloc)?))
+                target_of(references, name).map(Destination::Named)
             }
         }
         _ => Err(ReadError::Section { at }),
@@ -325,7 +342,7 @@ fn scale(kind: SiteKind) -> u32 {
     match kind { SiteKind::LdstLo12_2 => 1, SiteKind::LdstLo12_4 => 2, SiteKind::LdstLo12_8 | SiteKind::GotLo12 => 3, SiteKind::LdstLo12_16 => 4, _ => 0 }
 }
 
-fn instruction(file: &object::File<'_>, relocation: &object::Relocation, at: u64, dest: Destination, placed: &[(SectionIndex, u64)], text: SectionIndex, start: u64, record: &mut CodeRecord<'_>) -> Result<(), ReadError> {
+fn instruction(file: &object::File<'_>, relocation: &object::Relocation, at: u64, dest: Destination<'_>, placed: &[(SectionIndex, u64)], text: SectionIndex, start: u64, record: &mut CodeRecord<'_>) -> Result<(), ReadError> {
     let original = word(&record.code, at)?;
     let kind = match relocation.flags() {
         RelocationFlags::MachO { r_type: macho::ARM64_RELOC_BRANCH26, r_pcrel: true, r_length: 2 } |
@@ -379,14 +396,14 @@ fn instruction(file: &object::File<'_>, relocation: &object::Relocation, at: u64
         Destination::Named(target) if kind == SiteKind::Branch26 => {
             if addend != 0 { return Err(ReadError::Semantics { at, what: "external branch with a nonzero addend" }); }
             let veneer = u32::try_from(record.code.len()).map_err(|_| ReadError::CodeOutside)?;
-            let target = record.target(target);
+            let target = target.store(record);
             // BL sets LR at its original site. The veneer tail-branches, preserving that
             // return address; a tail B also preserves its caller's LR.
             for word in [0x9000_0010u32, 0xf940_0210, 0xd61f_0200] { record.code.extend_from_slice(&word.to_le_bytes()); }
             record.sites.push(Site { at: veneer, kind: SiteKind::Load, target, addend: 0 });
             (OWN_CODE, i64::from(veneer))
         }
-        Destination::Named(target) if matches!(kind, SiteKind::GotPage21 | SiteKind::GotLo12) && addend == 0 => (record.target(target), 0),
+        Destination::Named(target) if matches!(kind, SiteKind::GotPage21 | SiteKind::GotLo12) && addend == 0 => (target.store(record), 0),
         Destination::Named(_) => return Err(ReadError::Semantics { at, what: "direct external address or nonzero GOT addend requires an address relocation" }),
     };
     let addend = u32::try_from(addend).map_err(|_| ReadError::Semantics { at, what: "local relocation is outside its record part" })?;
@@ -397,7 +414,7 @@ fn instruction(file: &object::File<'_>, relocation: &object::Relocation, at: u64
     Ok(())
 }
 
-fn data_relocation(file: &object::File<'_>, relocation: &object::Relocation, at: u64, dest: Destination, placed: &[(SectionIndex, u64)], text: SectionIndex, start: u64, record: &mut CodeRecord<'_>) -> Result<(), ReadError> {
+fn data_relocation(file: &object::File<'_>, relocation: &object::Relocation, at: u64, dest: Destination<'_>, placed: &[(SectionIndex, u64)], text: SectionIndex, start: u64, record: &mut CodeRecord<'_>) -> Result<(), ReadError> {
     if !matches!(relocation.flags(), RelocationFlags::MachO { r_type: macho::ARM64_RELOC_UNSIGNED, r_pcrel: false, r_length: 3 } | RelocationFlags::Elf { r_type: elf::R_AARCH64_ABS64 }) {
         return Err(unsupported(relocation, at));
     }
@@ -412,7 +429,7 @@ fn data_relocation(file: &object::File<'_>, relocation: &object::Relocation, at:
         }
     }
     let (target, addend) = match dest {
-        Destination::Named(target) => (record.target(target), addend),
+        Destination::Named(target) => (target.store(record), addend),
         Destination::Section { index, offset } => local(index, offset.checked_add(addend).ok_or(ReadError::CodeOutside)?, placed, text, start, at)?,
     };
     record.relro.get_mut(slot..slot + 8).ok_or(ReadError::CodeOutside)?.fill(0);
@@ -469,39 +486,24 @@ fn plain<'n>(macho: bool, name: &'n str) -> &'n str {
     if macho { name.strip_prefix('_').unwrap_or(name) } else { name }
 }
 
-/// The `Target` of the symbol `name`, as the lowering lane's `references` names it.
-fn target_of(module: &LlvmModule<'_>, name: &str, alloc: Alloc<'_>) -> Result<Target, ReadError> {
-    let Some(target) = module.references.iter().flatten().chain(module.implicit_references.iter()).find(|t| LinkName(**t).spells(name, alloc)) else {
+/// Resolve a spelling only if the actual linked module set supplied its typed target.
+fn target_of<'n>(references: &ABTreeSet<'_, Target>, name: &'n str) -> Result<Named<'n>, ReadError> {
+    let internal = LinkName::parse(name).filter(|target| references.contains(target));
+    let outside = Target { space: Space::Outside, symbol: blaze_code::record::Symbol::of_name(name) };
+    let outside = references.contains(&outside).then_some(outside);
+    let spelled = || {
         let mut spelled = FixedString::<80>::new();
         spelled.try_push_str(name).ok();
-        return Err(ReadError::UnknownSymbol { name: spelled });
+        spelled
     };
-    Ok(*target)
+    match (internal, outside) {
+        (Some(target), None) | (None, Some(target)) => Ok(Named { target, name }),
+        (Some(_), Some(_)) => Err(ReadError::AmbiguousSymbol { name: spelled() }),
+        (None, None) => Err(ReadError::UnknownSymbol { name: spelled() }),
+    }
 }
 
 /// log2 of an alignment, as the record's `code_align` is.
 fn align_of(align: u64) -> u8 {
     u8::try_from(align.max(1).trailing_zeros()).unwrap_or(blaze_code::record::MOST_PART_ALIGN)
-}
-
-/// How the lowering lane spells a target's link name (its `LinkName`, which is private).
-struct LinkName(Target);
-
-impl LinkName {
-    /// Whether the lowering lane spells this target `name`.
-    fn spells(self, name: &str, alloc: Alloc<'_>) -> bool {
-        let prefix = match self.0.space {
-            Space::Func => "blaze_fn_",
-            Space::Static => "blaze_static_",
-            Space::Vtable => "blaze_vtable_",
-            Space::Tls => "blaze_tls_",
-            Space::Outside => return self.0.symbol == blaze_code::record::Symbol::of_name(name),
-        };
-        let mut spelled = String::new_in(alloc);
-        spelled.push_str(prefix);
-        for b in self.0.symbol.0 {
-            blaze_own::format_into!(&mut spelled, "{b:02x}");
-        }
-        &*spelled == name
-    }
 }

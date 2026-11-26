@@ -77,16 +77,40 @@ impl core::error::Error for LowerError {}
 
 pub struct LinkName(pub Target);
 
+impl LinkName {
+    fn prefix(space: Space) -> Option<&'static str> {
+        match space {
+            Space::Func => Some("blaze_fn_"),
+            Space::Static => Some("blaze_static_"),
+            Space::Vtable => Some("blaze_vtable_"),
+            Space::Tls => Some("blaze_tls_"),
+            Space::Outside => None,
+        }
+    }
+
+    /// The internal target a symbol's canonical spelling could name. The object reader still
+    /// requires that the linked modules actually declare that target.
+    fn parse(name: &str) -> Option<Target> {
+        let (space, hex) = [Space::Func, Space::Static, Space::Vtable, Space::Tls]
+            .into_iter()
+            .find_map(|space| name.strip_prefix(Self::prefix(space)?).map(|hex| (space, hex)))?;
+        let digits: &[u8; 64] = hex.as_bytes().try_into().ok()?;
+        let digit = |byte| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        let mut bytes = [0; 32];
+        for (byte, &[hi, lo]) in bytes.iter_mut().zip(digits.as_chunks::<2>().0) {
+            *byte = (digit(hi)? << 4) | digit(lo)?;
+        }
+        Some(Target { space, symbol: Symbol(bytes) })
+    }
+}
+
 impl fmt::Display for LinkName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let prefix = match self.0.space {
-            Space::Func => "blaze_fn_",
-            Space::Static => "blaze_static_",
-            Space::Vtable => "blaze_vtable_",
-            Space::Tls => "blaze_tls_",
-            Space::Outside => return Err(fmt::Error),
-        };
-        f.write_str(prefix)?;
+        f.write_str(Self::prefix(self.0.space).ok_or(fmt::Error)?)?;
         for b in self.0.symbol.0 {
             write!(f, "{b:02x}")?;
         }

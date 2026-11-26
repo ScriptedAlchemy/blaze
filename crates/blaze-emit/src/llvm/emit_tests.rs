@@ -206,10 +206,15 @@ fn control() -> blaze_lir::VerifiedFunc<blaze_own::Alloc<'static>> {
 
 /// `fn(x: i32) -> i32 { callee(x) }`: one call of an outside function.
 fn caller() -> blaze_lir::VerifiedFunc<blaze_own::Alloc<'static>> {
+    caller_with_attrs(FnAttrs::default())
+}
+
+fn caller_with_attrs(attrs: FnAttrs) -> blaze_lir::VerifiedFunc<blaze_own::Alloc<'static>> {
     let mut b = Builder::<_, Full>::new_in(64, blaze_own::testing::heap().alloc());
     let p = Param::of(Ty::I32);
     let sig = b.sig(Conv::C, Variadic::No, &[p], &[p]);
     b.set_signature(sig);
+    b.set_attrs(attrs);
     let entry = b.create_block(BlockKind::Normal);
     b.begin(entry);
     let x = b.param(Ty::I32);
@@ -311,6 +316,69 @@ fn release_record_links_its_imports() {
     // is in the linked module. The record names at most that one target.
     assert!(view.targets() <= 1, "the caller names only its callee: {} targets", view.targets());
     println!("release record with imports: {} bytes of code, {} targets, {} sites", view.code().len(), view.targets(), view.sites());
+}
+
+#[test]
+fn release_record_resolves_calls_introduced_by_inlining() {
+    use super::{LinkName, emit::EmitError, object::ReadError};
+    use blaze_code::record::OWN_CODE;
+
+    struct Leaf(Named<'static>);
+    impl Names for Leaf {
+        fn name(&self, outside: Outside) -> Option<Named<'_>> {
+            match outside {
+                Outside::Func(0) => Some(self.0),
+                _ => None,
+            }
+        }
+
+        fn routines(&self) -> RoutinePlaces {
+            RoutinePlaces::NONE
+        }
+    }
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let root = prepare(Symbol([2; 32]), caller().verified(), &ByPlace, alloc).unwrap();
+    let middle_symbol = Symbol([7; 32]);
+    let middle_body = caller_with_attrs(FnAttrs::default().with_inline(Inline::Always));
+    for os in [blaze_tier::Os::Linux, blaze_tier::Os::MacOs] {
+        let machine = blaze_tier::Machine { os, ..machine() };
+        let before = emit_release(ReleaseTask { module: &root, imports: &[], opt: 2, machine }, alloc).unwrap();
+        let before = CodeView::read(&before.record).unwrap();
+        assert_eq!(before.targets(), 1, "{os:?}");
+        assert_eq!(before.target(0), Target { space: Space::Func, symbol: middle_symbol }, "{os:?}");
+
+        for leaf in [Named::Symbol(Symbol([9; 32])), Named::C("blaze_test_inlined_callee")] {
+            let (leaf_target, c_name) = match leaf {
+                Named::Symbol(symbol) => (Target { space: Space::Func, symbol }, None),
+                Named::C(name) => (Target { space: Space::Outside, symbol: Symbol::of_name(name) }, Some(name)),
+            };
+            let mut middle = prepare(middle_symbol, middle_body.verified(), &Leaf(leaf), alloc).unwrap();
+            let after = emit_release(ReleaseTask { module: &root, imports: &[&middle], opt: 2, machine }, alloc).unwrap();
+            let after = CodeView::read(&after.record).unwrap();
+            assert_eq!(after.targets(), 1, "{os:?}, {leaf:?}");
+            assert_eq!(after.target(0), leaf_target, "{os:?}, {leaf:?}");
+            assert_eq!(after.name(leaf_target.symbol), c_name, "{os:?}, {leaf:?}");
+            assert_eq!(after.sites(), 2, "{os:?}, {leaf:?}");
+            let branch = after.site(0);
+            let veneer = after.site(1);
+            assert_eq!((branch.kind, branch.target), (SiteKind::Branch26, OWN_CODE));
+            assert_eq!((veneer.at, veneer.kind, veneer.target), (branch.addend, SiteKind::Load, 0));
+
+            // Keep the call in the linked IR and remove only its reference metadata.
+            middle.references.clear();
+            let error = emit_release(ReleaseTask { module: &root, imports: &[&middle], opt: 2, machine }, alloc).err().unwrap();
+            let EmitError::Read(ReadError::UnknownSymbol { name }) = error else {
+                panic!("{os:?}, {leaf:?}: unexpected emission error {error:?}");
+            };
+            if let Some(c_name) = c_name {
+                assert_eq!(name.as_str(), c_name, "{os:?}");
+            } else {
+                let expected = blaze_own::format_in!(alloc, "{}", LinkName(leaf_target));
+                assert_eq!(name.as_str(), expected.as_str(), "{os:?}");
+            }
+        }
+    }
 }
 
 /// The linked record runs: `f(x) == x + 1` whether LLVM inlined the callee or left the call

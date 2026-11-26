@@ -424,7 +424,7 @@ fn record<'a>(
         .collect_in(alloc);
     let session = Session::new(root.as_deref().unwrap_or(module.ir.as_slice()), &imported, machine)?;
     let object = session.emit(opt, alloc)?;
-    super::object::read(&object, module, &tags, alloc).map_err(EmitError::Read)
+    super::object::read(&object, module, imports, &tags, alloc).map_err(EmitError::Read)
 }
 
 /// Emits a folded group: its body and one thunk per other member.
