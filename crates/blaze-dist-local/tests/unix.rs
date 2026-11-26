@@ -48,6 +48,18 @@ impl TestClock {
     fn current(&self) -> u64 {
         self.now.load(Ordering::Acquire)
     }
+
+    fn advance(&self, now: u64) {
+        self.now.store(now, Ordering::Release);
+        let clock = SystemClock;
+        let deadline = fixture_deadline_ns(&clock);
+        // Once the server samples this value, it ticks before handling any request
+        // sent after this acknowledgment.
+        while self.sampled.load(Ordering::Acquire) != now {
+            assert!(clock.monotonic_nanos().unwrap() < deadline, "the coordinator did not sample clock {now}");
+            sleep_ms(1);
+        }
+    }
 }
 
 impl Clock for TestClock {
@@ -184,15 +196,7 @@ impl Fixture {
     }
 
     fn at(&self, now: u64) {
-        self.clock.now.store(now, Ordering::Release);
-        let clock = SystemClock;
-        let deadline = fixture_deadline_ns(&clock);
-        // Once the server samples this value, it ticks before handling any request
-        // sent after this acknowledgment.
-        while self.clock.sampled.load(Ordering::Acquire) != now {
-            assert!(clock.monotonic_nanos().unwrap() < deadline, "the coordinator did not sample clock {now}");
-            sleep_ms(1);
-        }
+        self.clock.advance(now);
     }
 }
 
@@ -1273,8 +1277,7 @@ fn late_attempt_work_after_reconnect_is_refused_and_typed_terminal_is_bound() {
     let thread = spawn(move || server.run(&signal).unwrap(), alloc).unwrap();
     let mut c = Client::connect(path.as_str(), random_id().unwrap(), alloc).unwrap();
     let b = submit(&mut c, 100_000, alloc);
-    clock.0.store(15_001, Ordering::Release);
-    sleep_ms(10);
+    clock.advance(15_001);
     c.reconnect(path.as_str()).unwrap();
     let Answer::Binding(current) = c.call(Command::Resume(b.subscription.clone())).unwrap() else {
         panic!()
