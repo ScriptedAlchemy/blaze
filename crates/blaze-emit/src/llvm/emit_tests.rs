@@ -458,6 +458,49 @@ fn release_record_shuffles_both_vectors_into_each_result_width() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
+fn release_record_masks_each_vector_shift_amount() {
+    use blaze_lir::{Op, Scalar, builder::MemAttrs};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut b = Builder::<_, Full>::new_in(64, alloc);
+    let ptr = Param::of(Ty::PTR);
+    let sig = b.sig(Conv::C, Variadic::No, &[ptr, ptr, ptr], &[]);
+    b.set_signature(sig);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    let input = b.param(Ty::PTR);
+    let amounts = b.param(Ty::PTR);
+    let output = b.param(Ty::PTR);
+    let vector = Ty::vector(Scalar::I32, 4).unwrap();
+    let align = MemAttrs::aligned(2);
+    let values = b.load(vector, Flags::NONE, input, 0, align);
+    let amounts = b.load(vector, Flags::NONE, amounts, 0, align);
+    for (op, offset) in [(Op::Shl, 0), (Op::Lshr, 16), (Op::Ashr, 32)] {
+        let value = b.binary(op, Flags::NONE, values, amounts);
+        b.store(Flags::NONE, value, output, offset, align);
+    }
+    b.ret(&[]);
+
+    let func = b.finish_verified().unwrap();
+    let symbol = Symbol([19; 32]);
+    let module = prepare(symbol, func.verified(), &ByPlace, alloc).unwrap();
+    let emission = emit_release(ReleaseTask { module: &module, imports: &[], opt: 2, machine: machine() }, alloc).unwrap();
+    let view = CodeView::read(&emission.record).unwrap();
+    let code = place_leaf(&view, symbol);
+    // SAFETY: the placed leaf has the declared C ABI.
+    let shift: unsafe extern "C" fn(*const u32, *const u32, *mut u32) = unsafe { code.as_fn() };
+    let input = [0x8000_0003, 0x8000_0005, 0xffff_fff8, 0x22];
+    let amounts = [0, 33, u32::MAX, 64];
+    let mut output = [0; 12];
+    // SAFETY: each input holds four readable lanes and output holds twelve writable lanes.
+    unsafe { shift(input.as_ptr(), amounts.as_ptr(), output.as_mut_ptr()) };
+    assert_eq!(output[..4], [0x8000_0003, 10, 0, 0x22]);
+    assert_eq!(output[4..8], [0x8000_0003, 0x4000_0002, 1, 0x22]);
+    assert_eq!(output[8..], [0x8000_0003, 0xc000_0002, u32::MAX, 0x22]);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
 fn release_record_packs_bitmask_lanes_low_to_high() {
     use blaze_lir::{IntCond, Op, Scalar, builder::MemAttrs};
 

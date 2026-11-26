@@ -272,13 +272,23 @@ impl<'a> Lower<'a, '_> {
                 let (opcode, constant) = if op == Op::Neg { ("sub", "0") } else { ("xor", "-1") };
                 format_into!(out, "  %v{i} = {opcode} {t} {constant}, %v{}", o.value().0);
             }
-            Op::Shl | Op::Lshr | Op::Ashr if ty.form() == Form::Scalar => {
+            Op::Shl | Op::Lshr | Op::Ashr => {
                 let (a, b) = (o.value(), o.value());
+                // LIR masks each amount by the lane width. LLVM produces poison
+                // for a shift amount at least that width.
+                let lane = LlType(view, ty.lane());
+                let lane_mask = ty.elem().bits(view.head.ptr_bits) - 1;
+                let mask = fmt::from_fn(|f| {
+                    if ty.is_vector() {
+                        write!(f, "splat ({lane} {lane_mask})")
+                    } else {
+                        write!(f, "{lane_mask}")
+                    }
+                });
                 format_into!(
                     out,
-                    "  %mask{i} = and {t} %v{}, {}\n  %v{i} = {} {t} %v{}, %mask{i}",
+                    "  %mask{i} = and {t} %v{}, {mask}\n  %v{i} = {} {t} %v{}, %mask{i}",
                     b.0,
-                    ty.elem().bits(view.head.ptr_bits) - 1,
                     op.name(),
                     a.0
                 );
