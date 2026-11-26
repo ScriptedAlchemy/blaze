@@ -1922,9 +1922,23 @@ pub struct TempDir {
 impl TempDir {
     /// Creates a unique temporary directory under `$TMPDIR` (or `/tmp`).
     pub fn new(prefix: &str, alloc: WireAlloc) -> Result<Self, IoError> {
-        let base = env_var("TMPDIR", alloc)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| WireString::from_str_in("/tmp", alloc));
+        unsafe extern "C" {
+            fn getenv(name: *const c_char) -> *mut c_char;
+        }
+        // The test launcher sets TMPDIR to its writable mount after exec. On Linux,
+        // /proc/self/environ still shows the original path in the launch environment.
+        // SAFETY: the name is NUL-terminated. The launcher sets TMPDIR before starting
+        // test code, and these fixtures never mutate the process environment.
+        let value = unsafe { getenv(c"TMPDIR".as_ptr()) };
+        let base = if value.is_null() {
+            "/tmp"
+        } else {
+            // SAFETY: getenv returns a NUL-terminated value and no fixture changes it.
+            let path = unsafe { core::ffi::CStr::from_ptr(value) }.to_str().map_err(|_| {
+                IoError::with_message(Errno::Inval, WireString::from_str_in("TMPDIR is not UTF-8", alloc))
+            })?;
+            if path.is_empty() { "/tmp" } else { path }
+        };
         let tag = random_id()?;
         let pid = current_pid();
         let mut hex = String::with_capacity_in(16, alloc);
@@ -1932,8 +1946,10 @@ impl TempDir {
             let _ = core::fmt::write(&mut hex, format_args!("{b:02x}"));
         }
         let name = format_in!(alloc, "{prefix}-{pid}-{hex}");
-        let path = join_path(base.as_str(), name.as_str(), alloc);
-        create_dir_all(path.as_str()).map_err(IoError::from_errno)?;
+        let path = join_path(base, name.as_str(), alloc);
+        create_dir(path.as_str(), DIR_MODE).map_err(|errno| {
+            IoError::with_message(errno, format_in!(alloc, "creating temporary directory {path}"))
+        })?;
         Ok(Self { path, alloc })
     }
 
