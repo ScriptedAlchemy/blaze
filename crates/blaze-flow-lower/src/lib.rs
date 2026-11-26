@@ -5253,17 +5253,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             // The Reference, "Constant promotion": a borrow the checker promoted
             // (`Checked::promoted`) is of a `'static` slot: no loan of the body's, and the
             // operand's code does not run here (the builder reads the evaluator's value).
-            Expr::Ref { mutbl: Mutbl::Not, .. } if self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok() => {
-                let ty = TyD::of(self.expr_ty(e)?);
-                let t = self.temp(ty, e)?;
-                let tp = self.place_of(t);
-                self.b.assign(tp, Operand::Const, self.span(e));
-                self.push_place(tp, ty);
-            }
-            // The Reference, "Constant promotion": a borrow the checker promoted
-            // (`Checked::promoted`) is of a `'static` slot: no loan of the body's, and the
-            // operand's code does not run here (the builder reads the evaluator's value).
-            Expr::Ref { mutbl: Mutbl::Not, .. } if self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok() => {
+            Expr::Ref { .. } if self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok() => {
                 let ty = TyD::of(self.expr_ty(e)?);
                 let t = self.temp(ty, e)?;
                 let tp = self.place_of(t);
@@ -5551,8 +5541,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 // Through a temporary, `RNG.with_borrow_mut(..)` (a `thread_local!` is a `const`
                 // `LocalKey` whose methods take `&'static self`) tied the temporary's loan to
                 // `'static` (tempo test_utils.rs:32, a false E0505 and E0597).
-                AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. }
-                    if matches!(v.at, At::Const)
+                AdjustKind::Borrow { mutbl, raw: false, .. }
+                    if (mutbl == Mutbl::Not && matches!(v.at, At::Const))
                         || (i == lo
                             && !matches!(self.body.exprs.get(e.ix()), Some(Expr::Ref { .. }))
                             && self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok()) =>

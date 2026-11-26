@@ -1088,9 +1088,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
     /// (`Checked::promoted`) is the promoted constant, and its operand's code does not run here.
     fn ref_into(&mut self, dest: Place, e: ExprId, mutbl: Mutbl, operand: ExprId) -> Result<(), LowerError> {
         let span = self.span(e);
-        if mutbl == Mutbl::Not
-            && let Ok(i) = self.ck.promoted.binary_search_by_key(&e.0, |x| x.0)
-        {
+        if let Ok(i) = self.ck.promoted.binary_search_by_key(&e.0, |x| x.0) {
             let ty = self.expr_ty(e)?;
             let c = self.b.new_const(ConstDecl { kind: ConstKind::Promoted(i as u32), ty });
             self.b.assign(dest, Value::Use(Operand::Const(c)), span);

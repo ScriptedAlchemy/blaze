@@ -65,13 +65,13 @@ pub(crate) fn promoted_operand<'a>(owner: ItemKey, borrow: ExprId, exprs: &[tc::
     if checked.promoted.binary_search_by_key(&borrow.0, |x| x.0).is_err() {
         return Err(refused());
     }
-    if let tc::Expr::Ref { mutbl: tc::Mutbl::Not, operand } = exprs.get(borrow.0 as usize).ok_or_else(refused)? {
+    if let tc::Expr::Ref { operand, .. } = exprs.get(borrow.0 as usize).ok_or_else(refused)? {
         return Ok(PromotedOperand { root: *operand, adjusts: None });
     }
     let exprs = checked.adjusts.column::<0>();
     let start = exprs.partition_point(|e| e.0 < borrow.0);
     if exprs.get(start) != Some(&borrow)
-        || !matches!(checked.adjusts.column::<1>().get(start), Some(tc::AdjustKind::Borrow { mutbl: tc::Mutbl::Not, raw: false, .. }))
+        || !matches!(checked.adjusts.column::<1>().get(start), Some(tc::AdjustKind::Borrow { raw: false, .. }))
     {
         return Err(refused());
     }
