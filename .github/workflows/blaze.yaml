@@ -104,6 +104,10 @@ jobs:
         run: |
           evidence="$RUNNER_TEMP/plan-evidence"
           tc="$(cat pins/toolchain)"
+          timeout -k 20 600 cargo +"$tc" test --locked --release -p blaze-code --lib \
+            -- place_tests::relro_end_addresses_place_across_a_page_boundary --exact \
+            2>&1 | tee "$evidence/relro-address.log"
+          grep -Fq 'place_tests::relro_end_addresses_place_across_a_page_boundary ... ok' "$evidence/relro-address.log"
           timeout -k 30 1200 cargo +"$tc" test --locked --release -p blaze-emit --features llvm --lib \
             release_record 2>&1 | tee "$evidence/llvm-records.log"
           grep -Fq 'release_record_stores_a_splat_to_every_lane ... ok' "$evidence/llvm-records.log"
