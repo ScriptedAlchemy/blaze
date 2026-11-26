@@ -1644,7 +1644,7 @@ fn make_world<'f>(
         let id = plan.id;
         let unit = &graph.units[id.unit.index()];
         let mut module = plan_script_module(graph, lock, id.unit, None, home, heap);
-        if id.side == Side::Macro && module.ran_as == crate::scripts::RanAs::Wasm && matches!(lock.package(unit.package).source, LockSource::Path) {
+        if id.side == blaze_world::Side::Macro && module.ran_as == crate::scripts::RanAs::Wasm && matches!(lock.package(unit.package).source, LockSource::Path) {
             module.subject = crate::script_modules::producer_subject(module.subject);
             module.checkout = crate::script_modules::CheckoutPolicy::ProducerRevision;
         }
