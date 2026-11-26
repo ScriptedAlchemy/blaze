@@ -3,6 +3,10 @@ use blaze_code::record::{CodeRecord, CodeView, Site, SiteKind, Space, Symbol, Ta
 use blaze_export::{CExport, Data, DataPlace, DataWord, Entry, Function, Panic, Platform, ProgramIn, Tier, TlsRuntime, export};
 use blaze_own::{AVec, Alloc, Vec};
 
+#[cfg(all(target_arch = "aarch64", any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+#[path = "load.rs"]
+mod load;
+
 const PLATFORM: Platform = if cfg!(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64")) { Platform::LinuxArm64 } else { Platform::MacosArm64 };
 
 fn record<'a>(code: &[u32], target: Option<(Space, Symbol)>, outside: Option<&str>, alloc: Alloc<'a>) -> AVec<'a, u8> {
@@ -88,18 +92,7 @@ fn cdylib_has_no_entry_and_exports_reached_rust_records() {
         assert_eq!(u64::from_le_bytes(out[24..32].try_into().unwrap()), 0, "e_entry");
     }
     #[cfg(all(target_arch = "aarch64", any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
-    load(&out, program.name);
-}
-
-#[cfg(all(target_arch = "aarch64", any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
-fn load(bytes: &[u8], name: &str) {
-    let extension = if PLATFORM == Platform::LinuxArm64 { "so" } else { "dylib" };
-    let status = crate::host::run(&format!("{name}.{extension}"), bytes, |path| {
-        let mut cmd = std::process::Command::new("python3");
-        cmd.args(["-I", "-c", include_str!("load.py")]).arg(path).arg(name);
-        cmd
-    });
-    assert!(status.success(), "loading {name}: {status}");
+    load::run(&out, program.name, "rust_cdylib::cdylib_has_no_entry_and_exports_reached_rust_records");
 }
 
 #[test]
@@ -144,7 +137,7 @@ fn cdylib_loader_rebases_data_binds_allocator_and_initializes_rust_tls() {
     let report = export(&program, PLATFORM, &mut out, a).unwrap();
     assert_eq!(report.made, 1, "only the TLS initializer, never a fake main");
     #[cfg(all(target_arch = "aarch64", any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
-    load(&out, program.name);
+    load::run(&out, program.name, "rust_cdylib::cdylib_loader_rebases_data_binds_allocator_and_initializes_rust_tls");
 }
 
 #[test]
@@ -207,5 +200,5 @@ fn cdylib_can_be_empty_without_a_manufactured_function() {
     let report = export(&program, PLATFORM, &mut out, a).unwrap();
     assert_eq!((report.functions, report.made), (0, 0));
     #[cfg(all(target_arch = "aarch64", any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
-    load(&out, program.name);
+    load::run(&out, program.name, "rust_cdylib::cdylib_can_be_empty_without_a_manufactured_function");
 }

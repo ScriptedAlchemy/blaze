@@ -329,7 +329,7 @@ pub trait FrontEnd {
     fn expr_site(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Option<u32> {
         self.caller_site(owner, expr).ok().map(|site| site.offset)
     }
-    /// The line and the column (each from 1; the column in chars) of byte `site` of item
+    /// The line and the display column (each from 1) of byte `site` of item
     /// `item`'s text, from the item's present first byte in today's text of its file and that
     /// file's line starts: what a `#[track_caller]` `Location`'s line and column are when the
     /// program is placed (rule 71: the code record holds only `item` and `site`). The default
