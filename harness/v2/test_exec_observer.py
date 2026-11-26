@@ -79,6 +79,29 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaises(observer.Failed):
                     self.inspect()
 
+    def test_a_thread_can_die_at_an_unresumed_syscall_entry(self) -> None:
+        self.traces[10] = execute(self.python) + "clone(flags=CLONE_THREAD) = 11\n" + END
+        self.traces[11] = "???( <unfinished ...>\n+++ exited with 0 +++\n"
+        result = self.inspect()
+        self.assertEqual(result["aborted_syscall_entries"], [11])
+        self.assertEqual(result["processes"], 2)
+        self.assertEqual(result["creations"], 1)
+
+        self.traces[11] = execute("/usr/bin/cargo") + self.traces[11]
+        with self.assertRaisesRegex(observer.Failed, "forbidden compiler"):
+            self.inspect()
+
+    def test_the_oracle_catches_an_unknown_entry_without_immediate_termination(self) -> None:
+        aborted = "???( <unfinished ...>\n"
+        terminal = "+++ exited with 0 +++\n"
+        for value in (aborted, aborted + END, aborted + execute("/tmp/blaze") + terminal,
+                      "execve( <unfinished ...>\n" + terminal, aborted + aborted + terminal,
+                      "clone(flags=SIGCHLD <unfinished ...>\n" + aborted + terminal):
+            with self.subTest(trace=value):
+                self.traces[11] = value
+                with self.assertRaises(observer.Failed):
+                    self.inspect()
+
     def test_the_oracle_catches_absolute_and_descriptor_compiler_executions(self) -> None:
         for tool in ("cargo", "rustc", "rustdoc", "rustc.real", "cargo.exe"):
             with self.subTest(tool=tool):

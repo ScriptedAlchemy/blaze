@@ -56,6 +56,7 @@ SUPERSEDED = re.compile(r"^\+\+\+ superseded by execve in pid (\d+) \+\+\+$")
 TERMINAL = re.compile(r"^\+\+\+ (?:exited with \d+|killed by SIG[A-Z0-9_+]+(?: \(core dumped\))?) \+\+\+$")
 SIGNAL = re.compile(r"^--- SIG[A-Z0-9_+]+ .* ---$")
 GROUP_STOP = re.compile(r"^--- stopped by SIG[A-Z0-9_+]+ ---$")
+ABORTED_ENTRY = "???( <unfinished ...>"
 
 
 class Failed(Exception):
@@ -251,6 +252,7 @@ class Trace:
     resumed: list[tuple[int, int, str]] = field(default_factory=list[tuple[int, int, str]])
     ended: bool = False
     terminal: str | None = None
+    aborted_entry: bool = False
 
 
 def parse_trace(pid: int, data: str) -> Trace:
@@ -259,7 +261,8 @@ def parse_trace(pid: int, data: str) -> Trace:
     result = Trace(pid)
     pending: str | None = None
     switched: int | None = None
-    for number, line in enumerate(data.splitlines(), 1):
+    lines = data.splitlines()
+    for number, line in enumerate(lines, 1):
         where = f"trace pid {pid}, line {number}"
         if result.ended or result.moved_to is not None:
             raise Failed(f"{where}: records follow process completion")
@@ -293,6 +296,15 @@ def parse_trace(pid: int, data: str) -> Trace:
                 raise Failed(f"{where}: resumed syscall has no matching entry")
             line, pending = pending + match[2], None
         elif line.endswith(" <unfinished ...>"):
+            # strace 6.8 syscall_entering_decode emits "???(" when ptrace cannot
+            # read the syscall number on entry. dispatch_event returns without
+            # resuming the syscall. A following terminal record proves the task
+            # died at that stop (for example, during another thread's exit_group).
+            # A known syscall's incomplete exit or any later activity is still an error.
+            if (line == ABORTED_ENTRY and pending is None and switched is None
+                    and number == len(lines) - 1 and TERMINAL.fullmatch(lines[-1])):
+                result.aborted_entry = True
+                continue
             if pending is not None or switched is not None or CALL.match(line) is None:
                 raise Failed(f"{where}: invalid unfinished syscall")
             pending = line.removesuffix(" <unfinished ...>")
@@ -372,6 +384,7 @@ def inspect_traces(directory: Path, root_pid: int, python: str) -> dict[str, obj
     if violations:
         raise Failed("forbidden compiler execution: " + "; ".join(violations))
     return {"processes": len(traces), "creations": forks, "bytes": total, "executions": executions,
+            "aborted_syscall_entries": sorted(trace.pid for trace in traces.values() if trace.aborted_entry),
             "terminations": {str(pid): trace.terminal for pid, trace in traces.items() if trace.ended}}
 
 
