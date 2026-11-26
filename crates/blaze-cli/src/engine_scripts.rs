@@ -1402,9 +1402,18 @@ impl<'f> ScriptsStage<'f> {
                 Err(why) => return Err(EngineCheckError::NamesWorld(why).into()),
             };
             let module = made.script_module(name.subject).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::WorldScriptModules, key: name })?;
-            let checkout = module.tracked.then_some(handles.side).flatten().and_then(|side| {
+            use crate::script_modules::CheckoutPolicy;
+            let tracked = module.checkout != CheckoutPolicy::Untracked;
+            let checkout = tracked.then_some(handles.side).flatten().and_then(|side| {
                 let entry = side.place.members?.iter().find(|entry| entry.id == module.package_id)?;
                 let directory = entry.dir.as_str();
+                let source = if module.checkout == CheckoutPolicy::ProducerRevision {
+                    let leaf = side.place.rows.of(crate::sweep::LeafKind::MacroFiles)
+                        .find(|leaf| !leaf.absent() && side.place.rows.path(leaf) == directory)?;
+                    Some(blaze_build_script::module_record::Digest::from_content(leaf.id))
+                } else {
+                    None
+                };
                 let mut files = Vec::new_in(queue.jobs);
                 for leaf in side.place.rows.of(crate::sweep::LeafKind::MacroFile).filter(|leaf| !leaf.absent()) {
                     files.push((work::held_str(side.place.rows.path(leaf), queue.jobs), blaze_build_script::module_record::Digest::from_content(leaf.id)));
@@ -1422,11 +1431,14 @@ impl<'f> ScriptsStage<'f> {
                     directory: if directory.is_empty() { "." } else { work::held_str(directory, queue.jobs) },
                     required: queue.jobs.alloc_slice_copy(&["Cargo.toml", "Cargo.lock", at_package("Cargo.toml"), at_package(module.root)]),
                     files: files.into_bump_slice(),
+                    source,
                 })
             });
-            if module.tracked && checkout.is_none() {
+            if tracked && checkout.is_none() {
                 let failure = TaskFailure { name, why: Why::Refused { what: "the checkout module's local source is missing", rule: crate::script_modules::RULE } };
-                return Ok(Dispatch::Answered(Completed::answer(drive, Did::FailedSaying(failure, "the layout did not supply the checkout package of the build-script module"))?));
+                let words = if module.checkout == CheckoutPolicy::ProducerRevision { "the layout did not supply a complete checkout revision for the standalone WASI producer" }
+                    else { "the layout did not supply the checkout package of the build-script module" };
+                return Ok(Dispatch::Answered(Completed::answer(drive, Did::FailedSaying(failure, words))?));
             }
             let wanted = crate::script_modules::Wanted {
                 ran_as: module.ran_as, package: module.package, version: module.version,

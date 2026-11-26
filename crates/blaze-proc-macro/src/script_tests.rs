@@ -140,6 +140,7 @@ fn checkout_script_lookup_selects_only_the_current_compiler_reads() {
             directory,
             required: &["pkg/build.rs"],
             agrees: &|read| read.path == "pkg/build.rs" && read.content == Digest::checkout_file(source),
+            source: None,
         }).unwrap()
     };
     assert_eq!(select("pkg", b"build old archive"), Some(old.clone()));
@@ -147,6 +148,61 @@ fn checkout_script_lookup_selects_only_the_current_compiler_reads() {
     assert_eq!(select("pkg", b"build old archive"), Some(old));
     assert_eq!(select("pkg", b"not built yet"), None);
     assert_eq!(select("foreign", b"build old archive"), None);
+    std::fs::remove_dir_all(store).unwrap();
+}
+
+#[test]
+fn a_standalone_producer_selects_the_checkout_revision_with_identical_wasm() {
+    use blaze_build_script::module_record::{CheckoutRead, Digest, Executable, Selected, checkout_files};
+    use crate::module::{files_digest, package_files, sha256_hex};
+    use crate::script_unit::{CheckoutModule, checkout_module_of, read_selected_module, select_record, selected_identity, wasm_runner_lines};
+
+    const BUILD: &[u8] = b"fn main() {}";
+    const WASM: &[u8] = b"\0asm\x01\0\0\0";
+    const BEFORE: &[u8] = b"pub const ANSWER: u8 = 1;";
+    const AFTER: &[u8] = b"pub const ANSWER: u8 = 2;";
+    let store = folder("checkout-producer-source");
+    let checkout = store.join("checkout/dep");
+    std::fs::create_dir_all(checkout.join("src")).unwrap();
+    std::fs::write(checkout.join("build.rs"), BUILD).unwrap();
+    let [shim, recipe] = wasm_runner_lines();
+    let read = CheckoutRead { path: "dep/build.rs", content: Digest::checkout_file(BUILD) };
+    let revision = |library: &[u8]| {
+        std::fs::write(checkout.join("src/lib.rs"), library).unwrap();
+        Digest::parse(&files_digest(&mut package_files(&checkout).unwrap())).unwrap()
+    };
+    let publish = |source: Digest| {
+        let identity = format!("blaze build-script module 3\nname dep\nversion 0.1.0\nfiles {}\nfeatures \n{shim}\n{recipe}\ntoolchain {}\ncheckout-package dep\n{read}", source.text(), blaze_pins::TOOLCHAIN);
+        let record = store.join("build-script/modules").join(sha256_hex(identity.as_bytes()));
+        std::fs::create_dir_all(&record).unwrap();
+        std::fs::write(record.join("identity"), identity).unwrap();
+        std::fs::write(record.join(Executable::Wasm.filename()), WASM).unwrap();
+        std::fs::write(record.join(Executable::Wasm.digest_filename()), sha256_hex(WASM)).unwrap();
+        record
+    };
+    let before = revision(BEFORE);
+    let after = revision(AFTER);
+    let old = publish(before);
+    let new = publish(after);
+    assert_ne!(old, new);
+    let lookup = |source| checkout_module_of(&store, "dep", "0.1.0", &[], CheckoutModule {
+        directory: "dep",
+        required: &["dep/build.rs"],
+        agrees: &|input| input == read,
+        source,
+    }).unwrap();
+    let unqualified = lookup(None).unwrap();
+    assert!(unqualified == old || unqualified == new);
+    assert!(lookup(Some(revision(b"pub const ANSWER: u8 = 3;"))).is_none());
+    for (library, record) in [(AFTER, &new), (BEFORE, &old), (AFTER, &new)] {
+        let current = revision(library);
+        let matched = lookup(Some(current)).unwrap();
+        assert_eq!(&matched, record);
+        let proof = select_record(&matched, Executable::Wasm).unwrap();
+        let proof = Selected::decode(&proof.encode()).unwrap();
+        assert_eq!(checkout_files(&selected_identity(&store, proof).unwrap()), Some(current));
+        assert_eq!(read_selected_module(&store, proof).unwrap(), WASM);
+    }
     std::fs::remove_dir_all(store).unwrap();
 }
 

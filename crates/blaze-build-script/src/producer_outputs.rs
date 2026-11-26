@@ -72,7 +72,8 @@ impl<'a> Binding<'a> {
             let first = values.next()?;
             values.next().is_none().then_some(first)
         };
-        self.source.strip_prefix("files:").is_some_and(|source| field("files") == Some(source))
+        self.source.strip_prefix("files:").and_then(Digest::parse)
+            .is_some_and(|source| crate::module_record::checkout_files(identity) == Some(source))
             && field("name") == Some(self.name)
             && field("version") == Some(self.version)
             && field("features").is_some_and(|set| features(set.split_terminator(',')) == self.features)

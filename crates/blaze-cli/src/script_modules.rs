@@ -23,6 +23,7 @@
 //! lookup, cached by the lookup's record.
 
 use blaze_build_script::module_record::{CheckoutRead, Digest, Executable, Selected, checkout_owner};
+use blaze_build_script::producer_outputs::Binding;
 use blaze_drive::{Kind, Name, Task, TaskFailure, Why};
 use blaze_ids::ContentId;
 use bstd::cx::Cx;
@@ -63,6 +64,12 @@ pub(crate) fn name(subject: ContentId) -> Name {
     Name::new(Kind::MacroModule, subject)
 }
 
+/// A standalone producer uses the exact package revision. A checked script can still
+/// reuse a module when just its compiler reads agree.
+pub(crate) fn producer_subject(module: ContentId) -> ContentId {
+    ContentId::of("blaze-cli WASI producer module subject 1", &module.0)
+}
+
 /// The lookup's part source: the graph's source (which holds the module store's listing) and
 /// the subject.
 pub(crate) fn part_source(graph_source: ContentId, subject: ContentId) -> ContentId {
@@ -76,6 +83,13 @@ pub(crate) fn selected_out(selected: Selected) -> ContentId {
     ContentId::of(OUT_DOMAIN, &selected.encode())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckoutPolicy {
+    Untracked,
+    CompilerReads,
+    ProducerRevision,
+}
+
 /// A module lookup a crate's script reads: its subject, the world index of the crate reading
 /// it, and the script unit's package, version and features (from the graph, held to the end
 /// of the command with the names world). Made in names.rs `world`.
@@ -87,7 +101,7 @@ pub(crate) struct ScriptModule {
     pub version: &'static str,
     pub package_id: blaze_manifest::lock::LockId,
     pub root: &'static str,
-    pub tracked: bool,
+    pub checkout: CheckoutPolicy,
     pub features: std::vec::Vec<&'static str, std::alloc::Global>,
 }
 
@@ -148,10 +162,12 @@ pub(crate) struct Checkout<'a> {
     pub directory: &'a str,
     pub required: &'a [&'a str],
     pub files: &'a [(&'a str, Digest)],
+    pub source: Option<Digest>,
 }
 
-/// Supply the source facts of provisioned local modules. A normal package's source tree is
-/// never walked here. The sweep carries unchanged rows, and a changed row moves the lookup.
+/// Supply the source facts of provisioned local modules. Only declared WASI producers
+/// require a whole-package revision. The sweep carries unchanged rows, and a changed
+/// row moves the lookup.
 #[expect(clippy::too_many_arguments, reason = "the receipt's store, proved layout, stamps and checkout capability")]
 pub(crate) fn read_checkout_receipts(
     cx: &Cx,
@@ -172,6 +188,7 @@ pub(crate) fn read_checkout_receipts(
         records
     };
     let mut paths = blaze_own::Vec::new_in(frame);
+    let mut producer_dirs = blaze_own::Vec::new_in(frame);
     for identity in &identities {
         let Some((name, version, directory)) = checkout_owner(identity) else { continue };
         let directory = if directory == "." { "" } else { directory };
@@ -181,6 +198,22 @@ pub(crate) fn read_checkout_receipts(
             continue;
         }
         paths.extend(CheckoutRead::inputs(identity).flatten().map(|read| read.path));
+        for binding in Binding::in_identity(identity).flatten() {
+            if binding.source.strip_prefix("files:").and_then(Digest::parse).is_none() {
+                continue;
+            }
+            for id in lock.named(binding.name).filter(|&id| lock.package(id).version.to_string() == binding.version) {
+                producer_dirs.extend(members.iter().filter(|member| member.id == id).map(|member| member.dir.as_str()));
+            }
+        }
+    }
+    producer_dirs.sort_unstable();
+    producer_dirs.dedup();
+    for dir in producer_dirs {
+        if rows.of(LeafKind::MacroFiles).any(|leaf| rows.path(leaf) == dir) {
+            continue;
+        }
+        crate::macro_files::read_row(cx, root, stamps, dir, rows, frame)?;
     }
     paths.sort_unstable();
     paths.dedup();
@@ -226,6 +259,7 @@ pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Ta
                     required: checkout.required,
                     agrees: &|read| checkout.files.binary_search_by_key(&read.path, |(path, _)| *path)
                         .is_ok_and(|index| checkout.files[index].1 == read.content),
+                    source: checkout.source,
                 }),
                 None => blaze_proc_macro::script_unit::module_of(&store, package, version, features),
             };

@@ -16,7 +16,7 @@ use blaze_build_script::{
     Outputs, OutputsRef,
     env::{DepMetadata, Given, PackageFacts},
     key::{CMode, RunLimits},
-    module_record::{CheckoutRead, Digest, Executable, Request, Selected, checkout_package},
+    module_record::{CheckoutRead, Digest, Executable, Request, Selected, checkout_files, checkout_package},
     native::Runner,
     probe::Row,
     toolchain::Mode,
@@ -159,6 +159,8 @@ pub struct CheckoutModule<'a> {
     pub directory: &'a str,
     pub required: &'a [&'a str],
     pub agrees: &'a dyn Fn(CheckoutRead<'_>) -> bool,
+    /// A standalone WASI producer must answer the exact package revision in the receipt.
+    pub source: Option<Digest>,
 }
 
 pub fn checkout_module_of(store: &Path, name: &str, version: &str, features: &[&str], checkout: CheckoutModule<'_>) -> Result<Option<PathBuf>, ModuleLookupError> {
@@ -289,6 +291,7 @@ fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host
             let valid = |read: Option<CheckoutRead<'_>>| read.is_some_and(checkout.agrees);
             let mut toolchain = identity.lines().filter_map(|line| line.strip_prefix("toolchain "));
             checkout_package(identity) == Some(checkout.directory)
+                && checkout.source.is_none_or(|source| checkout_files(identity) == Some(source))
                 && toolchain.next() == Some(blaze_pins::TOOLCHAIN) && toolchain.next().is_none()
                 && reads.next().is_some_and(valid) && reads.all(valid)
                 && checkout.required.iter().all(|required| CheckoutRead::inputs(identity).flatten().any(|read| read.path == *required))
