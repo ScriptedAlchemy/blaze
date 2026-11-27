@@ -40,6 +40,41 @@ python3 -m py_compile harness/distv2.py harness/distv2/evidence.py harness/distv
 python3 harness/distv2/selfcheck.py
 ```
 
+## Three GitHub-hosted ARM64 machines
+
+The manual `three_hosts` option runs a primary and two helpers against the same sealed source
+compiler package from that workflow run. Use the tailnet that serves tracedecay's Bazel fleet.
+Create a separate Blaze Tailscale federated identity with the `auth_keys` scope and
+`tag:blaze-ci`. Give that tag only peer access on TCP/42222.
+For a tailnet policy using grants, add:
+
+```json
+{"src": ["tag:blaze-ci"], "dst": ["tag:blaze-ci"], "ip": ["tcp:42222"]}
+```
+
+Configure issuer `https://token.actions.githubusercontent.com`, audience
+`api.tailscale.com/<Blaze client ID>`, and exact GitHub claim matches:
+
+- `repository_id` is `1433869082` for `ScriptedAlchemy/blaze`.
+- `actor_id` is `25274700` for ScriptedAlchemy.
+- `event_name` is `workflow_dispatch`.
+- `ref` is `refs/heads/<trusted-branch>`.
+- `job_workflow_ref` is
+  `ScriptedAlchemy/blaze/.github/workflows/distributed-hosts.yaml@refs/heads/<trusted-branch>`.
+
+In GitHub, restrict the `blaze-distributed-hosts` environment to that branch and set its
+`BLAZE_TAILSCALE_CLIENT_ID` variable to the Blaze client ID. Then dispatch with the authorized branch name:
+
+```sh
+gh workflow run blaze.yaml --repo ScriptedAlchemy/blaze --ref "<trusted-branch>" -f three_hosts=true
+```
+
+The runners pin SSH keys for that attempt. The coordinator and cache are reached through
+SSH forwards and listen only locally. The harness holds each participant's first real grant
+before letting the workers publish. The proof checks distinct hosts, disjoint compiled function
+keys, placement of records from both helpers in the primary export, and artifact bytes and stdout
+against a solo export. The barrier is for correctness. Its elapsed time includes the hold.
+
 ## Required product telemetry
 
 The acceptance harness reads these fields from the compiler, worker and coordinator.

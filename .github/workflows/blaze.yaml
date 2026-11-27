@@ -7,6 +7,11 @@ on:
   pull_request:
   merge_group:
   workflow_dispatch:
+    inputs:
+      three_hosts:
+        description: Run one distributed build on three GitHub-hosted ARM64 machines
+        type: boolean
+        default: false
 
 concurrency:
   # A pull request's newer push cancels its run before. Main runs one push at a time: a push
@@ -881,6 +886,18 @@ jobs:
             ${{ runner.temp }}/blaze-fs/forkfixes/*.json
             ${{ runner.temp }}/blaze-fs/forkfixes/evidence
           if-no-files-found: warn
+
+  three-hosts:
+    if: github.event_name == 'workflow_dispatch' && inputs.three_hosts
+    needs: source-compiler
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/distributed-hosts.yaml
+    with:
+      source: ${{ github.sha }}
+      source_run: ${{ github.run_id }}
 
   ci:
     name: ci

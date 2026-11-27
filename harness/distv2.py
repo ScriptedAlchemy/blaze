@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""distv2.py: export a workspace across two real worker processes and prove cache reuse.
+"""distv2.py: prove distributed compilation and cache reuse with real export clients.
 
 Input, one JSON value (`python3 harness/distv2.py '{...}'`):
     blaze        the blaze binary under test
@@ -16,6 +16,7 @@ Input, one JSON value (`python3 harness/distv2.py '{...}'`):
     cache_overlap (optional) run only the independent native-cache overlap oracle; default false
     dev_latency  (optional) measure warm dev exports separately from the fault run; default false
     repetitions  (optional) independent dev latency samples per mode; default 2
+
     profile      (optional) the directory under the target directory programs are in; default "debug"
     timeout      (optional) bound in seconds for each build/fault stage; default 3600
     command_timeout (optional) seconds for probes, stop and running the program; default 60
@@ -45,6 +46,12 @@ Checks, each on what the build itself reports (BLAZE_DIST_REPORT) and on running
 
 Every program is run: what it prints covers a panic unwinding across units, a static of another
 crate, and a build script's output.
+
+A separate input with role="controller" runs the three-host proof. It names the sealed
+compiler and services, the local Unix socket and loopback cache address, and two pinned
+SSH helper aliases with forwards. The controller launches role="primary" and role="helper"
+sessions that each run a real export against one coordinator. The retained three-host wall
+times include the explicit correctness barrier.
 """
 from __future__ import annotations
 
@@ -52,9 +59,11 @@ import dataclasses
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -62,7 +71,9 @@ from contextlib import closing, contextmanager
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from selectors import EVENT_READ, DefaultSelector
 from threading import Event, Lock, Thread
+from uuid import UUID
 
 from distv2 import evidence
 from distv2.evidence import Failed
@@ -95,10 +106,18 @@ class Input:
     module_builder: str | None = None
 
 
-def load(text: str) -> Input:
+def read_input(text: str) -> dict:
     raw = json.loads(sys.stdin.read() if text == "-" else (Path(text).read_text() if not text.lstrip().startswith(("{", "[")) else text))
     if not isinstance(raw, dict):
         raise Failed("input must be a JSON object")
+    return raw
+
+
+def load(text: str) -> Input:
+    return load_profile(read_input(text))
+
+
+def load_profile(raw: dict) -> Input:
     for name in ("args", "run"):
         if name in raw:
             if not isinstance(raw[name], list) or not all(isinstance(value, str) and "\0" not in value for value in raw[name]):
@@ -1403,10 +1422,517 @@ def main(given: Input) -> None:
         run.stop()
 
 
+HOST_LEAVES = 512
+HOST_MASK = (1 << 64) - 1
+HOST_FNV = 0x100000001B3
+HOST_SEED = 0xCBF29CE484222325
+HOST_PROGRAM_INPUT = 17
+HOST_MESSAGE_LIMIT = 8 << 20
+HOST_PACKAGE = "host_proof"
+
+
+@dataclasses.dataclass(frozen=True)
+class HostNode:
+    checkout: str
+    scratch: str
+    blaze: str
+    python: str
+    runner: str
+    socket: str
+    blobs: str
+
+
+@dataclasses.dataclass(frozen=True)
+class HostHelper(HostNode):
+    alias: str
+
+
+@dataclasses.dataclass(frozen=True)
+class HostWorker(HostNode):
+    role: str
+    namespace: str
+    cores: int
+    timeout: int
+
+
+@dataclasses.dataclass(frozen=True)
+class HostController(HostWorker):
+    dist_local: str
+    serve: str
+    ssh_config: str
+    helpers: list[HostHelper]
+
+
+def load_host(raw: dict) -> HostController | HostWorker:
+    if raw.get("role") == "controller":
+        evidence.require(isinstance(raw.get("helpers"), list) and len(raw["helpers"]) == 2,
+                         "controller requires exactly two SSH helpers")
+        given = HostController(**{**raw, "helpers": [HostHelper(**value) for value in raw["helpers"]]})
+        evidence.require([helper.alias for helper in given.helpers] == ["helper-1", "helper-2"],
+                         "helpers must use the pinned helper-1 and helper-2 SSH aliases")
+        for name in ("dist_local", "serve", "ssh_config"):
+            host_absolute(getattr(given, name), name)
+        for node in given.helpers:
+            host_valid_node(node)
+    else:
+        given = HostWorker(**raw)
+        evidence.require(given.role in ("primary", "helper"), "role must be controller, primary or helper")
+    host_valid_node(given)
+    evidence.require(type(given.cores) is int and given.cores > 0 and type(given.timeout) is int
+                     and 0 < given.timeout <= 3600, "cores must be positive and timeout must be 1–3600 seconds")
+    evidence.require(isinstance(given.namespace, str) and bool(given.namespace),
+                     "namespace must identify this rendezvous")
+    return given
+
+
+def host_absolute(value: str, name: str) -> None:
+    evidence.require(isinstance(value, str) and "\0" not in value and Path(value).is_absolute(),
+                     f"{name} must be an absolute path")
+
+
+def host_valid_node(node: HostNode) -> None:
+    for name in ("checkout", "scratch", "blaze", "python", "socket"):
+        host_absolute(getattr(node, name), name)
+    evidence.require(isinstance(node.runner, str) and bool(node.runner), "runner identity is required")
+    host_cache_address(node.blobs)
+
+
+def host_cache_address(value: str) -> tuple[str, int]:
+    evidence.require(isinstance(value, str), "cache address must be a string")
+    host, separator, port = value.partition(":")
+    evidence.require(host == "127.0.0.1" and bool(separator) and port.isdecimal() and 0 < int(port) <= 65535,
+                     f"cache listener must use a numeric loopback address: {value!r}")
+    return host, int(port)
+
+
+def host_write_json(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def host_send(stream, message: dict) -> None:
+    stream.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
+    stream.flush()
+
+
+class HostMessages:
+    """Bounded JSON lines over one connected SSH or local subprocess stream."""
+
+    def __init__(self, stream, label: str):
+        self.stream = stream
+        self.label = label
+        self.buffer = bytearray()
+
+    def receive(self, phase: str, deadline: float) -> dict:
+        with DefaultSelector() as selector:
+            selector.register(self.stream, EVENT_READ)
+            while b"\n" not in self.buffer:
+                remaining = deadline - time.monotonic()
+                evidence.require(remaining > 0 and bool(selector.select(remaining)),
+                                 f"{self.label}: deadline waiting for {phase}")
+                chunk = os.read(self.stream.fileno(), 65536)
+                evidence.require(bool(chunk), f"{self.label}: stream ended before {phase}")
+                self.buffer.extend(chunk)
+                evidence.require(len(self.buffer) <= HOST_MESSAGE_LIMIT, f"{self.label}: message exceeds configured limit")
+        row, _, rest = self.buffer.partition(b"\n")
+        self.buffer = rest
+        message = json.loads(row)
+        evidence.require(isinstance(message, dict) and message.get("phase") == phase,
+                         f"{self.label}: expected {phase}, saw {message.get('phase') if isinstance(message, dict) else type(message)}")
+        return message
+
+
+def host_stop(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+    for stream in (process.stdin, process.stdout):
+        if stream is not None:
+            stream.close()
+
+
+def host_fixture(path: Path) -> tuple[str, str]:
+    (path / "src").mkdir(parents=True)
+    files = {
+        "Cargo.toml": f'[package]\nname = "{HOST_PACKAGE}"\nversion = "0.1.0"\nedition = "2024"\n',
+        "Cargo.lock": f'version = 4\n\n[[package]]\nname = "{HOST_PACKAGE}"\nversion = "0.1.0"\n',
+    }
+    source = []
+    expected = HOST_SEED
+    for index in range(HOST_LEAVES):
+        factor = 2 * index + 1
+        salt = (HOST_SEED * factor) & HOST_MASK
+        shift = index % 64
+        source.append(
+            f"#[inline(never)]\nfn leaf_{index}(n: u64) -> u64 {{ "
+            f"n.wrapping_mul({factor}).rotate_left({shift}) ^ {salt} }}\n"
+        )
+        term = HOST_PROGRAM_INPUT * factor & HOST_MASK
+        term = ((term << shift) | (term >> (64 - shift))) & HOST_MASK
+        expected = ((expected ^ term ^ salt) * HOST_FNV) & HOST_MASK
+    for start in range(0, HOST_LEAVES, 16):
+        source.append(f"#[inline(never)]\nfn group_{start}(n: u64, mut hash: u64) -> u64 {{\n")
+        for index in range(start, start + 16):
+            source.append(f"    hash = (hash ^ leaf_{index}(n)).wrapping_mul({HOST_FNV});\n")
+        source.append("    hash\n}\n")
+    source.extend((
+        "fn main() {\n",
+        "    let n: u64 = std::env::args().nth(1).unwrap().parse().unwrap();\n",
+        f"    let mut hash: u64 = {HOST_SEED};\n",
+    ))
+    for index in range(0, HOST_LEAVES, 16):
+        source.append(f"    hash = group_{index}(n, hash);\n")
+    source.append('    println!("{hash:016x}");\n}\n')
+    files["src/main.rs"] = "".join(source)
+    identity = hashlib.sha256()
+    for name, data in sorted(files.items()):
+        (path / name).write_text(data)
+        identity.update(name.encode() + b"\0" + bytes.fromhex(file_hash(path / name)))
+    return identity.hexdigest(), f"{expected:016x}\n"
+
+
+def host_worker_env(root: Path, cores: int) -> dict:
+    # Give every export its own persisted state. Only the compiler's staged shelf is copied.
+    shelf = Path.home() / ".blaze" / "v2" / "toolchain"
+    evidence.require(shelf.is_dir(), f"staged toolchain shelf is missing: {shelf}")
+    home = root / "home"
+    shutil.copytree(shelf, home / ".blaze" / "v2" / "toolchain")
+    (root / "tmp").mkdir()
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("CARGO", "RUST", "BLAZE_"))}
+    return {**env, "HOME": str(home), "TMPDIR": str(root / "tmp"), "XDG_CACHE_HOME": str(root / "cache"),
+            "BLAZE_CORES": str(cores), "CARGO_TARGET_DIR": str(root / "target"), "RUST_BACKTRACE": "0"}
+
+
+def host_checked_output(command: list[str], *, timeout: int, env: dict | None = None) -> str:
+    return subprocess.check_output(command, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+
+
+def host_node_identity(given: HostWorker, env: dict, source: str) -> dict:
+    boot_id = str(UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
+    git = ["git", "-C", given.checkout, "rev-parse"]
+    triple = json.loads(host_checked_output([given.blaze, "toolchain", "--json"], timeout=given.timeout, env=env))["host"]
+    binary = Path(given.blaze)
+    digest = file_hash(binary)
+    seal_path = binary.with_name("blaze-build.json")
+    seal = json.loads(seal_path.read_text())
+    evidence.require(seal.get("schema") == 2 and seal["binaries"]["blaze"] == digest,
+                     f"{binary}: compiler does not match its source-build identity")
+    return {
+        "namespace": given.namespace,
+        "runner": given.runner,
+        "boot_id": boot_id,
+        "commit": host_checked_output([*git, "HEAD"], timeout=given.timeout).strip(),
+        "tree": host_checked_output([*git, "HEAD^{tree}"], timeout=given.timeout).strip(),
+        "blaze_sha256": digest,
+        "compiler_source": seal["source"],
+        "compiler_seal_sha256": file_hash(seal_path),
+        "workload_sha256": source,
+        "triple": triple,
+        "cores": given.cores,
+    }
+
+
+def host_wait_gate(gate: Path, events_path: Path, process: subprocess.Popen, deadline: float) -> dict:
+    while time.monotonic() < deadline and process.poll() is None:
+        events = evidence.jsonl(events_path, live=True)
+        if (gate / "ready.json").is_file():
+            # Read the reported pid from this worker's own validated grant stream. The
+            # actual host binding is the authenticated session plus boot ID, not this pid.
+            for grant in reversed(events):
+                if grant["event"] == "grant":
+                    captured = evidence.held_result(gate, events, grant["pid"])
+                    if captured is not None:
+                        return captured
+                    break
+        if (gate / "error.txt").is_file():
+            raise evidence.Failed((gate / "error.txt").read_text())
+        time.sleep(0.02)
+    raise evidence.Failed(f"no real held batch from {events_path.parent}; see export.log")
+
+
+def host_run_export(given: HostWorker, root: Path, project: Path, env: dict) -> subprocess.Popen:
+    with (root / "export.log").open("xb") as log:
+        return subprocess.Popen(
+            [given.blaze, "export", "-p", HOST_PACKAGE, "-o", str(root / "artifact"), "--stats"],
+            cwd=project, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+
+def host_artifact(root: Path, expected: str, timeout: int) -> dict:
+    path = root / "artifact"
+    output = host_checked_output([str(path), str(HOST_PROGRAM_INPUT)], timeout=timeout)
+    evidence.require(output == expected, f"{path}: unexpected function-result hash {output!r}; expected {expected!r}")
+    return {"stdout": output, "sha256": file_hash(path)}
+
+
+def host_worker(given: HostWorker) -> None:
+    root = Path(given.scratch)
+    root.mkdir(parents=True, exist_ok=False)
+    project = root / "project"
+    source, expected = host_fixture(project)
+    env = host_worker_env(root, given.cores)
+    identity = host_node_identity(given, env, source)
+    host_write_json(root / "identity.json", identity)
+    controls = HostMessages(sys.stdin.buffer, "controller")
+    host_send(sys.stdout.buffer, {"phase": "prepared", "identity": identity})
+    controls.receive("start", time.monotonic() + given.timeout)
+    gate = root / "gate"
+    gate.mkdir()
+    (gate / "keepalive").touch()
+    events_path = root / "events.jsonl"
+    report_path = root / "report.jsonl"
+    artifact_keys_path = root / "artifact-keys.json"
+    env.update(BLAZE_DIST_SOCKET=given.socket, BLAZE_DIST_BLOBS=given.blobs,
+               BLAZE_DIST_REPORT=str(report_path), BLAZE_DIST_EVENTS=str(events_path),
+               BLAZE_DIST_DEADLINE_SECS=str(given.timeout),
+               BLAZE_DIST_TEST_RESULT_GATE=str(gate), BLAZE_DIST_TEST_RESULT_UNIT=HOST_PACKAGE)
+    if given.role == "primary":
+        env["BLAZE_DIST_ARTIFACT_KEYS"] = str(artifact_keys_path)
+    started = time.monotonic_ns()
+    process = host_run_export(given, root, project, env)
+    try:
+        deadline = time.monotonic() + given.timeout
+        held = host_wait_gate(gate, events_path, process, deadline)
+        capture = json.loads((gate / "ready.json").read_text())
+        host_send(sys.stdout.buffer, {"phase": "held", "grant": held, "capture": capture})
+        controls.receive("release", deadline)
+        (gate / "release").touch()
+        code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        elapsed = time.monotonic_ns() - started
+        evidence.require(code == 0, f"{given.runner}: export exited {code}; see {root / 'export.log'}")
+        evidence.require(evidence.gate_answer(gate, held, refused=False),
+                         f"{given.runner}: the actual Client did not retain the accepted Result answer")
+        evidence.require(host_node_identity(given, env, source) == identity, f"{given.runner}: measured identity changed")
+        completed = {"phase": "complete", "elapsed_ns": elapsed, "identity": identity,
+                     "artifact": host_artifact(root, expected, given.timeout), "rows": evidence.jsonl(report_path),
+                     "plans": evidence.unit_plan(Path(str(report_path) + ".plans"))}
+        if given.role == "primary":
+            evidence.no_local_emission("primary final assembly", (root / "export.log").read_text())
+            completed["artifact_keys"] = json.loads(artifact_keys_path.read_text())
+        host_write_json(root / "completion.json", completed)
+        host_send(sys.stdout.buffer, completed)
+    finally:
+        host_stop(process)
+
+
+def host_same_hosts(identities: list[dict]) -> None:
+    evidence.require(len(identities) == 3, "exactly three sessions must report identity")
+    for field in ("namespace", "commit", "tree", "blaze_sha256", "compiler_seal_sha256",
+                  "workload_sha256", "triple", "cores"):
+        evidence.require(len({identity[field] for identity in identities}) == 1, f"participants disagree on {field}")
+    evidence.require(len({identity["boot_id"] for identity in identities}) == 3,
+                     "participants must have distinct boot_id values")
+
+
+def host_shared_grants(held: list[dict]) -> tuple[str, int, int]:
+    grants = [row["grant"] for row in held]
+    evidence.validate_events(grants)
+    executions = {(grant["unit_digest"], grant["execution"], grant["attempt"]) for grant in grants}
+    evidence.require(len(grants) == 3 and len(executions) == 1 and len({grant["holder"] for grant in grants}) == 3,
+                     "three distinct holders must share one unit, execution and attempt")
+    used: set[str] = set()
+    for grant in grants:
+        work = set(grant["work"])
+        evidence.require(bool(work) and used.isdisjoint(work), "every participant must have disjoint nonempty work")
+        used.update(work)
+    return next(iter(executions))
+
+
+def host_dev_machine_entry(record: bytes) -> bool:
+    """Dev packs contain ladder entries, with the machine record embedded in the entry."""
+    if len(record) < 20 or not record.startswith(b"bzcent01"):
+        return False
+    form, _, size = struct.unpack_from("<III", record, 8)
+    return form == 9 and size <= len(record) - 20 and evidence.machine_record(record[20:20 + size])
+
+
+def host_accepted_outputs(blobs: Path, held: dict, participant: dict, events: list[dict], unit: str,
+                     published: dict[str, tuple[int, bytes]]) -> set[str]:
+    grant, capture = held["grant"], held["capture"]
+    evidence.require(capture["command"][1]["0"] == unit and capture["command_sha256"] == grant["capture_sha256"],
+                     f"{grant['holder']}: captured Result has a different unit or command digest")
+    acknowledgements = [event for event in events if event["event"] == "result_accepted"
+                        and evidence.lease(event) == evidence.lease(grant)
+                        and set(event["work"]) == set(grant["work"])]
+    evidence.require(bool(acknowledgements), f"coordinator did not accept {grant['holder']}'s exact held batch")
+    references = capture["command"][1]["2"]["3"]
+    batch = evidence.logical_outputs(blobs, [reference["0"] for reference in references])
+    rows = [row for row in participant["rows"] if row["unit_digest"] == unit]
+    evidence.require(len(rows) == 1 and rows[0]["joined"] and rows[0]["source"] == "executed"
+                     and rows[0]["execution"] == grant["execution"] and rows[0]["attempt"] == grant["attempt"],
+                     f"{grant['holder']}: unit report does not identify its shared execution")
+    evidence.compiled(rows[0])
+    compiled = {key for key in rows[0]["work_compiled_keys"]
+                if key in batch and batch[key][0] == 0 and host_dev_machine_entry(batch[key][1])}
+    evidence.require(bool(compiled), f"{grant['holder']}: accepted batch contains no locally compiled function keys")
+    evidence.require(all(published.get(key) == batch[key] for key in compiled),
+                     f"{grant['holder']}: published bytes differ from its accepted compiled records")
+    return compiled
+
+
+def host_placed_helper_keys(primary: dict, helpers: list[set[str]]) -> list[list[str]]:
+    receipt = primary["artifact_keys"]
+    evidence.require(isinstance(receipt, dict) and receipt.get("artifact_sha256") == primary["artifact"]["sha256"],
+                     "primary placement receipt must bind the final artifact bytes")
+    placed = receipt.get("keys")
+    evidence.require(isinstance(placed, list) and all(evidence.digest(key) for key in placed)
+                     and placed == sorted(set(placed)), "primary placement receipt needs sorted unique function keys")
+    consumed = [sorted(keys.intersection(placed)) for keys in helpers]
+    evidence.require(len(consumed) == 2 and all(consumed), "primary must place accepted function records from both helpers")
+    return consumed
+
+
+def host_prove(blobs: Path, held: list[dict], completed: list[dict], events: list[dict], solo: dict) -> dict:
+    unit, execution, attempt = host_shared_grants(held)
+    for participant in completed:
+        evidence.require(participant["artifact"] == solo, "every worker's artifact must match solo in bytes and stdout")
+        evidence.same_unit_plans(completed[0]["plans"], participant["plans"])
+    all_rows = [row for participant in completed for row in participant["rows"]]
+    evidence.no_duplicate_compile(all_rows)
+    evidence.publication(blobs, all_rows, events)
+    packs, _ = evidence.manifest(blobs, unit)
+    published = evidence.logical_outputs(blobs, packs)
+    outputs = [host_accepted_outputs(blobs, gate, participant, events, unit, published)
+               for gate, participant in zip(held, completed, strict=True)]
+    for index, keys in enumerate(outputs):
+        evidence.require(all(keys.isdisjoint(other) for other in outputs[index + 1:]),
+                         "accepted compiled function sets overlap")
+    consumed = host_placed_helper_keys(completed[0], outputs[1:])
+    return {"unit_digest": unit, "execution": execution, "attempt": attempt,
+            "grants": [row["grant"] for row in held], "accepted_compiled_keys": [sorted(keys) for keys in outputs],
+            "placed_helper_keys": consumed}
+
+
+def host_wait_ready(process: subprocess.Popen, predicate, deadline: float, description: str) -> None:
+    while process.poll() is None and time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise evidence.Failed(f"{description} did not start")
+
+
+def host_connected(address: str) -> bool:
+    try:
+        with socket.create_connection(host_cache_address(address), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def host_controller(given: HostController) -> None:
+    root = Path(given.scratch)
+    root.mkdir(parents=True, exist_ok=False)
+    solo_root = root / "solo"
+    solo_root.mkdir()
+    project = solo_root / "project"
+    solo_source, expected = host_fixture(project)
+    env = host_worker_env(solo_root, given.cores)
+    started = time.monotonic_ns()
+    process = host_run_export(given, solo_root, project, env)
+    try:
+        code = process.wait(timeout=given.timeout)
+        solo_ns = time.monotonic_ns() - started
+        evidence.require(code == 0, f"solo export exited {code}; see {solo_root / 'export.log'}")
+    finally:
+        host_stop(process)
+    solo = host_artifact(solo_root, expected, given.timeout)
+    triple = json.loads(host_checked_output([given.blaze, "toolchain", "--json"], timeout=given.timeout, env=env))["host"]
+
+    services = []
+    channels = []
+    blobs = root / "blobs"
+    coordinator_events = root / "coordinator.events.jsonl"
+    carrier = Path(given.socket)
+    evidence.require(not carrier.exists() and not carrier.is_symlink(), f"coordinator socket already exists: {carrier}")
+    coordinator_started = False
+    try:
+        with (root / "serve.log").open("xb") as log:
+            cache = subprocess.Popen([given.serve, "--dir", str(blobs), "--listen", given.blobs],
+                                     stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        services.append(cache)
+        host_wait_ready(cache, lambda: host_connected(given.blobs), time.monotonic() + 30, "native cache")
+        with (root / "coordinator.log").open("xb") as log:
+            coord = subprocess.Popen([given.dist_local, "coordinate", given.socket, triple, "64"],
+                                     env={**env, "BLAZE_DIST_EVENTS": str(coordinator_events)},
+                                     stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        services.append(coord)
+        coordinator_started = True
+        host_wait_ready(coord, carrier.is_socket, time.monotonic() + 30, "coordinator UDS")
+        primary = HostNode(given.checkout, str(root / "worker"), given.blaze, given.python, given.runner, given.socket, given.blobs)
+        for index, node in enumerate((primary, *given.helpers)):
+            role = "primary" if index == 0 else "helper"
+            fields = {field.name: getattr(node, field.name) for field in dataclasses.fields(HostNode)}
+            request = HostWorker(**fields, role=role, namespace=given.namespace, cores=given.cores, timeout=given.timeout)
+            command = [node.python, str(Path(node.checkout) / "harness" / "distv2.py"),
+                       json.dumps(dataclasses.asdict(request), separators=(",", ":"))]
+            if isinstance(node, HostHelper):
+                command = ["ssh", "-F", given.ssh_config, node.alias, shlex.join(command)]
+            with (root / f"session-{index}.log").open("xb") as log:
+                child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+                                         start_new_session=True)
+            services.append(child)
+            channels.append((child.stdin, HostMessages(child.stdout, f"{role} {node.runner}"), child))
+
+        deadline = time.monotonic() + given.timeout
+        identities = [channel.receive("prepared", deadline)["identity"] for _, channel, _ in channels]
+        host_same_hosts(identities)
+        evidence.require(identities[0]["workload_sha256"] == solo_source,
+                         "the solo and distributed workloads must have identical source")
+        host_write_json(root / "hosts.json", identities)
+        print("Three distinct runners prepared matching source, compiler and fixture identities", flush=True)
+        deadline = time.monotonic() + given.timeout
+        host_send(channels[0][0], {"phase": "start"})
+        held = [channels[0][1].receive("held", deadline)]
+        for stream, _, _ in channels[1:]:
+            host_send(stream, {"phase": "start"})
+        held.extend(channel.receive("held", deadline) for _, channel, _ in channels[1:])
+        host_shared_grants(held)
+        host_write_json(root / "held.json", held)
+        print("Three nonempty, disjoint grants reached the explicit correctness barrier", flush=True)
+        for stream, _, _ in channels:
+            host_send(stream, {"phase": "release"})
+        completed = [channel.receive("complete", deadline) for _, channel, _ in channels]
+        for (_, _, child), identity, worker_result in zip(channels, identities, completed, strict=True):
+            evidence.require(worker_result["identity"] == identity and child.wait(timeout=max(0.001, deadline - time.monotonic())) == 0,
+                             f"{identity['runner']}: identity changed or its session failed")
+        events = evidence.jsonl(coordinator_events)
+        evidence.validate_events(events)
+        proof = host_prove(blobs, held, completed, events, solo)
+        host_write_json(root / "three-host-proof.json", {
+            "hosts": identities, "solo_artifact": solo, "solo_export_ns": solo_ns,
+            "gated_primary_export_ns": completed[0]["elapsed_ns"],
+            "gated_worker_export_ns": [row["elapsed_ns"] for row in completed],
+            "barrier": "primary holds its first batch, then both helpers hold their first batches before all release",
+            "proof": proof,
+        })
+        print("distv2: three-host cooperation and primary artifact checks passed", flush=True)
+    finally:
+        for process in reversed(services):
+            host_stop(process)
+        if coordinator_started and carrier.is_socket():
+            carrier.unlink()
+
+
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     try:
-        main(load(sys.argv[1]))
-    except (Failed, OSError, ValueError, TypeError, subprocess.SubprocessError) as failed:
+        request = read_input(sys.argv[1])
+        if "role" in request:
+            signal.signal(signal.SIGTERM, lambda signum, _: sys.exit(f"distv2: interrupted by signal {signum}"))
+            hosts = load_host(request)
+            if isinstance(hosts, HostController):
+                host_controller(hosts)
+            else:
+                host_worker(hosts)
+        else:
+            main(load_profile(request))
+    except (Failed, OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as failed:
         sys.exit(f"distv2: {failed}")

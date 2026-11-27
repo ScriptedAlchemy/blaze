@@ -1,0 +1,444 @@
+name: Distributed build across three ARM64 hosts
+on:
+  workflow_call:
+    inputs:
+      source:
+        required: true
+        type: string
+      source_run:
+        required: true
+        type: string
+
+# Protect this environment so only trusted dispatch refs can request a tailnet identity.
+# Set BLAZE_TAILSCALE_CLIENT_ID on the environment.
+# Restrict the federated identity's claims to the Blaze repository ID, trusted actor ID,
+# exact authorized dispatch ref, workflow_dispatch, and this exact job_workflow_ref.
+# Allow tag:blaze-ci to reach tag:blaze-ci on TCP/42222. Peer SSH keys are scoped to one
+# workflow attempt. No coordinator, cache, SSH authentication or credentials are public.
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  host:
+    name: ${{ matrix.role }}
+    runs-on: ubuntu-24.04-arm
+    environment: blaze-distributed-hosts
+    timeout-minutes: 100
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [primary, helper-1, helper-2]
+    env:
+      ROLE: ${{ matrix.role }}
+      SESSION: blaze-${{ github.run_id }}-${{ github.run_attempt }}
+      SOURCE: ${{ inputs.source }}
+      SSH_PORT: "42222"
+      CACHE_PORT: "47081"
+      BLAZE_TESTS: verify
+      RUST_BACKTRACE: "0"
+    steps:
+      - name: Require the trusted manual dispatch and federation configuration
+        timeout-minutes: 1
+        env:
+          SOURCE_RUN: ${{ inputs.source_run }}
+          CLIENT: ${{ vars.BLAZE_TAILSCALE_CLIENT_ID }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$GITHUB_REF" != refs/heads/* \
+                || "$GITHUB_WORKFLOW_REF" != "$GITHUB_REPOSITORY/.github/workflows/blaze.yaml@$GITHUB_REF" \
+                || "$SOURCE" != "$GITHUB_SHA" || "$SOURCE_RUN" != "$GITHUB_RUN_ID" ]]; then
+            echo "::error::Dispatch blaze.yaml on an authorized branch and use its same-run source compiler."
+            exit 1
+          fi
+          if [[ -z "$CLIENT" ]]; then
+            echo "::error::Configure BLAZE_TAILSCALE_CLIENT_ID on the blaze-distributed-hosts environment."
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Record the exact controller and compiler checkout
+        timeout-minutes: 1
+        run: |
+          timeout 10s mkdir -p "$RUNNER_TEMP/host-evidence"
+          test "$(timeout 10s git rev-parse HEAD)" = "$GITHUB_SHA"
+          timeout 10s git rev-parse HEAD 'HEAD^{tree}' | tee "$RUNNER_TEMP/host-evidence/controller-source.txt"
+      - uses: ./.github/actions/locked-memory
+      - uses: ./.github/actions/reflink
+      - uses: ./.github/actions/apt
+        with:
+          packages: bubblewrap
+      - uses: ./.github/actions/apt
+        if: matrix.role != 'primary'
+        with:
+          packages: openssh-server
+      - name: Disable the distribution SSH listener on helpers
+        if: matrix.role != 'primary'
+        timeout-minutes: 1
+        run: timeout 20s sudo systemctl stop ssh.socket ssh.service
+      - name: Enable user namespaces for native fixture sandboxes
+        timeout-minutes: 1
+        run: |
+          restrict=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [[ -f "$restrict" && "$(timeout 10s cat "$restrict")" != 0 ]]; then
+            timeout 10s sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          timeout 10s bwrap --unshare-user --ro-bind / / -- /usr/bin/true
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: source-compiler
+          path: ${{ runner.temp }}/source-package
+      - name: Verify source compiler and shelf handoff
+        timeout-minutes: 6
+        run: |
+          bin="$RUNNER_TEMP/source-binaries"
+          out="$RUNNER_TEMP/host-evidence"
+          timeout 10s mkdir -p "$bin" "$HOME/.blaze/v2" "$RUNNER_TEMP/blaze-fs/host-case"
+          timeout 120s tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$bin"
+          timeout 120s tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$HOME/.blaze/v2"
+          # jq variables are evaluated by jq.
+          # shellcheck disable=SC2016
+          input=$(timeout 10s jq -nc --arg bin "$bin" '{command:"verify",binaries:$bin,services:true}')
+          timeout 120s python3 .github/scripts/dist_build_identity.py "$input" | tee "$out/identity-before.log"
+          timeout 10s cp "$bin/blaze-build.json" "$out/"
+          timeout 20s sha256sum "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" | tee "$out/shelf.sha256"
+          timeout 10s findmnt -T "$RUNNER_TEMP/blaze-fs" | tee "$out/filesystem.txt"
+
+      - name: Preserve configured runner network variables for Tailscale
+        timeout-minutes: 1
+        run: |
+          # The official action uses sudo for the exchange and daemon. Ubuntu sudo-rs
+          # does not pass these settings via -E, so preserve only those the runner exports.
+          network_env=()
+          for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy SSL_CERT_FILE SSL_CERT_DIR; do
+            if [[ -v "$name" ]]; then network_env+=("$name"); fi
+          done
+          if (( ${#network_env[@]} > 0 )); then
+            config=/etc/sudoers.d/blaze-tailscale-network
+            printf 'Defaults!/usr/local/bin/tailscale,/usr/local/bin/tailscaled env_keep += "%s"\n' "${network_env[*]}" \
+              | timeout 10s sudo tee "$config" >/dev/null
+            timeout 10s sudo chmod 0440 "$config"
+            timeout 10s sudo visudo -cf "$config"
+          fi
+
+      - name: Join the private tailnet as a run-specific ephemeral node
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4
+        with:
+          oauth-client-id: ${{ vars.BLAZE_TAILSCALE_CLIENT_ID }}
+          audience: api.tailscale.com/${{ vars.BLAZE_TAILSCALE_CLIENT_ID }}
+          tags: tag:blaze-ci
+          hostname: ${{ env.SESSION }}-${{ matrix.role }}
+          args: --accept-dns=false --accept-routes=false --ssh=false
+          timeout: 1m
+          retry: "1"
+          log-mode: quiet
+
+      - name: Generate SSH identities and publish only the public rendezvous
+        timeout-minutes: 2
+        run: |
+          sshdir="$RUNNER_TEMP/host-ssh"
+          rendezvous="$RUNNER_TEMP/host-rendezvous"
+          timeout 10s mkdir -m 700 "$sshdir"
+          timeout 10s mkdir "$rendezvous"
+          ip=$(timeout 10s tailscale ip -4)
+          user=$(timeout 10s id -un)
+          host_key=""
+          client_key=""
+          if [[ "$ROLE" == primary ]]; then
+            timeout 10s ssh-keygen -q -t ed25519 -N '' -f "$sshdir/client"
+            client_key=$(timeout 10s cat "$sshdir/client.pub")
+          else
+            timeout 10s ssh-keygen -q -t ed25519 -N '' -f "$sshdir/host"
+            host_key=$(timeout 10s cat "$sshdir/host.pub")
+          fi
+          boot_id=$(timeout 10s cat /proc/sys/kernel/random/boot_id)
+          # jq variables are evaluated by jq.
+          # shellcheck disable=SC2016
+          timeout 10s jq -n --arg role "$ROLE" --arg session "$SESSION" --arg ip "$ip" --arg user "$user" \
+            --arg host_key "$host_key" --arg client_key "$client_key" --arg runner_name "$RUNNER_NAME" --arg boot_id "$boot_id" \
+            --arg repo "$GITHUB_WORKSPACE" --arg scratch "$RUNNER_TEMP/blaze-fs/host-case" \
+            --arg bin "$RUNNER_TEMP/source-binaries" --arg python "$(command -v python3)" \
+            --arg shelf_sha "$(timeout 10s sha256sum "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" | cut -d' ' -f1)" \
+            '{role:$role,session:$session,ip:$ip,user:$user,host_key:$host_key,client_key:$client_key,
+              runner_name:$runner_name,boot_id:$boot_id,repo:$repo,scratch:$scratch,bin:$bin,python:$python,shelf_sha:$shelf_sha}' \
+            > "$rendezvous/identity.json"
+          timeout 10s cp "$RUNNER_TEMP/source-binaries/blaze-build.json" "$rendezvous/"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.SESSION }}-${{ matrix.role }}-identity
+          path: ${{ runner.temp }}/host-rendezvous
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Install bounded same-attempt rendezvous commands
+        timeout-minutes: 1
+        run: |
+          timeout 10s tee "$RUNNER_TEMP/get-host-artifact" >/dev/null <<'BASH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          name=$1
+          dir=$2
+          limit=$3
+          deadline=$((SECONDS + limit))
+          while (( SECONDS < deadline )); do
+            id=$(timeout 20s gh api --method GET "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+              -f name="$name" --jq '.artifacts[] | select(.expired == false) | .id')
+            if [[ -n "$id" ]]; then
+              [[ "$id" =~ ^[0-9]+$ ]]
+              timeout 10s mkdir -p "$dir"
+              timeout 60s gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$name" --dir "$dir"
+              exit 0
+            fi
+            timeout 20s sleep 15
+          done
+          echo "::error::Timed out waiting for this attempt's artifact $name" >&2
+          exit 1
+          BASH
+          timeout 10s chmod 700 "$RUNNER_TEMP/get-host-artifact"
+
+      - name: Authorize only this attempt's primary on the helper
+        if: matrix.role != 'primary'
+        timeout-minutes: 16
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          peer="$RUNNER_TEMP/primary-identity"
+          sshdir="$RUNNER_TEMP/host-ssh"
+          timeout 900s "$RUNNER_TEMP/get-host-artifact" "$SESSION-primary-identity" "$peer" 820
+          timeout 10s cmp "$peer/blaze-build.json" "$RUNNER_TEMP/source-binaries/blaze-build.json"
+          # jq variables are evaluated by jq.
+          # shellcheck disable=SC2016
+          timeout 10s jq -er --arg session "$SESSION" '
+            select(.session == $session and .role == "primary") |
+            .client_key | sub(" [^ ]+$"; "") |
+            select(test("^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$"))
+          ' "$peer/identity.json" > "$sshdir/primary.pub"
+          timeout 10s ssh-keygen -lf "$sshdir/primary.pub"
+          ip=$(timeout 10s tailscale ip -4)
+          # jq variables are evaluated by jq.
+          # shellcheck disable=SC2016
+          primary_ip=$(timeout 10s jq -er --arg session "$SESSION" '
+            select(.session == $session and .role == "primary") |
+            .ip | select(test("^100\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))
+          ' "$peer/identity.json")
+          timeout 10s python3 -c 'import ipaddress, sys; sys.exit(ipaddress.IPv4Address(sys.argv[1]) not in ipaddress.IPv4Network("100.64.0.0/10"))' "$primary_ip"
+          key=$(timeout 10s cat "$sshdir/primary.pub")
+          printf 'from="%s",no-agent-forwarding,no-X11-forwarding,no-pty,no-user-rc %s\n' "$primary_ip" "$key" \
+            > "$sshdir/authorized_keys"
+          timeout 10s chmod 600 "$sshdir/authorized_keys"
+          user=$(timeout 10s id -un)
+          timeout 10s sudo install -d -m 0755 /run/sshd
+          timeout 10s tee "$sshdir/sshd_config" >/dev/null <<CONF
+          ListenAddress $ip
+          Port $SSH_PORT
+          HostKey $sshdir/host
+          PidFile $sshdir/sshd.pid
+          AuthorizedKeysFile $sshdir/authorized_keys
+          AllowUsers $user
+          PubkeyAuthentication yes
+          AuthenticationMethods publickey
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          UsePAM yes
+          AllowAgentForwarding no
+          X11Forwarding no
+          AllowTcpForwarding remote
+          PermitListen 127.0.0.1:$CACHE_PORT
+          AllowStreamLocalForwarding remote
+          StreamLocalBindUnlink yes
+          GatewayPorts no
+          PermitUserEnvironment no
+          CONF
+          timeout 10s sudo /usr/sbin/sshd -t -f "$sshdir/sshd_config"
+          timeout 10s sudo /usr/sbin/sshd -f "$sshdir/sshd_config" -E "$RUNNER_TEMP/host-evidence/sshd.log"
+
+      - name: Pin and verify this attempt's two helper SSH hosts
+        if: matrix.role == 'primary'
+        timeout-minutes: 17
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sshdir="$RUNNER_TEMP/host-ssh"
+          # Wait concurrently so a missing peer costs one bounded rendezvous window.
+          timeout 900s "$RUNNER_TEMP/get-host-artifact" "$SESSION-helper-1-identity" "$RUNNER_TEMP/helper-1-identity" 820 &
+          first=$!
+          timeout 900s "$RUNNER_TEMP/get-host-artifact" "$SESSION-helper-2-identity" "$RUNNER_TEMP/helper-2-identity" 820 &
+          second=$!
+          first_exit=0
+          wait "$first" || first_exit=$?
+          wait "$second"
+          test "$first_exit" = 0
+          timeout 30s python3 - <<'PY'
+          import ipaddress
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from uuid import UUID
+
+          temp = Path(os.environ["RUNNER_TEMP"])
+          keys = temp / "host-ssh"
+          session = os.environ["SESSION"]
+          port = int(os.environ["SSH_PORT"])
+          cache = f"127.0.0.1:{int(os.environ['CACHE_PORT'])}"
+          socket = f"/tmp/bh-{session}.sock"
+          manifest = (temp / "source-binaries/blaze-build.json").read_bytes()
+          primary = json.loads((temp / "host-rendezvous/identity.json").read_text())
+          boot_ids = {UUID(primary["boot_id"])}
+          peers = {"primary": primary}
+          with (keys / "config").open("w") as config, (keys / "known_hosts").open("w") as hosts:
+              for role in ("helper-1", "helper-2"):
+                  directory = temp / f"{role}-identity"
+                  assert (directory / "blaze-build.json").read_bytes() == manifest, role
+                  peer = json.loads((directory / "identity.json").read_text())
+                  assert (peer["session"], peer["role"]) == (session, role), role
+                  assert peer["shelf_sha"] == primary["shelf_sha"], role
+                  ip = ipaddress.IPv4Address(peer["ip"])
+                  assert ip in ipaddress.IPv4Network("100.64.0.0/10"), ip
+                  assert ip not in [ipaddress.IPv4Address(node["ip"]) for node in peers.values()], ip
+                  boot = UUID(peer["boot_id"])
+                  assert boot not in boot_ids, (role, boot)
+                  boot_ids.add(boot)
+                  user = peer["user"]
+                  assert re.fullmatch(r"[a-z_][a-z0-9_-]*", user), user
+                  key = " ".join(peer["host_key"].split()[:2])
+                  assert re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/]+={0,2}", key), role
+                  print(f"[{ip}]:{port} {key}", file=hosts)
+                  print(f"""Host {role}
+            HostName {ip}
+            Port {port}
+            User {user}
+            IdentityFile {keys / 'client'}
+            UserKnownHostsFile {keys / 'known_hosts'}
+            GlobalKnownHostsFile /dev/null
+            StrictHostKeyChecking yes
+            BatchMode yes
+            IdentitiesOnly yes
+            RemoteForward {socket} {socket}
+            RemoteForward {cache} {cache}
+            ExitOnForwardFailure yes
+            ConnectTimeout 5
+            ServerAliveInterval 5
+            ServerAliveCountMax 3""", file=config)
+                  peers[role] = peer
+          out = temp / "host-evidence"
+          (out / "peers.json").write_text(json.dumps(peers, indent=2) + "\n")
+
+          def node_settings(node):
+              return dict(checkout=node["repo"], scratch=node["scratch"] + "/worker",
+                          blaze=node["bin"] + "/blaze", python=node["python"],
+                          runner=f"{node['role']}:{node['runner_name']}",
+                          socket=socket, blobs=cache)
+
+          request = dict(role="controller", **node_settings(primary), namespace=session,
+                         dist_local=primary["bin"] + "/blaze-dist-local", cores=2, timeout=900,
+                         serve=primary["bin"] + "/blaze-serve", ssh_config=str(keys / "config"),
+                         helpers=[dict(alias=role, **node_settings(peers[role])) for role in ("helper-1", "helper-2")])
+          (out / "host-input.json").write_text(json.dumps(request, indent=2) + "\n")
+          PY
+          for host in helper-1 helper-2; do
+            deadline=$((SECONDS + 45))
+            until boot_id=$(timeout 8s ssh -F "$sshdir/config" -o ClearAllForwardings=yes "$host" cat /proc/sys/kernel/random/boot_id); do
+              if (( SECONDS >= deadline )); then
+                echo "::error::Pinned SSH did not become available for $host"
+                exit 1
+              fi
+              timeout 3s sleep 1
+            done
+            expected=$(timeout 10s jq -er .boot_id "$RUNNER_TEMP/$host-identity/identity.json")
+            test "$boot_id" = "$expected"
+          done
+
+      - name: Prove two helpers performed useful unique work for the primary build
+        id: build
+        if: matrix.role == 'primary'
+        timeout-minutes: 40
+        run: |
+          out="$RUNNER_TEMP/host-evidence"
+          timeout -k 30s 2280s python3 harness/distv2.py "$out/host-input.json" \
+            2>&1 | tee "$out/build.log"
+          proof="$RUNNER_TEMP/blaze-fs/host-case/worker/three-host-proof.json"
+          timeout 10s jq -e '
+            (.hosts | length == 3) and (.proof.placed_helper_keys | length == 2 and all(length > 0))
+          ' "$proof"
+
+      - name: Verify the primary's source executables after the build
+        id: primary_identity
+        if: ${{ always() && matrix.role == 'primary' && steps.build.outcome != 'skipped' }}
+        timeout-minutes: 3
+        run: |
+          # jq variables are evaluated by jq.
+          # shellcheck disable=SC2016
+          input=$(timeout 10s jq -nc --arg bin "$RUNNER_TEMP/source-binaries" '{command:"verify",binaries:$bin,services:true}')
+          timeout 120s python3 .github/scripts/dist_build_identity.py "$input" \
+            | tee "$RUNNER_TEMP/host-evidence/identity-after.log"
+
+      - name: Publish the primary's terminal status
+        if: ${{ always() && matrix.role == 'primary' }}
+        timeout-minutes: 1
+        env:
+          RESULT: ${{ steps.build.outcome }}
+          IDENTITY: ${{ steps.primary_identity.outcome }}
+        run: |
+          dir="$RUNNER_TEMP/host-finished"
+          timeout 10s mkdir "$dir"
+          # jq variables are evaluated by jq.
+          # shellcheck disable=SC2016
+          timeout 10s jq -n --arg session "$SESSION" --arg result "$RESULT" --arg identity "$IDENTITY" \
+            '{session:$session,build:$result,identity:$identity}' > "$dir/result.json"
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() && matrix.role == 'primary' }}
+        with:
+          name: ${{ env.SESSION }}-finished
+          path: ${{ runner.temp }}/host-finished/result.json
+          if-no-files-found: error
+
+      - name: Keep this helper alive through the primary build
+        if: matrix.role != 'primary'
+        timeout-minutes: 62
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          out="$RUNNER_TEMP/host-evidence"
+          timeout 3600s "$RUNNER_TEMP/get-host-artifact" "$SESSION-finished" "$out" 3500
+          # jq variables are evaluated by jq.
+          # shellcheck disable=SC2016
+          input=$(timeout 10s jq -nc --arg bin "$RUNNER_TEMP/source-binaries" '{command:"verify",binaries:$bin,services:true}')
+          timeout 120s python3 .github/scripts/dist_build_identity.py "$input" \
+            | tee "$out/identity-after.log"
+          # jq variables are evaluated by jq.
+          # shellcheck disable=SC2016
+          timeout 10s jq -e --arg session "$SESSION" \
+            '.session == $session and .build == "success" and .identity == "success"' "$out/result.json"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ${{ env.SESSION }}-${{ matrix.role }}-evidence
+          path: |
+            ${{ runner.temp }}/host-evidence
+            ${{ runner.temp }}/blaze-fs/host-case/**/*.json
+            ${{ runner.temp }}/blaze-fs/host-case/**/*.jsonl
+            ${{ runner.temp }}/blaze-fs/host-case/**/*.plans
+            ${{ runner.temp }}/blaze-fs/host-case/**/gate
+            ${{ runner.temp }}/blaze-fs/host-case/**/blobs/manifests/*
+            ${{ runner.temp }}/blaze-fs/host-case/**/blobs/packs/*.pack
+            ${{ runner.temp }}/blaze-fs/host-case/**/*.log
+            ${{ runner.temp }}/blaze-fs/host-case/**/.blaze/v2/start.txt
+            ${{ runner.temp }}/blaze-fs/host-case/**/.blaze/v2/profile.txt
+            ${{ runner.temp }}/blaze-fs/host-case/**/*.parquet
+          if-no-files-found: warn
+          include-hidden-files: true

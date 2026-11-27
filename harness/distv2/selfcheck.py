@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import struct
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from http.client import HTTPConnection
@@ -14,6 +15,7 @@ from pathlib import Path
 from blake3 import blake3
 import sys
 import tempfile
+import time
 from threading import Thread
 import unittest
 from unittest.mock import patch
@@ -848,6 +850,95 @@ class ReleaseFoldEvidence(unittest.TestCase):
         self.assertTrue(e.machine_record(raw))
         self.assertFalse(e.machine_record(raw[:-1] + b"\x01"))
         self.assertFalse(e.machine_record(raw[:-8]))
+
+HOST_UNIT = "00" * 32
+HOST_KEYS = [f"{index + 1:02x}" * 32 for index in range(3)]
+HOST_ARTIFACT = "ff" * 32
+
+
+def host_test_held(index: int) -> dict:
+    grant = {"event": "grant", "pid": 1, "unit_digest": HOST_UNIT, "execution": 9, "attempt": 0,
+             "holder": f"holder-{index}", "generation": 1, "seq": 0, "work": [HOST_KEYS[index]],
+             "capture_sha256": "aa" * 32}
+    return {"grant": grant, "capture": {"command_sha256": grant["capture_sha256"],
+                                       "command": [7, {"0": HOST_UNIT}]}}
+
+
+class HostProof(unittest.TestCase):
+    def test_distinct_hosts_are_required_independent_of_pid(self):
+        template = {"namespace": "run", "commit": "commit", "tree": "tree", "blaze_sha256": "binary",
+                    "compiler_seal_sha256": "seal", "workload_sha256": "fixture",
+                    "triple": "aarch64-unknown-linux-gnu", "cores": 2}
+        identities = [{**template, "runner": "shared-runner-name", "boot_id": f"boot-{i}"} for i in range(3)]
+        h.host_same_hosts(identities)
+        identities[2]["boot_id"] = identities[1]["boot_id"]
+        with self.assertRaisesRegex(e.Failed, "distinct boot_id"):
+            h.host_same_hosts(identities)
+
+    def test_grants_require_shared_execution_and_disjoint_work(self):
+        ranks = [host_test_held(i) for i in range(3)]
+        self.assertEqual(h.host_shared_grants(ranks), (HOST_UNIT, 9, 0))
+        ranks[2]["grant"]["execution"] += 1
+        with self.assertRaisesRegex(e.Failed, "share one unit, execution and attempt"):
+            h.host_shared_grants(ranks)
+        ranks[2]["grant"]["execution"] -= 1
+        ranks[2]["grant"]["work"] = ranks[1]["grant"]["work"]
+        with self.assertRaisesRegex(e.Failed, "disjoint nonempty work"):
+            h.host_shared_grants(ranks)
+
+    def test_output_requires_coordinator_accepted_machine_pack(self):
+        rank = host_test_held(1)
+        grant = rank["grant"]
+        code = bytearray(72)
+        code[:8] = b"bzcode09"
+        code[12:14] = b"\x04\x03"
+        struct.pack_into("<I", code, 16, 4)
+        code[-8:-4] = b"\xc0\x03\x5f\xd6"  # AArch64 ret
+        entry = b"bzcent01" + struct.pack("<III", 9, 4, len(code)) + code
+        value = bytes.fromhex(HOST_KEYS[1]) + b"\x00" + len(entry).to_bytes(8, "little") + entry
+        pack = b"blzdpk\0\x01" + value
+        name = hashlib.sha256(pack).hexdigest()
+        rank["capture"]["command"][1]["2"] = {"3": [{"0": name}]}
+        host_worker = {"rows": [{"unit": "host_proof", "unit_digest": HOST_UNIT,
+                            "joined": True, "source": "executed", "execution": 9, "attempt": 0,
+                            "compiled_for_work": 1, "work_compiled_keys": [HOST_KEYS[1]],
+                            "tail_compiled": 0, "tail_compiled_keys": []}]}
+        with tempfile.TemporaryDirectory() as directory:
+            blobs = Path(directory)
+            (blobs / "packs").mkdir()
+            (blobs / "packs" / f"{name}.pack").write_bytes(pack)
+            accepted = {**grant, "event": "result_accepted"}
+            published = {HOST_KEYS[1]: (0, entry)}
+            self.assertEqual(h.host_accepted_outputs(blobs, rank, host_worker, [accepted], HOST_UNIT, published), {HOST_KEYS[1]})
+            with self.assertRaisesRegex(e.Failed, "published bytes differ"):
+                h.host_accepted_outputs(blobs, rank, host_worker, [accepted], HOST_UNIT, {HOST_KEYS[1]: (0, b"wrong entry")})
+            accepted["seq"] += 1
+            with self.assertRaisesRegex(e.Failed, "exact held batch"):
+                h.host_accepted_outputs(blobs, rank, host_worker, [accepted], HOST_UNIT, published)
+
+    def test_final_executable_has_a_byte_bound_receipt_from_both_helpers(self):
+        primary = {"artifact": {"sha256": HOST_ARTIFACT}, "artifact_keys": {"artifact_sha256": HOST_ARTIFACT, "keys": HOST_KEYS[:]}}
+        helpers = [{HOST_KEYS[1]}, {HOST_KEYS[2]}]
+        self.assertEqual(h.host_placed_helper_keys(primary, helpers), [[HOST_KEYS[1]], [HOST_KEYS[2]]])
+        primary["artifact_keys"]["keys"].pop()
+        with self.assertRaisesRegex(e.Failed, "from both helpers"):
+            h.host_placed_helper_keys(primary, helpers)
+        primary["artifact_keys"]["artifact_sha256"] = HOST_KEYS[0]
+        with self.assertRaisesRegex(e.Failed, "bind the final artifact bytes"):
+            h.host_placed_helper_keys(primary, helpers)
+
+    def test_fixture_identity_is_independent_of_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(h.host_fixture(root / "first"), h.host_fixture(root / "second"))
+
+    def test_messages_reject_unexpected_phase(self):
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as incoming, os.fdopen(write_fd, "wb") as outgoing:
+            h.host_send(outgoing, {"phase": "complete"})
+            with self.assertRaisesRegex(e.Failed, "expected start"):
+                h.HostMessages(incoming, "helper").receive("start", time.monotonic() + 1)
+
 
 if __name__ == "__main__":
     unittest.main()
