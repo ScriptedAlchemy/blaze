@@ -13,6 +13,7 @@ Input, one JSON value (`python3 harness/distv2.py '{...}'`):
     run          (optional) the arguments it is run with; default ["11"]
     faults       (optional) run the fault cases; default true
     release_fold (optional) require two real holders for both LLVM and folded work; default false
+    cache_overlap (optional) run only the independent native-cache overlap oracle; default false
     profile      (optional) the directory under the target directory programs are in; default "debug"
     timeout      (optional) bound in seconds for each build/fault stage; default 3600
     command_timeout (optional) seconds for probes, stop and running the program; default 60
@@ -58,7 +59,7 @@ from contextlib import closing, contextmanager
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 
 from distv2 import evidence
 from distv2.evidence import Failed
@@ -77,6 +78,7 @@ class Input:
     program: str = "app"
     run: tuple[str, ...] = ("11",)
     faults: bool = True
+    cache_overlap: bool = False
     profile: str = "debug"
     release_fold: bool = False
     stall_bound: int | None = None
@@ -119,7 +121,7 @@ def load(text: str) -> Input:
         raise Failed("env must map strings to strings")
     if any(name.startswith("BLAZE_DIST_") for name in given.env):
         raise Failed("env must not override BLAZE_DIST_*: distribution and policies are controlled case inputs")
-    for name in ("faults", "release_fold"):
+    for name in ("faults", "release_fold", "cache_overlap"):
         if type(getattr(given, name)) is not bool:
             raise Failed(f"{name} must be boolean")
     if given.release_fold and ("--release" not in given.args or given.profile != "release"):
@@ -332,6 +334,25 @@ class Run:
         """Pause a real cache request after planning and before the unit can submit."""
         Path(f"{self.report_path(home)}.plans").unlink(missing_ok=True)
         requested, release = Event(), Event()
+
+        def before_get(path):
+            if path.startswith("/v1/list/manifests/") and not requested.is_set():
+                plan = self.plan(home) or []
+                if any(row["unit"] == unit and path == f"/v1/list/manifests/{row['unit_digest']}"
+                       for row in plan):
+                    requested.set()
+                    return release.wait(self.given.command_timeout)
+            return True
+
+        with self.cache_proxy(f"{home}-{unit}-manifest", before_get=before_get) as carrier:
+            try:
+                yield carrier, requested, release
+            finally:
+                release.set()
+
+    @contextmanager
+    def cache_proxy(self, name, *, before_get=None, before_reply=None, before_body=None):
+        """Forward the real cache protocol, with test barriers at its wire boundaries."""
         run = self
 
         class Carrier(BaseHTTPRequestHandler):
@@ -342,14 +363,9 @@ class Run:
                 super().setup()
 
             def do_GET(self):
-                if self.path.startswith("/v1/list/manifests/") and not requested.is_set():
-                    plan = run.plan(home) or []
-                    if any(row["unit"] == unit and self.path == f"/v1/list/manifests/{row['unit_digest']}"
-                           for row in plan):
-                        requested.set()
-                        if not release.wait(run.given.command_timeout):
-                            self.send_error(504, f"release did not arrive for the held {unit} manifest lookup")
-                            return
+                if before_get is not None and not before_get(self.path):
+                    self.send_error(504, f"{name}: release did not arrive for {self.path}")
+                    return
                 self.forward()
 
             def do_PUT(self):
@@ -372,22 +388,32 @@ class Run:
                         upstream.send(chunk)
                         size -= len(chunk)
                     with upstream.getresponse() as response:
+                        length = int(response.headers["Content-Length"])
+                        reply = (self.path, response.status, length)
+                        if self.command == "GET" and before_reply is not None and not before_reply(*reply):
+                            self.send_error(504, f"{name}: release did not arrive for {self.path}")
+                            return
                         self.send_response_only(response.status)
-                        self.send_header("Content-Length", response.headers["Content-Length"])
+                        self.send_header("Content-Length", str(length))
                         self.send_header("Connection", "close")
                         self.end_headers()
+                        if self.command == "GET" and before_body is not None:
+                            self.wfile.flush()
+                            if not before_body(*reply):
+                                self.close_connection = True
+                                return
                         shutil.copyfileobj(response, self.wfile)
 
         with ThreadingHTTPServer(("127.0.0.1", 0), Carrier) as server:
             driver = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05},
-                            name=f"distv2-{home}-{unit}-manifest", daemon=True)
+                            name=f"distv2-{name}", daemon=True)
             driver.start()
             try:
-                yield f"127.0.0.1:{server.server_port}", requested, release
+                yield f"127.0.0.1:{server.server_port}"
             finally:
-                release.set()
                 server.shutdown()
                 driver.join(timeout=self.given.command_timeout)
+                check(not driver.is_alive(), f"{name}: cache proxy stopped")
 
     def start_services(self) -> None:
         log = open(self.root / "logs" / "serve.log", "w")
@@ -617,6 +643,16 @@ def file_hash(path: Path) -> str:
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def verify_run_identity(run: Run) -> None:
+    for name, identity in run.identities.items():
+        check(file_hash(Path(identity["path"])) == identity["sha256"], f"{name} binary did not change during acceptance")
+    provenance = json.loads((run.root / "provenance.json").read_text())
+    commit, tree, diff = source_state(HERE.parent, run.given.command_timeout)
+    check(commit == provenance["commit"] and tree == provenance["tree"]
+          and hashlib.sha256(diff).hexdigest() == provenance["patch_sha256"],
+          "source commit, tree and patch did not change during acceptance")
+
+
 def stopped_status(pid: int) -> bool:
     try:
         child, status = os.waitpid(pid, os.WUNTRACED | os.WNOHANG)
@@ -642,6 +678,225 @@ def control(run: Run, project: Path | None = None) -> tuple[str, str]:
     code, text = run.build("solo", dist=False, project=project)
     check(code == 0, f"solo control builds: {text[-800:] if code else ''}")
     return run.behaviour("solo", project)
+
+
+def overlap_fixture(path: Path) -> None:
+    """Two reachable sibling leaves, with no build scripts or external packages."""
+    path.mkdir()
+    (path / "Cargo.toml").write_text('[workspace]\nmembers = ["app", "overlap_a", "overlap_b"]\nresolver = "2"\n')
+    for name, body in (("overlap_a", "n.wrapping_mul(7).wrapping_add(3)"),
+                       ("overlap_b", "n.rotate_left(3) ^ 0x5a")):
+        (path / name / "src").mkdir(parents=True)
+        (path / name / "Cargo.toml").write_text(f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2024"\n')
+        (path / name / "src/lib.rs").write_text(f"#[inline(never)]\npub fn work(n: u64) -> u64 {{ {body} }}\n")
+    (path / "app/src").mkdir(parents=True)
+    (path / "app/Cargo.toml").write_text(
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2024"\n'
+        '[dependencies]\noverlap_a = { path = "../overlap_a" }\noverlap_b = { path = "../overlap_b" }\n')
+    (path / "app/src/main.rs").write_text(
+        'fn main() {\n'
+        '    let n = std::env::args().nth(1).unwrap().parse::<u64>().unwrap();\n'
+        '    println!("cache overlap: {} {}", overlap_a::work(n), overlap_b::work(n));\n'
+        '}\n')
+    # All requests see the same input workspace before planning starts.
+    (path / "Cargo.lock").write_text('version = 4\n\n[[package]]\nname = "app"\nversion = "0.1.0"\n'
+        'dependencies = ["overlap_a", "overlap_b"]\n\n[[package]]\nname = "overlap_a"\nversion = "0.1.0"\n'
+        '\n[[package]]\nname = "overlap_b"\nversion = "0.1.0"\n')
+
+
+class HeldPack:
+    """Withhold a real pack body and let the earlier manifest miss through only then."""
+
+    def __init__(self, missing, packs, timeout, *, speculative_miss, event_mark):
+        self.missing = f"/v1/list/manifests/{missing}"
+        self.packs = {f"/v1/blob/packs/{name}.pack": path.stat().st_size for name, path in packs.items()}
+        self.timeout = timeout
+        self.speculative_miss = speculative_miss
+        self.event_mark = event_mark
+        self.held = Event()
+        self.release = Event()
+        self.lock = Lock()
+        self.receipt = None
+        self.misses = []
+        self.miss_before_pack = False
+        self.expired = False
+        self.error = None
+        self.requests = []
+
+    def before_reply(self, path, status, size):
+        if path != self.missing:
+            return True
+        with self.lock:
+            miss = {"path": path, "status": status, "bytes": size, "at_ns": time.monotonic_ns()}
+            self.misses.append(miss)
+            if status != 404:
+                self.error = f"the earlier manifest was not absent: HTTP {status}"
+                return False
+            if self.speculative_miss and len(self.misses) == 1:
+                miss["speculative"] = True
+                return True
+            if len(self.misses) != (2 if self.speculative_miss else 1):
+                self.error = "the earlier leaf looked up its absent manifest more than expected"
+                return False
+        active = self.held.wait(self.timeout)
+        with self.lock:
+            miss["forwarded_ns"] = time.monotonic_ns()
+            self.miss_before_pack = not active
+        # The serial control still gets the origin's real 404, so the harness can
+        # reject its actual early grant instead of attributing a fabricated HTTP error.
+        return True
+
+    def before_body(self, path, status, size):
+        if path not in self.packs:
+            return True
+        with self.lock:
+            self.requests.append(path)
+            if self.release.is_set():
+                return True
+            if self.receipt is not None or status != 200 or size != self.packs[path] or size <= 8:
+                self.error = f"unexpected additional or invalid later pack response {path}: {status}, {size} bytes"
+                return False
+            self.receipt = {"path": path, "status": status, "bytes": size, "at_ns": time.monotonic_ns(),
+                            "event_mark": self.event_mark()}
+            self.held.set()
+        if self.release.wait(self.timeout):
+            return True
+        with self.lock:
+            self.expired = True
+        return False
+
+    def observed(self):
+        with self.lock:
+            check(self.error is None, self.error or "the proxy held exactly one real later pack response")
+            check(self.receipt is not None and not self.expired and not self.release.is_set(),
+                  "the later pack body is still held by the proxy")
+            check(len(self.misses) == (2 if self.speculative_miss else 1) and not self.miss_before_pack
+                  and self.misses[-1]["forwarded_ns"] >= self.receipt["at_ns"],
+                  "the earlier on-demand lookup saw its real 404 after the later body was held")
+            return self.receipt, self.misses
+
+
+def cache_overlap(given: Input) -> None:
+    """A causal check on the actual cache carrier and compiler, with no elapsed-time oracle."""
+    project = Path(given.scratch).resolve() / "project"
+    given = dataclasses.replace(given, project=str(project), program="app", run=("11",), module_builder=None)
+    run = Run(given)
+    run.project = project
+    overlap_fixture(project)
+    try:
+        run.provenance()
+        resource_env = run.env("solo", False)
+        check(bool(resource_env.get("BLAZE_CORES", "").strip()), "overlap requires a per-process core budget")
+        run.host = host_triple(given.blaze, resource_env, given.command_timeout, run.root / "logs")
+        run.start_services()
+        wanted = control(run)
+        check(wanted[0] == "cache overlap: 80 2\n", "the solo artifact runs both sibling leaves")
+        seed, log = run.build("seed", wait=False)
+        require_build(run.wait(seed), Path(log).read_text(), "seed the real unit publications", Path(log))
+        check(run.behaviour("seed") == wanted, "seed artifact equals solo in bytes and behavior")
+        plan = run.plan("seed")
+        check(plan is not None, "seed reported its complete unit plan")
+        ordered = [row["unit"] for row in plan]
+        leaves = [i for i, name in enumerate(ordered) if name in ("overlap_a", "overlap_b")]
+        check(len(leaves) == 2 and leaves[1] == leaves[0] + 1 and ordered[-1] == "app",
+              f"sibling leaves are consecutive and the product is last: {ordered}")
+        earlier, later = [plan[i] for i in leaves]
+        first, second = earlier["unit_digest"], later["unit_digest"]
+        check(bool(earlier["plan_names"] and later["plan_names"]), "both leaves own real planned work")
+        blobs = run.root / "blobs"
+        seed_rows = run.report("seed")
+        check([row["unit_digest"] for row in seed_rows] == [row["unit_digest"] for row in plan],
+              "the seed reported every unit in admission order")
+        evidence.publication(blobs, seed_rows, run.events())
+        seeded = {row["unit_digest"]: evidence.manifest(blobs, row["unit_digest"])[0] for row in seed_rows}
+        check(bool(seeded[first] and seeded[second]) and not set(seeded[first]).intersection(seeded[second]),
+              "the earlier miss and later hit have distinct nonempty pack sets")
+        earlier_manifest = blobs / "manifests" / first
+        later_manifest = blobs / "manifests" / second
+        unchanged_later = later_manifest.read_bytes()
+        earlier_manifest.rename(run.root / "seed-earlier.manifest")
+        after = len(run.events())
+        held = HeldPack(first, seeded[second], given.command_timeout, speculative_miss=leaves[0] != 0,
+                        event_mark=lambda: len(run.events()))
+        result_gate = run.root / "gates" / "overlap-earlier-result"
+        with run.cache_proxy("sibling-pack-overlap", before_reply=held.before_reply, before_body=held.before_body) as carrier:
+            try:
+                replay, replay_log = run.build("replay", wait=False, result_gate=result_gate, result_unit=earlier["unit"],
+                                               keep_gate_lease=True, BLAZE_DIST_BLOBS=carrier)
+
+                def held_before_grant():
+                    events = run.events()
+                    packet = held.receipt
+                    before_hold = events[after:packet["event_mark"]] if packet is not None else events[after:]
+                    if any(event["event"] == "grant" and event["unit_digest"] == first
+                           and event["pid"] == replay.pid for event in before_hold):
+                        raise Failed("the earlier grant started before the later pack's headers and body gate")
+                    if held.error is not None:
+                        raise Failed(held.error)
+                    return held.held.is_set()
+
+                run.until("the later leaf's actual pack response reaches its body gate", held_before_grant, [replay])
+                end = held.receipt["at_ns"] / 1e9 + given.command_timeout
+
+                def while_held(what, predicate):
+                    left = end - time.monotonic()
+                    check(left > 0 and not held.expired and not held.release.is_set(), f"{what}: the pack gate still has time")
+                    return run.until(what, predicate, [replay], timeout=left)
+
+                grant = while_held("the earlier miss gets a real grant and captures its Result",
+                    lambda: evidence.held_result(result_gate, run.events()[after:], replay.pid))
+                check(grant["unit_digest"] == first, "the captured grant belongs to the missing earlier leaf")
+                (result_gate / "release").touch()
+                while_held("the earlier Result is committed by the coordinator and acknowledged by its Client",
+                    lambda: evidence.overlap_accepted(run.events()[after:], grant) is not None
+                    and evidence.gate_answer(result_gate, grant, refused=False))
+                row = while_held("the earlier leaf reports a successful complete publication",
+                    lambda: next((row for row in evidence.jsonl(run.report_path("replay"), live=True)
+                                  if row["unit_digest"] == first), None))
+                events = run.events()[after:]
+                evidence.overlap_publication(blobs, result_gate, row, grant, events)
+                packet, miss = held.observed()
+                (run.root / "overlap-before-release.json").write_text(json.dumps({
+                    "held": packet, "missing": miss, "later_unit": second, "earlier_grant": grant,
+                    "earlier_report": row, "event_start": after, "events_read": len(events),
+                    "before_release_ns": time.monotonic_ns(),
+                }, indent=2) + "\n")
+            finally:
+                held.release.set()
+                (run.root / "overlap-transport.json").write_text(json.dumps({
+                    "held": held.receipt, "missing": held.misses, "pack_requests": held.requests,
+                    "miss_before_pack": held.miss_before_pack, "expired": held.expired, "error": held.error,
+                    "released_ns": time.monotonic_ns(),
+                }, indent=2) + "\n")
+            replay_code = run.wait(replay)
+            replay_output = Path(replay_log).read_text()
+            require_build(replay_code, replay_output, "replay finishes after releasing the cached body", Path(replay_log))
+        check(run.behaviour("replay") == wanted, "overlap replay artifact equals solo in bytes and behavior")
+        replay_plan = run.plan("replay")
+        check(replay_plan is not None, "replay reported its complete plan")
+        evidence.same_unit_plans(plan, replay_plan)
+        rows = run.report("replay")
+        check([row["unit_digest"] for row in rows] == [row["unit_digest"] for row in seed_rows],
+              "replay preserves the original admission order")
+        cached = [row for row in rows if row["unit_digest"] != first]
+        evidence.cached(cached)
+        # Release's summary includes actual worker compilation. Dev's counts are only
+        # the final assembly walk, whose complete input must have arrived from the units.
+        release_compiled = row["compiled_for_work"] + row["tail_compiled"] if "--release" in given.args else 0
+        evidence.no_local_emission("overlap replay", replay_output, already_compiled=release_compiled)
+        check(not any(event["event"] == "grant" and event["unit_digest"] != first for event in run.events()[after:]),
+              "no cached unit received a grant, including the later leaf")
+        check(later_manifest.read_bytes() == unchanged_later, "the later leaf retains its exact original manifest")
+        check(held.requests.count(packet["path"]) == 1, "the replay consumes the held pack without fetching it again")
+        for row in rows:
+            unit = row["unit_digest"]
+            actual, _ = evidence.manifest(blobs, unit)
+            check(evidence.logical_outputs(blobs, actual) == evidence.logical_outputs(blobs, seeded[unit]),
+                  f"{row['unit']}: exact published record keys, kinds and values equal the seed")
+        verify_run_identity(run)
+        print("distv2: native cache overlap passed", flush=True)
+    finally:
+        run.stop()
 
 
 def committed_pack_refused(run: Run, home: str, policy: str, target: Path) -> None:
@@ -783,6 +1038,9 @@ def main(given: Input) -> None:
     def interrupted(signum, _frame):
         raise Failed(f"received signal {signum}; stopping owned children")
     signal.signal(signal.SIGTERM, interrupted)
+    if given.cache_overlap:
+        cache_overlap(given)
+        return
     run = Run(given)
     run.project = run.root / "project"
     shutil.copytree(given.project, run.project, ignore=shutil.ignore_patterns("target", ".git"), dirs_exist_ok=True)
@@ -965,13 +1223,7 @@ def main(given: Input) -> None:
             except Failed as error:
                 replay_failures.append(str(error))
         check(not replay_failures, "\n".join(replay_failures) if replay_failures else "cold and warm replay emitted no local code")
-        for name, identity in run.identities.items():
-            check(file_hash(Path(identity["path"])) == identity["sha256"], f"{name} binary did not change during acceptance")
-        provenance = json.loads((run.root / "provenance.json").read_text())
-        current_commit, current_tree, current_diff = source_state(HERE.parent, given.command_timeout)
-        check(current_commit == provenance["commit"] and current_tree == provenance["tree"]
-              and hashlib.sha256(current_diff).hexdigest() == provenance["patch_sha256"],
-              "source commit, tree and patch did not change during acceptance")
+        verify_run_identity(run)
         print("distv2: every check passed" if given.faults else "distv2: non-fault checks passed; fault acceptance NOT RUN", flush=True)
     finally:
         run.stop()

@@ -144,6 +144,92 @@ class ResultGateOracles(unittest.TestCase):
                 origin.shutdown()
                 worker.join(timeout=3)
 
+    def test_pack_proxy_holds_the_body_and_not_the_earlier_miss(self):
+        missing = f"/v1/list/manifests/{UNIT}"
+        pack = f"/v1/blob/packs/{KEY}.pack"
+        payload = b"native pack response"
+
+        class Origin(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = payload if self.path == pack else b""
+                self.send_response(200 if body else 404)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        with tempfile.TemporaryDirectory() as tmp, ThreadingHTTPServer(("127.0.0.1", 0), Origin) as origin:
+            worker = Thread(target=origin.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            worker.start()
+            try:
+                given = h.Input(blaze="blaze", dist_local="local", serve="serve", scratch=tmp, command_timeout=3)
+                with patch.dict(os.environ, HOME=tmp):
+                    run = h.Run(given)
+                run.port = origin.server_port
+                file = run.root / "cached.pack"
+                file.write_bytes(payload)
+                held = h.HeldPack(UNIT, {KEY: file}, 3, speculative_miss=True, event_mark=lambda: 23)
+                with run.cache_proxy("pack-selfcheck", before_reply=held.before_reply, before_body=held.before_body) as proxy:
+                    def get(path):
+                        client = HTTPConnection(proxy, timeout=3)
+                        try:
+                            client.request("GET", path, headers={"Content-Length": "0"})
+                            response = client.getresponse()
+                            return response.status, response.read()
+                        finally:
+                            client.close()
+
+                    with ThreadPoolExecutor(2) as reader:
+                        try:
+                            self.assertEqual(get(missing), (404, b""))
+                            self.assertFalse(held.held.is_set())
+                            demand = reader.submit(get, missing)
+                            body = reader.submit(get, pack)
+                            self.assertTrue(held.held.wait(1))
+                            self.assertEqual(demand.result(timeout=1), (404, b""))
+                            self.assertFalse(body.done())
+                            receipt, misses = held.observed()
+                            self.assertEqual(receipt["event_mark"], 23)
+                            self.assertEqual([miss["status"] for miss in misses], [404, 404])
+                        finally:
+                            held.release.set()
+                        self.assertEqual(body.result(timeout=1), (200, payload))
+                # With no speculative transfer, the serial compiler still sees its real miss.
+                serial = h.HeldPack(UNIT, {KEY: file}, 0, speculative_miss=False, event_mark=lambda: 0)
+                self.assertTrue(serial.before_reply(missing, 404, 0))
+                self.assertTrue(serial.miss_before_pack)
+                with self.assertRaises(e.Failed):
+                    serial.observed()
+            finally:
+                origin.shutdown()
+                worker.join(timeout=3)
+
+    def test_overlap_needs_a_compiled_batch_before_successful_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blobs = Path(tmp)
+            (blobs / "packs").mkdir()
+            (blobs / "manifests").mkdir()
+            name, size = write_pack(blobs, [(KEY, 0, b"compiler record")])
+            (blobs / "manifests" / UNIT).write_text(f"{name} {size} {e.pack_keys_digest({KEY})}\n")
+            ready = blobs / "ready.json"
+            ready.write_text(json.dumps({"command": [7, {"2": {"3": [{"0": name}]}}]}))
+            issued = grant(work=[KEY])
+            accepted = {**issued, "event": "result_accepted"}
+            published = {"event": "published", "unit_digest": UNIT, "execution": 7, "attempt": 2, "packs": [name]}
+            done = {"event": "done", "unit_digest": UNIT, "execution": 7, "attempt": 2, "outcome": "Passed"}
+            events = [issued, accepted, published, done]
+            e.overlap_publication(blobs, blobs, row(), issued, events)
+            for plant in ([accepted, issued, published, done], [issued, published, accepted, done],
+                          [issued, accepted, published], [issued, {**accepted, "work": []}, published, done],
+                          [issued, {**accepted, "work": [OTHER]}, published, done]):
+                with self.subTest(plant=plant), self.assertRaises(e.Failed):
+                    e.overlap_publication(blobs, blobs, row(), issued, plant)
+            with self.assertRaisesRegex(e.Failed, "contains no record compiled"):
+                e.overlap_publication(blobs, blobs, row(compiled_for_work=0, work_compiled_keys=[]), issued, events)
+            other, _ = write_pack(blobs, [(OTHER, 0, b"unrelated record")])
+            ready.write_text(json.dumps({"command": [7, {"2": {"3": [{"0": other}]}}]}))
+            with self.assertRaisesRegex(e.Failed, "contains no record compiled"):
+                e.overlap_publication(blobs, blobs, row(), issued, events)
+
     def test_peer_must_commit_disjoint_work_in_the_held_execution_and_attempt(self):
         held = grant(work=[KEY])
         other = grant(pid=124, holder="b", generation=4, work=[OTHER])

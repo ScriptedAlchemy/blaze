@@ -1246,7 +1246,46 @@ fn storage_to_socket_addr(storage: &sockaddr_storage, len: socklen_t) -> Result<
     }
 }
 
-/// Blocking TCP stream with bounded connect/read/write timeouts over `blaze-sys`.
+/// A finite deadline on the system monotonic clock, reusable across socket operations.
+#[derive(Clone, Copy, Debug)]
+pub struct TcpDeadline(u64);
+
+impl TcpDeadline {
+    /// Makes a deadline measured from the same clock as [`SystemClock::monotonic_nanos`].
+    pub fn after(timeout: Duration) -> Result<Self, IoError> {
+        let now = SystemClock.monotonic_nanos().map_err(IoError::from_errno)?;
+        let at = now.checked_add(duration_to_nanos(timeout)).ok_or_else(|| IoError::from_errno(Errno::Inval))?;
+        Ok(Self::at_monotonic_nanos(at))
+    }
+
+    /// Uses an absolute nanosecond deadline from [`SystemClock::monotonic_nanos`].
+    pub const fn at_monotonic_nanos(at: u64) -> Self {
+        Self(at)
+    }
+
+    fn remaining(self) -> Result<Duration, Errno> {
+        let now = SystemClock.monotonic_nanos()?;
+        if now >= self.0 {
+            return Err(Errno::TimedOut);
+        }
+        Ok(Duration::from_nanos(self.0 - now))
+    }
+}
+
+fn wait_tcp_until(fd: Fd, events: PollEvents, deadline: TcpDeadline) -> Result<(), Errno> {
+    let mut fds = [PollFd::new(fd, events)];
+    for _ in 0..MAX_INTR_RETRIES {
+        let remaining = deadline.remaining()?;
+        match sys_poll(&mut fds, Some(duration_to_timespec(remaining))) {
+            Ok(0) | Err(Errno::Intr) => continue,
+            Ok(_) => return deadline.remaining().map(|_| ()),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Errno::Intr)
+}
+
+/// TCP stream over `blaze-sys`, with blocking and absolute-deadline operations.
 pub struct TcpStream {
     fd: OwnedFd,
 }
@@ -1254,6 +1293,26 @@ pub struct TcpStream {
 impl TcpStream {
     /// Connects to `addr` with a bounded timeout, then restores blocking mode.
     pub fn connect_timeout(addr: SocketAddr, timeout: Duration) -> Result<Self, IoError> {
+        let stream = Self::connect(addr, |fd| {
+            let mut fds = [PollFd::new(fd, PollEvents::OUT)];
+            match poll_fds(&mut fds, Some(duration_to_timespec(timeout)))? {
+                0 => Err(Errno::TimedOut),
+                _ => Ok(()),
+            }
+        })?;
+        sys_set_nonblocking(stream.fd.fd(), false).map_err(IoError::from_errno)?;
+        Ok(stream)
+    }
+
+    /// Connects by `deadline`, leaving the socket nonblocking for the bounded request.
+    pub(crate) fn connect_until(addr: SocketAddr, deadline: TcpDeadline) -> Result<Self, IoError> {
+        deadline.remaining().map_err(IoError::from_errno)?;
+        let stream = Self::connect(addr, |fd| wait_tcp_until(fd, PollEvents::OUT, deadline))?;
+        deadline.remaining().map_err(IoError::from_errno)?;
+        Ok(stream)
+    }
+
+    fn connect(addr: SocketAddr, wait: impl FnOnce(Fd) -> Result<(), Errno>) -> Result<Self, IoError> {
         let domain = match addr {
             SocketAddr::V4(_) => AF_INET,
             SocketAddr::V6(_) => AF_INET6,
@@ -1276,19 +1335,13 @@ impl TcpStream {
         match sys_connect(fd.fd(), &storage, len) {
             Ok(()) => {}
             Err(Errno::InProgress | Errno::Already | Errno::Intr) => {
-                let mut fds = [PollFd::new(fd.fd(), PollEvents::OUT)];
-                let ready = poll_fds(&mut fds, Some(duration_to_timespec(timeout)))
-                    .map_err(IoError::from_errno)?;
-                if ready == 0 {
-                    return Err(IoError::from_errno(Errno::TimedOut));
-                }
+                wait(fd.fd()).map_err(IoError::from_errno)?;
                 if let Some(err) = pending_error(fd.fd()).map_err(IoError::from_errno)? {
                     return Err(IoError::from_errno(err));
                 }
             }
             Err(err) => return Err(IoError::from_errno(err)),
         }
-        sys_set_nonblocking(fd.fd(), false).map_err(IoError::from_errno)?;
         Ok(Self { fd })
     }
 
@@ -1310,31 +1363,67 @@ impl TcpStream {
 
     /// Reads bytes from the stream.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        self.read_with(buf, None)
+    }
+
+    pub(crate) fn read_until(&mut self, buf: &mut [u8], deadline: TcpDeadline) -> Result<usize, IoError> {
+        self.read_with(buf, Some(deadline))
+    }
+
+    fn read_with(&mut self, buf: &mut [u8], deadline: Option<TcpDeadline>) -> Result<usize, IoError> {
         for _ in 0..MAX_INTR_RETRIES {
+            if let Some(deadline) = deadline {
+                deadline.remaining().map_err(IoError::from_errno)?;
+            }
             match sys_recv(self.fd.fd(), buf, MsgFlags::NONE) {
                 Ok(n) => return Ok(n),
                 Err(Errno::Intr) => continue,
-                Err(err) => return Err(IoError::from_errno(err)),
+                Err(err) => {
+                    let error = IoError::from_errno(err);
+                    if let Some(deadline) = deadline && error.is_would_block() {
+                        wait_tcp_until(self.fd.fd(), PollEvents::IN, deadline).map_err(IoError::from_errno)?;
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
         }
         Err(IoError::from_errno(Errno::Intr))
     }
 
     /// Writes all bytes to the stream suppressing `SIGPIPE`.
-    pub fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), IoError> {
+    pub fn write_all(&mut self, bytes: &[u8]) -> Result<(), IoError> {
+        self.write_with(bytes, None)
+    }
+
+    pub(crate) fn write_all_until(&mut self, bytes: &[u8], deadline: TcpDeadline) -> Result<(), IoError> {
+        self.write_with(bytes, Some(deadline))
+    }
+
+    fn write_with(&mut self, mut bytes: &[u8], deadline: Option<TcpDeadline>) -> Result<(), IoError> {
         let mut iters = 0usize;
         while !bytes.is_empty() {
             if iters >= MAX_WRITE_ITERS {
                 return Err(IoError::from_errno(Errno::Again));
             }
             iters = iters.saturating_add(1);
+            if let Some(deadline) = deadline {
+                deadline.remaining().map_err(IoError::from_errno)?;
+            }
             match sys_send(self.fd.fd(), bytes, MsgFlags::NO_SIGNAL) {
                 Ok(0) => return Err(IoError::from_errno(Errno::Pipe)),
                 Ok(n) => {
                     bytes = bytes.get(n..).ok_or(IoError::from_errno(Errno::Inval))?;
                 }
                 Err(Errno::Intr) => continue,
-                Err(err) => return Err(IoError::from_errno(err)),
+                Err(err) => {
+                    let error = IoError::from_errno(err);
+                    if let Some(deadline) = deadline && error.is_would_block() {
+                        wait_tcp_until(self.fd.fd(), PollEvents::OUT, deadline).map_err(IoError::from_errno)?;
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
         }
         Ok(())

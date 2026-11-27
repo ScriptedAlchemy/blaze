@@ -413,59 +413,62 @@ where
             return Ok((ResultImage::UpToDate, Some(fp)));
         }
         fingerprint = Some(fp);
-        let cancelled = AtomicBool::new(false);
-        let mut budget = agent::ExportBudget::new(&dist.config);
-        let mut store = DistStore::new(codes, wire);
-        for krate in &plans {
-            let result_gate = dist.result_gate.as_ref()
-                .filter(|gate| gate.unit.as_ref().is_none_or(|unit| unit.as_str() == krate.name))
-                .map(|gate| gate.directory.as_str());
-            let mut holder = Holder { krate, work, backend, store: &mut store, alloc, wire, heap: request.heap, result_gate };
-            let arrived = match budget.run(&krate.unit, &mut holder, &cancelled) {
-                Ok(arrived) => arrived,
-                Err(err) => match agent::decide(&dist.config.local, err, wire) {
-                    Ok(()) => {
-                        fingerprint = None;
-                        break;
-                    }
-                    Err(fatal) => {
-                        let mut shown = String::new_in(request.heap.alloc());
-                        let _ = write!(shown, "{fatal}");
-                        return Err(DistError::UnitFailed {
-                            unit: own_str(krate.name, request.heap.alloc()),
-                            shown,
-                        });
-                    }
-                },
-            };
-            check_publication(
-                krate,
-                work,
-                &krate.side,
-                arrived.values.len(),
-                |key| arrived.values.get(&key.0.0).map(|(kind, bytes)| (*kind, bytes.as_slice())),
-                alloc,
-                request.heap,
-            )?;
-            store.merge_arrived(&arrived.values)?;
-            compiled += usize::try_from(arrived.compiled_here).map_err(|_| {
-                refused(request.heap, format_args!("compiled count for {}", krate.name))
-            })?;
-            cached += usize::try_from(arrived.stored_here).map_err(|_| {
-                refused(request.heap, format_args!("stored count for {}", krate.name))
-            })?;
-            append_report_row(
-                dist.report.as_ref().map(|path| path.as_str()),
-                krate.name,
-                &krate.unit,
-                &arrived,
-                0,
-                0,
-                krate.members.len(),
-                &[],
-                wire,
-            );
-        }
+        agent::ExportBudget::with_published_ahead(&dist.config, |budget| {
+            let cancelled = AtomicBool::new(false);
+            let mut store = DistStore::new(codes, wire);
+            for (index, krate) in plans.iter().enumerate() {
+                let next = plans.get(index + 1).filter(|plan| !plan.product).map(|plan| plan.unit.spec);
+                let result_gate = dist.result_gate.as_ref()
+                    .filter(|gate| gate.unit.as_ref().is_none_or(|unit| unit.as_str() == krate.name))
+                    .map(|gate| gate.directory.as_str());
+                let mut holder = Holder { krate, work, backend, store: &mut store, alloc, wire, heap: request.heap, result_gate };
+                let arrived = match budget.run_with_next(&krate.unit, next, &mut holder, &cancelled) {
+                    Ok(arrived) => arrived,
+                    Err(err) => match agent::decide(&dist.config.local, err, wire) {
+                        Ok(()) => {
+                            fingerprint = None;
+                            break;
+                        }
+                        Err(fatal) => {
+                            let mut shown = String::new_in(request.heap.alloc());
+                            let _ = write!(shown, "{fatal}");
+                            return Err(DistError::UnitFailed {
+                                unit: own_str(krate.name, request.heap.alloc()),
+                                shown,
+                            });
+                        }
+                    },
+                };
+                check_publication(
+                    krate,
+                    work,
+                    &krate.side,
+                    arrived.values.len(),
+                    |key| arrived.values.get(&key.0.0).map(|(kind, bytes)| (*kind, bytes.as_slice())),
+                    alloc,
+                    request.heap,
+                )?;
+                store.merge_arrived(&arrived.values)?;
+                compiled += usize::try_from(arrived.compiled_here).map_err(|_| {
+                    refused(request.heap, format_args!("compiled count for {}", krate.name))
+                })?;
+                cached += usize::try_from(arrived.stored_here).map_err(|_| {
+                    refused(request.heap, format_args!("stored count for {}", krate.name))
+                })?;
+                append_report_row(
+                    dist.report.as_ref().map(|path| path.as_str()),
+                    krate.name,
+                    &krate.unit,
+                    &arrived,
+                    0,
+                    0,
+                    krate.members.len(),
+                    &[],
+                    wire,
+                );
+            }
+            Ok::<(), DistError>(())
+        }).map_err(DistError::PublishedRead)??;
     }
     if fingerprint.is_none() {
         for (_, task) in work.tasks() {
