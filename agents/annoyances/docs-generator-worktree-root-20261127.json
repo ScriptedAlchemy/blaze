@@ -1,0 +1,13 @@
+{
+  "id": "docs-generator-worktree-root-20261127",
+  "date": "2026-11-27",
+  "who": "GPT-6 Astra Pro, distributed compile review lane",
+  "where": "scripts/src/bin/docs.rs; a Cargo target shared by the blaze-verify and blaze checkouts",
+  "what": "A local docs write/check passed while updating the older verification checkout. PR 82's actual checkout still had the old distributed.md summary in docs/README.md, and its required docs gate failed.",
+  "cause": "docs selects its repository from the compile-time CARGO_MANIFEST_DIR. Reusing one Cargo target across checkouts retained the source-identical docs executable with the old absolute root, even when a later build compiled other scripts from the intended checkout. Changing the invocation's working directory did not change that root.",
+  "class": "reusing a path-bound generator across repository roots",
+  "reproduction": "Build the docs binary in one checkout, reuse its Cargo target from a second checkout with unchanged docs.rs, then run docs write/check there. Inspect the executable's embedded scripts path and the checkout that actually changes; a successful check alone does not identify that checkout.",
+  "prevention": "Keep each checkout's Cargo target separate as the build instructions require. When transferring an already built generator, verify how it chooses its source root. After regeneration, inspect the intended checkout's diff instead of accepting the exit status alone.",
+  "fix": "Cleaned only the scripts package's release artifacts, rebuilt docs and the required gate tools from the intended checkout, and verified the new executable contains its scripts path and no verification-checkout path. Canonical docs write then produced the one expected summary-line change, and docs check reported 234 docs hold. No ratchet was raised.",
+  "state": "The audit's generator provenance and index are corrected. The existing docs CLI and its embedded-root behavior are unchanged."
+}

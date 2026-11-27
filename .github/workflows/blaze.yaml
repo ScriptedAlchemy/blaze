@@ -601,10 +601,14 @@ jobs:
           rustc "+$toolchain" --version --verbose > "$RUNNER_TEMP/core-evidence/rustc-version.txt"
           timeout -k 30 4200 cargo "+$toolchain" test --release --locked --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve --no-fail-fast \
             2>&1 | tee "$RUNNER_TEMP/core-evidence/tests.log"
-          while IFS= read -r case_name; do
-            grep -Eq "^test ([[:alnum:]_]+::)*$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \
-              || { echo "::error::missing executed library control: $case_name"; exit 1; }
-          done < .github/distributed-controls.txt
+          # The source compiler has no native panic-unwind runtime. Require those native
+          # controls here in addition to every control also required from source execution.
+          for controls in .github/distributed-controls.txt .github/distributed-native-controls.txt; do
+            while IFS= read -r case_name; do
+              grep -Eq "^test ([[:alnum:]_]+::)*$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \
+                || { echo "::error::missing executed library control: $case_name"; exit 1; }
+            done < "$controls"
+          done
       - name: distributed library binaries and integration targets compile
         id: retained-all-targets
         if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}

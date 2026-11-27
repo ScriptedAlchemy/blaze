@@ -13,7 +13,7 @@
     "Thread-start errors and unwinding require the same release obligation as successful callback completion."
   ],
   "class": "a lifetime proof depends on a forgettable handle or an unchecked completion result",
-  "prevention": "A private completion ticket follows the existing trampoline payload and releases its obligation on return, failed setup or unwinding. A scope guard drains all registered callbacks before returning. Only a successful OS join permits reclaiming the shared result slot.",
+  "prevention": "A private completion ticket follows the existing trampoline payload and releases its obligation on return, failed setup or unwinding. One allocation-free Arc share per callback keeps its atomic count alive through the final wake, without a completion queue or disconnect errors. A scope guard waits for all registered callbacks before returning. Only a successful OS join permits reclaiming the shared result slot.",
   "fix": "Added deterministic simulation of production tickets with a planted handle-ownership failure and native regressions for forgotten borrows, explicit join/drop, nested spawn, parent/setup unwind and self-join/self-drop. Public API signatures and the existing callback panic boundary are unchanged.",
   "state": "Implemented; exact-tree validation is coordinated by the main lane."
 }
