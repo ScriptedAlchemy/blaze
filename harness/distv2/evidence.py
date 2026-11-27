@@ -445,6 +445,13 @@ def gate_answer(gate: Path, grant: dict, *, refused: bool) -> bool:
     return True
 
 
+def main_job_content(unit: str, triple: str) -> str:
+    """Wire v5 JobContent for the host fixture's unit, platform and Main namespace."""
+    platform = hashlib.sha256(b"blaze/blaze/dist-platform/v5\0" + triple.encode()).digest()
+    cbor = b"\xa3\x00\x58\x20" + bytes.fromhex(unit) + b"\x01\x58\x20" + platform + b"\x02\x82\x00\xf6"
+    return hashlib.sha256(b"blaze/JobContent/v5\0" + cbor).hexdigest()
+
+
 def wire_work(unit: str, stable: bytes) -> str:
     """Wire v5 WorkKey::Item with the fixed unit, stable recipe and empty environment."""
     cbor = b"\x82\x00\xa3\x00\x58\x20" + bytes.fromhex(unit) + b"\x01\x58\x20" + stable + b"\x02\x58\x20" + bytes(32)

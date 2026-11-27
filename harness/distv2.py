@@ -1757,8 +1757,9 @@ def host_dev_machine_entry(record: bytes) -> bool:
 def host_accepted_outputs(blobs: Path, held: dict, participant: dict, events: list[dict], unit: str,
                      published: dict[str, tuple[int, bytes]]) -> set[str]:
     grant, capture = held["grant"], held["capture"]
-    evidence.require(capture["command"][1]["0"] == unit and capture["command_sha256"] == grant["capture_sha256"],
-                     f"{grant['holder']}: captured Result has a different unit or command digest")
+    expected_job = evidence.main_job_content(unit, participant["identity"]["triple"])
+    evidence.require(capture["command"][1]["0"] == expected_job, f"{grant['holder']}: captured Result names a different job")
+    evidence.require(capture["command_sha256"] == grant["capture_sha256"], f"{grant['holder']}: captured Result digest changed")
     acknowledgements = [event for event in events if event["event"] == "result_accepted"
                         and evidence.lease(event) == evidence.lease(grant)
                         and set(event["work"]) == set(grant["work"])]

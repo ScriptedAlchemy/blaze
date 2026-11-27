@@ -852,6 +852,7 @@ class ReleaseFoldEvidence(unittest.TestCase):
         self.assertFalse(e.machine_record(raw[:-8]))
 
 HOST_UNIT = "00" * 32
+HOST_JOB = "f57ea1a0751c3bd3416494c4e4b2912dfdefa542b90d2b95d2301f99be3bb016"
 HOST_KEYS = [f"{index + 1:02x}" * 32 for index in range(3)]
 HOST_ARTIFACT = "ff" * 32
 
@@ -861,7 +862,7 @@ def host_test_held(index: int) -> dict:
              "holder": f"holder-{index}", "generation": 1, "seq": 0, "work": [HOST_KEYS[index]],
              "capture_sha256": "aa" * 32}
     return {"grant": grant, "capture": {"command_sha256": grant["capture_sha256"],
-                                       "command": [7, {"0": HOST_UNIT}]}}
+                                       "command": [7, {"0": HOST_JOB}]}}
 
 
 class HostProof(unittest.TestCase):
@@ -921,7 +922,7 @@ class HostProof(unittest.TestCase):
         pack = b"blzdpk\0\x01" + value
         name = hashlib.sha256(pack).hexdigest()
         rank["capture"]["command"][1]["2"] = {"3": [{"0": name}]}
-        host_worker = {"rows": [{"unit": "host_proof", "unit_digest": HOST_UNIT,
+        host_worker = {"identity": {"triple": "aarch64-unknown-linux-gnu"}, "rows": [{"unit": "host_proof", "unit_digest": HOST_UNIT,
                             "joined": True, "source": "executed", "execution": 9, "attempt": 0,
                             "compiled_for_work": 1, "work_compiled_keys": [HOST_KEYS[1]],
                             "tail_compiled": 0, "tail_compiled_keys": []}]}
@@ -932,6 +933,8 @@ class HostProof(unittest.TestCase):
             accepted = {**grant, "event": "result_accepted"}
             published = {HOST_KEYS[1]: (0, entry)}
             self.assertEqual(h.host_accepted_outputs(blobs, rank, host_worker, [accepted], HOST_UNIT, published), {HOST_KEYS[1]})
+            with patch.dict(rank["capture"]["command"][1], {"0": HOST_UNIT}), self.assertRaisesRegex(e.Failed, "different job"):
+                h.host_accepted_outputs(blobs, rank, host_worker, [accepted], HOST_UNIT, published)
             with self.assertRaisesRegex(e.Failed, "published bytes differ"):
                 h.host_accepted_outputs(blobs, rank, host_worker, [accepted], HOST_UNIT, {HOST_KEYS[1]: (0, b"wrong entry")})
             accepted["seq"] += 1
