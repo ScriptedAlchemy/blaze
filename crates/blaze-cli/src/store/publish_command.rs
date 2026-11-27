@@ -140,6 +140,8 @@ pub(crate) mod trusted {
         let alloc = *lent.alloc();
         let mut walked = std::vec::Vec::new_in(alloc);
         published::walk_toolchain(lent, toolchain, &mut walked)?;
+        // The acceptance control publishes the exact same payloads while withholding the scope index entries.
+        walked.retain(|record| !blaze_keyed::kind::ReservedTag::ScopeCandidate.is(record.tag));
         let dir = fs.open_dir(cx, &Path::new(origin)?)?;
         let set_dir = folder::set_dir(cx, &dir, &set)?;
         let plan = folder::plan(cx, &set_dir, &set, &walked, &signer, alloc)?;
