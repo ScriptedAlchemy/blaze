@@ -1,5 +1,8 @@
 //! Callback obligations survive forgotten handles, failed starts, and parent unwinding.
 
+use core::sync::atomic::AtomicUsize;
+
+use blaze_own::{Arc, Vec};
 use blaze_sim::{Broken, Config, Tape};
 #[cfg(all(not(blaze), panic = "unwind"))]
 use blaze_sim::Verdict;
@@ -30,20 +33,18 @@ blaze_sim::plants! {
     }
 }
 
-/// Drive the production registration tickets and completion consumer without OS scheduling.
-/// A live callback may spawn children; failed starts and completed callbacks queue the same
-/// notice. Handle disposition cannot release a callback's obligation.
+/// Drive the production registration tickets without OS scheduling. A live callback may
+/// spawn children; failed starts and completed callbacks release the same obligation.
+/// Handle disposition cannot release a callback's obligation.
 fn obligations(tape: &Tape, plant: ScopePlant) -> Result<(), Broken<ScopeBroken>> {
     let alloc = test_alloc();
-    let (completed, receiver) = channel(alloc);
     let scope = Scope {
         alloc,
-        pending: AtomicUsize::new(0),
-        completed,
+        threads: Arc::new_in(ScopeThreads { pending: AtomicU32::new(0) }, alloc),
         _scope: PhantomData,
         _env: PhantomData,
     };
-    let wait = ScopeWait { pending: &scope.pending, completed: receiver };
+    let wait = ScopeWait { threads: &scope.threads };
     let mut callbacks = Vec::new_in(alloc);
     callbacks.push(scope.register().unwrap());
     let children = tape.below(8, "nested callback count");
@@ -52,44 +53,32 @@ fn obligations(tape: &Tape, plant: ScopePlant) -> Result<(), Broken<ScopeBroken>
     // planted old ownership attaches the obligation to that forgettable handle instead.
     if matches!(plant, ScopePlant::HandleOwnsCompletion) {
         drop(callbacks.pop().unwrap());
-        wait.complete_one();
     }
-    if scope.pending.load(Ordering::Acquire) == 0 {
+    if scope.threads.pending.load(Ordering::Acquire) == 0 {
         return Err(Broken::Oracle(ScopeBroken::ReleasedLiveBorrow));
     }
 
-    let mut queued = 0;
     for _ in 0..children {
         let registration = scope.register().unwrap();
         if tape.coin("pthread creation is refused after registration") {
             drop(registration);
-            queued += 1;
         } else {
             callbacks.push(registration);
         }
-        if queued != 0 && tape.coin("receive failed start before parent completion") {
-            wait.complete_one();
-            queued -= 1;
-        }
-        assert_eq!(scope.pending.load(Ordering::Acquire), callbacks.len() + queued);
+        assert_eq!(scope.threads.pending.load(Ordering::Acquire), u32::try_from(callbacks.len()).unwrap());
     }
 
     while !callbacks.is_empty() {
         let count = u64::try_from(callbacks.len()).unwrap();
         let at = usize::try_from(tape.below(count, "next callback completion")).unwrap();
         drop(callbacks.remove_swap(at));
-        queued += 1;
-        if tape.coin("receive completion before another callback ends") {
-            wait.complete_one();
-            queued -= 1;
-        }
-        assert_eq!(scope.pending.load(Ordering::Acquire), callbacks.len() + queued);
-        assert!(callbacks.is_empty() || scope.pending.load(Ordering::Acquire) != 0);
+        assert_eq!(scope.threads.pending.load(Ordering::Acquire), u32::try_from(callbacks.len()).unwrap());
+        assert!(callbacks.is_empty() || scope.threads.pending.load(Ordering::Acquire) != 0);
     }
-    // No callback can register a child now. The same guard used by scope() consumes the
-    // remaining notices; it must neither stop early nor wait for a refused start forever.
+    // No callback can register a child now. The same guard used by scope() must neither
+    // stop early nor wait for a refused start forever.
     drop(wait);
-    assert_eq!(scope.pending.load(Ordering::Acquire), 0);
+    assert_eq!(scope.threads.pending.load(Ordering::Acquire), 0);
     Ok(())
 }
 
@@ -102,6 +91,38 @@ fn scope_completion_obligations_survive_handle_disposition_and_failed_starts() {
 #[test]
 fn the_oracle_catches_completion_owned_by_a_forgotten_handle() {
     blaze_sim::controls(Config::cases(128), obligations);
+}
+
+#[test]
+fn scope_registration_refuses_counter_overflow() {
+    let alloc = test_alloc();
+    let scope = Scope {
+        alloc,
+        threads: Arc::new_in(ScopeThreads { pending: AtomicU32::new(u32::MAX) }, alloc),
+        _scope: PhantomData,
+        _env: PhantomData,
+    };
+    assert!(matches!(scope.register(), Err(error) if error.errno() == Errno::Again));
+    assert_eq!(scope.threads.pending.load(Ordering::Acquire), u32::MAX);
+}
+
+#[test]
+fn scope_wait_rechecks_completion_before_parking() {
+    let alloc = test_alloc();
+    let scope = Scope {
+        alloc,
+        threads: Arc::new_in(ScopeThreads { pending: AtomicU32::new(0) }, alloc),
+        _scope: PhantomData,
+        _env: PhantomData,
+    };
+    let completed = scope.register().unwrap();
+    let observed = scope.threads.pending.load(Ordering::Acquire);
+    drop(completed);
+    // The final wake already happened. Waiting against the earlier nonzero observation
+    // must return; waiting against a refreshed zero instead would lose that wake.
+    wait_on_counter(&scope.threads.pending, observed);
+    drop(ScopeWait { threads: &scope.threads });
+    assert_eq!(scope.threads.pending.load(Ordering::Acquire), 0);
 }
 
 struct BorrowOnDrop<'a>(&'a AtomicUsize);

@@ -8,11 +8,11 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::time::Duration;
 
 use blaze_int::Int as _;
-use blaze_own::{Arc, Box, String, Vec, VecDeque, format_in};
+use blaze_own::{Arc, Box, Share, String, Vec, VecDeque, format_in};
 pub(crate) use blaze_sys::posix::io::{OwnedFd, PollEvents, PollFd};
 use blaze_sys::posix::io::{
     CWD, ClockId, OpenFlags, Timeval, clock_gettime as sys_read_clock, nanosleep, openat,
@@ -1624,13 +1624,33 @@ struct ChannelInner<T> {
     signal: AtomicU32,
 }
 
+fn wake_counter(counter: &AtomicU32) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = futex_wake(counter, u32::MAX);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = counter;
+    }
+}
+
+fn wait_on_counter(counter: &AtomicU32, observed: u32) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = futex_wait_bitset(counter, observed, None, u32::MAX);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (counter, observed);
+        let _ = nanosleep(Timespec { sec: 0, nsec: 200_000 });
+    }
+}
+
 impl<T> ChannelInner<T> {
     fn notify(&self) {
         let _ = self.signal.fetch_add(1, Ordering::Release);
-        #[cfg(target_os = "linux")]
-        {
-            let _ = futex_wake(&self.signal, u32::MAX);
-        }
+        wake_counter(&self.signal);
     }
 }
 
@@ -1718,15 +1738,7 @@ impl<T> Receiver<T> {
                     return Err(RecvError);
                 }
             }
-            #[cfg(target_os = "linux")]
-            {
-                let _ = futex_wait_bitset(&self.inner.signal, seq, None, u32::MAX);
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let _ = seq;
-                let _ = nanosleep(Timespec { sec: 0, nsec: 200_000 });
-            }
+            wait_on_counter(&self.inner.signal, seq);
         }
     }
 
@@ -1863,7 +1875,7 @@ where
             *result_slot = Some(value);
         }
         // `func` and its captures are gone and the result is stored before the scope may
-        // release borrowed data. The sender owns the channel while delivering this notice.
+        // release borrowed data. The completion ticket owns its counter through the final wake.
         drop(completed);
         core::ptr::null_mut()
     }
@@ -1992,8 +2004,7 @@ impl<T> Drop for JoinHandle<'_, T> {
 /// Scope for spawning borrowed threads whose callbacks finish before [`scope`] returns.
 pub struct Scope<'scope, 'env: 'scope> {
     alloc: WireAlloc,
-    pending: AtomicUsize,
-    completed: Sender<()>,
+    threads: Arc<ScopeThreads, WireAlloc>,
     _scope: PhantomData<&'scope mut &'scope ()>,
     _env: PhantomData<&'env mut &'env ()>,
 }
@@ -2013,48 +2024,52 @@ impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
     }
 
     fn register(&self) -> Result<ScopeCompletion, IoError> {
-        // Clone before reserving a count: from the increment onward the completion ticket
-        // exists without another allocation and releases the obligation on every unwind.
-        let completed = self.completed.clone();
-        self.pending
+        // One allocation-free shared handle per callback keeps the counter alive through
+        // its last wake, even if the scope observes zero and returns before that wake ends.
+        // Share before reserving: no fallible operation separates the count and its ticket.
+        let threads = self.threads.share();
+        threads
+            .pending
             .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| pending.checked_add(1))
             .map_err(|_| IoError::from_errno(Errno::Again))?;
-        Ok(ScopeCompletion { completed })
+        Ok(ScopeCompletion { threads })
     }
+}
+
+struct ScopeThreads {
+    pending: AtomicU32,
 }
 
 /// The obligation follows the callback payload, never its forgettable join handle.
 struct ScopeCompletion {
-    completed: Sender<()>,
+    threads: Arc<ScopeThreads, WireAlloc>,
 }
 
 impl Drop for ScopeCompletion {
     fn drop(&mut self) {
         // Failed allocation or pthread creation drops the same ticket as a finished callback.
-        self.completed
-            .send(())
-            .expect("a scope retains its completion receiver until every callback finishes");
+        if self.threads.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            wake_counter(&self.threads.pending);
+        }
     }
 }
 
 struct ScopeWait<'a> {
-    pending: &'a AtomicUsize,
-    completed: Receiver<()>,
-}
-
-impl ScopeWait<'_> {
-    fn complete_one(&self) {
-        self.completed.recv().expect("a running scoped thread retains its completion sender");
-        self.pending.fetch_sub(1, Ordering::AcqRel);
-    }
+    threads: &'a ScopeThreads,
 }
 
 impl Drop for ScopeWait<'_> {
     fn drop(&mut self) {
         // A scoped borrow cannot be abandoned on a timeout. Every live callback owns one
         // count until its completion; a nested spawn adds its count before the parent ends.
-        while self.pending.load(Ordering::Acquire) != 0 {
-            self.complete_one();
+        loop {
+            let pending = self.threads.pending.load(Ordering::Acquire);
+            if pending == 0 {
+                break;
+            }
+            // A completion between the load and wait changes the futex value, so the
+            // kernel refuses to sleep on that old value instead of losing the final wake.
+            wait_on_counter(&self.threads.pending, pending);
         }
     }
 }
@@ -2064,16 +2079,14 @@ pub fn scope<'env, F, T>(alloc: WireAlloc, f: F) -> T
 where
     F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
 {
-    let (completed, receiver) = channel(alloc);
     let scope = Scope {
         alloc,
-        pending: AtomicUsize::new(0),
-        completed,
+        threads: Arc::new_in(ScopeThreads { pending: AtomicU32::new(0) }, alloc),
         _scope: PhantomData,
         _env: PhantomData,
     };
     // Declared after the borrowed scope so unwinding drains callbacks before its fields drop.
-    let wait = ScopeWait { pending: &scope.pending, completed: receiver };
+    let wait = ScopeWait { threads: &scope.threads };
     let result = f(&scope);
     drop(wait);
     result

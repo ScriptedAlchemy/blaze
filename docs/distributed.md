@@ -125,6 +125,8 @@ Carrier thread scopes retain their own callback-completion obligations. Forgetti
 join handle cannot let a borrowed callback outlive its scope, including nested spawns
 and parent unwinding. A callback releases its obligation only after its captures have
 been dropped and its result stored; failed thread setup releases the same obligation.
+The completion count is shared once per callback and stays alive through its last wake;
+it needs no completion queue or disconnectable receiver.
 Forgetting a handle can still leak its result and joinable OS-thread resources. An OS
 join refusal, including a thread joining itself, leaves the live result allocation
 intact rather than treating the refusal as completion. Callback panic behavior is
@@ -492,6 +494,9 @@ speed and acceptance still require the real-compiler harness.
 tickets across failed starts, nested registrations and completion order, with a planted
 handle-ownership fault. Native controls cover forgotten borrowed callbacks, explicit
 join/drop, nested spawns, refused self-joins and parent/setup unwinding where supported.
+The native-unwind controls are additionally required by
+`.github/distributed-native-controls.txt`; `.github/distributed-controls.txt` remains
+the common receipt required from both native and source-compiler execution.
 
 `harness/distv2.py` retains real-compiler acceptance cases: two workers on one workspace,
 published reuse, edits, separate PR namespaces, killed or stopped workers, stale results,

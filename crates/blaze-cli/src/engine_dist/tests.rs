@@ -5,7 +5,7 @@
 use super::*;
 use blaze_cas::plain::{Lent, Settings};
 use blaze_core::{FileName, sim::{Faults, Sim}};
-use blaze_own::CollectIn;
+use blaze_own::{BTreeMap, CollectIn};
 use crate::store::plain_place::{Facts, StoreAlloc, after_answer, config, open, test_cx};
 
 fn process(sim: Sim, nonce: u64) -> Lent<Sim, StoreAlloc> {

@@ -2,6 +2,7 @@
 
 use core::fmt;
 
+use blaze_own::Vec;
 use blaze_sim::{Broken, Config, Point, Tape};
 
 use super::*;

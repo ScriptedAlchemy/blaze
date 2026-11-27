@@ -1,0 +1,2 @@
+scope_releases_registration_when_spawn_setup_unwinds
+scope_waits_for_forgotten_callbacks_when_parent_unwinds
