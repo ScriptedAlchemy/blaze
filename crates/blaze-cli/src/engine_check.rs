@@ -447,7 +447,7 @@ pub(crate) fn warm_toolchain(
         None => bstd::mem::format_in!(&request, ".blaze/{rel_ws}"),
     };
     let located = crate::run_package::Located { root: ws_dir, at: work::held_str(abs_at.as_str(), &request), member: "" };
-    edge_at(cx, fs, env, net, host, out, err, phases, heap, &flags, None, Some(located), &request, |edge, phases| {
+    edge_at(cx, fs, env, host, out, err, phases, heap, &flags, None, Some(located), &request, |edge, phases| {
         let Edge { root, opts, mut shown, err, frame, lazy_sdk, .. } = edge;
         shown.quiet = true;
         let mut check_opts = opts();
@@ -494,7 +494,7 @@ fn serve(
     let mut flags = crate::parse_flags_with(args, |_| {}, |feat| features.push(feat))?;
     flags.features = features.as_slice();
     let request = request_frame()?;
-    edge(cx, fs, env, net, host, out, err, phases, heap, &flags, why, &request, |edge, phases| {
+    edge(cx, fs, env, host, out, err, phases, heap, &flags, why, &request, |edge, phases| {
         let Edge { root, opts, mut shown, err, caps, view, shown_root, frame, lazy_sdk, .. } = edge;
         let Some(target) = why else {
             let checked = match flags.fix {
@@ -620,7 +620,6 @@ fn edge<R>(
     cx: &Cx,
     fs: &bstd::fs::Fs,
     env: Option<&bstd::env::Env>,
-    net: Option<&bstd::net::Net>,
     host: &bstd::host::Host,
     out: &Out,
     err: &Out,
@@ -631,7 +630,7 @@ fn edge<R>(
     frame: &Frame,
     then: impl for<'f> FnOnce(Edge<'f>, &mut Phases) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
-    edge_at(cx, fs, env, net, host, out, err, phases, heap, flags, why, None, frame, then)
+    edge_at(cx, fs, env, host, out, err, phases, heap, flags, why, None, frame, then)
 }
 
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one handle of it")]
@@ -639,7 +638,6 @@ fn edge_at<'l, R>(
     cx: &Cx,
     fs: &bstd::fs::Fs,
     env: Option<&bstd::env::Env>,
-    net: Option<&bstd::net::Net>,
     host: &bstd::host::Host,
     out: &Out,
     err: &Out,
@@ -654,16 +652,11 @@ fn edge_at<'l, R>(
     let var = |name: &str| -> Option<&str> { env?.get(&VarName::new(name).ok()?).ok().flatten() };
     let cert_file = var("SSL_CERT_FILE");
     let cert_dir = var("SSL_CERT_DIR");
-    // The named origin, opened as `check-old` opens it (main.rs): a miss is read from it.
-    // Declared before `shown`: the request's options and what it prints share one lifetime
-    // (`checking` takes `&mut Shown<'f>`), so the origin must outlive the printer's state.
-    let origin = crate::store::NamedOrigin::of(cx, fs, net, flags.origin, flags.origin_key, tls_places(cert_file, cert_dir))?;
     // The open checkout's parts, each a phase (rule 17): its 22 ms on tempo (score-c1725wave42)
     // was one phase until 2026-11-20. Its floor is a few opens: one manifest read and the
     // pointer. `locate` reads one manifest where the start folder's has `[workspace]`, else the
     // layout whole (every member's manifest); the SDK is xcrun's, a process started, wherever
     // SDKROOT is unset.
-    phases.mark_cx(cx, "open checkout: the origin named", frame);
     // Single-file `.rs` script (`blaze run script.rs`, `blaze check script.rs`, `blaze test script.rs`),
     // or a directory/workspace checkout walking up to its workspace root (run_package.rs `locate`, R3).
     let located = match located_override {
@@ -793,7 +786,6 @@ fn edge_at<'l, R>(
         scope_reads: crate::engine_scope_reads::ScopeReadsAs::DEFAULT,
         unreadable: None,
         body_locals: blaze_ladder::front2::tables::seeds::BodyLocals::Lowered,
-        origin: origin.as_ref(),
         names_oracle: flags.names_oracle,
         driver: flags.driver,
         ready_plant: crate::engine_ready_edit::CommitPlant::None,
@@ -2123,7 +2115,7 @@ fn check_and_open<R>(
     then: impl for<'r, 'm, 'f> FnOnce(CiContext<'r, 'm, 'f>, &mut Phases, &mut bstd::rng::Rng) -> Result<R, CliError>,
 ) -> Result<R, CliError> {
     let request = request_frame()?;
-    edge(cx, fs, env, net, host, out, err, phases, heap, flags, None, &request, |edge, phases| {
+    edge(cx, fs, env, host, out, err, phases, heap, flags, None, &request, |edge, phases| {
         #[cfg(unix)]
         let Edge { root, opts, mut shown, err, caps, shown_root, frame, mut place, lazy_sdk, workers, producers, member, signals, .. } = edge;
         #[cfg(not(unix))]
@@ -2426,9 +2418,6 @@ pub(crate) struct Opts<'f> {
     /// What may ask the check for its status or stop it (engine_status.rs): the command's
     /// signals and `--status-every`; a test's plant; `Asking::NONE` in the other tests.
     pub(crate) status: crate::engine_status::Asking<'f>,
-    /// The named origin a miss is read from (`--origin <folder or http base> --origin-key
-    /// <hex>`, store.rs `NamedOrigin`), as `check-old` opens its store; `None`: the home alone.
-    pub(crate) origin: Option<&'f crate::store::NamedOrigin>,
     /// `--names-oracle` (engine_names.rs `NamesOracle`, D158 step 1): every crate's names
     /// decided twice and compared, answered in full (as `fresh`) so every crate is entered; a
     /// disagreement fails the command. The command's default is `Off`.
@@ -2765,7 +2754,7 @@ fn checking<'f, 's: 'f>(
 ) -> Result<BoxedChecked, CliError> {
     #[cfg(test)]
     stack_probe::at("checking");
-    let &Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, features, scope: check_scope } = opts;
+    let &Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, names_oracle, driver, ready_plant, features, scope: check_scope } = opts;
     // The oracle compares every crate's names, so every crate is entered: no stored answer read.
     let fresh = fresh || recovery == StoredRecovery::Fresh || names_oracle.on();
     let began = phases.now();
@@ -2780,8 +2769,8 @@ fn checking<'f, 's: 'f>(
     // The one store, opened as `check` opens it (main.rs), committed after the answer.
     let opened = crate::store::open_for_command(cx, fs, host, rng, place.home, place.max_store_bytes, root, place.checkout, phases.clock(), err, heap)?;
     let tls = tls_places(place.cert_file, place.cert_dir);
-    crate::store::take::before_first_phase(cx, args, fs, net, &opened, toolchain, tls, phases, err)?;
-    let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, origin, phases.clock().clone(), err, erased.handle())?;
+    let origin = crate::store::take::before_first_phase(cx, args, fs, net, &opened, toolchain, tls, phases, err)?;
+    let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, origin.as_ref(), phases.clock().clone(), err, erased.handle())?;
     phases.mark_cx(cx, "store open", frame);
     // 0. The stored answer (engine_answer.rs): its pointer, then the sweep of what it read.
     // Nothing moved, nothing owed and no findings kept: the certificate, from the pointer alone.

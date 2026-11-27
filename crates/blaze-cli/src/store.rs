@@ -1391,25 +1391,6 @@ impl HeadCheck for OneKey {
 }
 
 impl NamedOrigin {
-    /// The origin the arguments name (main.rs reads them): `--origin` and `--origin-key`
-    /// together or neither.
-    pub fn of(cx: &Cx, fs: &Fs, net: Option<&Net>, folder: Option<&str>, key: Option<&str>, tls: blaze_core::trust::Places<'_>) -> Result<Option<NamedOrigin>, CliError> {
-        match (folder, key) {
-            (None, None) => Ok(None),
-            (Some(folder), Some(key)) => {
-                let key = PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?;
-                let at = if folder.starts_with("https://") || folder.starts_with("http://") {
-                    let net = net.ok_or(CliError::Usage("--origin http(s)://: this host offers no network"))?;
-                    OriginAt::Http(HttpAt::of(folder, net, tls)?)
-                } else {
-                    OriginAt::Folder(fs.open_dir(cx, &Path::new(folder)?)?)
-                };
-                Ok(Some(NamedOrigin { at, check: OneKey { keys: [key], set: None } }))
-            }
-            _ => Err(CliError::Usage("--origin and --origin-key are named together")),
-        }
-    }
-
     /// The published set `set` of the origin `origin`: its folder `public/<toolchain>/<target>`
     /// beneath a folder, or that path joined to an `http://` / `https://` base (each object then
     /// one ranged GET of `<base>/public/<toolchain>/<target>/<name>`). Believed when its head is

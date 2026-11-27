@@ -22,7 +22,7 @@ import sys
 import tempfile
 import threading
 from collections.abc import Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
 
@@ -49,6 +49,14 @@ class TakenSet(TypedDict):
     records: int
     bytes: int
     reads: list[RangeRead]
+
+
+@dataclass
+class OriginTraffic:
+    requests: list[str] = field(default_factory=list[str])
+    reads: list[RangeRead] = field(default_factory=list[RangeRead])
+    refusals: list[str] = field(default_factory=list[str])
+    handshake_failed: threading.Event = field(default_factory=threading.Event)
 
 
 def require(condition: bool, why: str) -> None:
@@ -89,12 +97,10 @@ def certificate(directory: Path) -> tuple[ssl.SSLContext, Path, Path]:
 @contextlib.contextmanager
 def serve(
     directory: Path, tls: ssl.SSLContext, receipt: Path,
-) -> Generator[tuple[str, list[RangeRead], list[str], threading.Event]]:
+) -> Generator[tuple[str, OriginTraffic]]:
     objects = {"/" + path.relative_to(directory).as_posix(): path
                for path in directory.rglob("*") if path.is_file()}
-    reads: list[RangeRead] = []
-    refused_tls: list[str] = []
-    handshake_failed = threading.Event()
+    traffic = OriginTraffic()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -103,6 +109,7 @@ def serve(
             pass
 
         def do_GET(self):
+            traffic.requests.append(self.path)
             file = objects.get(self.path)
             if file is None:
                 self.send_error(404)
@@ -121,7 +128,7 @@ def serve(
                 return
             last = min(last, size - 1)
             count = last - start + 1
-            reads.append({"path": self.path, "first": start, "bytes": count})
+            traffic.reads.append({"path": self.path, "first": start, "bytes": count})
             self.send_response(206)
             self.send_header("Content-Range", f"bytes {start}-{last}/{size}")
             self.send_header("Content-Length", str(count))
@@ -143,19 +150,21 @@ def serve(
                 return tls.wrap_socket(sock, server_side=True), peer
             except OSError as error:
                 sock.close()
-                refused_tls.append(str(error))
-                handshake_failed.set()
+                traffic.refusals.append(str(error))
+                traffic.handshake_failed.set()
                 raise
 
     with Server(("127.0.0.1", 0), Handler) as server:
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1})
         thread.start()
         try:
-            yield f"https://127.0.0.1:{server.server_port}", reads, refused_tls, handshake_failed
+            yield f"https://127.0.0.1:{server.server_port}", traffic
         finally:
             server.shutdown()
             thread.join(timeout=6)
-            receipt.write_text(json.dumps({"tls_refusals": refused_tls, "https_reads": reads}, indent=2) + "\n")
+            receipt.write_text(json.dumps({
+                "tls_refusals": traffic.refusals, "https_reads": traffic.reads, "https_requests": traffic.requests,
+            }, indent=2) + "\n")
             require(not thread.is_alive(), "the disposable origin did not stop")
 
 
@@ -201,6 +210,9 @@ def run(given: Input) -> None:
         with (scratch / f"{which}.stdout").open("w+") as stdout, (scratch / f"{which}.stderr").open("w+") as stderr:
             result = subprocess.run([binary, *args], cwd=checkout, env=env, stdout=stdout, stderr=stderr,
                                     check=False, timeout=given.timeout)
+            profile = checkout / ".blaze/v2/profile.txt"
+            if profile.is_file():
+                shutil.copyfile(profile, scratch / f"{which}.profile.txt")
             stdout.seek(0)
             stderr.seek(0)
             return result.returncode, stdout.read(), stderr.read()
@@ -228,7 +240,9 @@ def run(given: Input) -> None:
         key = made[3]
         tls, ca, unrelated = certificate(directory)
 
-        with serve(origin, tls, scratch / "https-observations.json") as (url, reads, refused_tls, handshake_failed):
+        with serve(origin, tls, scratch / "https-observations.json") as (url, traffic):
+            reads = traffic.reads
+
             def origin_args(public_key: str) -> tuple[str, ...]:
                 return "--origin", url, "--origin-key", public_key
 
@@ -236,8 +250,8 @@ def run(given: Input) -> None:
             # The client may close before sending a TLS alert. The paired trusted-CA run
             # below must take the same origin with the same binary and signing key.
             require(status != 0 and "the published set of --origin was not taken" in stderr
-                    and handshake_failed.wait(timeout=6) and not reads,
-                    f"the client did not refuse the handshake before HTTP with the unrelated TLS root: {refused_tls!r}")
+                    and traffic.handshake_failed.wait(timeout=6) and not traffic.requests,
+                    f"the client did not refuse the handshake before HTTP: {traffic.refusals!r}")
             _, _, (status, _, stderr) = check("untrusted-signer", blaze, *origin_args("00" * 32), ca=ca)
             require(status != 0 and "a key this blaze was not given for the namespace" in stderr
                     and bool(reads) and all(row["path"].endswith("/prefix") for row in reads),
@@ -258,7 +272,6 @@ def run(given: Input) -> None:
                                         "bytes": int(adopted[2]), "reads": asked}
 
             checkout, home, https = taken("https", blaze)
-            require(https["entered"] < cold, f"the same compiler entered {https['entered']} tasks with HTTPS and {cold} cold")
             status, stdout, _ = command("run", blaze, checkout, home, "run", *origin_args(key), ca=ca)
             require(status == 0 and stdout == "signed origin: 6\n", "the HTTPS consumer did not run the expected program")
             comparison = None
@@ -282,13 +295,19 @@ def run(given: Input) -> None:
                     "reuse_observed": alternate_https["entered"] < alternate_cold,
                     "local_records_excluded": int(excluded[1]),
                 }
+            sets = list(origin.glob("public/*/*/prefix"))
+            require(len(sets) == 1, "the publisher did not produce exactly one toolchain set")
+            expected = "/" + sets[0].parent.relative_to(origin).as_posix() + "/"
+            mismatched = sorted({path for path in traffic.requests if not path.startswith(expected)})
+            require(not mismatched, f"the compiler queried outside the signed toolchain set: {mismatched}")
 
     require(all(digest(Path(path)) == sha for path, sha in binaries.items()), "a CLI changed during acceptance")
     (scratch / "result.json").write_text(json.dumps({
         "binaries_sha256": binaries, "signer": key, "published_records": int(made[1]),
-        "cold_entered": cold, "same_binary_https": https, "alternate": comparison,
-        "tls_refusals": refused_tls, "https_reads": reads,
+        "cold_entered": cold, "same_binary_https": https, "reuse_observed": https["entered"] < cold, "alternate": comparison,
+        "tls_refusals": traffic.refusals, "https_reads": reads, "https_requests": traffic.requests,
     }, indent=2) + "\n")
+    require(https["entered"] < cold, f"the same compiler entered {https['entered']} tasks with HTTPS and {cold} cold")
     print(f"signed_origin.py: published, verified over HTTPS and ran; {cold} → {https['entered']} tasks entered; evidence {scratch}")
 
 
