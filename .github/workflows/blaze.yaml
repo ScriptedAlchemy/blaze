@@ -1,4 +1,4 @@
-name: PR 81 focused protocol execution diagnosis
+name: PR 81 verify heartbeat fixture ordering
 on:
   workflow_dispatch:
     inputs:
@@ -19,7 +19,7 @@ env:
 jobs:
   protocol:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 40
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v7
         with:
@@ -48,24 +48,28 @@ jobs:
           tc=$(timeout 10 cat pins/toolchain)
           timeout -k 20 1200 cargo +"$tc" build --locked --bins -p blaze-cli -p blaze-launcher 2>&1 | tee "$evidence/build.log"
           timeout 30 sha256sum "$CARGO_TARGET_DIR/debug"/{blaze,blaze-launcher,blaze-fact-shim} > "$evidence/binaries.txt"
+      - name: Run the Cargo-built driver tests
+        run: |
+          tc=$(timeout 10 cat pins/toolchain)
+          timeout -k 20 600 cargo +"$tc" test --locked -p blaze-dist-local --lib 'driver::tests::' \
+            2>&1 | tee "$RUNNER_TEMP/diagnostics/cargo-driver.log"
+          timeout 10 grep -F 'test result: ok. 3 passed;' "$RUNNER_TEMP/diagnostics/cargo-driver.log"
       - name: Observe the exact affected protocol cases
         run: |
           evidence="$RUNNER_TEMP/diagnostics"
           status=0
-          for entry in missing:absent_invalid_and_expired_connections_are_named_refusals \
-            frames:fragmented_coalesced_and_malformed_frames_are_real_socket_boundaries \
-            version:versions_content_session_and_terminal_bindings_fail_closed \
-            coordinator:the_coordinator_owns_and_removes_its_actual_socket \
-            result:the_real_driver_submits_a_gated_result_with_valid_and_expired_lease_controls; do
+          for entry in cancel:heartbeats_during_compile_fence_a_cancelled_batch_and_release_its_findings \
+            disconnect:transport_failure_during_compile_releases_its_unreported_findings \
+            result:failed_result_acknowledgement_releases_new_findings; do
             name=${entry%%:*}
             test=${entry#*:}
             timeout 20 jq -n --arg blaze "$CARGO_TARGET_DIR/debug/blaze" --arg cwd "$GITHUB_WORKSPACE" \
               --arg home "$RUNNER_TEMP/blaze-fs/protocol-home-$name" --arg out "$evidence/$name" --arg test "$test" \
               --arg shelf "$HOME/.blaze/v2/toolchain" --arg name "$name" \
-              '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:235,commands:[{name:$name,args:["test","-p","blaze-dist-local","--view","json","--","--run-all","--format","json",$test]}]}' \
+              '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:420,commands:[{name:$name,args:["test","-p","blaze-dist-local","--view","json","--","--run-all","--format","json",$test]}]}' \
               > "$evidence/$name.json"
-            timeout -k 15 265 python3 harness/v2/exec_observer.py "$evidence/$name.json" || status=$?
-            timeout 10 jq -rc 'select(.event=="failed" or .event=="not_run" or .event=="summary")' "$evidence/$name/$name.log" || status=$?
+            timeout -k 15 450 python3 harness/v2/exec_observer.py "$evidence/$name.json" || status=$?
+            timeout 10 jq -se 'any(.[]; .event=="summary" and .ran==1 and .passed==1)' "$evidence/$name/$name.log" || status=$?
           done
           timeout 30 sha256sum --check "$evidence/binaries.txt"
           exit "$status"
