@@ -842,6 +842,11 @@ impl<'s> Directory<'s> {
         self.records
     }
 
+    /// The expansion keys declared by the directory's record-key table.
+    pub fn record_keys(&self) -> impl ExactSizeIterator<Item = ContentId> + 's {
+        self.record_keys.as_chunks::<32>().0.iter().copied().map(ContentId)
+    }
+
     fn call_at(&self, i: usize) -> ItemKey {
         let mut key = [0u8; 32];
         key.copy_from_slice(&self.rows[i * DIRECTORY_ROW..i * DIRECTORY_ROW + 32]);

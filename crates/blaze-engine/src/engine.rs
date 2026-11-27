@@ -387,6 +387,37 @@ pub struct Done<'a> {
     pub failed: bool,
 }
 
+/// A selected task whose producers the phase driver has settled. A remembered result can
+/// stand only if its key and every witnessed cell still agree with this view.
+pub struct Admission<'e, 'a, L> {
+    task: Task,
+    view: View<'e, 'a, L>,
+}
+
+/// A remembered result checked against the selected task and this admission's live cells.
+pub struct Reused<'e, 'a> {
+    done: Done<'a>,
+    admission: core::marker::PhantomData<&'e ()>,
+}
+
+impl<'e, 'a, L: LastAnswer> Admission<'e, 'a, L> {
+    pub fn task(&self) -> Task {
+        self.task
+    }
+
+    pub fn validate(self, done: Done<'a>) -> Option<Reused<'e, 'a>> {
+        if done.name != self.task.planned.name || done.key != self.task.key || done.failed {
+            return None;
+        }
+        if done.reads.iter().any(|(id, saw)| self.view.cell(id) != *saw) {
+            return None;
+        }
+        Some(Reused { done, admission: core::marker::PhantomData })
+    }
+}
+
+type Reuse<'e, 'a, L, E> = dyn for<'v> FnMut(Admission<'v, 'a, L>) -> Result<Option<Reused<'v, 'a>>, E> + 'e;
+
 /// A record a task made inline that the plan did not name (engine.md, "The design" 3).
 #[derive(PartialEq, Eq, Debug)]
 pub struct Made<'a> {
@@ -998,6 +1029,8 @@ pub struct Report {
     /// Tasks entered, planned or inline, and results merged: equal in every request.
     pub entered: u32,
     pub results: u32,
+    /// Selected tasks satisfied by a remembered result before worker admission.
+    pub reused: u32,
     pub made: u32,
     /// Candidates the scope did not run.
     pub not_run: u32,
@@ -1501,7 +1534,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
             return Err(EngineError::OutOfTurn);
         }
         while let Some((phase, selected)) = self.pending.pop_first() {
-            if self.enter(phase, selected.iter().copied())? {
+            if self.enter::<EngineError>(phase, selected.iter().copied(), &mut None)? {
                 return Ok(Some(phase));
             }
         }
@@ -1516,7 +1549,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
             if self.open.is_some_and(|phase| phase.stage == stage) || self.saved.keys().any(|phase| phase.stage == stage) {
                 continue;
             }
-            if let Some(phase) = self.select(stage, false, &mut |phase, name, _| ready(phase, name))? {
+            if let Some(phase) = self.select::<EngineError>(stage, false, &mut |phase, name, _| ready(phase, name), None)? {
                 return Ok(Some(phase));
             }
         }
@@ -1527,7 +1560,19 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
     /// the task's own producer edges, including same-stage edges. Its second argument asks if
     /// a producer is pending or entered but not yet filed. Neither query walks the last answer.
     pub fn next_phase_in(&mut self, stage: Stage, ready: &mut dyn FnMut(Name, &dyn Fn(Name) -> bool) -> bool) -> Result<Option<Phase>, EngineError> {
-        self.select(stage, true, &mut |_, name, unsettled| ready(name, unsettled))
+        self.select(stage, true, &mut |_, name, unsettled| ready(name, unsettled), None)
+    }
+
+    /// Like [`Self::next_phase_in`], consulting a remembered result once per selected planned
+    /// task before it is counted or submitted. Reused results publish their cells in phase
+    /// order. Use this for work whose result needs no driver-side growth.
+    pub fn next_phase_in_reusing<E: From<EngineError>>(
+        &mut self,
+        stage: Stage,
+        ready: &mut dyn FnMut(Name, &dyn Fn(Name) -> bool) -> bool,
+        reuse: &mut Reuse<'_, 'a, L, E>,
+    ) -> Result<Option<Phase>, E> {
+        self.select(stage, true, &mut |_, name, unsettled| ready(name, unsettled), Some(reuse))
     }
 
     fn unsettled(&self, name: Name) -> bool {
@@ -1541,7 +1586,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
 
     /// Select only from the pending index. In particular, an empty frontier asks no task a
     /// readiness question and allocates no list proportional to the workspace.
-    fn select(&mut self, stage: Stage, across_waves: bool, ready: &mut dyn FnMut(Phase, Name, &dyn Fn(Name) -> bool) -> bool) -> Result<Option<Phase>, EngineError> {
+    fn select<E: From<EngineError>>(&mut self, stage: Stage, across_waves: bool, ready: &mut dyn FnMut(Phase, Name, &dyn Fn(Name) -> bool) -> bool, mut reuse: Option<&mut Reuse<'_, 'a, L, E>>) -> Result<Option<Phase>, E> {
         let mut wave = 0;
         while let Some((&phase, names)) = self.pending.range(Phase::new(stage, wave)..=Phase::new(stage, u16::MAX)).next() {
             let mut selected = Vec::new_in(self.alloc);
@@ -1556,7 +1601,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
             }
             if !selected.is_empty() {
                 self.save_open()?;
-                if self.enter(phase, selected.iter().copied())? {
+                if self.enter(phase, selected.iter().copied(), &mut reuse)? {
                     return Ok(Some(phase));
                 }
             }
@@ -1580,7 +1625,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         Ok(())
     }
 
-    fn enter(&mut self, phase: Phase, selected: impl Iterator<Item = Name> + Clone) -> Result<bool, EngineError> {
+    fn enter<E: From<EngineError>>(&mut self, phase: Phase, selected: impl Iterator<Item = Name> + Clone, reuse: &mut Option<&mut Reuse<'_, 'a, L, E>>) -> Result<bool, E> {
         self.passed = Some(self.passed.map_or(phase, |passed| passed.max(phase)));
         self.tasks.clear();
         self.opened.clear();
@@ -1625,6 +1670,9 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
                 self.opened.push(*cause);
             }
         }
+        if let Some(reuse) = reuse {
+            self.reuse_selected(phase, *reuse)?;
+        }
         if self.tasks.is_empty() {
             return Ok(false);
         }
@@ -1632,6 +1680,30 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         self.report.entered += self.tasks.len() as u32;
         self.open = Some(phase);
         Ok(true)
+    }
+
+    fn reuse_selected<E: From<EngineError>>(&mut self, phase: Phase, reuse: &mut Reuse<'_, 'a, L, E>) -> Result<(), E> {
+        let mut kept = 0;
+        for at in 0..self.tasks.len() {
+            let task = self.tasks[at];
+            if self.planned.contains_key(&task.planned.name)
+                && let Some(done) = reuse(Admission { task, view: self.view() })?.map(|proved| proved.done)
+            {
+                let mut changed = Vec::new_in(self.alloc);
+                self.apply(task.planned, done, phase, false, &mut changed)?;
+                for (id, digest) in changed.into_iter() {
+                    self.move_cell(id, digest, Some(phase))?;
+                }
+                self.report.reused += 1;
+                continue;
+            }
+            self.tasks[kept] = task;
+            self.opened[kept] = self.opened[at];
+            kept += 1;
+        }
+        self.tasks.truncate(kept);
+        self.opened.truncate(kept);
+        Ok(())
     }
 
     /// Whether a candidate for `stage` remains pending. Drivers use this to keep a producer
@@ -2838,7 +2910,7 @@ impl<'a, S: Scope, L: Fold<'a>, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
         // Any owed task held, with a row under today's key or not, refuses the certificate: its
         // row is not today's answer for its plan until a request reaches it.
         let holds_owed = !owed_tasks.is_empty() && self.plant != Plant::OwedRowCertified;
-        self.report.certified = self.report.entered == 0 && self.moved.is_empty() && !holds_owed;
+        self.report.certified = self.report.entered == 0 && self.report.reused == 0 && self.moved.is_empty() && !holds_owed;
         // The reverse index's writes, one sorted column, to the working set the form folds.
         let mut cost = self.index.cost();
         cost.phase_allocations_max = self.report.index.phase_allocations_max;
@@ -2883,6 +2955,66 @@ pub fn drive_growing<'a, S: Scope, P: Pool<'a>, L: LastAnswer + Sync, R: ReaderI
         grow(engine)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+
+    #[test]
+    fn reuse_stands_on_cells_published_by_an_earlier_wave() {
+        let alloc = blaze_own::testing::heap().shared();
+        let tool = Tool(ContentId([1; 32]));
+        let tools = Tools([tool; key::KINDS]);
+        let producer = Name::new(blaze_drive::Kind::CrateScope, ContentId([2; 32]));
+        let reader = Name::new(blaze_drive::Kind::CrateScope, ContentId([3; 32]));
+        let produced = CellId { of: producer, cell: Cell([1; 16]) };
+        let producer_out = ContentId([4; 32]);
+        let reader_out = ContentId([5; 32]);
+        let plans = [
+            [Planned { name: producer, phase: Phase::new(Stage::Names, 0), source: producer_out, file: producer }],
+            [Planned { name: reader, phase: Phase::new(Stage::Names, 1), source: reader_out, file: reader }],
+        ];
+        let files = [(producer, plans[0].as_slice()), (reader, plans[1].as_slice())];
+        let result = |task: Task, witness: ContentId| {
+            let name = task.planned.name;
+            let mut reads = Vec::new_in(alloc);
+            if name == reader {
+                reads.push((produced, witness));
+            }
+            let out = task.planned.source;
+            let defines = Vec::from_slice_in(&[(produced.cell, out)], alloc);
+            Done { name, key: task.key, out, defines, reads, findings: 0, failed: false }
+        };
+        let request = |witness: ContentId| {
+            let mut engine = Engine::new_in(tools, Answer::new_in(alloc), &Edit { files: &files }, Everything, Plant::None, alloc).expect("plan");
+            let mut considered = Vec::new_in(alloc);
+            let phase = engine.next_phase_in_reusing::<EngineError>(Stage::Names, &mut |name, pending| name == producer || !pending(producer), &mut |admission| {
+                let task = admission.task();
+                considered.push(task.planned.name);
+                Ok(admission.validate(result(task, witness)))
+            }).expect("admit scopes");
+            assert_eq!(considered.as_slice(), &[producer, reader]);
+            if let Some(phase) = phase {
+                assert_eq!(phase, plans[1][0].phase);
+                let [task] = engine.tasks() else { panic!("one unresolved scope") };
+                assert_eq!(task.planned.name, reader);
+                let mut buffer = Buffer::new_in(alloc);
+                buffer.push(result(*task, engine.view().cell(&produced)), Stands::ByReads);
+                engine.merge_phase(phase, &mut [buffer]).expect("file the reader");
+            }
+            engine.finish().expect("answer")
+        };
+        let reused = request(producer_out);
+        let stale = request(ContentId([6; 32]));
+        assert_eq!(reused.report.reused, 2);
+        assert!(reused.entered.is_empty());
+        assert_eq!(stale.report.reused, 1);
+        assert_eq!(stale.entered.as_slice(), &[reader]);
+        assert_eq!(reused.answer.rows, stale.answer.rows);
+        assert_eq!(reused.answer.readers.get(&produced), Some([reader].as_slice()));
+        assert_eq!(reused.answer.readers.get(&produced), stale.answer.readers.get(&produced));
+    }
 }
 
 #[cfg(test)]

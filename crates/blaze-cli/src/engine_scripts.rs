@@ -1532,6 +1532,7 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
         &mut self, cx: &Cx, engine: &mut blaze_engine::Engine<'a, blaze_engine::Everything>,
         scripts: &mut ScriptsStage<'f>, names: &mut NamesStage<'f>, store: &mut dyn crate::store::Store<'r>,
         read: &mut crate::engine_records::EngineRecords<'r>, handles: &Handles<'s, 'f>, alloc: SharedAlloc<'a>, frame: &'f Frame,
+        mut keep_published: Option<&mut dyn FnMut(Name, Key)>,
     ) -> Result<(), CliError> {
         self.script_reads.clear();
         while engine.next_phase_in(Stage::Scripts, &mut |name, pending| scripts.producers_ready(name, pending, &mut self.script_reads))?.is_some() {
@@ -1555,10 +1556,11 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
         let runnable_scripts = self.scripts.active_scripts()
             + usize::from(engine.has_pending_stage(Stage::Scripts) && self.scripts.active_scripts() == 0);
         self.names.set_width(self.scripts.scope, handles, runnable_scripts);
+        let mut published = SVec::new_in(alloc);
         loop {
             self.name_reads.clear();
             self.script_reads.clear();
-            let phase = engine.next_phase_in(Stage::Names, &mut |name, pending| {
+            let mut ready = |name, pending: &dyn Fn(Name) -> bool| {
                 names.producers_ready(name, &mut |producer| {
                     #[cfg(test)]
                     if producer.kind == Kind::Script && runner_clock().is_some_and(|clock| clock.drop_names_producer()) {
@@ -1566,7 +1568,27 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
                     }
                     pending(producer) || (producer.kind == Kind::Script && !scripts.producers_ready(producer, pending, &mut self.script_reads))
                 }, &mut self.name_reads)
-            })?;
+            };
+            let phase = if let Some(keep) = &mut keep_published {
+                let phase = engine.next_phase_in_reusing::<CliError>(Stage::Names, &mut ready, &mut |admission| {
+                    let task = admission.task();
+                    let Some(scope) = store.published_scope(cx, task)? else { return Ok(None) };
+                    let done = crate::engine_names::published_done(&scope, alloc)?;
+                    let hit = crate::engine_names::PublishedReuse { task, record: scope.entry.payload, out: done.out };
+                    let reused = admission.validate(done);
+                    if reused.is_some() {
+                        published.push(hit);
+                    }
+                    Ok(reused)
+                })?;
+                for hit in published.drain(..) {
+                    keep(hit.task.planned.name, hit.record);
+                    names.reuse_published(hit);
+                }
+                phase
+            } else {
+                engine.next_phase_in(Stage::Names, &mut ready)?
+            };
             if phase.is_none() { break; }
             let mark = handles.board.phase_began(Stage::Names, engine.tasks().len() as u64, handles.board.now(&handles.env.clock));
             let view = engine.view();

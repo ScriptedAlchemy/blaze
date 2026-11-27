@@ -392,3 +392,95 @@ fn a_take_stopped_anywhere_leaves_no_root_or_the_whole_set_and_the_next_command_
 fn the_oracle_catches_a_take_that_names_the_root_before_the_set_is_whole() {
     blaze_sim::control(Config::cases(96), false, true, "half a root", interrupted);
 }
+
+fn interrupted_scope_directory(tape: &Tape, root_each_segment: bool) -> Result<(), Broke> {
+    use blaze_drive::{Key, Kind, Name};
+    use super::super::{plain_place::PlainPlace, roots, scope_cache, scope_directory};
+
+    let io = Io::simulated(SimWorld::new(tape.below(1 << 32, "sim seed"), Limits::USUAL));
+    let name = Name::new(Kind::CrateScope, ContentId([1; 32]));
+    let source = ContentId([2; 32]);
+    let out = ContentId([3; 32]);
+    let task = Key(ContentId([4; 32]));
+    let records = planted(0..0, 0);
+    let candidate = {
+        let cx = io.cx(BUDGET, TASK_FRAME).map_err(|why| harness("the publishing context", why))?;
+        let body = crate::names::sections::write(0, [&[]; crate::names::sections::SECTIONS]);
+        let payload = crate::engine_store::record_key(task, out, &[], &body);
+        let erased = blaze_own::Erased::new(cx.frame());
+        let alloc = erased.handle();
+        let head = blaze_drive::record::write_plain_head(name, source, out, &[], body.len(), alloc);
+        let mut wire = blaze_own::AVec::with_capacity_in(head.len() + body.len(), alloc);
+        wire.extend_from_slice(&head);
+        wire.extend_from_slice(&body);
+        let hex = TOOLCHAIN.hex();
+        let target = set_name(&hex).dir()[2];
+        let bytes = scope_cache::write(TOOLCHAIN, target, task, name, payload, core::iter::empty(), alloc);
+        let candidate = scope_cache::entry_key(&bytes);
+        let (_a, lent) = plant(&io, &cx, "/a", &records, false);
+        let mut place = PlainPlace::new(&lent, true);
+        place.put_record(payload, true, ReservedTag::Drive.tag(), &wire).map_err(|why| harness("put the scope", why))?;
+        place.put_record(candidate, true, ReservedTag::ScopeCandidate.tag(), &bytes).map_err(|why| harness("put the entry", why))?;
+        roots::keep_toolchain(&lent, TOOLCHAIN, &[CasKey(payload.0), CasKey(candidate.0)], &[]).map_err(|why| harness("keep the signed records", why))?;
+        place.commit().map_err(|why| harness("commit the published records", why))?;
+        let objects = publish_sized(&io, &cx, &lent, "o", 128);
+        if objects.iter().filter(|(name, _)| name.starts_with("segz-")).count() != 2 {
+            return Err(Broke::Harness("the scope and entry must be in separate segments".into()));
+        }
+        candidate
+    };
+    let world = World { io, records, objects: std::vec::Vec::new() };
+    let check = |lent: &CommandLent| -> Result<bool, Broke> {
+        let seen = published::seen(lent, &set_id()).map_err(|why| harness("read the scope receipt", why))?;
+        if let Some(key) = seen.taken.and_then(|take| take.scope_index) {
+            let directory = scope_directory::Directory::load(lent, key).map_err(|why| harness("open the scope directory", why))?;
+            if directory.find(task) != Some(candidate) || !rooted(lent) {
+                return Err(Broke::Oracle("the receipt points outside the complete scope directory".into()));
+            }
+            let entry = scope_directory::read_entry(lent, candidate).map_err(|why| harness("open the scope entry", why))?;
+            let wire = scope_directory::wire(lent, &entry).map_err(|why| harness("open the scope payload", why))?;
+            if wire.name != name || wire.source != source || wire.out != out {
+                return Err(Broke::Oracle("the signed scope has different bytes".into()));
+            }
+            Ok(true)
+        } else if rooted(lent) {
+            Err(Broke::Oracle("the signed scope store has a root without a complete directory".into()))
+        } else {
+            Ok(false)
+        }
+    };
+
+    {
+        let cx = world.cx();
+        let (home, lent) = developer_home(&world.io, &cx, "/b", 6);
+        if tape.one_in(3, "the home's syncs fail") {
+            let name = home.dir().name().name().expect("the home is named").clone();
+            world.io.with_sim(|sim| sim.fail_syncs(name));
+        }
+        let stop_after = Some(tape.below(3, "records taken before a stop") as u32);
+        let _ = world.take(&cx, &lent, TakePlant { root_each_segment, stop_after, ..TakePlant::NONE });
+        check(&lent)?;
+    }
+    if !world.io.crash() {
+        return Err(Broke::Harness("the world is not simulated".into()));
+    }
+    let cx = world.cx();
+    let (_home, lent) = developer_home(&world.io, &cx, "/b", 7);
+    check(&lent)?;
+    world.take(&cx, &lent, TakePlant::NONE).map_err(|why| harness("finish the signed take", why))?;
+    if !check(&lent)? {
+        return Err(Broke::Oracle("the complete signed take has no scope directory".into()));
+    }
+    Ok(())
+}
+
+/// The invariant: a signed scope directory becomes accessible with its complete set, including after a crash interrupts the take.
+#[test]
+fn a_signed_scope_directory_commits_with_its_complete_set() {
+    blaze_sim::check(Config::cases(24), |tape| interrupted_scope_directory(tape, false));
+}
+
+#[test]
+fn the_oracle_catches_a_root_without_a_complete_directory() {
+    blaze_sim::control(Config::cases(48), false, true, "root without a complete directory", interrupted_scope_directory);
+}

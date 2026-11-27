@@ -106,6 +106,10 @@ reserved! {
     /// A macro expansion's record: a call's text and origin column, keyed by its bytes
     /// (blaze-scope expansion_records.rs), put beside its crate's `CrateScope` record.
     Expansion = u16::MAX - 9, reach: Opaque;
+    /// A signed set's candidate toolchain scope and its read witnesses.
+    ScopeCandidate = u16::MAX - 10, reach: Opaque;
+    /// The local lookup directory made from a completely verified signed set.
+    ScopeDirectory = u16::MAX - 11, reach: Opaque;
 }
 
 impl ReservedTag {

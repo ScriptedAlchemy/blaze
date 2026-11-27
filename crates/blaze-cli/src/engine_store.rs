@@ -40,9 +40,13 @@ const RECORD_FORM: &str = "blaze-cli engine record key 2";
 /// its cells do not say. The stored answer keeps each row's key (pages.rs `records`), so a
 /// request reads the record of a row that stands by it.
 pub(crate) fn record_key(key: Key, out: ContentId, reads: &[(Name, ContentId)], payload: &[u8]) -> Key {
+    record_key_from(key, out, reads.iter().copied(), payload)
+}
+
+pub(crate) fn record_key_from(key: Key, out: ContentId, reads: impl ExactSizeIterator<Item = (Name, ContentId)>, payload: &[u8]) -> Key {
     let mut h = blaze_ids::Hasher::new(RECORD_FORM);
     h.update(&key.0.0).update(&out.0).update(&(reads.len() as u64).to_le_bytes());
-    for (read, digest) in reads.iter() {
+    for (read, digest) in reads {
         h.update(&[read.kind as u8]).update(&read.subject.0).update(&digest.0);
     }
     h.update(&(payload.len() as u64).to_le_bytes()).update(payload);

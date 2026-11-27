@@ -54,6 +54,7 @@ use blaze_cas::plain::Lent;
 use blaze_core::Driver;
 use blaze_drive::Key;
 use blaze_ids::ContentId;
+use blaze_keyed::kind::ReservedTag;
 use blaze_keyed::store::{Put, StoreError};
 use blaze_remote::PublicKey;
 use blaze_remote::published::set::{SetCheck, SetName, SetNameError};
@@ -71,6 +72,7 @@ use bstd::par::{self, Grain};
 
 use super::plain_place::{PlaceError, PlainPlace, StoreAlloc};
 use super::published::{self, PublishedError, Seen, TakenHead};
+use super::scope_directory;
 use super::roots::{self, RootError, RootName};
 use super::{FolderOrigin, HttpOrigin, NamedOrigin, Opened, OriginAt};
 use crate::CliError;
@@ -125,6 +127,7 @@ pub(crate) struct Taken {
     /// Reads of the origin: of its head, and of anything.
     pub head_reads: u32,
     pub reads: u32,
+    pub scope_index: Option<Key>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -224,6 +227,7 @@ pub enum TakeError {
     TooLarge { what: &'static str, len: u64, most: u64 },
     /// Other bytes under a key this home holds (rule 21).
     TwoValues { key: ContentId },
+    Scope { key: Key, why: &'static str },
     Place(PlaceError),
     Published(PublishedError),
     Root(RootError),
@@ -247,6 +251,7 @@ impl fmt::Display for TakeError {
             TakeError::Segment { object, why: SegmentWhy::Entry { what, at } } => write!(f, "{object}: the index entry at byte {at}: {what}")?,
             TakeError::TooLarge { what, len, most } => write!(f, "{what} is {len}, past the {most} a take holds")?,
             TakeError::TwoValues { key } => write!(f, "the set's record {key} has other bytes than the one this home holds (rule 21)")?,
+            TakeError::Scope { key, why } => write!(f, "the selected toolchain scope index at {}: {why}", key.0)?,
             TakeError::Place(error) => write!(f, "{error}")?,
             TakeError::Published(error) => write!(f, "{error}")?,
             TakeError::Root(error) => write!(f, "{error}")?,
@@ -302,6 +307,7 @@ pub(crate) fn before_first_phase(
     if let Some(set) = &mut named.check.set {
         set.seen = set.seen.max(taken.generation);
     }
+    named.scope_index = taken.scope_index;
     if taken.how == How::Took {
         err.line(cx, format_args!("blaze: {taken}"))?;
     }
@@ -354,7 +360,7 @@ fn take_from_inner<D: Driver, O: Origin + ?Sized>(
     let wall = clock.wall().as_ns();
     let seen = published::seen(lent, &set).map_err(TakeError::Published)?;
     let rooted = lent.root_named(RootName::toolchain(toolchain).as_str()).is_some();
-    let mut taken = Taken { set, generation: seen.generation, how: How::Current, records: 0, bytes: 0, already: 0, take_ns: 0, verify_ns: 0, head_reads: 0, reads: 0 };
+    let mut taken = Taken { set, generation: seen.generation, how: How::Current, records: 0, bytes: 0, already: 0, take_ns: 0, verify_ns: 0, head_reads: 0, reads: 0, scope_index: None };
     // The window: a wall clock stepped back past the last ask asks again.
     if rooted
         && let Some(receipt) = seen.taken
@@ -363,6 +369,7 @@ fn take_from_inner<D: Driver, O: Origin + ?Sized>(
         && asked_ago_ns < FRESH_NS
     {
         taken.how = How::Fresh { asked_ago_ns };
+        taken.scope_index = receipt.scope_index;
         return Ok(taken);
     }
     let mut origin = Counted { origin, heads: 0, reads: 0 };
@@ -403,6 +410,7 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
         digest: ContentId::of("blaze-cli adopted published head 1", checked),
         signer: head.signer,
         asked_wall_ns: wall,
+        scope_index: None,
     };
     let (head, checked) = if rooted && let Some(prior) = seen.taken {
         let mut head_bytes = [0u8; HEAD_LEN + 1];
@@ -410,12 +418,13 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
         let head = Head::decode(&head_bytes[..n], Namespace::PUBLIC, &check).map_err(refused)?;
         let mut checked = [0u8; HEAD_LEN];
         checked.copy_from_slice(&head_bytes[..HEAD_LEN]);
-        let current = receipt(&head, &checked);
+        let current = TakenHead { scope_index: prior.scope_index, ..receipt(&head, &checked) };
         if current.digest == prior.digest {
             // Current: the window starts again; nothing else is read.
             published::keep_floor(&mut place, &set, Seen { generation: head.generation, taken: Some(current) }).map_err(TakeError::Published)?;
             place.commit().map_err(TakeError::Place)?;
             taken.how = How::Current;
+            taken.scope_index = current.scope_index;
             return Ok(());
         }
         read_to_end(origin, Object::Prefix, PREFIX_MOST, &mut bytes, clock)?;
@@ -447,6 +456,7 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
     //    deterministic row order with commits coalesced to at most one per intermediate wave.
     let records_cap = usize::try_from(records_named).unwrap_or(0);
     let mut kept: blaze_own::Vec<CasKey, StoreAlloc> = blaze_own::Vec::with_capacity_in(records_cap, alloc);
+    let mut scope_rows: blaze_own::Vec<(Key, Key), StoreAlloc> = blaze_own::Vec::new_in(alloc);
     let kept_alloc = blaze_mem::Kept(blaze_mem::Tag::Store);
     let mut lan_wire_bufs: blaze_own::Vec<blaze_own::Vec<u8, blaze_mem::Kept>, StoreAlloc> = blaze_own::Vec::with_capacity_in(SEGMENT_IN_FLIGHT, alloc);
     let mut wire_bufs: blaze_own::Vec<blaze_own::Vec<u8, blaze_mem::Kept>, StoreAlloc> = blaze_own::Vec::with_capacity_in(SEGMENT_IN_FLIGHT, alloc);
@@ -710,6 +720,14 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
                 if plant.stop_after == Some(taken.records + taken.already) {
                     return Err(TakeError::Stopped);
                 }
+                if ReservedTag::ScopeCandidate.is(tag) {
+                    if scope_rows.len() == scope_directory::ENTRIES_MOST {
+                        return Err(TakeError::TooLarge { what: "the set's scope index", len: scope_rows.len() as u64 + 1, most: scope_directory::ENTRIES_MOST as u64 });
+                    }
+                    let candidate = Key(key);
+                    let task = scope_directory::check_entry(payload, candidate, set, toolchain)?;
+                    scope_rows.push((task, candidate));
+                }
                 match place.put_record(Key(key), false, tag, payload).map_err(TakeError::Place)? {
                     Put::Same => taken.already += 1,
                     Put::Written => {
@@ -742,11 +760,20 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
     // 3. The root last, then the floor, then the single atomic commit that makes everything durable.
     kept.sort_unstable();
     kept.dedup();
+    let scope_index = scope_directory::keep(&mut place, &mut scope_rows, &kept)?;
+    if let Some(index) = scope_index {
+        let index = CasKey(index.0);
+        if let Err(at) = kept.binary_search(&index) {
+            kept.insert(at, index);
+        }
+    }
     roots::keep_toolchain(lent, toolchain, &kept, &[]).map_err(TakeError::Root)?;
-    published::keep_floor(&mut place, &set, Seen { generation: head.generation, taken: Some(receipt(&head, &checked)) }).map_err(TakeError::Published)?;
+    let receipt = TakenHead { scope_index, ..receipt(&head, &checked) };
+    published::keep_floor(&mut place, &set, Seen { generation: head.generation, taken: Some(receipt) }).map_err(TakeError::Published)?;
     place.commit().map_err(TakeError::Place)?;
     taken.generation = head.generation;
     taken.how = How::Took;
+    taken.scope_index = scope_index;
     Ok(())
 }
 

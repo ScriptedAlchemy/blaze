@@ -2166,13 +2166,13 @@ fn save<'m, D: Driver, S: Sharing>(
         lent.index(&direct).map_err(crate::store::PlaceError::from)?
     };
     lent.root_through(answer_name.as_str(), &[answer_index], blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
-    // This root accumulates indexes across commands. Unchanged pages' toolchain
-    // payloads were admitted with the page and this renewal extends their lifetime.
-    store.keep_toolchain(toolchain, &toolchain_records)?;
     // Refresh the toolchain-only fallback base (`tool-base.<PINNED>.<TRIPLE>.<tools>`) whenever
     // this build holds non-failed closed toolchain rows, so any fresh project or git worktree
     // automatically reuses pre-warmed `core`/`alloc`/`std`/`bstd`.
     keep_toolchain_base(cx, store, lent, toolchain, tools, kept, workers, alloc, frame)?;
+    // Keep this answer's toolchain payloads and the candidates filed with them in one root.
+    // The root accumulates indexes across commands, including the unchanged pages' records.
+    store.keep_toolchain(toolchain, &toolchain_records)?;
     store.pin(name, &[key])?;
     // Reset `<name>.journal` to `[key]` (reusing the exact same 32-byte root record as `name`)
     // so subsequent runs do not probe older segments for a stale checkpoint of an earlier answer.
@@ -2842,6 +2842,21 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     fresh_names.dedup();
     if fresh_names.is_empty() {
         return Ok(());
+    }
+    if crate::store::TRUSTED_BUILDER {
+        let (owed_tasks, owed_cells) = match kept.answer.work() {
+            Some(work) => (&work.owed_tasks, &work.owed_cells),
+            None => (&kept.answer.owed_tasks, &kept.answer.owed_cells),
+        };
+        for &name in fresh_names.iter() {
+            if !owed_tasks.contains_key(&name)
+                && let Some(row) = row_of(&name)
+                && let Some(&payload) = kept.records.get(&name)
+                && row.reads.iter().all(|(id, _)| !owed_cells.contains_key(id))
+            {
+                crate::store::scope_cache::keep(cx, store, lent, toolchain, name, row, payload, blaze_own::Alloc::from(frame))?;
+            }
+        }
     }
     let tc_root = toolchain_base_root(toolchain, tools, frame);
     let existing_ptr = match load_pointer(cx, store, tc_root.as_str())? {

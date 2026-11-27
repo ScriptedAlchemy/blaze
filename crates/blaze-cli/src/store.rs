@@ -66,6 +66,8 @@ pub(crate) mod published;
 
 /// A fresh home takes a published set whole, once, before the command's first phase (D138).
 pub(crate) mod take;
+pub(crate) mod scope_cache;
+mod scope_directory;
 
 /// `blaze store publish <folder> --signer <key file>`: a trusted builder's (D136).
 pub(crate) mod publish_command;
@@ -168,9 +170,17 @@ pub trait Store<'m> {
     /// toolchain's crates' records, by the answer's save ([`CommandStore::keep_toolchain`]),
     /// renewed with that root. A store with no roots keeps nothing.
     fn keep_with_toolchain(&mut self, key: Key) -> Result<(), CliError>;
+    fn has_published_scopes(&self) -> bool { false }
+    fn published_scope(&mut self, _cx: &Cx, _task: blaze_engine::Task) -> Result<Option<PublishedScope<'m>>, CliError> { Ok(None) }
     /// What this store's puts cost the process so far (rules 50, 51): the copies of records it
     /// made into the heap and the bytes of them it holds now, counted where it copies.
     fn kept(&self) -> StoreKept;
+}
+
+/// A scope payload reached from the verified directory and matched to the current task.
+pub(crate) struct PublishedScope<'m> {
+    pub(crate) entry: scope_cache::Entry<'m>,
+    pub(crate) wire: blaze_drive::record::WholeView<'m>,
 }
 
 /// A verified, immutable view of the store's committed generation. The mappings are owned by the
@@ -777,6 +787,7 @@ pub struct CommandStore<'m, 'r, D: Driver, S: Sharing = ToolchainCrates> {
     /// in the store's allocator: named by the toolchain's root at the answer's save.
     toolchain_records: std::vec::Vec<Key, StoreAlloc>,
     remote: Option<Remote<'r>>,
+    published_scopes: Option<scope_directory::Directory<'m>>,
     mapped_all: bool,
     /// The open's time, for the profile and `--stats`.
     open_ns: u64,
@@ -789,6 +800,7 @@ impl<'m, 'r, D: Driver> CommandStore<'m, 'r, D, ToolchainCrates> {
     /// commits, or a trusted writer's namespaces waiting for their slices).
     #[expect(clippy::too_many_arguments, reason = "the store's edge: each argument one handle or fact of it")]
     pub fn new(cx: &Cx, lent: &'m Lent<D, StoreAlloc>, public_writer: bool, open_ns: u64, origin: Option<&'r NamedOrigin>, clock: Clock, err: &'r Out, alloc: Alloc<'r>) -> Result<CommandStore<'m, 'r, D>, CliError> {
+        let published_scopes = origin.and_then(|named| named.scope_index).map(|key| scope_directory::Directory::load(lent, key)).transpose()?;
         let remote = origin.map(|named| Remote {
             named,
             // The prefix on (published.md): a batch's head, manifest and summaries in one read,
@@ -810,7 +822,7 @@ impl<'m, 'r, D: Driver> CommandStore<'m, 'r, D, ToolchainCrates> {
             err.line(cx, format_args!("blaze: the store under the home's .blaze/{} names {named} segments, past {most}: its compaction is behind", plain_place::STORE_DIR))?;
         }
         // A trusted builder's blaze writes the public class `PUBLIC` whoever calls ([`TRUSTED_BUILDER`]).
-        Ok(CommandStore { place: PlainPlace::new(lent, public_writer || TRUSTED_BUILDER), sharing: ToolchainCrates::new(), toolchain: std::vec::Vec::new_in(Global), toolchain_records: std::vec::Vec::new_in(*lent.alloc()), remote, mapped_all: false, open_ns })
+        Ok(CommandStore { place: PlainPlace::new(lent, public_writer || TRUSTED_BUILDER), sharing: ToolchainCrates::new(), toolchain: std::vec::Vec::new_in(Global), toolchain_records: std::vec::Vec::new_in(*lent.alloc()), remote, published_scopes, mapped_all: false, open_ns })
     }
 }
 
@@ -1183,6 +1195,29 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         Ok(())
     }
 
+    fn has_published_scopes(&self) -> bool {
+        self.published_scopes.is_some()
+    }
+
+    fn published_scope(&mut self, _cx: &Cx, task: blaze_engine::Task) -> Result<Option<PublishedScope<'m>>, CliError> {
+        if task.planned.name.kind != Kind::CrateScope || !self.is_toolchain(task.planned.name) {
+            return Ok(None);
+        }
+        let Some(key) = self.published_scopes.and_then(|directory| directory.find(task.key)) else {
+            return Ok(None);
+        };
+        let lent = self.place.lent();
+        let entry = scope_directory::read_entry(lent, key)?;
+        let wire = scope_directory::wire(lent, &entry)?;
+        if entry.task != task.key || entry.name != task.planned.name || wire.source != task.planned.source {
+            return Err(scope_directory::refused(key, "the stored scope does not match its planned task").into());
+        }
+        if entry.reads().any(|(read, _)| !self.is_toolchain(read.of)) {
+            return Err(scope_directory::refused(key, "the stored scope witnesses name a producer outside the toolchain").into());
+        }
+        Ok(Some(PublishedScope { entry, wire }))
+    }
+
     fn kept(&self) -> StoreKept {
         let lent = self.place.counts().lent;
         // A commit frees each arena chunk no get lent from (blaze-cas plain/lent.rs).
@@ -1325,6 +1360,7 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
 pub struct NamedOrigin {
     at: OriginAt,
     check: OneKey,
+    scope_index: Option<Key>,
 }
 
 /// Where a named origin's objects are: a folder, or an `http://` / `https://` base address.
@@ -1420,7 +1456,7 @@ impl NamedOrigin {
         let seen = published::floor(lent, &id)?;
         // With no key named, the one slot is never consulted (`OneKey::named_keys`).
         let keys = [named.unwrap_or(PublicKey([0; 32]))];
-        Ok(NamedOrigin { at, check: OneKey { keys, set: Some(PublishedSet { id, seen, named: named.is_some() }) } })
+        Ok(NamedOrigin { at, check: OneKey { keys, set: Some(PublishedSet { id, seen, named: named.is_some() }) }, scope_index: None })
     }
 }
 

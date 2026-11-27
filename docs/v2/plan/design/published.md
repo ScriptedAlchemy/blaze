@@ -94,6 +94,29 @@ the same number of origin reads for a fresh home and for a home with a matching 
 adoption simulation checks the receipt and records across interrupted writes, including a rollback
 floor advanced by a range read and a change in signer trust.
 
+### Discovering toolchain scopes
+
+The public set carries an immutable entry per eligible toolchain `CrateScope`. Its task key covers
+the planned source and complete producer identity. Its content covers the toolchain identity,
+target, scope payload key and sorted `(cell, digest)` witnesses. The writer has these values where
+it saves the toolchain answer. It checks that the scope and every expansion it names are held in
+the public namespace and that each witness refers to a closed toolchain dependency. A scope with
+findings or checkout reads stays local. The public entry carries no checkout page, serial, cause
+or file position.
+
+The signed take builds a sorted directory from the verified entries and attaches its key to the
+completed receipt. It refuses conflicting entries for one task key and missing public payloads.
+An old origin without entries has an empty directory. A fresh compiler looks up today's task once
+by key after its producers settle, verifies the witnesses against its current cells and installs
+the result using the ordinary row and reverse-reader updates. The scope's payload and expansion
+reach follow the existing stored scope path. A stale witness leaves the task eligible to run.
+
+The lookup costs one binary search per unresolved toolchain scope and one pass over the matching
+row's witnesses. The HTTPS proof uses two empty homes and the same compiler, with an entry withheld
+from one correctly signed set. Both sets carry the scope payload. The profiled scope executes in
+the control, stands in the treatment and yields the same answer. A different producer and a
+changed witness exercise the miss path. The take simulation covers directory and receipt commits.
+
 ## 4. The reader's waves
 
 A fresh home checking a small project, its keys computed from text before anything is fetched (rule

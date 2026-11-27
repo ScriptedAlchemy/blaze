@@ -90,6 +90,8 @@ pub(crate) struct NamesStage<'f> {
     failed_out: ContentId,
     /// Each crate entered so far, by name: its key and out, `None` when it failed.
     made: Vec<(Name, Option<(Key, ContentId)>), &'f Frame>,
+    /// Toolchain scopes installed from the signed set before worker admission.
+    published: Vec<PublishedReuse, &'f Frame>,
     /// Each crate's result, in the order entered.
     pub(crate) results: Vec<Published<'f>, &'f Frame>,
     /// What the phases' frames held, for the profile's memory lines (engine_memory.rs).
@@ -321,7 +323,7 @@ impl<'f> NamesStage<'f> {
         let list = names.list();
         let mut crate_names = Vec::with_capacity_in(blaze_world::crate_list::CrateGraph::len(list), frame);
         crate_names.extend((0..blaze_world::crate_list::CrateGraph::len(list)).map(|r| blaze_drive::key::crate_scope_name(&list.key(r))));
-        NamesStage { names: Some(names), crate_names, plan: core::cell::OnceCell::new(), admissions: Admissions(BTreeMap::new_in(frame)), heads: Vec::new_in(frame), failed_out: work::failed_out(), made: Vec::new_in(frame), results: Vec::new_in(frame), memory: crate::engine_memory::NamesMemory::new(), oracle: Vec::new_in(frame), oracle_missed: Vec::new_in(frame), found: Vec::new_in(frame) }
+        NamesStage { names: Some(names), crate_names, plan: core::cell::OnceCell::new(), admissions: Admissions(BTreeMap::new_in(frame)), heads: Vec::new_in(frame), failed_out: work::failed_out(), made: Vec::new_in(frame), published: Vec::new_in(frame), results: Vec::new_in(frame), memory: crate::engine_memory::NamesMemory::new(), oracle: Vec::new_in(frame), oracle_missed: Vec::new_in(frame), found: Vec::new_in(frame) }
     }
 
     /// What each crate whose names answered this command said of the files found (D161,
@@ -417,6 +419,24 @@ impl<'f> NamesStage<'f> {
     pub(crate) fn feeds_names(&self, name: Name) -> bool {
         self.names.as_ref().and_then(|names| names.crate_at(name.subject))
             .and_then(|at| self.plan.get()?.get(at)).is_some_and(|entry| entry.has_readers)
+    }
+
+    pub(crate) fn reuse_published(&mut self, hit: PublishedReuse) {
+        let name = hit.task.planned.name;
+        self.mark(name, Some((hit.record, hit.out)));
+        let at = self.published.partition_point(|one| one.task.planned.name < name);
+        self.published.insert(at, hit);
+    }
+
+    pub(crate) fn published_profile(&self, text: &mut impl core::fmt::Write) {
+        let Some(names) = self.names.as_ref() else { return };
+        for hit in self.published.iter() {
+            let name = hit.task.planned.name;
+            let Some(at) = names.crate_at(name.subject) else { continue };
+            let (label, macro_side) = names.crate_label(at);
+            let side = if macro_side { "macro" } else { "target" };
+            let _ = writeln!(text, "signed CrateScope reused {label} {side} subject={:x} task={:x} record={:x}", name.subject, hit.task.key.0, hit.record.0);
+        }
     }
 
     /// A standing dependency can still change when one of its own producers publishes.
@@ -1051,6 +1071,39 @@ fn exports_digest(bytes: &[u8]) -> ContentId {
     ContentId::of(EXPORTS_DOMAIN, bytes)
 }
 
+fn closed_cells<'a>(out: ContentId, exports: ContentId, alloc: SharedAlloc<'a>) -> Result<SVec<'a, (Cell, ContentId)>, EngineCheckError> {
+    const WHAT: &str = "the cells a closed `CrateScope` task defines (engine_names.rs `closed_cells`)";
+    let mut defines = SVec::try_with_capacity_in(2, alloc).map_err(|_| EngineCheckError::Grow { what: WHAT, had: 0 })?;
+    EngineCheckError::push(&mut defines, (WHOLE, out), WHAT)?;
+    EngineCheckError::push(&mut defines, (EXPORTS, exports), WHAT)?;
+    Ok(defines)
+}
+
+pub(crate) struct PublishedReuse {
+    pub(crate) task: EngineTask,
+    pub(crate) record: Key,
+    pub(crate) out: ContentId,
+}
+
+pub(crate) fn published_done<'a>(scope: &crate::store::PublishedScope<'_>, alloc: SharedAlloc<'a>) -> Result<Done<'a>, CliError> {
+    let name = scope.entry.name;
+    let parts = crate::names::sections::sections(scope.wire.payload)
+        .map_err(|_| EngineCheckError::CellTable { task: name, what: "is in a signed payload whose sections do not read" })?;
+    let witnessed = scope.entry.reads();
+    let mut reads = SVec::try_with_capacity_in(witnessed.len(), alloc)
+        .map_err(|_| EngineCheckError::Grow { what: "the signed scope's read witnesses", had: 0 })?;
+    reads.extend(witnessed);
+    Ok(Done {
+        name,
+        key: scope.entry.task,
+        out: scope.wire.out,
+        defines: closed_cells(scope.wire.out, exports_digest(parts.exports), alloc)?,
+        reads,
+        findings: 0,
+        failed: false,
+    })
+}
+
 /// What the crate `name`'s `CrateScope` task defines (engine.md E4): its record's [`WHOLE`]
 /// cell, its [`EXPORTS`] cell (what downstream `CrateScope` tasks read), and, for a crate whose
 /// names read a file of the checkout (a `Surface` read: the crates an edit can move), the
@@ -1067,10 +1120,7 @@ fn cells_of<'a>(name: Name, record: &work::Record<SharedAlloc<'_>>, exports: &[u
     let sized = |cells: usize| SVec::try_with_capacity_in(cells, alloc).map_err(|_| EngineCheckError::Grow { what: WHAT, had: 0 });
     let exports_id = exports_digest(exports);
     if !record.reads.iter().any(|(read, _)| read.kind == Kind::Surface) {
-        let mut defines: SVec<'a, (Cell, ContentId)> = sized(2)?;
-        EngineCheckError::push(&mut defines, (WHOLE, record.out), WHAT)?;
-        EngineCheckError::push(&mut defines, (EXPORTS, exports_id), WHAT)?;
-        return Ok(defines);
+        return closed_cells(record.out, exports_id, alloc);
     }
     let row = blaze_scope::names_cells::TABLE_ROW;
     if table.len() % row != 0 {

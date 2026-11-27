@@ -37,6 +37,7 @@ const TAKEN_MAGIC: [u8; 4] = *b"BLPT";
 const FLOOR_LEN: usize = 4 + 32 + 8 + 8;
 /// A complete receipt adds the signed head's digest and signer to the floor.
 const TAKEN_LEN: usize = FLOOR_LEN + 32 + 32;
+const INDEXED_LEN: usize = TAKEN_LEN + 32;
 
 /// What this home knows about a published set, under its signed set identity.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -51,6 +52,7 @@ pub(crate) struct TakenHead {
     pub digest: ContentId,
     pub signer: PublicKey,
     pub asked_wall_ns: u64,
+    pub scope_index: Option<blaze_drive::Key>,
 }
 
 /// Why the published set's walk, floor or write stopped: each names the root or the object.
@@ -182,7 +184,7 @@ pub(crate) fn seen<D: Driver>(lent: &Lent<D, StoreAlloc>, set: &ContentId) -> Re
     let Some(record) = lent.get(&key).map_err(store)? else { return Err(PublishedError::Gone { root, key }) };
     let bytes = record.bytes;
     let incomplete = bytes.len() == FLOOR_LEN && bytes[..4] == FLOOR_MAGIC;
-    let complete = bytes.len() == TAKEN_LEN && bytes[..4] == TAKEN_MAGIC;
+    let complete = matches!(bytes.len(), TAKEN_LEN | INDEXED_LEN) && bytes[..4] == TAKEN_MAGIC;
     if !ReservedTag::Floor.is(record.tag) || !(incomplete || complete) || bytes[4..36] != set.0 {
         return Err(PublishedError::Floor { root, len: bytes.len() });
     }
@@ -195,13 +197,14 @@ pub(crate) fn seen<D: Driver>(lent: &Lent<D, StoreAlloc>, set: &ContentId) -> Re
         digest: ContentId(bytes[52..84].try_into().expect("the head digest is 32 bytes")),
         signer: PublicKey(bytes[84..116].try_into().expect("the signer key is 32 bytes")),
         asked_wall_ns: word(44),
+        scope_index: (bytes.len() == INDEXED_LEN).then(|| blaze_drive::Key(key_of(&bytes[TAKEN_LEN..]).0)),
     });
     Ok(Seen { generation: word(36), taken })
 }
 
 /// Keeps the rollback floor and its optional adoption receipt under the local `pubf.<set>` root.
 pub(crate) fn keep_floor<D: Driver>(place: &mut PlainPlace<'_, D>, set: &ContentId, seen: Seen) -> Result<(), PublishedError> {
-    let mut bytes = [0u8; TAKEN_LEN];
+    let mut bytes = [0u8; INDEXED_LEN];
     bytes[4..36].copy_from_slice(&set.0);
     bytes[36..44].copy_from_slice(&seen.generation.to_le_bytes());
     let bytes = if let Some(taken) = seen.taken {
@@ -209,7 +212,12 @@ pub(crate) fn keep_floor<D: Driver>(place: &mut PlainPlace<'_, D>, set: &Content
         bytes[44..52].copy_from_slice(&taken.asked_wall_ns.to_le_bytes());
         bytes[52..84].copy_from_slice(&taken.digest.0);
         bytes[84..116].copy_from_slice(&taken.signer.0);
-        bytes.as_slice()
+        if let Some(index) = taken.scope_index {
+            bytes[TAKEN_LEN..].copy_from_slice(&index.0.0);
+            bytes.as_slice()
+        } else {
+            &bytes[..TAKEN_LEN]
+        }
     } else {
         bytes[..4].copy_from_slice(&FLOOR_MAGIC);
         &bytes[..FLOOR_LEN]

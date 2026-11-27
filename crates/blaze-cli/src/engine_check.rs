@@ -4263,6 +4263,9 @@ fn checking<'f, 's: 'f>(
         let NotAudited = audited;
         let because = entered_because(&causes, alloc);
         let mut text = profile_text(&ran, &report, &because, &causes, &outlined, phases, frame);
+        if let Some(stage) = names.as_ref() {
+            stage.published_profile(&mut text);
+        }
         bodies.profile(&outlined, workers, &mut text);
         let _ = pool.balance_line(&mut text);
         lints.profile(&mut text);
@@ -5202,7 +5205,10 @@ where
     rq.pipelined |= rq.names.is_some() && (engine.has_pending_stage(Stage::Scripts) || engine.has_pending_stage(Stage::Names));
     let mut mixed = None;
     if prior.is_none() && rq.pipelined && let Some(stage) = rq.names.as_mut() {
-        pipeline.admit(cx, &mut *engine, &mut *rq.scripts, &mut *stage, &mut *store, &mut *read, rq.handles, alloc, rq.frame)?;
+        let mut remember_published = |name, key| { records.changes.insert(name, Some(key)); };
+        let published = (!rq.fresh && crate::store::Store::has_published_scopes(&*store))
+            .then_some(&mut remember_published as &mut dyn FnMut(Name, blaze_drive::Key));
+        pipeline.admit(cx, &mut *engine, &mut *rq.scripts, &mut *stage, &mut *store, &mut *read, rq.handles, alloc, rq.frame, published)?;
         mixed = pipeline.first(stage);
         if mixed.is_none() && (engine.has_pending_stage(Stage::Scripts) || engine.has_pending_stage(Stage::Names)) {
             return Err(CliError::Text { what: "Scripts and Names have pending readers with no runnable producer (engine_check.rs)" });
@@ -7531,6 +7537,9 @@ fn profile_text<'f>(ran: &[(Phase, u32, u32)], report: &blaze_engine::Report, be
         if count.entered > 0 {
             let _ = writeln!(text, "  {stage:?}: {:>7} {:>7}", count.entered, count.identical);
         }
+    }
+    if report.reused > 0 {
+        let _ = writeln!(text, "engine reused before entry: {}", report.reused);
     }
     let settle = report.settle;
     let _ = writeln!(text, "finish: owed cells {}, settled {}, saw calls {}, reads compared {}, {} ms", settle.owed, settle.settled, settle.saw_calls, settle.compared, settle.finish_ns / 1_000_000);
