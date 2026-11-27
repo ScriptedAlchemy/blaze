@@ -43,9 +43,12 @@
 //! a pointer; a provided buffer's id is checked against its group (`Provided::buffer`); and a
 //! ring offset against its mapping (`Mapping::at`), in every build.
 
+mod deferred;
 mod files;
 mod flight;
 mod ops;
+
+pub use deferred::DeferredUring;
 
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
@@ -65,7 +68,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering, fence},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use blaze_hash::{FixedState, Map, MapOpts};
@@ -1764,7 +1767,7 @@ fn wake_ring(wake: &Wake) {
 }
 
 pub struct Uring {
-    start: Instant,
+    clock: DriverClock,
     /// The machine's boot, read once as the driver is made ([`crate::Driver::boot`]).
     boot: Result<crate::Boot, crate::NoBoot>,
     /// Shared with the work done off the ring, so handing it out is a count, not a copy.
@@ -1826,7 +1829,7 @@ pub struct Uring {
     /// Each spawn in flight by its tag, for a kill.
     spawning: Map<Tag, Handle<Spawning>, FixedState, Global>,
     conns: Slab<Connection>,
-    /// By ticks since `start`; a wait of the ring ends at the next one due.
+    /// By ticks on `clock`; a wait of the ring ends at the next one due.
     timers: Wheel<Tag>,
     // dyn: the embedder's sandbox, called once per spawn, which makes a process anyway.
     confine: Option<Arc<dyn Confine>>,
@@ -1910,9 +1913,40 @@ impl crate::host::Sink for HostSink {
 /// [`crate::fs::temporary_next_to`]'s, which count from 0.
 static TEMPORARY: AtomicU64 = AtomicU64::new(1 << 63);
 
+// The driver's legacy effect boundary is shared by its deferred entry point.
+type EffectQueue = Vec<Effect>;
+type CompletionQueue = Vec<Completion>;
+
+/// The Linux driver's clock. The eager driver starts it at open, and the deferred driver
+/// starts it at world creation and lends that same origin to the ring when it opens.
+#[derive(Clone, Copy)]
+struct DriverClock(Monotonic);
+
+impl DriverClock {
+    fn new() -> Self {
+        Self(Monotonic::new())
+    }
+
+    /// Both entry points read wall time from the OS independently of the monotonic origin.
+    fn wall_ns() -> u64 {
+        crate::system_wall_ns()
+    }
+}
+
+impl Clock for DriverClock {
+    fn now(&self) -> Duration {
+        self.0.now()
+    }
+}
+
 impl Uring {
     /// A driver whose files are under `root`, or why this kernel has no ring for it.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Uring> {
+        Self::open_ring(&root.into(), DriverClock::new(), crate::boot::system())
+    }
+
+    fn open_ring(root: &Path, clock: DriverClock, boot: Result<crate::Boot, crate::NoBoot>) -> io::Result<Uring> {
+        let alloc = Global;
         let ring = Ring::new(ENTRIES, COMPLETIONS)?;
         let offload = Offload::new()?;
         let table = Table::new(&ring.fd)?;
@@ -1920,19 +1954,19 @@ impl Uring {
         fn slab<T>(max: u32) -> io::Result<Slab<T>> {
             Slab::new(max, MemTag::Io).map_err(io::Error::other)
         }
-        let root: Arc<Path> = Arc::from(root.into());
         let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
+        let root: Arc<Path> = Arc::from(root);
         Ok(Uring {
-            start: Instant::now(),
-            boot: crate::boot::system(),
+            clock,
+            boot,
             root,
             ring,
             table,
             provided,
             kept: slab(KEPT)?,
-            names: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
-            positional: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
-            batches: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            names: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            positional: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            batches: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             // alloc: setup, once per driver: an empty table, which nothing reads through.
             descriptors: Arc::new(crate::descriptors::Descriptors::new()),
             ops: ManuallyDrop::new(ops::Ops::new(PENDING).map_err(io::Error::other)?),
@@ -1949,25 +1983,25 @@ impl Uring {
             slots_held: 0,
             zero_copy_sends: 0,
             ready: Vec::new(), // alloc: empty, nothing allocated; reused after.
-            watches: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            watches: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             watchings: ManuallyDrop::new(slab(WATCHES)?),
-            listens: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            listens: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             listeners: slab(LISTENS)?,
             connectings: ManuallyDrop::new(slab(CONNS)?),
             spawns: slab(SPAWNS)?,
-            spawning: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            spawning: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             conns: slab(CONNS)?,
             timers: Wheel::new(),
             confine: None,
             spawn_dirs,
             buffers: Vec::with_capacity(SPARES), // alloc: setup, once per driver.
             trees: Vec::with_capacity(SPARES),   // alloc: setup, once per driver.
-            starting: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(STARTS) }),
-            held: Vec::new_in(Global),
-            started: Vec::with_capacity_in(STARTS, Global),
-            grown: Vec::with_capacity_in(STARTS, Global),
+            starting: Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(STARTS) }),
+            held: Vec::new_in(alloc),
+            started: Vec::with_capacity_in(STARTS, alloc),
+            grown: Vec::with_capacity_in(STARTS, alloc),
             grows_out: 0,
-            ungrown: Vec::with_capacity_in(STARTS, Global),
+            ungrown: Vec::with_capacity_in(STARTS, alloc),
             walker: None,
             #[cfg(test)]
             walk_gate: None,
@@ -2007,7 +2041,7 @@ impl Uring {
     /// Every timer due, fired in the order they were due.
     fn fire_timers(&mut self) {
         let ready = &mut self.ready;
-        self.timers.advance(wheel::ticks(self.start.elapsed()), |_, tag| {
+        self.timers.advance(wheel::ticks(self.clock.now()), |_, tag| {
             ready.push(Completion { tag, done: Done::Fired });
         });
     }
@@ -2404,7 +2438,7 @@ impl Uring {
     /// held again. Then each grow the walker is done with is merged ([`Uring::merge`]).
     fn put_in_place(&mut self) {
         if !self.grown.is_empty() {
-            let mut grown = std::mem::take(&mut self.grown);
+            let mut grown = core::mem::take(&mut self.grown);
             for it in grown.drain(..) {
                 self.merge(it);
             }
@@ -2413,7 +2447,7 @@ impl Uring {
         if self.started.is_empty() {
             return;
         }
-        let mut started = std::mem::take(&mut self.started);
+        let mut started = core::mem::take(&mut self.started);
         for Started { tag, tree } in started.drain(..) {
             let Some(mut start) = self.starting.remove(&tag) else {
                 unreachable!("the start of {tag:?}, which no watch is starting")
@@ -2438,7 +2472,7 @@ impl Uring {
         if self.held.is_empty() {
             return;
         }
-        let mut held = std::mem::take(&mut self.held);
+        let mut held = core::mem::take(&mut self.held);
         // Counted in flight as they were held; `submit` counts each again.
         self.in_flight -= held.len();
         self.submit(&mut held);
@@ -2682,19 +2716,19 @@ fn connect_socket(table: &Rc<Table>, domain: core::ffi::c_int, options: &crate::
 impl Uring {
     /// [`Driver::now`]'s clock as a value read with no `&self` (`Kqueue::clock`'s doc).
     pub fn clock(&self) -> crate::wait::Monotonic {
-        crate::wait::Monotonic::since(self.start)
+        self.clock.0
     }
 }
 
 impl Driver for Uring {
-    fn submit(&mut self, effects: &mut Vec<Effect>) {
+    fn submit(&mut self, effects: &mut EffectQueue) {
         // The one now of every timer in this submit: each one's `after` counts from when it was
         // asked, which is this call, so timers asked together fire in the order of their
         // `after`s whatever the thread is kept from running between two of them. With a clock
         // read per timer, a preemption longer than the gap between two `after`s orders them by
         // when each was read instead (`more_than_the_ring_holds` fired 2, 0, 1 under a load of
         // about 55 on 2026-11-14).
-        let now = wheel::ticks(self.start.elapsed());
+        let now = wheel::ticks(self.clock.now());
         for effect in effects.drain(..) {
             if self.holds(&effect) {
                 self.in_flight += 1;
@@ -2985,7 +3019,7 @@ impl Driver for Uring {
         self.submit_ring();
     }
 
-    fn poll(&mut self, out: &mut Vec<Completion>, until: Deadline) -> usize {
+    fn poll(&mut self, out: &mut CompletionQueue, until: Deadline) -> usize {
         let before = out.len();
         self.reap();
         self.fire_timers();
@@ -2995,7 +3029,7 @@ impl Driver for Uring {
         // has been handed out; with neither, nothing can come and the poll only looks (the
         // rule on `Driver::waker`).
         if out.len() == before && (self.in_flight > 0 || self.waker_given.get()) {
-            let clock = Monotonic::since(self.start);
+            let clock = self.clock();
             while out.len() == before {
                 // The caller's deadline or the next timer's, whichever is sooner.
                 let wait = self
@@ -3060,11 +3094,11 @@ impl Driver for Uring {
     }
 
     fn now(&self) -> Duration {
-        self.start.elapsed()
+        self.clock.now()
     }
 
     fn wall_ns(&self) -> u64 {
-        crate::system_wall_ns()
+        DriverClock::wall_ns()
     }
 
     fn boot(&self) -> Result<crate::Boot, crate::NoBoot> {
@@ -3076,11 +3110,15 @@ impl Driver for Uring {
         // clone: a handle to the ring's wake, once per waker asked for
         Some(crate::Waker::new(Arc::clone(&self.offload.wake) as Arc<dyn crate::Wake>))
     }
+
+    fn confined_files(&self) -> Option<crate::fs::ConfinedFiles> {
+        Some(crate::fs::ConfinedFiles::new(&self.root))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, time::Instant};
     use blaze_sys::{Errno, linux::OpenFlags, posix::signal};
 
     use super::*;
@@ -5683,7 +5721,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while received < sent && Instant::now() < deadline {
             ring.submit_ring();
-            let clock = Monotonic::since(ring.start);
+            let clock = ring.clock();
             let until = Deadline::after(clock.now(), Duration::from_millis(50));
             ring.ring.enter(Some(until), &clock).unwrap();
             let shown = ring.provided.shown();

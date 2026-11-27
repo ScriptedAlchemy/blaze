@@ -24,6 +24,7 @@ use core::time::Duration;
 
 use blaze_core::{
     Done, Driver, Effect, FileName, Tag,
+    fs::{ConfinedEntries, ConfinedFiles},
     lock::LockGuard,
     threads::inline::{Inline, Lent, LentRead, Now, inline_op},
     wait::Monotonic,
@@ -40,6 +41,8 @@ pub(crate) enum ReadAllLent {
     Moved { stated: u64, read: u64 },
     /// The file did not exist on a confined read (`blaze_core::threads::inline::LentRead::NotFound`).
     NotFound,
+    /// A confined read found a directory.
+    IsADirectory,
     Failed(blaze_core::IoError),
 }
 
@@ -95,6 +98,8 @@ pub(super) struct Beside {
     pub(super) time: Time,
     /// The native driver's inline file calls; `None` where every effect keeps its queue.
     files: Option<Inline>,
+    /// The native driver's strictly descriptor-relative file operations.
+    confined: Option<ConfinedFiles>,
     /// Whether this world has a simulated disk ledger (`false` on native worlds so
     /// `waited_for_device` / `names_synced` take no lock).
     pub(super) has_disk: bool,
@@ -129,15 +134,16 @@ pub(crate) struct Seen {
 impl Beside {
     /// What `driver` lets a world read and do without its lock.
     pub(super) fn of(driver: &Backend, trace_most: usize) -> Beside {
-        let (time, files, has_disk) = match driver {
+        let (time, files, confined, has_disk) = match driver {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
-            Backend::Native(native) => (Time::Native(native.clock()), native.inline_files(), false),
-            Backend::Sim(_) => (Time::Locked, None, true),
-            Backend::Guest(_) => (Time::Locked, None, false),
+            Backend::Native(native) => (Time::Native(native.clock()), native.inline_files(), native.confined_files(), false),
+            Backend::Sim(_) => (Time::Locked, None, None, true),
+            Backend::Guest(_) => (Time::Locked, None, None, false),
         };
         Beside {
             time,
             files,
+            confined,
             has_disk,
             // alloc: once per world, the lock-free trace gate.
             trace: Arc::new(TraceGate::new(trace_most)),
@@ -380,14 +386,16 @@ impl Io {
     /// `memset(0)`, zero intermediate `Vec`, zero copy, zero global `world` lock when not
     /// recording). On every outcome but `Read`, `into` is untouched.
     pub(crate) fn read_all_lent(&self, cx: &Cx, file: &FileName, into: &mut crate::mem::Bytes<'_>) -> Option<Result<ReadAllLent, Stopped>> {
-        self.read_all_inline(cx, file, into, false)
+        let files = self.inline_files()?;
+        self.read_all_inline(cx, file, into, |into| files.read_all_into_vec(file, into.as_vec_mut()))
     }
 
     /// Kernel-confined, zero-memset whole-file read: opens `file` strictly beneath this world's
     /// root `dirfd` via `openat`/`O_NOFOLLOW` (Linux: `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`),
     /// rejecting any symlink at any component with `ELOOP`.
     pub(crate) fn read_all_confined(&self, cx: &Cx, file: &FileName, into: &mut crate::mem::Bytes<'_>) -> Option<Result<ReadAllLent, Stopped>> {
-        self.read_all_inline(cx, file, into, true)
+        let files = self.kept_beside()?.confined.as_ref()?;
+        self.read_all_inline(cx, file, into, |into| files.read_into_vec(file, None, into.as_vec_mut()))
     }
 
     /// Kernel-confined, zero-memset positional range read strictly beneath this world's root `dirfd`.
@@ -399,7 +407,7 @@ impl Io {
         len: usize,
         into: &mut crate::mem::Bytes<'_>,
     ) -> Option<Result<ReadAllLent, Stopped>> {
-        let files = self.inline_files()?;
+        let files = self.kept_beside()?.confined.as_ref()?;
         let began = self.now();
         if let Err(stopped) = cx.stopped_by(began) {
             return Some(Err(stopped));
@@ -413,7 +421,7 @@ impl Io {
             blaze_meter::Call::Read
         };
         let arena = into.arena();
-        let read = files.read_confined_into_vec(file, Some((at, len)), into.as_vec_mut());
+        let read = files.read_into_vec(file, Some((at, len)), into.as_vec_mut());
         #[cfg(test)]
         self.counted(|seen| &seen.inline);
         let ns = u64::try_from(self.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
@@ -426,6 +434,7 @@ impl Io {
             }
             LentRead::Moved { stated, read } => ReadAllLent::Moved { stated, read },
             LentRead::NotFound => ReadAllLent::NotFound,
+            LentRead::IsADirectory => ReadAllLent::IsADirectory,
             LentRead::Failed(error) => ReadAllLent::Failed(error),
         }))
     }
@@ -436,8 +445,8 @@ impl Io {
         cx: &Cx,
         rel: &FileName,
         name: &blaze_core::DirName,
-    ) -> Option<Result<Result<Option<blaze_core::Listing>, blaze_core::IoError>, Stopped>> {
-        let files = self.inline_files()?;
+    ) -> Option<Result<ConfinedEntries, Stopped>> {
+        let files = self.kept_beside()?.confined.as_ref()?;
         let began = self.now();
         if let Err(stopped) = cx.stopped_by(began) {
             return Some(Err(stopped));
@@ -450,35 +459,29 @@ impl Io {
             blaze_meter::call(blaze_meter::Call::Read);
             blaze_meter::Call::Read
         };
-        let listed = files.entries_confined(rel, name);
+        let listed = files.entries(rel, name);
         #[cfg(test)]
         self.counted(|seen| &seen.inline);
         let ns = u64::try_from(self.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
         cx.on_worker(|w| w.meter().call_took(kind, ns));
-        match listed {
-            blaze_core::threads::inline::ConfinedEntries::Listed(listing) => Some(Ok(Ok(Some(listing)))),
-            blaze_core::threads::inline::ConfinedEntries::NotFound => Some(Ok(Ok(None))),
-            blaze_core::threads::inline::ConfinedEntries::OutOfMemory => {
-                Some(Err(Stopped::OutOfMemory { arena: "bstd::fs entries_confined", asked: 0 }))
-            }
-            blaze_core::threads::inline::ConfinedEntries::Failed(err) => Some(Ok(Err(err))),
-        }
+        Some(Ok(listed))
     }
 
     /// Streaming O(1)-memory `.part-<tag>` sweep over `rel` (or this driver's root when `None`)
-    /// on native inline drivers. Returns `None` on simulated worlds.
+    /// on the blocking-file driver. A queued driver keeps its normal removal effects.
     pub(crate) fn sweep_parts_confined(
         &self,
         cx: &Cx,
         rel: Option<&FileName>,
         should_remove: impl FnMut(&str, u64) -> bool,
     ) -> Option<Result<Result<u32, blaze_core::IoError>, Stopped>> {
-        let files = self.inline_files()?;
+        self.inline_files()?;
+        let files = self.kept_beside()?.confined.as_ref()?;
         let began = self.now();
         if let Err(stopped) = cx.stopped_by(began) {
             return Some(Err(stopped));
         }
-        let swept = files.sweep_parts_confined(rel, should_remove);
+        let swept = files.sweep_parts(rel, should_remove);
         let ns = u64::try_from(self.now().saturating_sub(began).as_nanos()).unwrap_or(u64::MAX);
         cx.on_worker(|w| w.meter().call_took(blaze_meter::Call::Attributes, ns));
         Some(Ok(swept))
@@ -489,9 +492,8 @@ impl Io {
         cx: &Cx,
         file: &FileName,
         into: &mut crate::mem::Bytes<'_>,
-        confined: bool,
+        read: impl FnOnce(&mut crate::mem::Bytes<'_>) -> LentRead,
     ) -> Option<Result<ReadAllLent, Stopped>> {
-        let files = self.inline_files()?;
         let began = self.now();
         if let Err(stopped) = cx.stopped_by(began) {
             return Some(Err(stopped));
@@ -506,11 +508,7 @@ impl Io {
             blaze_meter::Call::Read
         };
         let arena = into.arena();
-        let read = if confined {
-            files.read_confined_into_vec(file, None, into.as_vec_mut())
-        } else {
-            files.read_all_into_vec(file, into.as_vec_mut())
-        };
+        let read = read(into);
         #[cfg(test)]
         self.counted(|seen| &seen.inline);
         // The meter (D169): the call's time by its kind, as `Io::call` takes it.
@@ -524,6 +522,7 @@ impl Io {
             }
             LentRead::Moved { stated, read } => ReadAllLent::Moved { stated, read },
             LentRead::NotFound => ReadAllLent::NotFound,
+            LentRead::IsADirectory => ReadAllLent::IsADirectory,
             LentRead::Failed(error) => ReadAllLent::Failed(error),
         }))
     }

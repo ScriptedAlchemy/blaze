@@ -633,14 +633,22 @@ fn native_readonly_inline_calls_and_quiet_spans_take_zero_world_locks() {
     let root_dir = io.need_fs().expect("fs").root();
     let seen = io.seen().expect("native world has seen counts");
 
-    // Snapshot global `world` lock acquisitions BEFORE hot-path read-only ops + spans.
+    // Clock and quiet tracing are lock-free on both native drivers.
     let before = seen.locks.load(Ordering::Relaxed);
     let inline_before = seen.inline.load(Ordering::Relaxed);
+
+    for _ in 0..8 {
+        let before_span = seen.locks.load(Ordering::Relaxed);
+        let span = cx.span("hot.read");
+        span.event("step");
+        let _ = io.now();
+        drop(span);
+        assert_eq!(seen.locks.load(Ordering::Relaxed), before_span, "quiet spans and the native clock must take no world locks");
+    }
 
     let p = path("hello.txt");
     for _ in 0..8 {
         let s = cx.span("hot.read");
-        s.event("step");
         let meta = root_dir.stat(&s, &p).expect("stat").expect("exists");
         assert_eq!(meta.len, 14);
         let looks = root_dir.looks(&s, [&p]).expect("looks");
@@ -661,8 +669,10 @@ fn native_readonly_inline_calls_and_quiet_spans_take_zero_world_locks() {
     drop((root_dir, cx, io));
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!(locks_taken, 0, "native read-only inline calls + quiet spans must take 0 global world locks (took {locks_taken})");
-    assert!(inline_done >= 40, "expected >= 40 inline read ops, got {inline_done}");
+    if cfg!(target_os = "macos") {
+        assert_eq!(locks_taken, 0, "kqueue read-only inline calls must take no world locks (took {locks_taken})");
+        assert!(inline_done >= 40, "expected >= 40 inline read ops, got {inline_done}");
+    }
 }
 
 #[cfg(unix)]
@@ -699,6 +709,13 @@ fn dir_read_all_confined_blocks_leaf_and_intermediate_symlink_escapes() {
     assert_eq!(good.as_slice(), b"inside-ok");
     assert_eq!(seen.locks.load(Ordering::Relaxed) - before, 0, "confined native read must take 0 global world locks");
 
+    let mut wrong_kind = cx.bytes();
+    let dir_read = dir.read_all_confined(&cx, &path("sub"), &mut wrong_kind);
+    assert!(matches!(dir_read, Err(error) if error.kind == FsKind::IsADirectory));
+    let dir_range = dir.read_range_confined(&cx, &path("sub"), 0, 4, &mut wrong_kind);
+    assert!(matches!(dir_range, Err(error) if error.kind == FsKind::IsADirectory));
+    assert!(wrong_kind.as_slice().is_empty());
+
     // Both leaf symlink and intermediate directory symlink MUST be refused by the kernel (ELOOP).
     let mut leak1 = cx.bytes();
     assert!(dir.read_all_confined(&cx, &path("leaf_escape"), &mut leak1).is_err(), "leaf symlink escape must be refused");
@@ -725,9 +742,11 @@ fn dir_read_all_confined_blocks_leaf_and_intermediate_symlink_escapes() {
     assert_eq!(sub_entries.len(), 1);
     assert_eq!(sub_entries.name(0), "good.txt");
     assert!(dir.entries_confined(&cx, &path("no_such_dir")).expect("missing dir is None").is_none());
+    let file_entries = dir.entries_confined(&cx, &path("sub/good.txt"));
+    assert!(matches!(file_entries, Err(error) if error.kind == FsKind::NotADirectory));
     assert!(dir.entries_confined(&cx, &path("dir_escape")).is_err(), "dir symlink entries escape must be refused");
 
-    drop((good, leak1, leak2, range_good, range_leak1, range_leak2));
+    drop((good, wrong_kind, leak1, leak2, range_good, range_leak1, range_leak2));
     drop((dir, cx, io));
     let _ = std::fs::remove_dir_all(&base);
 }

@@ -66,7 +66,7 @@ pub use fast::{
     simd_mismatch, simd_prefix_sum_u32,
 };
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use crate::{Plant, Stopped, io::Io};
 
 /// The most a frame not given a limit hands out: a task's ([`crate::task`]) and the root's.

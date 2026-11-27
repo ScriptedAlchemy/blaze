@@ -94,7 +94,7 @@
 use alloc::{format, string::String, sync::Arc, vec::Vec};
 use core::{fmt, marker::PhantomData, num::NonZero};
 
-use blaze_core::{DirName, Done, Effect, FileName, Tag};
+use blaze_core::{DirName, Done, Effect, FileName, Tag, fs::ConfinedEntries};
 use blaze_mem::Frame;
 use blaze_own::Share as _;
 
@@ -1664,7 +1664,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         }
     }
 
-    /// Simulation / non-inline helper: checks every parent component along `path` is a real
+    /// For drivers without a descriptor capability: checks each parent component is a real
     /// directory (never a symlink) and returns the leaf's [`EntryKind`].
     fn check_confined_leaf(&self, cx: &Cx, op: FsOp, name: &FileName, path: &Path) -> Result<Option<EntryKind>, FsError> {
         let raw_rel = path.as_str();
@@ -1701,9 +1701,14 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         let owned_path = Path::new(path.as_str()).ok();
         if let Some(listed) = self.io.entries_confined(cx, &name, &dir_name) {
             return match listed {
-                Ok(Ok(Some(listing))) => Ok(Some(Entries { listing, path: owned_path })),
-                Ok(Ok(None)) => Ok(None),
-                Ok(Err(error)) => Err(FsError::new(FsOp::Entries, &dir_name, FsKind::Driver(error.0))),
+                Ok(ConfinedEntries::Listed(listing)) => Ok(Some(Entries { listing, path: owned_path })),
+                Ok(ConfinedEntries::NotFound) => Ok(None),
+                Ok(ConfinedEntries::NotADirectory) => Err(FsError::new(FsOp::Entries, &dir_name, FsKind::NotADirectory)),
+                Ok(ConfinedEntries::OutOfMemory) => {
+                    let stopped = Stopped::OutOfMemory { arena: "bstd::fs entries_confined", asked: 0 };
+                    Err(FsError::new(FsOp::Entries, &dir_name, FsKind::Stopped(stopped)))
+                }
+                Ok(ConfinedEntries::Failed(error)) => Err(FsError::new(FsOp::Entries, &dir_name, FsKind::Driver(error.0))),
                 Err(stopped) => Err(FsError::new(FsOp::Entries, &dir_name, FsKind::Stopped(stopped))),
             };
         }
@@ -1726,6 +1731,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
                 Ok(crate::io::ReadAllLent::Read(read)) => Ok(read),
                 Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &name, FsKind::Moved { stated, read })),
                 Ok(crate::io::ReadAllLent::NotFound) => Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
+                Ok(crate::io::ReadAllLent::IsADirectory) => Err(FsError::new(FsOp::Read, &name, FsKind::IsADirectory)),
                 Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &name, FsKind::Driver(error.0))),
                 Err(stopped) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped))),
             };
@@ -1759,6 +1765,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
                 Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
                 Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &name, FsKind::Moved { stated, read })),
                 Ok(crate::io::ReadAllLent::NotFound) => Err(FsError::new(FsOp::Read, &name, FsKind::NotFound)),
+                Ok(crate::io::ReadAllLent::IsADirectory) => Err(FsError::new(FsOp::Read, &name, FsKind::IsADirectory)),
                 Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &name, FsKind::Driver(error.0))),
                 Err(stopped) => Err(FsError::new(FsOp::Read, &name, FsKind::Stopped(stopped))),
             };
@@ -2459,6 +2466,7 @@ impl<#[blaze::linear] P: Rights> File<P> {
                 Ok(crate::io::ReadAllLent::Read(len)) => Ok(len),
                 Ok(crate::io::ReadAllLent::Moved { stated, read }) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Moved { stated, read })),
                 Ok(crate::io::ReadAllLent::NotFound) => Ok(0),
+                Ok(crate::io::ReadAllLent::IsADirectory) => Err(FsError::new(FsOp::Read, &self.name, FsKind::IsADirectory)),
                 // alloc: an error's message.
                 Ok(crate::io::ReadAllLent::Failed(error)) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Driver(error.0))),
                 Err(stopped) => Err(FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped))),

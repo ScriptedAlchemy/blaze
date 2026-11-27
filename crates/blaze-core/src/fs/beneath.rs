@@ -7,21 +7,79 @@ use std::{
     fs::{self, File},
     io,
     path::Path,
+    sync::Arc,
 };
+use std::alloc::Global;
 
-use blaze_own::Share as _;
+use blaze_own::{Share as _, Vec};
 
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, IntoRawFd as _, OwnedFd};
 
-use crate::{FileName, threads::inline::LentRead};
+use crate::{DirName, FileName, IoError, Listing, threads::inline::LentRead};
+
+/// Descriptor-relative filesystem operations on a native world. Kept apart from ordinary
+/// inline files because a driver such as io_uring can queue general I/O while lending a
+/// directory capability for strictly confined operations.
+#[derive(Clone)]
+pub struct ConfinedFiles {
+    root: Arc<Path>,
+    dir: blaze_own::Arc<RootDir, Global>,
+}
+
+/// What a confined directory listing found.
+pub enum ConfinedEntries {
+    Listed(Listing),
+    NotFound,
+    NotADirectory,
+    OutOfMemory,
+    Failed(IoError),
+}
+
+impl ConfinedFiles {
+    pub(crate) fn new(root: &Path) -> Self {
+        let dir = blaze_own::Arc::new_in(RootDir::open(root), Global);
+        Self { root: Arc::from(root), dir }
+    }
+
+    /// Reads the regular file under `file` without following symlinks. A range limits the
+    /// positional read. Both forms read directly into the caller's spare capacity.
+    pub fn read_into_vec<A: Allocator>(&self, file: &FileName, range: Option<(u64, usize)>, into: &mut Vec<u8, A>) -> LentRead {
+        let done = crate::lock::io_wait("read confined", file.as_str(), || {
+            read_confined_into_vec(&self.dir, &self.root, file, range, into)
+        });
+        match done {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::IsADirectory => LentRead::IsADirectory,
+            Err(error) => LentRead::Failed(IoError(error.to_string())),
+        }
+    }
+
+    /// Lists a directory reached without following any symlink.
+    pub fn entries(&self, rel: &FileName, name: &DirName) -> ConfinedEntries {
+        match crate::lock::io_wait("entries confined", rel.as_str(), || entries_confined(&self.dir, &self.root, rel, name)) {
+            Ok(listing) => ConfinedEntries::Listed(listing),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ConfinedEntries::NotFound,
+            Err(error) if error.kind() == io::ErrorKind::NotADirectory => ConfinedEntries::NotADirectory,
+            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => ConfinedEntries::OutOfMemory,
+            Err(error) => ConfinedEntries::Failed(IoError(error.to_string())),
+        }
+    }
+
+    /// Streams the directory and removes regular scratch files selected by the predicate.
+    pub fn sweep_parts(&self, rel: Option<&FileName>, should_remove: impl FnMut(&str, u64) -> bool) -> Result<u32, IoError> {
+        let label = rel.map_or(".", FileName::as_str);
+        crate::lock::io_wait("sweep parts", label, || sweep_parts_confined(&self.dir, &self.root, rel, should_remove))
+            .map_err(|error| IoError(error.to_string()))
+    }
+}
 
 /// Maximum `EINTR` retries on one kernel call (bounded-progress invariant).
 #[cfg(unix)]
 const INTERRUPTS_MOST: u32 = 64;
 
 /// A cached kernel directory descriptor (`O_RDONLY | O_DIRECTORY | O_CLOEXEC`) for a driver's
-/// root directory. Kept once per [`crate::threads::inline::Inline`] so confined opens start
+/// root directory. Kept once per [`ConfinedFiles`] so confined opens start
 /// directly at `root_fd` instead of walking the absolute path prefix from `/` on every call.
 pub(crate) struct RootDir {
     #[cfg(unix)]
@@ -235,16 +293,25 @@ pub(crate) fn read_at_uninit(file: &File, into: &mut [MaybeUninit<u8>], at: u64)
     super::read_at(file, slice, at)
 }
 
+/// A read's descriptor must be a regular file. Preserve the directory outcome separately so
+/// a caller reading files from a recent directory stamp can account for a changed file kind.
+fn regular_metadata(file: &File) -> io::Result<fs::Metadata> {
+    let meta = file.metadata()?;
+    if meta.is_file() {
+        Ok(meta)
+    } else if meta.is_dir() {
+        Err(io::Error::new(io::ErrorKind::IsADirectory, "not a regular file"))
+    } else {
+        Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"))
+    }
+}
+
 /// Reads an already-opened regular `file` directly into `into`'s uninitialized spare capacity:
 /// `fstat` for length, `try_reserve(len + 1)` (NO zero-fill!), `pread` directly into spare
 /// capacity, and `set_len` once the full `stated` bytes land. On `NoRoom`, `Moved`, or `Err`,
 /// `into.len()` stays untouched.
 pub(crate) fn read_open_into_vec<A: Allocator>(file: &File, into: &mut Vec<u8, A>) -> io::Result<LentRead> {
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
-    }
-    let stated = meta.len();
+    let stated = regular_metadata(file)?.len();
     let Some(asked) = usize::try_from(stated).ok().and_then(|n| n.checked_add(1)) else {
         return Ok(LentRead::NoRoom { len: stated });
     };
@@ -305,10 +372,7 @@ pub(crate) fn read_confined_into_vec<A: Allocator>(
     let Some((at, len)) = range else {
         return read_open_into_vec(&file, into);
     };
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
-    }
+    regular_metadata(&file)?;
     if len == 0 {
         return Ok(LentRead::Read { len: 0 });
     }
