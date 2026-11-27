@@ -14,13 +14,16 @@ Input, one JSON value (`python3 harness/distv2.py '{...}'`):
     faults       (optional) run the fault cases; default true
     release_fold (optional) require two real holders for both LLVM and folded work; default false
     cache_overlap (optional) run only the independent native-cache overlap oracle; default false
+    dev_latency  (optional) measure warm dev exports separately from the fault run; default false
+    repetitions  (optional) independent dev latency samples per mode; default 2
     profile      (optional) the directory under the target directory programs are in; default "debug"
     timeout      (optional) bound in seconds for each build/fault stage; default 3600
     command_timeout (optional) seconds for probes, stop and running the program; default 60
     env          (optional) explicit toolchain/runtime environment for every child
     module_builder (optional) explicit D52 bootstrap proc_macro_modules executable for fixture modules;
                  runs sandboxed before export, never invoked by blaze
-    cores        (optional) per-process core budget; otherwise preserve the caller's BLAZE_CORES
+    cores        (optional) per-process core budget; otherwise preserve the caller's BLAZE_CORES.
+                 Dev latency requires an explicit total budget of at least two Linux CPUs.
     stall_bound, daemon_memory_gb (optional) legacy inputs retained in provenance only
 
 Checks, each on what the build itself reports (BLAZE_DIST_REPORT) and on running the program:
@@ -79,6 +82,8 @@ class Input:
     run: tuple[str, ...] = ("11",)
     faults: bool = True
     cache_overlap: bool = False
+    dev_latency: bool = False
+    repetitions: int = 2
     profile: str = "debug"
     release_fold: bool = False
     stall_bound: int | None = None
@@ -111,7 +116,7 @@ def load(text: str) -> Input:
         value = getattr(given, name)
         if not isinstance(value, str) or not value or "\0" in value:
             raise Failed(f"{name} must name a nonempty path without NUL bytes")
-    for name in ("timeout", "command_timeout", "cores", "daemon_memory_gb", "stall_bound"):
+    for name in ("timeout", "command_timeout", "cores", "daemon_memory_gb", "stall_bound", "repetitions"):
         value = getattr(given, name)
         if value is None and name in ("cores", "daemon_memory_gb", "stall_bound"):
             continue
@@ -121,11 +126,14 @@ def load(text: str) -> Input:
         raise Failed("env must map strings to strings")
     if any(name.startswith("BLAZE_DIST_") for name in given.env):
         raise Failed("env must not override BLAZE_DIST_*: distribution and policies are controlled case inputs")
-    for name in ("faults", "release_fold", "cache_overlap"):
+    for name in ("faults", "release_fold", "cache_overlap", "dev_latency"):
         if type(getattr(given, name)) is not bool:
             raise Failed(f"{name} must be boolean")
     if given.release_fold and ("--release" not in given.args or given.profile != "release"):
         raise Failed('release_fold requires args ["--release"] and profile "release"')
+    if given.dev_latency and (given.cache_overlap or given.profile != "debug" or given.args
+                              or given.cores is None or given.cores < 2):
+        raise Failed("dev_latency requires debug exports with no additional args, no cache_overlap and at least two cores")
     for name in ("profile", "program"):
         value = getattr(given, name)
         if (not isinstance(value, str) or not value or "\0" in value
@@ -520,7 +528,7 @@ class Run:
 
     def build(self, home: str, dist: bool = True, wait: bool = True, project: Path | None = None,
               *, result_gate: Path | None = None, result_unit: str | None = None,
-              keep_gate_lease: bool = False, **extra):
+              keep_gate_lease: bool = False, cpus: list[int] | None = None, **extra):
         self.prepare_modules(home, project or self.project)
         if result_gate is not None:
             check(dist, "a result gate belongs to a distributed export")
@@ -532,23 +540,39 @@ class Run:
             extra["BLAZE_DIST_TEST_RESULT_GATE"] = str(result_gate.resolve())
             if result_unit is not None:
                 extra["BLAZE_DIST_TEST_RESULT_UNIT"] = result_unit
+        process, log_path = self.start_export(home, dist, project or self.project, cpus=cpus, **extra)
+        if not wait:
+            return process, log_path
+        code = self.wait(process)
+        return code, Path(log_path).read_text()
+
+    def start_export(self, home: str, dist: bool, project: Path, *, cpus: list[int] | None = None,
+                     **extra) -> tuple[subprocess.Popen, str]:
+        """Launch after fixture modules have been prepared."""
         self.sequence += 1
         out = self.program(home, project)
         out.parent.mkdir(parents=True, exist_ok=True)
+        env = {**self.env(home, dist, **extra), "CARGO_TARGET_DIR": str(self.target(home, project))}
         with (self.root / "logs" / f"{home}.{self.sequence}.log").open("x") as log:
-            process = subprocess.Popen(
-                [self.given.blaze, "export", "-p", self.given.program, "-o", str(out), "--stats", *self.given.args],
-                cwd=project or self.project,
-                env={**self.env(home, dist, **extra), "CARGO_TARGET_DIR": str(self.target(home, project))},
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        self.clients.append((process, time.monotonic() + self.given.timeout, log.name))
-        if not wait:
-            return process, log.name
-        code = self.wait(process)
-        return code, Path(log.name).read_text()
+            # Blaze pins its worker threads to the fastest available CPUs. A disjoint inherited
+            # mask keeps the two processes from each selecting the same first CPU.
+            previous = os.sched_getaffinity(0) if cpus is not None else None
+            if cpus is not None:
+                os.sched_setaffinity(0, cpus)
+            try:
+                process = subprocess.Popen(
+                    [self.given.blaze, "export", "-p", self.given.program, "-o", str(out), "--stats", *self.given.args],
+                    cwd=project,
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                self.clients.append((process, time.monotonic() + self.given.timeout, log.name))
+            finally:
+                if previous is not None:
+                    os.sched_setaffinity(0, previous)
+        return process, log.name
 
     def target(self, home: str, project: Path | None = None) -> Path:
         """The per-worker output directory for this checkout."""
@@ -678,6 +702,153 @@ def control(run: Run, project: Path | None = None) -> tuple[str, str]:
     code, text = run.build("solo", dist=False, project=project)
     check(code == 0, f"solo control builds: {text[-800:] if code else ''}")
     return run.behaviour("solo", project)
+
+
+def latency_export(run: Run, placements: dict[str, list[int]], projects: dict[str, Path], *,
+                   dist: bool) -> list[dict]:
+    """Time invocation to successful exit. Qualify that time with the artifact oracle after both exit."""
+    started = time.monotonic_ns()
+    pending = {}
+    for home, cpus in placements.items():
+        process, log = run.start_export(home, dist, projects[home], cpus=cpus, BLAZE_CORES=str(len(cpus)))
+        pending[home] = process, Path(log)
+    deadline = started + run.given.timeout * 1_000_000_000
+    completions = []
+    while pending:
+        for home, (process, log) in tuple(pending.items()):
+            code = process.poll()
+            if code is None:
+                continue
+            elapsed = time.monotonic_ns() - started
+            if code != 0:
+                require_build(code, log.read_text(), f"latency export {home}", log)
+            completions.append({"home": home, "cpus": placements[home], "elapsed_ns": elapsed, "log": str(log)})
+            del pending[home]
+        if not pending:
+            break
+        if time.monotonic_ns() >= deadline:
+            raise Failed(f"latency export timed out with {list(pending)} still running; see {run.root / 'logs'}")
+        time.sleep(0.001)
+    return completions
+
+
+def latency_round(run: Run, placements: dict[str, dict[str, list[int]]], modes: list[str],
+                  repetition: int) -> list[dict]:
+    projects = {home: run.root / "checkouts" / home for by_home in placements.values() for home in by_home}
+    for project in projects.values():
+        shutil.copytree(run.given.project, project, ignore=shutil.ignore_patterns("target", ".git", ".blaze"))
+    edited = {home: project / "mathy" / "src" / "lib.rs" for home, project in projects.items()}
+    run.provenance()
+    run.host = host_triple(run.given.blaze, run.env("solo", False), run.given.command_timeout, run.root / "logs")
+    run.start_services()
+    for mode in modes:
+        dist = mode == "two_workers"
+        for home, cpus in placements[mode].items():
+            # Seed each worker's own persistent state. Seed times are outside the measured intervals.
+            code, output = run.build(home, dist=dist, project=projects[home], cpus=cpus, BLAZE_CORES=str(len(cpus)))
+            require_build(code, output, f"seed {home}", run.root / "logs" / f"{home}.{run.sequence}.log")
+    solo = run.behaviour("solo", projects["solo"])
+    n = int(run.given.run[0])
+    expected = (f"caught {str(n % 2 == 1).lower()}, dropped {n}, script says from the script\n"
+                "included as it was checked in\nseen by the macro 1\n")
+    check(solo[0].startswith("40 functions, ") and solo[0].endswith(expected),
+          "seed executes 40 functions and the expected unwind, drop, script, include and macro")
+    for home in placements["two_workers"]:
+        check(run.behaviour(home, projects[home]) == solo, f"seed {home} equals solo in bytes and behavior")
+
+    samples = []
+    for case in ("no_op", "single_function_edit"):
+        if case == "single_function_edit":
+            for source in edited.values():
+                check(source.read_text().count('format!("3:{sum}') == 1,
+                      "one function contains the body-edit marker")
+                edit(source, 'format!("3:{sum}', 'format!("3 edited:{sum}')
+        source_hash = file_hash(edited["solo"])
+        check(all(file_hash(source) == source_hash for source in edited.values()),
+              f"{case} uses the same body text in every checkout")
+        rows_before = {home: len(run.report(home)) for home in placements["two_workers"]}
+        results = {}
+        for mode in modes:
+            # Removing the previous reports outside the timer proves that each copy comes from this export.
+            state = {home: projects[home] / ".blaze" / "v2" for home in placements[mode]}
+            for directory in state.values():
+                for name in ("profile.txt", "start.txt"):
+                    (directory / name).unlink(missing_ok=True)
+            load_before = os.getloadavg()
+            completions = latency_export(run, placements[mode], projects, dist=mode == "two_workers")
+            load_after = os.getloadavg()
+            for completion in completions:
+                home = completion["home"]
+                profiles = {}
+                for name in ("profile.txt", "start.txt"):
+                    path = run.root / "logs" / f"{case}.{home}.{name}"
+                    shutil.copyfile(state[home] / name, path)
+                    profiles[name] = str(path)
+                stdout, digest = run.behaviour(home, projects[home])
+                completion.update(stdout=stdout, sha256=digest, profiles=profiles)
+            results[mode] = {
+                "repetition": repetition, "case": case, "mode": mode,
+                "source_sha256": source_hash, "cores": run.given.cores,
+                "first_artifact_ns": min(item["elapsed_ns"] for item in completions),
+                "workers": completions, "load_before": load_before, "load_after": load_after,
+            }
+        reference = results["solo"]["workers"][0]
+        for result in results.values():
+            for artifact in result["workers"]:
+                check((artifact["stdout"], artifact["sha256"]) == (reference["stdout"], reference["sha256"]),
+                      f"{case} {artifact['home']} equals solo in bytes and behavior")
+        rows = [row for home, before in rows_before.items() for row in run.report(home)[before:]]
+        if case == "no_op":
+            check((reference["stdout"], reference["sha256"]) == solo, "no-op matches the seeded artifact")
+            check(not rows, "distributed no-op runs no unit")
+            for worker in results["two_workers"]["workers"]:
+                evidence.no_local_emission(f"no-op {worker['home']}", Path(worker["log"]).read_text())
+        else:
+            check(reference["stdout"] != solo[0] and reference["stdout"].endswith(expected),
+                  "the body edit changes the function-result digest and preserves the expected runtime behavior")
+            check(any(row["unit"] == "mathy" and row["source"] == "executed" for row in rows),
+                  "the changed unit executes through the coordinator")
+            evidence.no_duplicate_compile(rows)
+            evidence.publication(run.root / "blobs", rows, run.events())
+        samples.extend(results.values())
+    verify_run_identity(run)
+    return samples
+
+
+def dev_latency(given: Input) -> None:
+    if not sys.platform.startswith("linux"):
+        raise Failed("dev latency requires Linux CPU affinity")
+    previous = os.sched_getaffinity(0)
+    cores = given.cores
+    if cores is None or len(previous) < cores:
+        raise Failed(f"dev latency needs {cores} CPUs in the runner affinity; available {sorted(previous)}")
+    cpus = sorted(previous)[:cores]
+    root = Path(given.scratch).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    if any(root.iterdir()):
+        raise Failed(f"scratch {root} is not empty; use a new run directory")
+    samples = []
+    os.sched_setaffinity(0, cpus)
+    try:
+        for repetition in range(given.repetitions):
+            order = cpus if repetition % 2 == 0 else list(reversed(cpus))
+            split = cores // 2
+            placements = {"solo": {"solo": cpus}, "two_workers": {"a": order[:split], "b": order[split:]}}
+            modes = list(placements) if repetition % 2 == 0 else list(reversed(placements))
+            scratch = root / f"run-{repetition + 1}"
+            env = {**given.env, "XDG_CACHE_HOME": str(scratch / "machine-cache")}
+            run = Run(dataclasses.replace(given, scratch=str(scratch), env=env))
+            try:
+                samples.extend(latency_round(run, placements, modes, repetition + 1))
+            finally:
+                run.stop()
+    finally:
+        os.sched_setaffinity(0, previous)
+    report = {"cpus": cpus, "poll_interval_ns": 1_000_000,
+              "endpoint": "first successful export exit whose artifact subsequently passes the oracle",
+              "samples": samples}
+    (root / "dev-latency.json").write_text(json.dumps(report, indent=2) + "\n")
+    print("distv2: dev latency checks passed", flush=True)
 
 
 def overlap_fixture(path: Path) -> None:
@@ -1038,6 +1209,9 @@ def main(given: Input) -> None:
     def interrupted(signum, _frame):
         raise Failed(f"received signal {signum}; stopping owned children")
     signal.signal(signal.SIGTERM, interrupted)
+    if given.dev_latency:
+        dev_latency(given)
+        return
     if given.cache_overlap:
         cache_overlap(given)
         return
