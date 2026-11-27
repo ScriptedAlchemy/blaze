@@ -1,9 +1,9 @@
-name: PR 81 signed cache over HTTPS
+name: PR 81 signed take receipt
 on:
   workflow_dispatch:
     inputs:
       source:
-        description: Exact signed-origin compiler source
+        description: Exact source commit to test
         type: string
         required: true
 permissions:
@@ -12,11 +12,14 @@ defaults:
   run:
     shell: bash
 env:
-  CARGO_BUILD_JOBS: "2"
+  CARGO_BUILD_JOBS: '2'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
 jobs:
-  signed-origin:
+  signed-take:
+    name: signed-set adoption and trust
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 100
+    timeout-minutes: 48
     steps:
       - uses: actions/checkout@v7
         with:
@@ -25,44 +28,19 @@ jobs:
       - uses: ./.github/actions/locked-memory
       - uses: ./.github/actions/reflink
       - uses: ./.github/actions/toolchain
-      - uses: ./.github/actions/script
-        with:
-          job: source-compiler
-      - uses: ./.github/actions/toolchain-shelf
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
-        with:
-          version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
-          enable-cache: false
-      - name: Build the trusted publisher and developer CLI
-        timeout-minutes: 75
+      - name: Test the exact source tree
+        env:
+          SOURCE: ${{ inputs.source }}
         run: |
-          timeout 15 git rev-parse HEAD 'HEAD^{tree}'
-          tc=$(timeout 10 cat pins/toolchain)
-          for role in publisher developer; do
-            features=()
-            if [[ $role == publisher ]]; then features=(--features blaze-cli/publish); fi
-            timeout -k 20 2100 cargo +"$tc" build --locked --release --bins -p blaze-cli -p blaze-launcher "${features[@]}"
-            dest="$RUNNER_TEMP/$role"
-            timeout 10 mkdir "$dest"
-            for bin in blaze blaze-launcher blaze-fact-shim; do
-              timeout 10 install -m 755 "${CARGO_TARGET_DIR}/release/$bin" "$dest/$bin"
-            done
-          done
-      - name: Publish, verify and consume the signed set
-        timeout-minutes: 22
-        run: |
-          # shellcheck disable=SC2016
-          input=$(timeout 10 jq -cn             --arg publisher "$RUNNER_TEMP/publisher/blaze" --arg developer "$RUNNER_TEMP/developer/blaze"             --arg shelf "$HOME/.blaze/v2/toolchain" --arg scratch "$RUNNER_TEMP/blaze-fs/signed-origin"             '{blaze:$publisher,alternate_blaze:$developer,shelf:$shelf,scratch:$scratch,timeout:240}')
-          timeout -k 15 1200 uv run --frozen --no-dev python harness/v2/signed_origin.py "$input"
+          test "$(timeout 10s git rev-parse HEAD)" = "$SOURCE"
+          timeout 10s git rev-parse HEAD 'HEAD^{tree}'
+          tc=$(timeout 10s cat pins/toolchain)
+          timeout -k 15s 2300s cargo +"$tc" test --locked -p blaze-cli --bin blaze 'store::take::' -- --nocapture 2>&1 | tee "$RUNNER_TEMP/signed-take.log"
+          timeout 10s grep -E '^test result: ok\. [1-9][0-9]* passed;' "$RUNNER_TEMP/signed-take.log"
+          timeout 10s grep -E 'test store::take::tests::one_record_from_a_new_generation_does_not_complete_its_take .*ok' "$RUNNER_TEMP/signed-take.log"
       - if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: signed-origin-receipt
+          name: signed-take-evidence
+          path: ${{ runner.temp }}/signed-take.log
           if-no-files-found: warn
-          path: |
-            ${{ runner.temp }}/blaze-fs/signed-origin/*.stdout
-            ${{ runner.temp }}/blaze-fs/signed-origin/*.stderr
-            ${{ runner.temp }}/blaze-fs/signed-origin/*.profile.txt
-            ${{ runner.temp }}/blaze-fs/signed-origin/https-observations.json
-            ${{ runner.temp }}/blaze-fs/signed-origin/result.json
