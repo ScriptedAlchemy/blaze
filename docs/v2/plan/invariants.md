@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-371 invariants, 47 refinements, 13 reference models.
-By level: 297 tested, 105 simulated, 1 model-checked, 15 proved.
+372 invariants, 47 refinements, 13 reference models.
+By level: 298 tested, 105 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -56,7 +56,9 @@ By level: 297 tested, 105 simulated, 1 model-checked, 15 proved.
 - **`a_publish_stopped_anywhere_leaves_the_old_set_whole_or_the_new`** *tested* (`crates/blaze-cli/src/store/published_e2e_tests.rs`): publishing a set interrupted at any point leaves either the old published set whole or the new one, never writing a head before its payloads.
   Controls: `a_publish_that_writes_its_head_first`.
 - **`a_take_stopped_anywhere_leaves_no_root_or_the_whole_set_and_the_next_command_finishes_it`** *tested* (`crates/blaze-cli/src/store/take_tests.rs`): taking a published set verifies every record digest, never names the root before the set is whole, and leaves either no root or the whole set after any interruption.
-  Controls: `a_take_that_checks_no_digest`, `a_take_that_names_the_root_before_the_set_is_whole`.
+  Controls: `a_take_that_checks_no_digest`, `a_take_that_names_the_root_before_the_set_is_whole`, `a_root_without_a_complete_directory`.
+- **`a_signed_scope_directory_commits_with_its_complete_set`** *tested* (`crates/blaze-cli/src/store/take_tests.rs`): a signed scope directory becomes accessible with its complete set, including after a crash interrupts the take.
+  Controls: `a_take_that_checks_no_digest`, `a_take_that_names_the_root_before_the_set_is_whole`, `a_root_without_a_complete_directory`.
 - **`the_sweep_follows_what_was_read_and_nothing_else`** *tested* (`crates/blaze-cli/src/sweep.rs`): the sweep checks every file, manifest, absent probe, and directory listing recorded in the leaf table without trusting racy timestamps.
   Controls: `a_racy_stamp_trusted`, `a_forgotten_absent_probe`.
 - **`every_acknowledged_row_payload_is_reachable_after_a_cut`** *tested* (`crates/blaze-cli/src/tests/engine_answer_rows_tests.rs`): every acknowledged row payload and carried payload is pinned and reachable after a cut at any point of a rows-answer write.
