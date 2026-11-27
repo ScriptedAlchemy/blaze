@@ -56,6 +56,8 @@ pub struct Phases {
     /// records read in place, the bytes copied (0), the trees opened at their first read.
     pub(crate) run_names: Option<crate::run_names::NamesRead>,
     pub(crate) export_verified_from_answers: Option<usize>,
+    /// The maker's cumulative row visits, including any distributed completion before export.
+    pub(crate) export_read_preparation: Option<blaze_ladder::run::make_one::ReadPreparation>,
     /// The cleanup line's part known before the commit after the answer (store/roots.rs
     /// `CleanupLine::before_commit`), for a profile written before that commit (main.rs).
     pub(crate) cleanup: Option<crate::store::roots::BeforeCommit>,
@@ -173,6 +175,7 @@ impl Phases {
             code_records: None,
             run_names: None,
             export_verified_from_answers: None,
+            export_read_preparation: None,
             cleanup: None,
             published: None,
             held: Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) },
@@ -203,6 +206,7 @@ impl Phases {
         self.code_records = None;
         self.run_names = None;
         self.export_verified_from_answers = None;
+        self.export_read_preparation = None;
         self.cleanup = None;
         self.published = None;
         self.held = Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) };
@@ -470,6 +474,9 @@ impl fmt::Display for Phases {
         }
         if let Some(count) = self.export_verified_from_answers {
             writeln!(f, "export       {count} code entries verified from known read answers")?;
+        }
+        if let Some(count) = self.export_read_preparation {
+            writeln!(f, "export       maker read preparation: {} rows prepared, {} known rows reused", count.prepared, count.reused)?;
         }
         if let Some(cleanup) = self.cleanup {
             writeln!(f, "{cleanup}")?;
