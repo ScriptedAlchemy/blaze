@@ -160,7 +160,7 @@ fn through(cx: &Cx, io: &Io, folder: &Dir<ReadWrite>, signer: &Signer, keys: &[C
     let folder_found = read(&by_folder);
     let addr = Addr::Tcp(HostPort::new(AT.0, AT.1).expect("an address"));
     let mut listener = net.listen(&cx, &addr).expect("a listener");
-    let at = HttpAt::of(&format!("http://{}:{}/o/", AT.0, AT.1), &net).expect("an http origin");
+    let at = HttpAt::of(&format!("http://{}:{}/o/", AT.0, AT.1), &net, Default::default()).expect("an http origin");
     let mut by_http = Reader::new_in(Namespace::PUBLIC, &check, Limits::DEFAULT, global.handle());
     let mut served = Served { origin: HttpOrigin::new(&cx, &at, &clock), listener: &mut listener, folder, lies, served: 0, failed: None };
     let fetched = fetch(&mut by_http, &mut served, &mut now, keys, global.handle());
