@@ -192,6 +192,7 @@ fn validate_answer(command: &Command, answer: &Answer, alloc: WireAlloc) -> Resu
         (_, Answer::Error(_)) => true,
         (Command::Release(_), Answer::Ack(_)) => true,
         (Command::Submit(s), Answer::Binding(b)) => b.subscription.content == s.content,
+        (Command::Submit(s), Answer::AcceptedPublication(p)) => p.content == s.content,
         (Command::Subscribe(s), Answer::Binding(b)) => {
             b.subscription.content == s.content && b.subscription.execution == s.execution
         }
@@ -218,7 +219,13 @@ fn validate_answer(command: &Command, answer: &Answer, alloc: WireAlloc) -> Resu
         (Command::KillAck(_), Answer::KillAck(_)) => true,
         (Command::RetireAssignment(_), Answer::Ack(_)) => true,
         (Command::OwnedAssignment(_), Answer::OwnedAssignment(_)) => true,
-        (Command::Claim(_), Answer::Claimed(_)) => true,
+        (Command::Claim(c), Answer::Claimed(claimed)) => {
+            admission_matches(&claimed.admission, c.content, c.execution, claimed.attempt)
+        }
+        (Command::ResolvePublication(r), Answer::AdmissionState(state)) => {
+            !matches!(state, AdmissionState::Resolving(_))
+                && admission_matches(state, r.content, r.execution, r.attempt)
+        }
         (Command::Packs(_), Answer::Packs(_)) => true,
         (Command::CommitPublication(_), Answer::Publication(_)) => true,
         (Command::Publication(_), Answer::Publication(_)) => true,
@@ -237,5 +244,68 @@ fn validate_answer(command: &Command, answer: &Answer, alloc: WireAlloc) -> Resu
         Ok(())
     } else {
         Err(Error::Protocol(WireString::from_str_in("answer-command-binding", alloc)))
+    }
+}
+
+fn admission_matches(
+    state: &AdmissionState,
+    content: blaze_wire::JobContent,
+    execution: blaze_wire::ExecutionId,
+    attempt: blaze_wire::Attempt,
+) -> bool {
+    match state {
+        AdmissionState::Resolving(_) => true,
+        AdmissionState::Compile(ready) => ready.execution == execution && ready.attempt == attempt,
+        AdmissionState::Accepted(accepted) => {
+            accepted.content == content
+                && accepted.execution == execution
+                && accepted.accepted_attempt <= attempt
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blaze_wire::{Ack, Attempt, Bytes, ExecutionId, JobContent, Reservation};
+
+    #[test]
+    fn accepted_and_compile_ready_answers_keep_their_request_identity() {
+        let alloc = blaze_own::testing::heap().shared();
+        let content = JobContent([1; 32]);
+        let execution = ExecutionId(7);
+        let attempt = Attempt(3);
+        let submit = Command::Submit(Submission {
+            content,
+            request: Bytes { bytes: Vec::new_in(alloc) },
+            need: Reservation { memory: 1, cpus: 1, disk: 1 },
+        });
+        let accepted = AcceptedPublication {
+            content, execution, accepted_attempt: attempt, packs: Vec::new_in(alloc), delivered: false,
+        };
+        // An accepted hit is valid without any subscriber or original carrier session.
+        assert!(validate_answer(&submit, &Answer::AcceptedPublication(accepted.clone()), alloc).is_ok());
+        let wrong = AcceptedPublication { content: JobContent([2; 32]), ..accepted.clone() };
+        assert!(validate_answer(&submit, &Answer::AcceptedPublication(wrong), alloc).is_err());
+        let claim = Command::Claim(Claim { content, execution, claimant: [3; 32] });
+        for ready in [
+            CompileReady { execution: ExecutionId(8), attempt },
+            CompileReady { execution, attempt: Attempt(2) },
+        ] {
+            let answer = Answer::Claimed(Claimed {
+                executor: Some(WireString::from_str_in("exec:1", alloc)),
+                attempt, lead: true, admission: AdmissionState::Compile(ready),
+            });
+            assert!(validate_answer(&claim, &answer, alloc).is_err());
+        }
+        let resolve = Command::ResolvePublication(ResolvePublication {
+            content, execution, attempt, executor: WireString::from_str_in("exec:1", alloc), packs: None,
+        });
+        assert!(validate_answer(&resolve, &Answer::AdmissionState(AdmissionState::Resolving(Ack {})), alloc).is_err());
+        assert!(validate_answer(&resolve, &Answer::AdmissionState(AdmissionState::Compile(CompileReady {
+            execution, attempt,
+        })), alloc).is_ok());
+        let future = AcceptedPublication { accepted_attempt: Attempt(4), ..accepted };
+        assert!(validate_answer(&resolve, &Answer::AdmissionState(AdmissionState::Accepted(future)), alloc).is_err());
     }
 }

@@ -324,7 +324,7 @@ fn no_lead_lost_delivery_is_not_a_completed_failed_verdict() {
     admission.add_machine("machine", [1; 32], reservation.clone());
     admission.add_builder(0, "machine", reservation.clone(), alloc).unwrap();
     let mut jobs = blaze_dist::jobs::Jobs::new(admission, ExecutionConfig::default(), alloc);
-    let answer = jobs
+    let Ok(blaze_dist::jobs::SubmitAnswer::Attached(answer)) = jobs
         .submit(
             0,
             &blaze_wire::JobRequest {
@@ -337,8 +337,7 @@ fn no_lead_lost_delivery_is_not_a_completed_failed_verdict() {
             },
             reservation,
             &mut Vec::new_in(alloc),
-        )
-        .unwrap();
+        ) else { panic!("expected a work-protocol subscription") };
     jobs.tick(0, &mut Vec::new_in(alloc));
     let mut effects = Vec::new_in(alloc);
     jobs.tick(15_001, &mut effects);

@@ -30,7 +30,7 @@ ClientFrame = [0, LocalHello] | [1, Request]
 ServerFrame = [0, LocalWelcome] | [1, Response] | [2, WireError]
 ```
 
-The carrier is version 5 and the terminal contract is version 2. The global codec version is
+The carrier is version 6 and the terminal contract is version 2. The global codec version is
 `blaze_wire::VERSION`. All three must match. A mismatch is refused without trying
 another decoder or invoking a compiler. Terminal version 2 is not global schema 2:
 typed digests use the codec's domain.
@@ -74,19 +74,25 @@ Join 5, Lease 6, Result 7, WorkerEvents 8, KillAck 9, Terminal 10, Release 11, C
 Full-manifest acceptance, lookup and delivery are CommitPublication 14, Publication 15 and
 DeliverPublication 16. RetireAssignment 17 requests the stop of an owned assignment.
 OwnedAssignment 18 reads the current token of an exact owned slot without claiming work.
+ResolvePublication 19 completes the current lead attempt's authoritative cache lookup.
 All payloads and their integer field numbers are in `src/protocol.rs`. All
 responses are in `Answer`.
 
-- Submit calls `Jobs::submit`, then admission. Subscribe adds an interest to
-  an exact content/execution. Resume returns the same subscription's current
+- Submit atomically returns either a binding from `Jobs::submit` or an accepted-result
+  handle. The latter allocates no subscriber or execution and remains available when new
+  work is refused by retention limits. A new published-work flight starts resolving.
+  Subscribe adds an interest to an exact content/execution. Resume returns the same subscription's current
   binding; it does **not** create another subscriber.
 - Events pages contain original `EventItem`s after the supplied sequence.
   Cancel calls `Jobs::unsubscribe`; cancelling one interest does not cancel the
   others. An explicitly cancelled subscriber receives a retained Cancelled
   terminal, not a fabricated successful result.
-- Join, Lease and Result call registry wrappers around actual Execution/WorkSet
-  transitions. Work content, execution, attempt and holder are validated; the
-  existing authority/fencing rules are unchanged.
+- ResolvePublication names the claimed lead, execution and attempt. Absence enables
+  compilation for that attempt; a verified durable manifest resolves the flight directly
+  without inventing grant or tail completion. An old lookup cannot enable a replacement
+  attempt. Helpers wait for resolution. Join, Lease and Result call the actual registry
+  transitions and require the published-work attempt's compilation permit as well as
+  their content, execution, attempt and holder fences.
 - WorkerEvents invokes the whole-batch ingress validator. Progress is not
   reconstructed by IO, and Passed never bypasses the authoritative work check.
 - KillAck carries exact content/execution/attempt/executor and alive status.
@@ -95,6 +101,8 @@ responses are in `Answer`.
 - Claim binds its claimant label to the validated transport session. A resumed session retains
   the owner; copying that label into a different session does not acquire the existing claim.
   Promotion keeps the owner of a continuing reservation; fresh or reused slots start unowned.
+  Its response also reports resolving, compilation-permitted, or accepted-result state.
+  That response is a snapshot; the core revalidates authority at actual work transitions.
 - OwnedAssignment carries exact content/execution/executor and the claimant label. It reads
   only that owner's current token, including an old pending stop. It cannot claim an unowned
   slot or follow a slot into another execution. Cleanup uses it only for slots the agent ran,
@@ -108,6 +116,15 @@ responses are in `Answer`.
 Subscription is `{0: content, 1: execution, 2: subscriber}`. Binding is
 `{0: Subscription, 1: attempt}`. Response identity must echo epoch/session/sequence,
 and `Client` verifies response kind and payload against the pending command.
+
+`CommitPublication` freezes output within the coordinator epoch. The accepted result remains
+discoverable after cancellation or deadline expiry, without reviving any old subscriber.
+Any authorized requester can mirror that result and acknowledge `DeliverPublication` after
+the catalog's durable response or verification of an equivalent durable record. Delivery
+can advance publication state on a terminal execution while its subscriber terminals stay
+unchanged. A requester holding a result uses its own request deadline, not the original
+subscriber's lifetime. Across a coordinator restart, reuse is guaranteed only after durable
+catalog publication; an unmirrored in-memory acceptance can be lost.
 Terminal lookup carries the exact subscription, returns Pending or immutable
 SubscriberTerminalV2, and checks content/subscriber ownership in the registry.
 `terminal_action(binding, terminal, policy)` also verifies the exact
@@ -166,9 +183,11 @@ The default limits are:
   without dropping items. This limit belongs to the local transport and does not
   restrict the language the compiler accepts.
 
-Terminal executions stay at least 600 seconds after the reactor observes termination
-and **until all assignment stops are acknowledged**. The explicit forget API
-releases core event/terminal/result data only then. Pending stops retain their
+Terminal executions stay at least 600 seconds after the reactor observes termination,
+**until all assignment stops are acknowledged**, and until any accepted result has a valid
+durable-delivery acknowledgement. The explicit forget API releases core event/terminal/result
+data only then. Accepted results require no live worker and can be drained even at the
+execution or subscriber cap. Pending stops retain their
 reservation and can exhaust the finite capacity rather than being evicted.
 Expired terminal lookup is a refusal. A previously journaled response can still
 be replayed during its own session lifetime. Global frame/request/depth/string/

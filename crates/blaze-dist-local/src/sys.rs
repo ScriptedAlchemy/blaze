@@ -1263,6 +1263,11 @@ impl TcpDeadline {
         Self(at)
     }
 
+    /// Keeps the earlier absolute bound when a request and one of its operations differ.
+    pub fn earlier(self, other: Self) -> Self {
+        Self(self.0.min(other.0))
+    }
+
     fn remaining(self) -> Result<Duration, Errno> {
         let now = SystemClock.monotonic_nanos()?;
         if now >= self.0 {
