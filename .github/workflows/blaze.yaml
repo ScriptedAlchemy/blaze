@@ -43,6 +43,10 @@ jobs:
           timeout -k 15s 2300s cargo +"$tc" test --locked -p blaze-cli --bin blaze 'store::take::' -- --nocapture 2>&1 | tee "$RUNNER_TEMP/signed-take.log"
           timeout 10s grep -E '^test result: ok\. [1-9][0-9]* passed;' "$RUNNER_TEMP/signed-take.log"
           timeout 10s grep -E 'test store::take::tests::one_record_from_a_new_generation_does_not_complete_its_take .*ok' "$RUNNER_TEMP/signed-take.log"
+          timeout 10s grep -E 'test store::take::tests::a_signed_scope_directory_commits_with_its_complete_set .*ok' "$RUNNER_TEMP/signed-take.log"
+          timeout -k 10s 120s cargo +"$tc" test --locked -p blaze-cli --bin blaze 'store::scope_cache::tests::' -- --nocapture 2>&1 | tee -a "$RUNNER_TEMP/signed-take.log"
+          timeout -k 10s 360s cargo +"$tc" test --locked -p blaze-engine --lib reuse_stands_on_cells_published_by_an_earlier_wave -- --nocapture 2>&1 | tee -a "$RUNNER_TEMP/signed-take.log"
+          timeout 10s grep -E 'test .*reuse_stands_on_cells_published_by_an_earlier_wave .*ok' "$RUNNER_TEMP/signed-take.log"
       - if: always()
         uses: actions/upload-artifact@v7
         with:
