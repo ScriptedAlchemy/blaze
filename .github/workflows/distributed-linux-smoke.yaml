@@ -1,4 +1,8 @@
-name: Distributed compile artifact smoke and focused controls
+# Fill all four SOURCE_* values from one completed source-compiler handoff.
+# SOURCE_COMMIT is its actual checkout commit (including a PR merge commit),
+# not the feature head or this validation workflow's commit. Never reseal it.
+# Reuse separately for PR83's baseline and PR84's candidate.
+name: Distributed performance canonical artifact smoke
 on:
   push:
     branches:
@@ -10,18 +14,17 @@ defaults:
   run:
     shell: bash
 env:
-  AUDIT_SOURCE_SHA: "951ee6f61aa33499310149b623c32d9f3b71816c"
-  AUDIT_RUN_ID: "46047508071"
+  AUDIT_SOURCE_SHA: "30c2295805414a8a38422dd74584c247e206880a"
+  AUDIT_SOURCE_TREE: "bd0e9242f647f8b5071fbc663a563c701077c532"
+  AUDIT_RUN_ID: "46054435751"
+  AUDIT_ARTIFACT_ID: "15227620366"
   RUST_BACKTRACE: "0"
   CARGO_TERM_COLOR: never
   CARGO_BUILD_JOBS: "2"
-  BLAZE_CORES: "2"
-  BLAZE_DAEMON_MEMORY_GB: "2"
-  BLAZE_TESTS: verify
 jobs:
   artifact-smoke:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 130
+    timeout-minutes: 65
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
@@ -36,15 +39,21 @@ jobs:
         timeout-minutes: 2
         run: |
           set -euo pipefail
+          [[ "$AUDIT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$AUDIT_SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$AUDIT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$AUDIT_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
           test "$(timeout 10 uname -s -m)" = "Linux aarch64"
           evidence="$RUNNER_TEMP/artifact-smoke-evidence"
           timeout 10 mkdir -p "$evidence"
           test "$(timeout 20 git rev-parse HEAD)" = "$AUDIT_SOURCE_SHA"
-          test -z "$(timeout 20 git status --porcelain)"
+          test "$(timeout 20 git rev-parse 'HEAD^{tree}')" = "$AUDIT_SOURCE_TREE"
+          test -z "$(timeout 20 git status --porcelain --untracked-files=all)"
           timeout 20 git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
           timeout 10 cp pins/toolchain "$evidence/toolchain-pin.txt"
-          printf 'source_run_id=%s\nartifact=source-compiler\nrunner_os=%s\nrunner_arch=%s\nrunner_environment=%s\n' \
-            "$AUDIT_RUN_ID" "$RUNNER_OS" "$RUNNER_ARCH" "$RUNNER_ENVIRONMENT" > "$evidence/handoff.txt"
+          printf 'source_run_id=%s\nsource_artifact_id=%s\nartifact=source-compiler\nvalidation_commit=%s\nrunner_os=%s\nrunner_arch=%s\nrunner_environment=%s\n' \
+            "$AUDIT_RUN_ID" "$AUDIT_ARTIFACT_ID" "$GITHUB_SHA" \
+            "$RUNNER_OS" "$RUNNER_ARCH" "$RUNNER_ENVIRONMENT" > "$evidence/handoff.txt"
           timeout 10 uname -a > "$evidence/kernel.txt"
           timeout 10 lscpu > "$evidence/cpu.txt"
           timeout 10 free -b > "$evidence/memory-before.txt"
@@ -52,7 +61,9 @@ jobs:
       - uses: actions/download-artifact@v8
         timeout-minutes: 15
         with:
-          name: source-compiler
+          # v8 resolves this ID within the specified run and verifies its digest.
+          # A single artifact is extracted directly into path.
+          artifact-ids: ${{ env.AUDIT_ARTIFACT_ID }}
           run-id: ${{ env.AUDIT_RUN_ID }}
           repository: ${{ github.repository }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -63,20 +74,20 @@ jobs:
         timeout-minutes: 6
         run: |
           set -euo pipefail
+          evidence="$RUNNER_TEMP/artifact-smoke-evidence"
           binaries="$RUNNER_TEMP/source-binaries"
           timeout 10 mkdir "$binaries"
           timeout -k 5 120 tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$binaries"
-          timeout 10 mkdir -p "$HOME/.blaze/v2" "$RUNNER_TEMP/source-shelf" "$RUNNER_TEMP/dist-evidence"
+          timeout 10 mkdir -p "$HOME/.blaze/v2"
           # The source job generated and checked this shelf before packaging it.
           # Reuse the same compiler and shelf handoff as production-acceptance.
           timeout -k 5 120 tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$HOME/.blaze/v2"
-          timeout -k 5 120 tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$RUNNER_TEMP/source-shelf"
           identity=$(timeout 10 jq -nc --arg bin "$binaries" '{command:"verify",binaries:$bin,services:true}')
           timeout 60 python3 .github/scripts/dist_build_identity.py "$identity" \
-            2>&1 | timeout 70 tee "$RUNNER_TEMP/artifact-smoke-evidence/handoff-verify.log"
-          timeout 10 cp "$binaries/blaze-build.json" "$RUNNER_TEMP/artifact-smoke-evidence/blaze-build.json"
-          timeout 60 sha256sum "$RUNNER_TEMP/source-package/"*.tar.gz \
-            > "$RUNNER_TEMP/artifact-smoke-evidence/archive-sha256.txt"
+            2>&1 | timeout 70 tee "$evidence/handoff-verify.log"
+          timeout 10 cp "$binaries/blaze-build.json" "$evidence/blaze-build.json"
+          timeout 30 sha256sum "$evidence/blaze-build.json" > "$evidence/manifest-sha256.txt"
+          timeout 60 sha256sum "$RUNNER_TEMP/source-package/"*.tar.gz > "$evidence/archive-sha256.txt"
       - uses: ./.github/actions/locked-memory
         timeout-minutes: 2
       - uses: ./.github/actions/reflink
@@ -102,25 +113,13 @@ jobs:
           test "$(ulimit -l)" = unlimited
           echo "TMPDIR=$short_temp" >> "$GITHUB_ENV"
           echo "AUDIT_SMOKE_WORK=$short_temp/smoke" >> "$GITHUB_ENV"
-      - uses: ./.github/actions/apt
-        timeout-minutes: 15
-        with:
-          packages: strace bubblewrap
-      - name: Enable source test sandbox user namespaces
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-          if [ "$(timeout 10 cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
-            timeout 10 sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
-          fi
       - uses: ./.github/actions/toolchain
         timeout-minutes: 15
-        with:
-          components: rust-src
-          targets: wasm32-wasip1
       - uses: ./.github/actions/script
         timeout-minutes: 25
         with:
+          # This source action keys scripts by their complete source closure and
+          # absolute checkout path; never transplant scripts from another root.
           job: artifact-smoke
       - name: Run and verify the canonical exact-tree hello smoke
         id: smoke
@@ -130,6 +129,7 @@ jobs:
           evidence="$RUNNER_TEMP/artifact-smoke-evidence"
           timeout 10 cp "$BLAZE_SCRIPTS/KEY" "$evidence/script-cache-key.txt"
           timeout 30 sha256sum "$BLAZE_SCRIPTS/smoke" > "$evidence/smoke-script-sha256.txt"
+          timeout 10 cmp "$evidence/blaze-build.json" "$RUNNER_TEMP/source-binaries/blaze-build.json"
           identity=$(timeout 10 jq -nc --arg bin "$RUNNER_TEMP/source-binaries" \
             '{command:"verify",binaries:$bin,services:true}')
           timeout 60 python3 .github/scripts/dist_build_identity.py "$identity" \
@@ -138,94 +138,28 @@ jobs:
             --arg work "$AUDIT_SMOKE_WORK" '{blaze:$blaze,work:$work}')
           timeout -k 20 480 "$BLAZE_SCRIPTS/smoke" "$input" \
             2>&1 | timeout 510 tee "$evidence/hello-smoke.txt"
-          tree=$(timeout 20 git rev-parse 'HEAD^{tree}')
           verify=$(timeout 10 jq -nc --rawfile quote "$evidence/hello-smoke.txt" \
-            --arg tree "$tree" '{verify:{quote:$quote,tree:$tree}}')
+            --arg tree "$AUDIT_SOURCE_TREE" '{verify:{quote:$quote,tree:$tree}}')
           timeout -k 5 30 "$BLAZE_SCRIPTS/smoke" "$verify" \
             2>&1 | timeout 40 tee "$evidence/hello-smoke-verify.txt"
-      - name: Exercise the migration fixture with detached descendant cleanup
-        id: focused_migration
-        if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
-        timeout-minutes: 60
-        run: |
-          set -euo pipefail
-          identity=$(timeout 10 jq -nc --arg bin "$RUNNER_TEMP/source-binaries" '{command:"verify",binaries:$bin,services:true}')
-          timeout 60 python3 .github/scripts/dist_build_identity.py "$identity"
-          input=$(timeout 10 jq -nc --arg blaze "$RUNNER_TEMP/source-binaries/blaze"   --arg modules "$BLAZE_SCRIPTS/proc_macro_modules" --arg source "$GITHUB_WORKSPACE"   --arg scratch "$RUNNER_TEMP/blaze-fs/forkfixes-focused"   '{blaze:$blaze,module_builder:$modules,scratch:$scratch,source:$source,timeout:900,workers:2,only:["a-test-sees-the-library-beside-its-bin"]}')
-          timeout -k 30 3300 python3 harness/forkfixes.py "$input"   2>&1 | timeout 3340 tee "$RUNNER_TEMP/dist-evidence/focused-forkfixes.log"
-          timeout 60 python3 .github/scripts/dist_build_identity.py "$identity"
-      - name: source protocol tests and complete execution observation
-        id: observed
-        if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
-        timeout-minutes: 60
-        run: |
-          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-          jq -n --arg blaze "$RUNNER_TEMP/source-binaries/blaze" --arg cwd "$GITHUB_WORKSPACE" --arg home "$RUNNER_TEMP/blaze-fs/protocol-home" --arg out "$RUNNER_TEMP/dist-evidence/exec" --arg shelf "$RUNNER_TEMP/source-shelf/toolchain" \
-            '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:3300,commands:(["blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"] | map({name:.,args:["test","-p",.,"--view","json","--","--run-all","--format","json"]}))}' \
-            > "$RUNNER_TEMP/dist-evidence/exec-input.json"
-          timeout -k 30 3500 python3 harness/v2/exec_observer.py "$RUNNER_TEMP/dist-evidence/exec-input.json"
-      - name: complete source protocol receipt with unchanged executables
-        id: protocol
-        if: ${{ !cancelled() && steps.observed.outcome == 'success' }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          out = Path(os.environ["RUNNER_TEMP"]) / "dist-evidence/exec"
-          result = json.loads((out / "result.json").read_text())
-          supervisor = json.loads((out / "supervisor.json").read_text())
-          packages = ["blaze-dist", "blaze-dist-local", "blaze-wire", "blaze-serve"]
-          scope = "linux-command-descendants-through-exit"
-          commands = supervisor.get("commands")
-          if (result.get("schema") != 2 or result.get("passed") is not True or result.get("returncode") != 0
-                  or result.get("scope") != scope or result.get("command_status") != 0
-                  or result.get("environment", {}).get("BLAZE_NO_DAEMON") != "1"
-                  or supervisor.get("schema") != 2 or supervisor.get("scope") != scope
-                  or supervisor.get("complete") is not True or "stop" in supervisor
-                  or not isinstance(commands, list) or len(commands) != len(packages)
-                  or any(not isinstance(row, dict) or set(row) != {"name","pid","returncode","timed_out"}
-                         or row["name"] != name or type(row["pid"]) is not int or row["pid"] <= 0
-                         or row["returncode"] != 0 or row["timed_out"] is not False
-                         for row, name in zip(commands, packages))
-                  or result.get("commands") != commands):
-              raise SystemExit("missing complete source protocol launch, exit and descendant evidence")
-          passed = []
-          for package in packages:
-              rows = [json.loads(line) for line in (out / (package + ".log")).read_text().splitlines() if line.strip()]
-              summaries = [row for row in rows if row.get("event") == "summary"]
-              tests = [row for row in rows if row.get("event") == "test"]
-              if len(summaries) != 1:
-                  raise SystemExit(f"{package}: no one source test summary")
-              summary = summaries[0]
-              ran = summary.get("ran")
-              if (summary.get("result") != "ok" or type(ran) is not int or ran <= 0
-                      or summary.get("passed") != ran or len(tests) != ran
-                      or any(summary.get(key, 0) != 0 for key in ("failed","reused","filtered_out","flaky","not_built"))
-                      or any(row.get("outcome") != "passed" or row.get("ran_because") != "run_all"
-                             or row.get("failure") is not None or row.get("basis") is not None for row in tests)):
-                  raise SystemExit(f"{package}: source tests did not all execute and pass")
-              for row in tests:
-                  path = row.get("path")
-                  parts = path.split("/") if isinstance(path, str) else []
-                  if len(parts) != 3 or parts[0] != package or not parts[1] or not parts[2]:
-                      raise SystemExit(f"{package}: invalid source test path {path!r}")
-                  passed.append(parts[2])
-          required = Path(".github/distributed-controls.txt").read_text().splitlines()
-          missing = [name for name in required if not any(path == name or path.endswith("::" + name) for path in passed)]
-          if not required or missing:
-              raise SystemExit(f"missing executed source protocol controls: {missing}")
-          PY
-          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-          echo 'accepted=true' >> "$GITHUB_OUTPUT"
-      - name: Verify the unchanged source compiler after smoke and focused controls
+          expected_binary=$(timeout 10 jq -er '.binaries.blaze' "$evidence/blaze-build.json")
+          quote_binary=$(timeout 10 awk '$1 == "binary" { print $2 }' "$evidence/hello-smoke.txt")
+          test "$quote_binary" = "$expected_binary"
+          printf 'quote_binary_sha256=%s\noriginal_manifest_match=true\n' "$quote_binary" \
+            > "$evidence/quote-identity.txt"
+      - name: Verify the unchanged source compiler after smoke
         if: ${{ !cancelled() && steps.handoff.outcome == 'success' && steps.smoke.outcome != 'skipped' }}
         timeout-minutes: 2
         run: |
           set -euo pipefail
+          evidence="$RUNNER_TEMP/artifact-smoke-evidence"
+          timeout 10 cmp "$evidence/blaze-build.json" "$RUNNER_TEMP/source-binaries/blaze-build.json"
           identity=$(timeout 10 jq -nc --arg bin "$RUNNER_TEMP/source-binaries" \
             '{command:"verify",binaries:$bin,services:true}')
           timeout 60 python3 .github/scripts/dist_build_identity.py "$identity" \
-            2>&1 | timeout 70 tee "$RUNNER_TEMP/artifact-smoke-evidence/identity-after-smoke.log"
+            2>&1 | timeout 70 tee "$evidence/identity-after-smoke.log"
+          test "$(timeout 20 git rev-parse HEAD)" = "$AUDIT_SOURCE_SHA"
+          test "$(timeout 20 git rev-parse 'HEAD^{tree}')" = "$AUDIT_SOURCE_TREE"
       - name: Collect smoke logs and final source and memory state
         if: always()
         timeout-minutes: 2
@@ -235,6 +169,9 @@ jobs:
           timeout 10 mkdir -p "$evidence"
           if [ -n "${AUDIT_SMOKE_WORK:-}" ] && [ -d "$AUDIT_SMOKE_WORK/logs" ]; then
             timeout 30 cp -a "$AUDIT_SMOKE_WORK/logs" "$evidence/smoke-logs"
+          fi
+          if [ -n "${AUDIT_SMOKE_WORK:-}" ] && [ -f "$AUDIT_SMOKE_WORK/quote.txt" ]; then
+            timeout 10 cp "$AUDIT_SMOKE_WORK/quote.txt" "$evidence/quote.txt"
           fi
           timeout 10 free -b > "$evidence/memory-after.txt"
           timeout 10 swapon --show --bytes > "$evidence/swap-after.txt"
@@ -246,11 +183,7 @@ jobs:
         uses: actions/upload-artifact@v7
         timeout-minutes: 10
         with:
-          name: distributed-artifact-smoke-arm64
-          path: |
-            ${{ runner.temp }}/artifact-smoke-evidence
-            ${{ runner.temp }}/dist-evidence
-            ${{ runner.temp }}/blaze-fs/forkfixes-focused/*.json
-            ${{ runner.temp }}/blaze-fs/forkfixes-focused/evidence
+          name: distributed-perf-canonical-smoke-arm64-${{ env.AUDIT_RUN_ID }}
+          path: ${{ runner.temp }}/artifact-smoke-evidence
           if-no-files-found: warn
           retention-days: 7
