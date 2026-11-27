@@ -18,6 +18,9 @@ One JSON object, inline, a file, or `-`:
              cold-process CLI has no such tuning and the value is reported as ignored
 
 Each case gets a fresh project and HOME. Each invocation owns a bounded command process.
+On Linux the harness is also a subreaper until that command's detached descendants have
+exited; their drain is recorded before a temporary HOME alias can be removed. Other hosts
+retain the process-group command path.
 Diagnostics come from `blaze check --view json`; execution from `blaze run`; tests from
 `blaze test -- --format json --run-all --exact`; the executable/cdylib artifact and
 cached-replay oracle from `blaze export --stats` (a cdylib through explicit `--lib`) and
@@ -29,6 +32,7 @@ is used. Independent semantic failures are collected. A timeout or an environmen
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -373,7 +377,7 @@ def save(path: Path, value: object) -> None:
 
 
 def terminate(process: subprocess.Popen) -> None:
-    """Signal the entire owned session, including descendants after the leader exits."""
+    """Signal the owned process group, including members after the leader exits."""
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(process.pid, sig)
@@ -386,6 +390,98 @@ def terminate(process: subprocess.Popen) -> None:
                 raise Failed(f"owned process group {process.pid} did not exit after SIGKILL") from error
 
 
+class LinuxChildren:
+    """One serial harness command's descendants, including helpers that call setsid.
+
+    This runner stays on its one main thread. No other child may exist on entry. A non-reaping
+    probe enforces that boundary before adoption; waitpid then owns every status it consumes.
+    A child PID remains ours until reaped, so cleanup never signals a potentially reused PID.
+    """
+
+    def __init__(self) -> None:
+        self.previous = ctypes.c_int()
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.started = False
+        self.report = {"scope": "linux-subreaper", "complete": False, "reaped": [], "killed": []}
+        self.signalled: set[int] = set()
+
+    def prctl(self, operation: int, argument: object) -> None:
+        if self.libc.prctl(operation, argument, 0, 0, 0) != 0:
+            code = ctypes.get_errno()
+            raise OSError(code, f"command subreaper prctl({operation}): {os.strerror(code)}")
+
+    def start(self) -> None:
+        try:
+            os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            pass
+        else:
+            raise Failed("command subreaper refused an existing child; its status was not consumed")
+        self.prctl(37, ctypes.byref(self.previous))  # PR_GET_CHILD_SUBREAPER
+        self.prctl(36, 1)  # PR_SET_CHILD_SUBREAPER
+        self.started = True
+
+    def reap(self) -> bool:
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                self.report["complete"] = True
+                return True
+            if pid == 0:
+                return False
+            self.signalled.discard(pid)
+            self.report["reaped"].append({"pid": pid, "returncode": os.waitstatus_to_exitcode(status)})
+
+    def wait(self, deadline: float, *, kill: bool = False) -> bool:
+        while not self.reap():
+            if kill:
+                # Only our direct, unreaped children can appear here. When a helper exits,
+                # its surviving descendants become our children before ECHILD is possible.
+                children = Path("/proc/thread-self/children").read_text().split()
+                for raw in children:
+                    pid = int(raw)
+                    if pid not in self.signalled:
+                        # Check ownership without consuming its exit status. This also
+                        # refuses a procfs mounted in a different PID namespace.
+                        try:
+                            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                        except ChildProcessError as error:
+                            raise Failed(f"procfs named PID {pid} outside the owned command tree") from error
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            continue  # exited but not reaped; its PID still cannot be reused
+                        self.signalled.add(pid)
+                        self.report["killed"].append(pid)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            time.sleep(min(left, 0.01))
+        return True
+
+    def finish(self, command_deadline: float) -> str | None:
+        if not self.started:
+            return None
+        failure = None
+        try:
+            # The command's overall bound still applies; a completed command grants at most
+            # thirty seconds for already-owned helpers, as the execution observer does.
+            if not self.wait(min(command_deadline, time.monotonic() + 30)):
+                failure = "owned command descendants exceeded their drain deadline"
+                if not self.wait(time.monotonic() + 5, kill=True):
+                    failure += "; cleanup is incomplete after SIGKILL"
+        except (OSError, ValueError) as error:
+            failure = f"owned command descendant cleanup failed: {error}"
+        if self.report["complete"]:
+            try:
+                self.prctl(36, self.previous.value)
+            except OSError as error:
+                failure = f"{failure}; {error}" if failure else str(error)
+        # Keep subreaper ownership and the HOME aliases if a live descendant remains.
+        return failure
+
+
 def run_command(argv: list[str], cwd: Path, env: dict[str, str], timeout: int,
                 evidence: Path, label: str) -> dict:
     """Keep full output on disk, including when a process is killed or cannot be reaped."""
@@ -394,7 +490,11 @@ def run_command(argv: list[str], cwd: Path, env: dict[str, str], timeout: int,
     record = {"label": label, "argv": [str(part) for part in argv], "cwd": str(cwd),
               "timeout": timeout, "returncode": None, "timed_out": False}
     stdout, stderr = evidence.with_suffix(".stdout"), evidence.with_suffix(".stderr")
+    descendants = None
     try:
+        if sys.platform == "linux":
+            descendants = LinuxChildren()
+            descendants.start()
         with stdout.open("wb") as out, stderr.open("wb") as err:
             child = subprocess.Popen(record["argv"], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                      stdout=out, stderr=err, start_new_session=True)
@@ -408,10 +508,19 @@ def run_command(argv: list[str], cwd: Path, env: dict[str, str], timeout: int,
                 raise
             record["returncode"] = child.returncode
     finally:
-        record["elapsed_seconds"] = time.monotonic() - started
-        record["stdout"] = stdout.read_text(errors="replace") if stdout.exists() else ""
-        record["stderr"] = stderr.read_text(errors="replace") if stderr.exists() else ""
-        save(evidence, record)
+        try:
+            if descendants:
+                record["descendants"] = descendants.report
+                cleanup_error = descendants.finish(started + timeout)
+                if cleanup_error:
+                    record["cleanup_error"] = cleanup_error
+        finally:
+            # An interrupted drain must still leave its incomplete ownership proof on disk,
+            # so CommandLog cannot allow HOME cleanup while propagating that interruption.
+            record["elapsed_seconds"] = time.monotonic() - started
+            record["stdout"] = stdout.read_text(errors="replace") if stdout.exists() else ""
+            record["stderr"] = stderr.read_text(errors="replace") if stderr.exists() else ""
+            save(evidence, record)
     return record
 
 
@@ -420,13 +529,33 @@ class CommandLog:
         self.directory = root / "evidence" / case
         self.directory.mkdir(parents=True, exist_ok=True)
         self.count = 0
+        self.cleanup_complete = True
 
     def __call__(self, argv: list[str], cwd: Path, env: dict[str, str], timeout: int,
                  label: str) -> dict:
         self.count += 1
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", label)
         evidence = self.directory / f"{self.count:03d}-{safe}.json"
-        record = run_command(argv, cwd, env, timeout, evidence, label)
+        try:
+            record = run_command(argv, cwd, env, timeout, evidence, label)
+        except BaseException:
+            if sys.platform == "linux":
+                previous = self.cleanup_complete
+                self.cleanup_complete = False
+                try:
+                    saved = json.loads(evidence.read_text())
+                except (OSError, ValueError):
+                    pass  # No completion proof; preserve the command's original exception.
+                else:
+                    descendants = saved.get("descendants") if isinstance(saved, dict) else None
+                    if (isinstance(descendants, dict) and descendants.get("scope") == "linux-subreaper"
+                            and descendants.get("complete") is True):
+                        self.cleanup_complete = previous
+            raise
+        self.cleanup_complete &= record.get("descendants", {}).get("complete", True)
+        if record.get("cleanup_error"):
+            raise Failed(f"{label}: exit={record['returncode']} timed_out={record['timed_out']}; "
+                         f"{record['cleanup_error']}; see {evidence}")
         if record["timed_out"]:
             raise Failed(f"{label} timed out after {timeout}s; see {evidence}")
         return record
@@ -948,11 +1077,15 @@ def run_case(case: dict, given: Input, scratch: Path) -> dict:
     finally:
         if "modules" in state:
             result["modules"] = state["modules"]
-        for container in state["home_containers"]:
-            try:
-                cleanup_logical_home(container)
-            except OSError as error:
-                result.setdefault("errors", []).append(f"cleanup logical HOME: {error}")
+        if log.cleanup_complete:
+            for container in state["home_containers"]:
+                try:
+                    cleanup_logical_home(container)
+                except OSError as error:
+                    result.setdefault("errors", []).append(f"cleanup logical HOME: {error}")
+        else:
+            result.setdefault("errors", []).append(
+                f"logical HOME aliases retained because owned descendants did not drain: {state['home_containers']}")
         if result.get("errors"):
             if result["ok"]:
                 result["why"] = "; ".join(result["errors"])
