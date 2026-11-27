@@ -55,6 +55,7 @@ pub struct Phases {
     /// `blaze run`'s parent's reads for its names records (run_names.rs `NamesRead`): the crates'
     /// records read in place, the bytes copied (0), the trees opened at their first read.
     pub(crate) run_names: Option<crate::run_names::NamesRead>,
+    pub(crate) export_verified_from_answers: Option<usize>,
     /// The cleanup line's part known before the commit after the answer (store/roots.rs
     /// `CleanupLine::before_commit`), for a profile written before that commit (main.rs).
     pub(crate) cleanup: Option<crate::store::roots::BeforeCommit>,
@@ -171,6 +172,7 @@ impl Phases {
             records: byte_rows::Records::new(),
             code_records: None,
             run_names: None,
+            export_verified_from_answers: None,
             cleanup: None,
             published: None,
             held: Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) },
@@ -200,6 +202,7 @@ impl Phases {
         self.records = byte_rows::Records::new();
         self.code_records = None;
         self.run_names = None;
+        self.export_verified_from_answers = None;
         self.cleanup = None;
         self.published = None;
         self.held = Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) };
@@ -464,6 +467,9 @@ impl fmt::Display for Phases {
         }
         if let Some(read) = self.run_names {
             writeln!(f, "run          {read}")?;
+        }
+        if let Some(count) = self.export_verified_from_answers {
+            writeln!(f, "export       {count} code entries verified from known read answers")?;
         }
         if let Some(cleanup) = self.cleanup {
             writeln!(f, "{cleanup}")?;

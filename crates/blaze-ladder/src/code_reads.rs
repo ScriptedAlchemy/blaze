@@ -1130,6 +1130,12 @@ impl<'a> Answers<'a> {
         self.rows.binary_search_by(|row| row.0[..].cmp(question)).ok().map(|at| self.rows[at].1)
     }
 
+    /// Every question in this entry already has its exact answer in this run.
+    /// An incomplete or different answer still needs the ordinary verifier.
+    pub(crate) fn covers(&self, entry: &EntryView<'_>) -> bool {
+        entry.reads().all(|row| row.is_ok_and(|(question, answer)| self.get(question) == Some(answer)))
+    }
+
     fn keep(&mut self, question: &[u8], answer: ContentId) {
         if let Err(at) = self.rows.binary_search_by(|row| row.0[..].cmp(question)) {
             let mut q = blaze_own::Vec::with_capacity_in(question.len(), self.alloc);

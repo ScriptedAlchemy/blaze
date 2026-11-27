@@ -357,6 +357,24 @@ fn a_second_run_over_names_records_finds_every_record_and_checks_no_body() {
     );
 }
 
+#[test]
+fn a_second_walk_with_the_same_maker_reuses_all_verified_read_answers() {
+    let f = fixture(PROGRAM);
+    let ids = ids_of(&f, true);
+    let mut store = MemoryStore::new_in(alloc());
+    walk(&f, &ids, &mut store);
+
+    let builder = builder();
+    let (control, mut maker) = walk_keeping(&f, &ids, ids.entry, &mut store, &builder);
+    let already_known = maker.verified_from_answers();
+    assert!(control.verified > already_known, "a fresh maker must prepare at least one entry");
+
+    let (_, repeated) = walk_records(ids.entry, &ids, &mut store, &builder, &producer(), &mut maker, alloc())
+        .expect("a second walk of the same program");
+    assert_eq!((repeated.found, repeated.made, repeated.verified), (control.found, 0, control.verified));
+    assert_eq!(maker.verified_from_answers() - already_known, repeated.verified);
+}
+
 /// One body's text edited between runs (`alpha`'s `1` to `5`), its records written again from
 /// the edited text: the ONE instance of `alpha` is made, every other found; `check_one` is asked
 /// of that one body, and constructing the lazy program checks none. Control: the same edit with

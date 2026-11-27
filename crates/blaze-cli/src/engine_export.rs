@@ -961,6 +961,7 @@ fn export_program<'f>(
     // Optional distributed compilation pass over workspace crates (D11).
     let mut dist_fp: Option<blaze_wire::Digest> = None;
     if let Some(dist_cfg) = dist.filter(|_| !release) {
+        let _dist_span = cx.span("export: distributed dev code");
         let mut dist_store = crate::engine_dist::DistStore::new(&mut codes, dist_cfg.wire_alloc);
         let (outcome, fp) = crate::engine_dist::run_distributed(
             dist_cfg,
@@ -1044,6 +1045,7 @@ fn export_program<'f>(
         Some(prepared) => prepared,
         None => prepare_export(cx, list, &ids, &builder, &mut maker, &mut codes, &roots, tier, alloc, frame, heap, after_walk)?,
     };
+    phases.export_verified_from_answers = Some(maker.verified_from_answers());
 
     // Assemble `ProgramIn` functions and data (zero-copy for cached positionless records).
     let mut functions: AVec<'_, Function<'_>> = Vec::with_capacity_in(outcomes.len() + 2, alloc);

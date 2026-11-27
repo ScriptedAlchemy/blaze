@@ -516,6 +516,7 @@ struct Work {
     /// The read-list answers found holding this run, by question ([`verify_instance`]): a
     /// question many found entries ask is asked of the front end once.
     answers: Answers<'static>,
+    verified_from_answers: usize,
     /// Per-`MakerState` memoization cache for pure ground-type queries (`normalize`,
     /// `adt_drop_impl`, `resolve`) keyed by interned IDs in `self.ground`. Sits below `Recorded` /
     /// `Asking` so every build's `ReadLog` is unchanged.
@@ -716,6 +717,7 @@ impl MakerState {
             reported: None,
             reads: ReadLog::new(ReadPlant::None),
             answers: Answers::new_in(alloc),
+            verified_from_answers: 0,
             query_cache: core::cell::RefCell::new(QueryCache::new_in(alloc)),
         };
         Ok(MakerState { asked: blaze_own::Vec::new_in(alloc), checked: blaze_own::Vec::new_in(alloc), tables: Some(tables), work })
@@ -1906,6 +1908,12 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>>(
     };
     let refused = |program: &RecordsProgram<'n>, error| RunError::CodeRecord { function: program.function(i).named(), error };
     let view = EntryView::read(entry).map_err(|e| refused(&*program, CodeRecordError::Entry(e)))?;
+    // The lazy preparation below supplies facts for questions that still need to be asked.
+    // When all exact answers already hold in this maker, there is no question left to prepare.
+    if state.work.answers.covers(&view) {
+        state.work.verified_from_answers += 1;
+        return Ok(Verdict::Holds);
+    }
     let alloc = state.work.alloc;
     let mut owners: AVec<'_, ItemKey> = blaze_own::Vec::new_in(alloc);
     // The coroutines whose states the rows read: laid again below, as the build's lay laid
@@ -3138,6 +3146,11 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// The checks the makes cost so far.
     pub fn checks(&self) -> CheckCount {
         self.checks
+    }
+
+    /// Entries proved from this maker's already verified read answers.
+    pub fn verified_from_answers(&self) -> usize {
+        self.made.as_ref().map_or(0, |(_, state)| state.work.verified_from_answers)
     }
 
     /// The lazy program's lowering counts, with the typing's counts of where each body's
