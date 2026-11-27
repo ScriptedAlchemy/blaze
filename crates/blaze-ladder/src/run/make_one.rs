@@ -517,10 +517,22 @@ struct Work {
     /// question many found entries ask is asked of the front end once.
     answers: Answers<'static>,
     verified_from_answers: usize,
+    /// Cumulative row visits across every partial-miss preparation pass of this maker.
+    read_preparation: ReadPreparation,
     /// Per-`MakerState` memoization cache for pure ground-type queries (`normalize`,
     /// `adt_drop_impl`, `resolve`) keyed by interned IDs in `self.ground`. Sits below `Recorded` /
     /// `Asking` so every build's `ReadLog` is unchanged.
     query_cache: core::cell::RefCell<QueryCache>,
+}
+
+/// Cumulative preparation row visits over a maker's lifetime, including distributed completion
+/// and later walks. Entries whose whole read lists are known add no preparation visits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadPreparation {
+    /// Rows decoded for front-end preparation, including temporary coroutine layouts.
+    pub prepared: usize,
+    /// Rows whose exact answer was already proved, so preparation was unnecessary.
+    pub reused: usize,
 }
 
 /// Compact stack-inline argument list key for [`QueryCache::normalize`] (99%+ of projections have
@@ -718,6 +730,7 @@ impl MakerState {
             reads: ReadLog::new(ReadPlant::None),
             answers: Answers::new_in(alloc),
             verified_from_answers: 0,
+            read_preparation: ReadPreparation::default(),
             query_cache: core::cell::RefCell::new(QueryCache::new_in(alloc)),
         };
         Ok(MakerState { asked: blaze_own::Vec::new_in(alloc), checked: blaze_own::Vec::new_in(alloc), tables: Some(tables), work })
@@ -1921,7 +1934,7 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>>(
     let mut roots: AVec<'_, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(alloc);
     state.work.needs.clear();
     for row in view.reads() {
-        let (bytes, _) = row.map_err(|e| refused(&*program, CodeRecordError::Entry(e)))?;
+        let (bytes, answer) = row.map_err(|e| refused(&*program, CodeRecordError::Entry(e)))?;
         // A row of no kind: `verify_today` refuses it by name below.
         let Some(kind) = bytes.first().copied().and_then(ReadKind::of) else { continue };
         match kind {
@@ -1940,6 +1953,16 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>>(
             | ReadKind::Promoted => {}
             _ => continue,
         }
+        // A partial read-list miss needs preparation only for its unanswered rows. Coroutine
+        // layouts are temporary (`forget_laid_in` below): a known state answer does not prove
+        // its layout is still present for another row, so their re-lay roots remain necessary.
+        if !matches!(kind, ReadKind::Laid | ReadKind::CoroutineState | ReadKind::CoroutineNiche)
+            && state.work.answers.holds(bytes, answer)
+        {
+            state.work.read_preparation.reused += 1;
+            continue;
+        }
+        state.work.read_preparation.prepared += 1;
         let (kind, extra, item, list) = reads::question(bytes, &mut state.work.ground, alloc).map_err(|e| refused(&*program, CodeRecordError::Reads(e)))?;
         let stale = Verdict::Stale { kind, item };
         let expr = u32::try_from(extra).ok().map(blaze_typeck::ExprId);
@@ -3151,6 +3174,11 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// Entries proved from this maker's already verified read answers.
     pub fn verified_from_answers(&self) -> usize {
         self.made.as_ref().map_or(0, |(_, state)| state.work.verified_from_answers)
+    }
+
+    /// Cumulative preparation row visits for this maker's lifetime, across every walk it serves.
+    pub fn read_preparation(&self) -> ReadPreparation {
+        self.made.as_ref().map_or_else(ReadPreparation::default, |(_, state)| state.work.read_preparation)
     }
 
     /// The lazy program's lowering counts, with the typing's counts of where each body's

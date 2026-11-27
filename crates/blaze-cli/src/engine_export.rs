@@ -1071,6 +1071,7 @@ fn export_program<'f>(
         None => prepare_export(cx, list, &ids, &builder, &mut maker, &mut codes, &roots, tier, alloc, frame, heap, after_walk)?,
     };
     phases.export_verified_from_answers = Some(maker.verified_from_answers());
+    phases.export_read_preparation = Some(maker.read_preparation());
 
     // Assemble `ProgramIn` functions and data (zero-copy for cached positionless records).
     let mut functions: AVec<'_, Function<'_>> = Vec::with_capacity_in(outcomes.len() + 2, alloc);
