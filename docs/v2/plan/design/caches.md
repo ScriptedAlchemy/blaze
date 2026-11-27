@@ -114,6 +114,11 @@ The retained protocol's `BLAZE_DIST_SOCKET`, `BLAZE_DIST_BLOBS`, `BLAZE_DIST_LOC
 carrier, namespace, report, event telemetry and bounded test rendezvous. None selects a
 different local caching path.
 
+`BLAZE_DIST_ARTIFACT_KEYS` names an absolute path for a distributed dev export's placement
+receipt. The JSON binds the executable's SHA-256 digest to the sorted content keys of the
+function records placed in it. Use a fresh executable destination and a separate receipt
+file. A fingerprint hit or local fallback cannot provide a fresh receipt.
+
 For a PR export, `BLAZE_DIST_DEADLINE_SECS` gives the distributed work one budget starting
 at its first coordinator handshake. The coordinator remembers the admitted PR sources
 through that budget, including gaps between units. A main-line export still has one budget

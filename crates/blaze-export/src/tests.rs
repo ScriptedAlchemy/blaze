@@ -211,19 +211,20 @@ fn equal_records_are_placed_once() {
         Member { symbol: sym("f"), record: CodeView::read(&a).unwrap(), tier: Some(Tier::Fast) },
         Member { symbol: sym("g"), record: CodeView::read(&a).unwrap(), tier: Some(Tier::Fast) },
     ];
-    let laid = lay_out(&members, &[], sym("main"), None, macho::plan(), 0, Alloc::global()).unwrap();
+    let alloc = Alloc::global();
+    let laid = lay_out(&members, &[], sym("main"), None, macho::plan(), 0, alloc).unwrap();
     let home = |name: &str| *laid.placed.iter().find(|p| p.symbol == sym(name)).unwrap();
     assert_eq!(home("f").at, home("g").at);
     assert_eq!(laid.placed.iter().filter(|p| p.folded).count(), 1);
     let functions = members.map(|member| Function { symbol: member.symbol, record: member.record, tier: Tier::Fast });
     let input = program(&functions, &[], None);
-    let mut observed = Vec::new_in(Alloc::global());
+    let mut observed = Vec::new_in(alloc);
     let mut saw_placement = false;
-    export_observing_placement(&input, &[], Platform::MacosArm64, &mut observed, Alloc::global(), Some(&mut |placed| {
+    export_observing_placement(&input, &[], Platform::MacosArm64, &mut observed, alloc, Some(&mut |placed| {
         saw_placement = true;
-        let aliases = placed.iter().filter(|p| p.symbol == sym("f") || p.symbol == sym("g"));
-        assert_eq!(aliases.clone().count(), 2);
-        assert_eq!(aliases.filter(|p| p.folded).count(), 1);
+        let aliases = || placed.iter().filter(|p| p.symbol == sym("f") || p.symbol == sym("g"));
+        assert_eq!(aliases().count(), 2);
+        assert_eq!(aliases().filter(|p| p.folded).count(), 1);
     })).unwrap();
     assert!(saw_placement);
     assert_eq!(observed.as_slice(), exported(&input, Platform::MacosArm64).as_slice());

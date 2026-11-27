@@ -190,11 +190,10 @@ pub(crate) fn keep<D: Driver, S: Sharing>(
             return Ok(());
         }
     }
-    let reads = row.reads.iter().copied();
-    if reads.clone().zip(reads.clone().skip(1)).any(|(first, second)| first.0 >= second.0) {
+    if !row.reads.as_slice().is_sorted_by(|first, second| first.0 < second.0) {
         return Err(invalid("the public scope's read witnesses are out of order").into());
     }
-    let bytes = write(toolchain, crate::graph::TRIPLE, row.key, name, payload, reads, alloc)
+    let bytes = write(toolchain, crate::graph::TRIPLE, row.key, name, payload, row.reads.iter().copied(), alloc)
         .map_err(|_| invalid("the public scope's target does not fit the entry"))?;
     let key = entry_key(&bytes);
     store.put_record(cx, key, ReservedTag::ScopeCandidate.tag(), &[held.bytes], &bytes)?;
