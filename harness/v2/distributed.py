@@ -19,8 +19,9 @@ shared clone blocks is an error; pass the Rust ledger a new work directory on th
 distv2.main is the acceptance authority, including its finally cleanup. Both profiles keep
 every cold-cache, publication and fault oracle; release also requires real LLVM and folded
 work from two holders. There is no profile filter, fault opt-out, or second receipt policy.
-These checks cover native distributed-cache reuse. D11's signed global-cache integration
-and off-critical-path latency/overlap evidence remain missing in the objective ledger.
+These checks cover native distributed-cache reuse. The held-pack run in distv2.py checks
+whether a native cache read overlaps independent compilation. Cold compiler reuse from
+the signed toolchain origin remains open in D11.
 """
 
 import contextlib
