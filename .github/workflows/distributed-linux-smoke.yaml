@@ -1,0 +1,162 @@
+name: Distributed compile Linux source smoke
+on:
+  push:
+    branches:
+      - validation/distributed-compile-audit-linux-smoke
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+env:
+  AUDIT_SOURCE_SHA: 836829acc2ed4da10ab4b32cdcfbb5a65e1954db
+  RUST_BACKTRACE: "0"
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: "2"
+jobs:
+  source-smoke:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+        timeout-minutes: 5
+        with:
+          ref: ${{ env.AUDIT_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        timeout-minutes: 5
+        with:
+          python-version: "3.13"
+      - name: Record the immutable source, host and available memory
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          test "$(timeout 10 uname -s -m)" = "Linux aarch64"
+          evidence="$RUNNER_TEMP/linux-evidence"
+          timeout 10 mkdir -p "$evidence"
+          test "$(timeout 20 git rev-parse HEAD)" = "$AUDIT_SOURCE_SHA"
+          test -z "$(timeout 20 git status --porcelain)"
+          timeout 20 git rev-parse HEAD 'HEAD^{tree}' > "$evidence/source.txt"
+          timeout 10 cp pins/toolchain "$evidence/toolchain-pin.txt"
+          printf 'runner_os=%s\nrunner_arch=%s\nrunner_environment=%s\n' \
+            "$RUNNER_OS" "$RUNNER_ARCH" "$RUNNER_ENVIRONMENT" > "$evidence/runner.txt"
+          timeout 10 uname -a > "$evidence/kernel.txt"
+          timeout 10 lscpu > "$evidence/cpu.txt"
+          timeout 10 free -b > "$evidence/memory-before.txt"
+          timeout 10 swapon --show --bytes > "$evidence/swap-before.txt"
+          timeout 10 cat /proc/self/cgroup > "$evidence/cgroup.txt"
+          timeout 10 df -B1 "$RUNNER_TEMP" > "$evidence/disk-before.txt"
+      - uses: ./.github/actions/locked-memory
+        timeout-minutes: 2
+      - uses: ./.github/actions/reflink
+        timeout-minutes: 15
+      - name: Keep smoke homes and temporary paths short on the verified filesystem
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          test_temp="$RUNNER_TEMP/blaze-fs/tmp"
+          timeout 10 mkdir "$test_temp"
+          short_temp=$(timeout 10 mktemp -d /tmp/bz.XXXXXX)
+          timeout 10 sudo mount --bind "$test_temp" "$short_temp"
+          store_device=$(timeout 10 stat -Lc %d "$BLAZE_HOME/v2/store")
+          target_device=$(timeout 10 stat -Lc %d "$CARGO_TARGET_DIR")
+          temp_device=$(timeout 10 stat -Lc %d "$short_temp")
+          test "$temp_device" = "$store_device"
+          test "$temp_device" = "$target_device"
+          printf 'TMPDIR=%s\nsmoke_work=%s/smoke\nstore_device=%s\ntarget_device=%s\ntemp_device=%s\n' \
+            "$short_temp" "$short_temp" "$store_device" "$target_device" "$temp_device" \
+            > "$RUNNER_TEMP/linux-evidence/native-filesystem.txt"
+          timeout 10 findmnt -T "$short_temp" >> "$RUNNER_TEMP/linux-evidence/native-filesystem.txt"
+          timeout 10 prlimit --pid "$$" --memlock > "$RUNNER_TEMP/linux-evidence/locked-memory.txt"
+          test "$(ulimit -l)" = unlimited
+          echo "TMPDIR=$short_temp" >> "$GITHUB_ENV"
+          echo "AUDIT_SMOKE_WORK=$short_temp/smoke" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/toolchain
+        timeout-minutes: 15
+      - name: Build the default release CLI, launcher, fact shim and canonical scripts
+        id: source_build
+        timeout-minutes: 95
+        run: |
+          set -euo pipefail
+          tc=$(timeout 10 cat pins/toolchain)
+          timeout -k 30 5400 nice -n 10 cargo +"$tc" build -j 2 --release --locked \
+            -p blaze-cli -p blaze-launcher -p scripts --bin blaze --bin blaze-fact-shim \
+            --bin blaze-launcher --bin toolchain_cut --bin smoke \
+            2>&1 | timeout 5450 tee "$RUNNER_TEMP/linux-evidence/build.log"
+          install_dir="$RUNNER_TEMP/source-binaries"
+          timeout 10 mkdir "$install_dir"
+          for name in blaze blaze-launcher blaze-fact-shim toolchain_cut smoke; do
+            timeout 30 install -m 0755 "$CARGO_TARGET_DIR/release/$name" "$install_dir/$name"
+          done
+          timeout 60 sha256sum "$install_dir"/* > "$RUNNER_TEMP/linux-evidence/binaries.txt"
+          seal=$(timeout 10 jq -nc --arg bin "$install_dir" '{command:"seal",binaries:$bin,services:false}')
+          timeout 60 python3 .github/scripts/dist_build_identity.py "$seal" \
+            2>&1 | timeout 70 tee "$RUNNER_TEMP/linux-evidence/build-identity.log"
+          timeout 10 cp "$install_dir/blaze-build.json" "$RUNNER_TEMP/linux-evidence/blaze-build.json"
+          echo "BLAZE_SCRIPTS=$install_dir" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/toolchain-shelf
+        timeout-minutes: 42
+      - name: Run and verify the clean exact-tree canonical hello smoke
+        id: smoke
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          identity=$(timeout 10 jq -nc --arg bin "$BLAZE_SCRIPTS" '{command:"verify",binaries:$bin,services:false}')
+          timeout 60 python3 .github/scripts/dist_build_identity.py "$identity" \
+            2>&1 | timeout 70 tee "$RUNNER_TEMP/linux-evidence/identity-before-smoke.log"
+          input=$(timeout 10 jq -nc --arg bin "$BLAZE_SCRIPTS" --arg work "$AUDIT_SMOKE_WORK" \
+            '{blaze:($bin+"/blaze"),work:$work}')
+          timeout -k 20 480 "$BLAZE_SCRIPTS/smoke" "$input" \
+            2>&1 | timeout 510 tee "$RUNNER_TEMP/linux-evidence/hello-smoke.txt"
+          timeout 60 python3 .github/scripts/dist_build_identity.py "$identity" \
+            2>&1 | timeout 70 tee "$RUNNER_TEMP/linux-evidence/identity-after-smoke.log"
+          tree=$(timeout 20 git rev-parse 'HEAD^{tree}')
+          verify=$(timeout 10 jq -nc --rawfile quote "$RUNNER_TEMP/linux-evidence/hello-smoke.txt" \
+            --arg tree "$tree" '{verify:{quote:$quote,tree:$tree}}')
+          timeout -k 5 30 "$BLAZE_SCRIPTS/smoke" "$verify" \
+            2>&1 | timeout 40 tee "$RUNNER_TEMP/linux-evidence/hello-smoke-verify.txt"
+      - name: Execute all three distributed CLI regressions
+        if: ${{ !cancelled() && steps.source_build.outcome == 'success' }}
+        timeout-minutes: 32
+        run: |
+          set -euo pipefail
+          tc=$(timeout 10 cat pins/toolchain)
+          log="$RUNNER_TEMP/linux-evidence/distributed-cli-tests.log"
+          timeout -k 20 1800 nice -n 10 cargo +"$tc" test -j 2 --release --locked \
+            -p blaze-cli --bin blaze engine_dist::tests:: -- --test-threads=1 \
+            2>&1 | timeout 1830 tee "$log"
+          expected=(
+            engine_dist::tests::distributed_written_pointers_export_their_cached_targets
+            engine_dist::tests::distributed_local_records_are_borrowed_and_failed_writes_keep_the_previous_value
+            engine_dist::tests::distributed_accepted_pointers_supersede_temporary_peer_values
+          )
+          for name in "${expected[@]}"; do
+            timeout 10 grep -Fx "test $name ... ok" "$log"
+          done
+          timeout 10 grep -E '^test result: ok\. 3 passed; 0 failed; 0 ignored;' "$log"
+      - name: Collect the smoke logs and final source and memory state
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/linux-evidence"
+          timeout 10 mkdir -p "$evidence"
+          if [ -n "${AUDIT_SMOKE_WORK:-}" ] && [ -d "$AUDIT_SMOKE_WORK/logs" ]; then
+            timeout 30 cp -a "$AUDIT_SMOKE_WORK/logs" "$evidence/smoke-logs"
+          fi
+          timeout 10 free -b > "$evidence/memory-after.txt"
+          timeout 10 swapon --show --bytes > "$evidence/swap-after.txt"
+          timeout 10 df -B1 "$RUNNER_TEMP" > "$evidence/disk-after.txt"
+          timeout 20 git status --short > "$evidence/source-after.txt"
+          timeout 20 git diff HEAD --binary > "$evidence/source-after.patch"
+      - name: Keep the exact source smoke and regression evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        timeout-minutes: 10
+        with:
+          name: distributed-linux-source-smoke-arm64
+          path: |
+            ${{ runner.temp }}/linux-evidence
+            ${{ runner.temp }}/toolchain-cut
+          if-no-files-found: warn
+          retention-days: 7
