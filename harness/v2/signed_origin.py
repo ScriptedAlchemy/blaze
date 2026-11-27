@@ -69,11 +69,15 @@ def certificate(directory: Path) -> tuple[ssl.SSLContext, Path, Path]:
         openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
                 "-subj", f"/CN=Blaze signed-origin fixture {name}",
                 "-addext", "basicConstraints=critical,CA:TRUE",
+                "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+                "-addext", "subjectKeyIdentifier=hash",
                 "-keyout", f"{name}.key", "-out", f"{name}.pem")
     openssl("req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=127.0.0.1",
             "-keyout", "server.key", "-out", "server.csr")
     (directory / "server.ext").write_text(
-        "subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n"
+        "subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\n"
+        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n"
     )
     openssl("x509", "-req", "-days", "1", "-in", "server.csr", "-CA", "origin.pem", "-CAkey", "origin.key",
             "-CAcreateserial", "-extfile", "server.ext", "-out", "server.pem")
@@ -83,11 +87,14 @@ def certificate(directory: Path) -> tuple[ssl.SSLContext, Path, Path]:
 
 
 @contextlib.contextmanager
-def serve(directory: Path, tls: ssl.SSLContext) -> Generator[tuple[str, list[RangeRead], list[str]]]:
+def serve(
+    directory: Path, tls: ssl.SSLContext, receipt: Path,
+) -> Generator[tuple[str, list[RangeRead], list[str], threading.Event]]:
     objects = {"/" + path.relative_to(directory).as_posix(): path
                for path in directory.rglob("*") if path.is_file()}
     reads: list[RangeRead] = []
     refused_tls: list[str] = []
+    handshake_failed = threading.Event()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -137,16 +144,18 @@ def serve(directory: Path, tls: ssl.SSLContext) -> Generator[tuple[str, list[Ran
             except OSError as error:
                 sock.close()
                 refused_tls.append(str(error))
+                handshake_failed.set()
                 raise
 
     with Server(("127.0.0.1", 0), Handler) as server:
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1})
         thread.start()
         try:
-            yield f"https://127.0.0.1:{server.server_port}", reads, refused_tls
+            yield f"https://127.0.0.1:{server.server_port}", reads, refused_tls, handshake_failed
         finally:
             server.shutdown()
             thread.join(timeout=6)
+            receipt.write_text(json.dumps({"tls_refusals": refused_tls, "https_reads": reads}, indent=2) + "\n")
             require(not thread.is_alive(), "the disposable origin did not stop")
 
 
@@ -219,14 +228,16 @@ def run(given: Input) -> None:
         key = made[3]
         tls, ca, unrelated = certificate(directory)
 
-        with serve(origin, tls) as (url, reads, refused_tls):
+        with serve(origin, tls, scratch / "https-observations.json") as (url, reads, refused_tls, handshake_failed):
             def origin_args(public_key: str) -> tuple[str, ...]:
                 return "--origin", url, "--origin-key", public_key
 
             _, _, (status, _, stderr) = check("untrusted-tls", blaze, *origin_args(key), ca=unrelated)
-            unknown_ca = any("unknown ca" in why.lower() or "certificate unknown" in why.lower() for why in refused_tls)
-            require(status != 0 and "the published set of --origin was not taken" in stderr and unknown_ca and not reads,
-                    "the client did not stop at the unrelated TLS root")
+            # The client may close before sending a TLS alert. The paired trusted-CA run
+            # below must take the same origin with the same binary and signing key.
+            require(status != 0 and "the published set of --origin was not taken" in stderr
+                    and handshake_failed.wait(timeout=6) and not reads,
+                    f"the client did not refuse the handshake before HTTP with the unrelated TLS root: {refused_tls!r}")
             _, _, (status, _, stderr) = check("untrusted-signer", blaze, *origin_args("00" * 32), ca=ca)
             require(status != 0 and "a key this blaze was not given for the namespace" in stderr
                     and bool(reads) and all(row["path"].endswith("/prefix") for row in reads),
