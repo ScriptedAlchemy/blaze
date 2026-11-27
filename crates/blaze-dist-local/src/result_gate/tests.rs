@@ -275,7 +275,11 @@ fn a_capture_roundtrips_the_exact_command_and_actual_answer_and_is_claimed_once(
         alloc,
     )
     .unwrap();
-    let capture = gate.hold(&command, || panic!("the gate has no keepalive marker")).unwrap().unwrap();
+    let before_expiry = || Ok(gate.deadline_ns - 1);
+    let capture = gate
+        .hold_with_clock(&command, || panic!("the gate has no keepalive marker"), before_expiry)
+        .unwrap()
+        .unwrap();
     let saved = read_file(directory.join("result.cbor").as_str(), alloc).unwrap();
     assert_eq!(decode::<Command>(&saved, &Limits::DOCUMENTED, alloc).unwrap(), command);
     assert_eq!(saved, encode(&command, alloc));
@@ -292,7 +296,11 @@ fn a_capture_roundtrips_the_exact_command_and_actual_answer_and_is_claimed_once(
         answer
     );
     assert!(
-        gate.hold(&command, || panic!("a claimed gate does not wait")).unwrap().is_none(),
+        gate.hold_with_clock(
+            &command,
+            || panic!("a claimed gate does not wait"),
+            || panic!("a claimed gate does not read the clock"),
+        ).unwrap().is_none(),
         "another unit must not pause on the same one-shot gate"
     );
     assert!(!path_exists(directory.join(".ready.json.tmp").as_str()));
@@ -309,7 +317,10 @@ fn a_missing_release_times_out_and_leaves_complete_failure_evidence() {
     assert!(ResultGate::new(dir_str.clone(), Duration::ZERO, alloc).is_err());
     assert!(ResultGate::new(dir_str.clone(), Duration::MAX, alloc).is_err());
     let gate = ResultGate::new(dir_str, Duration::from_nanos(1), alloc).unwrap();
-    assert!(matches!(gate.hold(&command, || panic!("the gate has no keepalive marker")), Err(Error::Protocol(_))));
+    assert!(matches!(
+        gate.hold_with_clock(&command, || panic!("the gate has no keepalive marker"), || Ok(gate.deadline_ns)),
+        Err(Error::Protocol(_))
+    ));
     assert!(path_is_file(directory.join("error.txt").as_str()));
     assert!(!path_exists(directory.join("answer.cbor").as_str()));
     assert_eq!(
@@ -338,11 +349,11 @@ fn a_released_keepalive_gate_preserves_its_result_after_a_heartbeat_refusal() {
     )
     .unwrap();
     let mut beats = 0;
-    assert!(gate.hold(&command, || {
+    assert!(gate.hold_with_clock(&command, || {
         beats += 1;
         write_file(directory.join("release").as_str(), b"").unwrap();
         Err(Error::Protocol(WireString::from_str_in("heartbeat refused during release", alloc)))
-    }).unwrap().is_some());
+    }, || Ok(gate.deadline_ns - HEARTBEAT_NS)).unwrap().is_some());
     assert_eq!(beats, 1);
     assert_eq!(read_file(directory.join("result.cbor").as_str(), alloc).unwrap(), encode(&command, alloc));
     assert!(!path_exists(directory.join("error.txt").as_str()));

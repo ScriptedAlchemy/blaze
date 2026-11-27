@@ -66,7 +66,16 @@ impl ResultGate {
         Ok(Self { directory, clock, deadline_ns, timeout, alloc })
     }
 
-    pub(crate) fn hold(&self, command: &Command, mut heartbeat: impl FnMut() -> Result<(), Error>) -> Result<Option<Capture<'_>>, Error> {
+    pub(crate) fn hold(&self, command: &Command, heartbeat: impl FnMut() -> Result<(), Error>) -> Result<Option<Capture<'_>>, Error> {
+        self.hold_with_clock(command, heartbeat, || self.clock.monotonic_nanos())
+    }
+
+    fn hold_with_clock(
+        &self,
+        command: &Command,
+        mut heartbeat: impl FnMut() -> Result<(), Error>,
+        mut now_ns: impl FnMut() -> Result<u64, Errno>,
+    ) -> Result<Option<Capture<'_>>, Error> {
         let Command::Result(submission) = command else { return Ok(None) };
         let claimed_path = join_path(self.directory.as_str(), "claimed", self.alloc);
         // An exclusive creation is the whole one-shot selection. No lock or open file is
@@ -122,7 +131,7 @@ impl ResultGate {
             let mut heartbeat_error = None;
             loop {
                 // Check expiry first: an old release file cannot revive a timed-out gate.
-                let now = self.clock.monotonic_nanos()?;
+                let now = now_ns()?;
                 if now >= self.deadline_ns {
                     return Err(Error::Protocol(format_in!(
                         self.alloc,
