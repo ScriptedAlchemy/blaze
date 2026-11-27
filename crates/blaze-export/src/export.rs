@@ -12,7 +12,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::eh_out::{Outside, eh_room_with, eh_sections_with};
 use crate::error::ExportError;
 use crate::input::{Entry, Panic, Platform, ProgramIn, Tier};
-use crate::layout::{Member, TlsPlan, lay_out_library_with_tls, lay_out_with_tls};
+use crate::layout::{Member, Placed, TlsPlan, lay_out_library_with_tls, lay_out_with_tls};
 use crate::native_merge::{self, MergeError};
 use crate::start::{main_of, start};
 use crate::{elf, macho};
@@ -105,6 +105,18 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
 /// Exports the program with a separate name table for calls from its native image to Rust.
 /// A shared library exposes only `program.exports` to the loader.
 pub fn export_with_native_exports<'a>(program: &ProgramIn<'_>, native_exports: &[crate::CExport<'_>], platform: Platform, out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<Exported, ExportError> {
+    export_observing_placement(program, native_exports, platform, out, alloc, None)
+}
+
+/// Reports final placements after the target writer has successfully built the image.
+pub fn export_observing_placement<'a>(
+    program: &ProgramIn<'_>,
+    native_exports: &[crate::CExport<'_>],
+    platform: Platform,
+    out: &mut AVec<'a, u8>,
+    alloc: Alloc<'a>,
+    placed: Option<&mut dyn FnMut(&[Placed])>,
+) -> Result<Exported, ExportError> {
     if platform == Platform::Wasm64 {
         return Err(ExportError::Wasm64RequiresWasmProgram);
     }
@@ -234,6 +246,9 @@ pub fn export_with_native_exports<'a>(program: &ProgramIn<'_>, native_exports: &
                 }
             }
         }
+    }
+    if let Some(placed) = placed {
+        placed(&laid.placed);
     }
     Ok(Exported { platform, functions, folded, fast, optimized, made, imports: bound as u32, len: out.len() as u64, identity, profile: program.profile.map(|p| p.digest), panics })
 }

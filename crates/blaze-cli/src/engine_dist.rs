@@ -66,6 +66,7 @@ const BLOBS_VAR: &str = "BLAZE_DIST_BLOBS";
 const LOCAL_VAR: &str = "BLAZE_DIST_LOCAL";
 /// JSONL report output path.
 const REPORT_VAR: &str = "BLAZE_DIST_REPORT";
+pub(crate) const ARTIFACT_KEYS_VAR: &str = "BLAZE_DIST_ARTIFACT_KEYS";
 /// Execution budget in seconds per main-line unit or per pull request export.
 const DEADLINE_VAR: &str = "BLAZE_DIST_DEADLINE_SECS";
 /// Pull request namespace number.
@@ -203,6 +204,7 @@ fn env_get<'a>(env: Option<&'a Env>, name: &str) -> Option<&'a str> {
 pub(crate) struct DistConfig {
     pub(crate) config: Config,
     pub(crate) report: Option<AString<'static>>,
+    pub(crate) artifact_keys: Option<AString<'static>>,
     pub(crate) wire_alloc: WireAlloc,
     result_gate: Option<TestResultGate>,
 }
@@ -223,7 +225,7 @@ impl DistConfig {
         let alloc = heap.alloc();
         let wire_alloc = heap.shared();
         let Some(socket) = env_get(env, SOCKET_VAR) else {
-            for name in [BLOBS_VAR, LOCAL_VAR, REPORT_VAR, DEADLINE_VAR, PR_VAR, SOURCE_VAR, RESULT_GATE_VAR, RESULT_UNIT_VAR] {
+            for name in [BLOBS_VAR, LOCAL_VAR, REPORT_VAR, ARTIFACT_KEYS_VAR, DEADLINE_VAR, PR_VAR, SOURCE_VAR, RESULT_GATE_VAR, RESULT_UNIT_VAR] {
                 if let Some(val) = env_get(env, name) {
                     return Err(DistError::OptionWithoutSocket { name, value: own_str(val, alloc) });
                 }
@@ -290,6 +292,7 @@ impl DistConfig {
             poll: Duration::from_millis(10),
         };
         let report = env_get(env, REPORT_VAR).map(|p| own_str(p, alloc));
+        let artifact_keys = env_get(env, ARTIFACT_KEYS_VAR).map(|p| own_str(p, alloc));
         let unit = env_get(env, RESULT_UNIT_VAR).map(|name| own_str(name, alloc));
         let result_gate = match env_get(env, RESULT_GATE_VAR) {
             Some(dir) => Some(TestResultGate { directory: own_str(dir, alloc), unit }),
@@ -298,7 +301,7 @@ impl DistConfig {
             }),
             None => None,
         };
-        Ok(Some(DistConfig { config, report, wire_alloc, result_gate }))
+        Ok(Some(DistConfig { config, report, artifact_keys, wire_alloc, result_gate }))
     }
 }
 

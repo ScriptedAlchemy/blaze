@@ -20,7 +20,7 @@
 //!    the output path via `bstd::fs`, mark executable (`0o755`), and print a concise summary (or
 //!    detailed breakdown with `--stats`).
 
-use core::fmt;
+use core::fmt::{self, Write};
 
 use blaze_code::datum::{DatumView, OWN_DATUM, Place as DatumPlace};
 use blaze_code::record::{CodeRecord, CodeView, NO_TARGET, PositionPart, Site, SiteKind, Space, Symbol as CodeSymbol, Target};
@@ -108,6 +108,7 @@ pub enum ExportCliError {
     OutputPath(PathError),
     /// Publishing the output executable failed.
     WriteOutput(FsError),
+    ArtifactKeys { path: AString<'static>, why: &'static str },
     /// Marking the published file executable (`0o755`) failed.
     #[cfg(unix)]
     Chmod { path: AString<'static>, errno: blaze_sys::Errno },
@@ -154,7 +155,8 @@ impl fmt::Display for ExportCliError {
             ExportCliError::BadOutputPath { path, why } => write!(f, "blaze export: invalid output path {}: {why} (engine_export.rs)", Code(path.as_str())),
             ExportCliError::OutputHome(error) => write!(f, "blaze export: output directory: {error} (engine_export.rs)"),
             ExportCliError::OutputPath(error) => write!(f, "blaze export: output path: {error} (engine_export.rs)"),
-            ExportCliError::WriteOutput(error) => write!(f, "blaze export: writing executable: {error} (engine_export.rs)"),
+            ExportCliError::WriteOutput(error) => write!(f, "blaze export: publishing output: {error} (engine_export.rs)"),
+            ExportCliError::ArtifactKeys { path, why } => write!(f, "blaze export: no fresh placement receipt for {} ({}): {why}", crate::engine_dist::ARTIFACT_KEYS_VAR, Code(path.as_str())),
             #[cfg(unix)]
             ExportCliError::Chmod { path, errno } => write!(f, "blaze export: chmod 0755 {} failed: {errno:?} (engine_export.rs)", Code(path.as_str())),
             ExportCliError::Dist(error) => fmt::Display::fmt(error, f),
@@ -249,6 +251,14 @@ pub(crate) fn command(
         .map_err(|error| box_err(ExportCliError::Dist(error), heap))?;
     if dist.is_some() && !flags.build_env.is_empty() {
         return Err(CliError::Usage("--build-env grants are private to this home and cannot be used for a distributed export"));
+    }
+    if let Some(path) = dist.as_ref().and_then(|dist| dist.artifact_keys.as_ref()) {
+        if flags.release || flags.export_kind != run_package::ExportKind::Binary {
+            return Err(receipt_error(path.as_str(), "the receipt requires a distributed dev executable", heap));
+        }
+        if !matches!(parse_output_target(path.as_str()), Ok(OutputTarget::Absolute { .. })) {
+            return Err(receipt_error(path.as_str(), "the receipt needs an absolute file path", heap));
+        }
     }
     if flags.release && dist.is_some() && !cfg!(feature = "llvm") {
         return Err(box_err(ExportCliError::Dist(crate::engine_dist::DistError::ReleaseBackendUnavailable), heap));
@@ -837,6 +847,14 @@ fn export_program<'f>(
         }
         None => picked.bin,
     };
+    let receipt_path = dist.and_then(|dist| dist.artifact_keys.as_ref()).map(|path| path.as_str());
+    if let Some(path) = receipt_path {
+        let receipt_name = path.rsplit('/').next().unwrap_or("");
+        let executable_name = output_path.rsplit('/').next().unwrap_or("");
+        if receipt_name.eq_ignore_ascii_case(executable_name) {
+            return Err(receipt_error(path, "the receipt and executable must have different file names", heap));
+        }
+    }
     let export_frame = Frame::with_reserve(EXPORT_FRAME_RESERVE, bstd::mem::Tag::Other).map_err(|_| box_err(ExportCliError::Frame, heap))?;
     let export_erased = Erased::new(&export_frame);
     let export_bump = export_erased.bump();
@@ -984,13 +1002,20 @@ fn export_program<'f>(
         drop(dist_store);
         match outcome {
             crate::engine_dist::DistExportOutcome::NoOp => {
+                if let Some(path) = receipt_path {
+                    return Err(receipt_error(path, "the existing executable already has the requested fingerprint", heap));
+                }
                 end_procs(cx, &maker_procs, standing.err, "export")?;
                 return Ok(unchanged());
             }
             crate::engine_dist::DistExportOutcome::Completed { .. } => {
                 dist_fp = Some(fp);
             }
-            crate::engine_dist::DistExportOutcome::FallbackLocal => {}
+            crate::engine_dist::DistExportOutcome::FallbackLocal => {
+                if let Some(path) = receipt_path {
+                    return Err(receipt_error(path, "the distributed export did not complete", heap));
+                }
+            }
         }
     }
 
@@ -1225,8 +1250,15 @@ fn export_program<'f>(
     };
 
     let mut exe_bytes: AVec<'_, u8> = Vec::new_in(alloc);
-    let exported = blaze_export::export_with_native_exports(&program_in, native_export.bindings.as_slice(), platform, &mut exe_bytes, alloc)
-        .map_err(|error| box_err(ExportCliError::Export(error), heap))?;
+    let mut receipt_keys = None;
+    let exported = match receipt_path {
+        Some(path) => blaze_export::export::export_observing_placement(
+            &program_in, native_export.bindings.as_slice(), platform, &mut exe_bytes, alloc,
+            Some(&mut |placed| receipt_keys = Some(placed_keys(path, placed, &walk, &outcomes, &codes, alloc, frame, heap))),
+        ),
+        None => blaze_export::export_with_native_exports(&program_in, native_export.bindings.as_slice(), platform, &mut exe_bytes, alloc),
+    }.map_err(|error| box_err(ExportCliError::Export(error), heap))?;
+    let receipt_keys = receipt_keys.transpose()?;
 
     // Keep every reached pointer and target across the next command's reach sweep.
     drop(functions);
@@ -1242,6 +1274,19 @@ fn export_program<'f>(
     }
 
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
+    if let (Some(path), Some(keys)) = (receipt_path, receipt_keys) {
+        let sha256 = blaze_sha256::digest(exe_bytes.as_slice());
+        let mut receipt = String::with_capacity_in(100 + keys.len() * 67, alloc);
+        let _ = write!(receipt, "{{\"artifact_sha256\":\"{}\",\"keys\":[", Hex(&sha256));
+        for (i, key) in keys.iter().enumerate() {
+            if i != 0 {
+                receipt.push(',');
+            }
+            let _ = write!(receipt, "\"{}\"", Hex(key));
+        }
+        receipt.push_str("]}\n");
+        publish_output(cx, fs, path, receipt.as_bytes(), heap)?;
+    }
     if let (Some(dist_cfg), Some(fp)) = (dist, dist_fp) {
         crate::engine_dist::write_output_fingerprint(output_path, &fp, dist_cfg.wire_alloc);
     }
@@ -1257,6 +1302,45 @@ fn export_program<'f>(
         lto_bodies,
         lto_inlined,
     })
+}
+
+fn receipt_error(path: &str, why: &'static str, heap: &'static blaze_own::Heap) -> CliError {
+    box_err(ExportCliError::ArtifactKeys { path: owned_str(path, heap.alloc()), why }, heap)
+}
+
+#[expect(clippy::too_many_arguments, reason = "final placed symbols, validated code entries, and explicit output capabilities")]
+fn placed_keys<'a>(
+    path: &str,
+    placed: &[blaze_export::layout::Placed],
+    walk: &Walk<'_>,
+    outcomes: &[RowOutcome<'_>],
+    codes: &dyn CodeStore,
+    alloc: Alloc<'a>,
+    frame: &Frame,
+    heap: &'static blaze_own::Heap,
+) -> Result<AVec<'a, blaze_wire::Digest>, CliError> {
+    const MOST: usize = 65_536;
+    let mut keys = Vec::new_in(alloc);
+    for place in placed {
+        if place.tier.is_none() || place.folded || place.len == 0 {
+            continue;
+        }
+        let Some(RowOutcome::Keyed(key)) = walk.row_of(&place.symbol).and_then(|row| outcomes.get(row)) else {
+            continue;
+        };
+        if keys.len() == MOST {
+            return Err(receipt_error(path, "the receipt exceeds 65,536 placed entries", heap));
+        }
+        let entry = entry_of(codes, *key)
+            .map_err(|why| box_err(ExportCliError::Store { symbol: place.symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
+            .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: place.symbol.0 }, heap))?;
+        // The grant's plain emission names the complete entry, including its read list.
+        // Older stores can have a plain entry under its recipe key, so hash the actual bytes.
+        keys.push(blaze_ladder::code_records::content_key(entry).0.0);
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Ok(keys)
 }
 
 /// Why an `-o` / `--output` path was rejected before writing.
@@ -1335,6 +1419,15 @@ fn parse_output_target(raw: &str) -> Result<OutputTarget<'_>, OutputPathIssue> {
 /// Atomically publishes `bytes` to `output_path` through `bstd::fs` and marks the resulting file
 /// executable (`0o755`) on real Unix hosts.
 fn write_executable(cx: &Cx, fs: &Fs, output_path: &str, bytes: &[u8], heap: &'static blaze_own::Heap) -> Result<(), CliError> {
+    publish_output(cx, fs, output_path, bytes, heap)?;
+    #[cfg(unix)]
+    if !cx.is_simulated() {
+        chmod_executable(output_path, heap)?;
+    }
+    Ok(())
+}
+
+fn publish_output(cx: &Cx, fs: &Fs, output_path: &str, bytes: &[u8], heap: &'static blaze_own::Heap) -> Result<(), CliError> {
     let target = parse_output_target(output_path).map_err(|why| {
         box_err(ExportCliError::BadOutputPath { path: owned_str(output_path, heap.alloc()), why }, heap)
     })?;
@@ -1353,10 +1446,6 @@ fn write_executable(cx: &Cx, fs: &Fs, output_path: &str, bytes: &[u8], heap: &'s
                 .publish(cx, &file_path, Content::bytes(bytes), Durable::No)
                 .map_err(|e| box_err(ExportCliError::WriteOutput(e), heap))?;
         }
-    }
-    #[cfg(unix)]
-    if !cx.is_simulated() {
-        chmod_executable(output_path, heap)?;
     }
     Ok(())
 }
