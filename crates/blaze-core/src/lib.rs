@@ -2021,9 +2021,8 @@ pub struct IoError(pub String);
 impl IoError {
     #[cfg(target_os = "linux")]
     fn from_display(why: &impl fmt::Display) -> Self {
-        let mut bytes = Vec::new_in(std::alloc::Global);
-        std::io::Write::write_fmt(&mut bytes, format_args!("{why}")).expect("writing a diagnostic to memory");
-        Self(String::from_utf8(bytes).expect("formatting writes UTF-8"))
+        let text = blaze_mem::format_in!(std::alloc::Global, "{why}");
+        Self(String::from(blaze_mem::text::into_std_boxed_str(text)))
     }
 }
 

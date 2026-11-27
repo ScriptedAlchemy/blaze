@@ -68,7 +68,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering, fence},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use blaze_hash::{FixedState, Map, MapOpts};
@@ -1767,7 +1767,7 @@ fn wake_ring(wake: &Wake) {
 }
 
 pub struct Uring {
-    start: Instant,
+    clock: DriverClock,
     /// The machine's boot, read once as the driver is made ([`crate::Driver::boot`]).
     boot: Result<crate::Boot, crate::NoBoot>,
     /// Shared with the work done off the ring, so handing it out is a count, not a copy.
@@ -1829,7 +1829,7 @@ pub struct Uring {
     /// Each spawn in flight by its tag, for a kill.
     spawning: Map<Tag, Handle<Spawning>, FixedState, Global>,
     conns: Slab<Connection>,
-    /// By ticks since `start`; a wait of the ring ends at the next one due.
+    /// By ticks on `clock`; a wait of the ring ends at the next one due.
     timers: Wheel<Tag>,
     // dyn: the embedder's sandbox, called once per spawn, which makes a process anyway.
     confine: Option<Arc<dyn Confine>>,
@@ -1917,13 +1917,35 @@ static TEMPORARY: AtomicU64 = AtomicU64::new(1 << 63);
 type EffectQueue = Vec<Effect>;
 type CompletionQueue = Vec<Completion>;
 
+/// The Linux driver's clock. The eager driver starts it at open, and the deferred driver
+/// starts it at world creation and lends that same origin to the ring when it opens.
+#[derive(Clone, Copy)]
+struct DriverClock(Monotonic);
+
+impl DriverClock {
+    fn new() -> Self {
+        Self(Monotonic::new())
+    }
+
+    /// Both entry points read wall time from the OS independently of the monotonic origin.
+    fn wall_ns() -> u64 {
+        crate::system_wall_ns()
+    }
+}
+
+impl Clock for DriverClock {
+    fn now(&self) -> Duration {
+        self.0.now()
+    }
+}
+
 impl Uring {
     /// A driver whose files are under `root`, or why this kernel has no ring for it.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Uring> {
-        Self::open_ring(&root.into(), Instant::now(), crate::boot::system())
+        Self::open_ring(&root.into(), DriverClock::new(), crate::boot::system())
     }
 
-    fn open_ring(root: &Path, start: Instant, boot: Result<crate::Boot, crate::NoBoot>) -> io::Result<Uring> {
+    fn open_ring(root: &Path, clock: DriverClock, boot: Result<crate::Boot, crate::NoBoot>) -> io::Result<Uring> {
         let alloc = Global;
         let ring = Ring::new(ENTRIES, COMPLETIONS)?;
         let offload = Offload::new()?;
@@ -1935,7 +1957,7 @@ impl Uring {
         let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
         let root: Arc<Path> = Arc::from(root);
         Ok(Uring {
-            start,
+            clock,
             boot,
             root,
             ring,
@@ -2019,7 +2041,7 @@ impl Uring {
     /// Every timer due, fired in the order they were due.
     fn fire_timers(&mut self) {
         let ready = &mut self.ready;
-        self.timers.advance(wheel::ticks(self.start.elapsed()), |_, tag| {
+        self.timers.advance(wheel::ticks(self.clock.now()), |_, tag| {
             ready.push(Completion { tag, done: Done::Fired });
         });
     }
@@ -2694,7 +2716,7 @@ fn connect_socket(table: &Rc<Table>, domain: core::ffi::c_int, options: &crate::
 impl Uring {
     /// [`Driver::now`]'s clock as a value read with no `&self` (`Kqueue::clock`'s doc).
     pub fn clock(&self) -> crate::wait::Monotonic {
-        crate::wait::Monotonic::since(self.start)
+        self.clock.0
     }
 }
 
@@ -2706,7 +2728,7 @@ impl Driver for Uring {
         // read per timer, a preemption longer than the gap between two `after`s orders them by
         // when each was read instead (`more_than_the_ring_holds` fired 2, 0, 1 under a load of
         // about 55 on 2026-11-14).
-        let now = wheel::ticks(self.start.elapsed());
+        let now = wheel::ticks(self.clock.now());
         for effect in effects.drain(..) {
             if self.holds(&effect) {
                 self.in_flight += 1;
@@ -3007,7 +3029,7 @@ impl Driver for Uring {
         // has been handed out; with neither, nothing can come and the poll only looks (the
         // rule on `Driver::waker`).
         if out.len() == before && (self.in_flight > 0 || self.waker_given.get()) {
-            let clock = Monotonic::since(self.start);
+            let clock = self.clock();
             while out.len() == before {
                 // The caller's deadline or the next timer's, whichever is sooner.
                 let wait = self
@@ -3072,11 +3094,11 @@ impl Driver for Uring {
     }
 
     fn now(&self) -> Duration {
-        self.start.elapsed()
+        self.clock.now()
     }
 
     fn wall_ns(&self) -> u64 {
-        crate::system_wall_ns()
+        DriverClock::wall_ns()
     }
 
     fn boot(&self) -> Result<crate::Boot, crate::NoBoot> {
@@ -3097,6 +3119,7 @@ impl Driver for Uring {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::Instant;
     use blaze_sys::{Errno, linux::OpenFlags, posix::signal};
 
     use super::*;
@@ -5699,7 +5722,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while received < sent && Instant::now() < deadline {
             ring.submit_ring();
-            let clock = Monotonic::since(ring.start);
+            let clock = ring.clock();
             let until = Deadline::after(clock.now(), Duration::from_millis(50));
             ring.ring.enter(Some(until), &clock).unwrap();
             let shown = ring.provided.shown();

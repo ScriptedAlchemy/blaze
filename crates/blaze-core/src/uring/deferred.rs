@@ -4,10 +4,10 @@ use core::time::Duration;
 
 use blaze_own::{Box, Vec};
 
-use crate::wait::{Deadline, Monotonic};
+use crate::wait::{Clock, Deadline, Monotonic};
 use crate::{Boot, Completion, Done, Driver, IoError, NoBoot, Os};
 
-use super::{Arc, CompletionQueue, EffectQueue, Global, Instant, Path, Uring};
+use super::{Arc, CompletionQueue, DriverClock, EffectQueue, Global, Path, Uring};
 
 enum State {
     Idle,
@@ -18,7 +18,7 @@ enum State {
 /// Opens the same io_uring backend on the first queued effect.
 pub struct DeferredUring {
     root: Arc<Path>,
-    start: Instant,
+    clock: DriverClock,
     boot: Result<Boot, NoBoot>,
     state: State,
 }
@@ -26,13 +26,17 @@ pub struct DeferredUring {
 impl DeferredUring {
     /// Acquires the world's clock and boot facts without creating a ring.
     pub fn new(_os: &Os, root: &Path) -> Self {
-        Self { root: Arc::from(root), start: Instant::now(), boot: crate::boot::system(), state: State::Idle }
+        Self { root: Arc::from(root), clock: DriverClock::new(), boot: crate::boot::system(), state: State::Idle }
     }
 
     /// The same monotonic clock before and after the ring is opened.
     pub fn clock(&self) -> Monotonic {
-        Monotonic::since(self.start)
+        self.clock.0
     }
+}
+
+fn refused<'a>(effects: &'a mut EffectQueue, why: &'a IoError) -> impl Iterator<Item = Completion> + 'a {
+    effects.drain(..).map(move |effect| Completion { tag: effect.tag(), done: Done::Failed(IoError::from_display(why)) })
 }
 
 impl Driver for DeferredUring {
@@ -40,19 +44,24 @@ impl Driver for DeferredUring {
         if effects.is_empty() {
             return;
         }
-        if matches!(self.state, State::Idle) {
-            self.state = match Uring::open_ring(&self.root, self.start, self.boot()) {
-                Ok(ring) => State::Active(Box::new_in(ring, Global)),
-                Err(why) => State::Refused { why: IoError::from_display(&why), ready: Vec::new_in(Global) },
-            };
-        }
         match &mut self.state {
             State::Active(ring) => ring.submit(effects),
-            State::Refused { why, ready } => ready.extend(effects.drain(..).map(|effect| Completion {
-                tag: effect.tag(),
-                done: Done::Failed(IoError::from_display(why)),
-            })),
-            State::Idle => unreachable!("the first submission sets the ring's state"),
+            State::Refused { why, ready } => ready.extend(refused(effects, why)),
+            State::Idle => {
+                self.state = match Uring::open_ring(&self.root, self.clock, self.boot()) {
+                    Ok(ring) => {
+                        let mut ring = Box::new_in(ring, Global);
+                        ring.submit(effects);
+                        State::Active(ring)
+                    }
+                    Err(error) => {
+                        let why = IoError::from_display(&error);
+                        let mut ready = Vec::new_in(Global);
+                        ready.extend(refused(effects, &why));
+                        State::Refused { why, ready }
+                    }
+                };
+            }
         }
     }
 
@@ -77,11 +86,11 @@ impl Driver for DeferredUring {
     }
 
     fn now(&self) -> Duration {
-        self.start.elapsed()
+        self.clock.now()
     }
 
     fn wall_ns(&self) -> u64 {
-        crate::system_wall_ns()
+        DriverClock::wall_ns()
     }
 
     fn boot(&self) -> Result<Boot, NoBoot> {

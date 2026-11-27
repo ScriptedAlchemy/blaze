@@ -400,7 +400,9 @@ fn torn_folds(folds: u32) -> u64 {
     let io = Io::sim(23);
     let cx = root_on(&io, running.pool());
     all_parked(running.pool());
-    let slots = PerWorker::new_racy_in(cx.workers(), Global, |_| (AtomicU64::new(0), AtomicU64::new(0)));
+    let slots = PerWorker::new_racy_in(cx.workers(), blaze_own::testing::heap().shared(), |_| {
+        (AtomicU64::new(0), AtomicU64::new(0))
+    });
     let stop = AtomicBool::new(false);
     let torn = AtomicU64::new(0);
     let next = AtomicU64::new(0);
@@ -473,20 +475,22 @@ fn the_fold_control_reading_slots_directly_sees_one_torn() {
     let io = Io::sim(23);
     let cx = root_on(&io, running.pool());
     all_parked(running.pool());
-    let slots = PerWorker::new_racy_in(cx.workers(), Global, |_| (AtomicU64::new(0), AtomicU64::new(0))).planted(FoldPlant::ReadsDirectly);
+    let slots = PerWorker::new_racy_in(cx.workers(), blaze_own::testing::heap().shared(), |_| {
+        (AtomicU64::new(0), AtomicU64::new(0))
+    }).planted(FoldPlant::ReadsDirectly);
     let (wrote_first, first_written) = blaze_core::chan::bounded(1);
     let (read_slot, slot_read) = blaze_core::chan::bounded(1);
     let scope = cx.scope();
     let writer = scope.must_overlap("write", TASK_FRAME, {
         let slots = &slots;
-        move |cx| -> Result<(), String> {
+        move |cx| -> Result<(), &'static str> {
             slots.with(cx, |(a, b)| {
                 a.store(1, Ordering::Relaxed);
-                wrote_first.try_send(()).map_err(|error| error.to_string())?;
-                slot_read.recv_timeout(Duration::from_secs(5)).map_err(|error| error.to_string())?;
+                wrote_first.try_send(()).map_err(|_| "could not signal the first slot write")?;
+                slot_read.recv_timeout(Duration::from_secs(5)).map_err(|_| "the fold did not acknowledge the slot read")?;
                 b.store(1, Ordering::Relaxed);
                 Ok(())
-            }).map_err(|error| error.to_string())?
+            }).map_err(|_| "the writer could not enter its worker slot")?
         }
     }).expect("a parked worker for the writer");
     first_written.recv_timeout(Duration::from_secs(5)).expect("the writer stored the first half");
