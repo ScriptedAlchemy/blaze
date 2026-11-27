@@ -63,5 +63,6 @@ jobs:
           path: |
             ${{ runner.temp }}/blaze-fs/signed-origin/*.stdout
             ${{ runner.temp }}/blaze-fs/signed-origin/*.stderr
+            ${{ runner.temp }}/blaze-fs/signed-origin/*.profile.txt
             ${{ runner.temp }}/blaze-fs/signed-origin/https-observations.json
             ${{ runner.temp }}/blaze-fs/signed-origin/result.json
