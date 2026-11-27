@@ -187,6 +187,67 @@ fn config(socket: &str, blobs: &Blobs) -> agent::Config {
     }
 }
 
+#[test]
+fn ordinary_import_limits_http_body_to_the_committed_pack_size() {
+    // The HTTP decoder's fragment tests prove the early buffer bound. This socket check
+    // proves the ordinary importer carries that commitment all the way to the real reader.
+    let alloc = test_alloc();
+    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let blobs = Blobs {
+        address: listener.local_addr(),
+        timeout: Duration::from_secs(5),
+        alloc,
+    };
+    let peer = spawn(
+        move || {
+            let clock = SystemClock;
+            let until = clock.monotonic_nanos().unwrap().saturating_add(5_000_000_000);
+            let mut client = loop {
+                match listener.accept() {
+                    Ok(client) => break client,
+                    Err(error) if error.is_would_block() => {
+                        assert!(clock.monotonic_nanos().unwrap() < until, "no import request arrived");
+                        sleep_ms(1);
+                    }
+                    Err(error) => panic!("accepting the import request: {error}"),
+                }
+            };
+            client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            client.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new_in(alloc);
+            let mut bytes = [0; 1024];
+            for _ in 0..1024 {
+                let n = client.read(&mut bytes).unwrap();
+                assert_ne!(n, 0, "the importer closed before its request head");
+                request.extend_from_slice(&bytes[..n]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    assert!(request.starts_with(b"GET /v1/blob/packs/"));
+                    client.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n").unwrap();
+                    return;
+                }
+            }
+            panic!("the import request head exceeded its bound");
+        },
+        alloc,
+    )
+    .unwrap();
+    let reference = blaze_wire::PackRef {
+        pack: [1; 32],
+        size: 64,
+        keys: [2; 32],
+        packed: None,
+        format: blaze_wire::DIST_PACK_FORMAT,
+    };
+    let error = agent::import(&blobs, &[reference], alloc).unwrap_err();
+    peer.join().unwrap();
+    assert!(
+        matches!(&error, Error::Committed(why) if why.contains("committed pack body ceiling")),
+        "the committed length must reject the head, before a truncated-body check: {error}"
+    );
+    assert!(matches!(agent::decide(&LocalPolicy::Fallback, error, alloc), Err(Error::Committed(_))));
+}
+
 fn unit(tag: u8, count: u8, alloc: WireAlloc) -> Unit {
     let mut names = Vec::with_capacity_in(usize::from(count), alloc);
     for at in 0..count {
