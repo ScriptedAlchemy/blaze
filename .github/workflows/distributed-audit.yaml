@@ -1,0 +1,92 @@
+name: Distributed audit native regressions
+on:
+  push:
+    branches: ["validation/distributed-compile-audit-core"]
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+env:
+  RUST_BACKTRACE: "0"
+  BLAZE_CORES: all
+jobs:
+  distributed-core:
+    name: distributed library controls with pinned Cargo (partial)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      BLAZE_TESTS: verify
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 65e760a4a59649d48d6160d66f5cccedc06c52e9
+          persist-credentials: false
+      - uses: ./.github/actions/locked-memory
+      # This Cargo job has no later swap allocation. Keep its existing memory/swap
+      # policy; the canonical filesystem action budgets the backing disk after it.
+      - name: runner memory before reflink allocation
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-evidence"
+          timeout 10s swapon --show --bytes | tee "$RUNNER_TEMP/core-evidence/runner-swap.txt"
+          timeout 10s free -b | tee "$RUNNER_TEMP/core-evidence/runner-memory.txt"
+      - uses: ./.github/actions/reflink
+      - name: short native test paths on the verified reflink filesystem
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          test_temp="$RUNNER_TEMP/blaze-fs/tmp"
+          mkdir "$test_temp"
+          short_temp=$(mktemp -d /tmp/bz.XXXXXX)
+          timeout 10s sudo mount --bind "$test_temp" "$short_temp"
+          store_device=$(stat -Lc %d "$BLAZE_HOME/v2/store")
+          target_device=$(stat -Lc %d "$CARGO_TARGET_DIR")
+          temp_device=$(stat -Lc %d "$short_temp")
+          [ "$temp_device" = "$store_device" ] && [ "$temp_device" = "$target_device" ] \
+            || { echo '::error::native test temporary files, store and target must share the verified reflink device'; exit 1; }
+          printf 'TMPDIR=%s\nstore_device=%s\ntarget_device=%s\ntemp_device=%s\n' \
+            "$short_temp" "$store_device" "$target_device" "$temp_device" \
+            | tee "$RUNNER_TEMP/core-evidence/native-filesystem.txt"
+          timeout 10s findmnt -T "$short_temp"
+          echo "TMPDIR=$short_temp" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/toolchain
+        id: pinned-cargo
+      - name: distributed library models and planted controls with pinned Cargo
+        id: retained-tests
+        shell: bash
+        timeout-minutes: 75
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-evidence"
+          toolchain="$(cat "$GITHUB_WORKSPACE/pins/toolchain")"
+          cp "$GITHUB_WORKSPACE/pins/toolchain" "$RUNNER_TEMP/core-evidence/toolchain-pin.txt"
+          cargo "+$toolchain" --version --verbose > "$RUNNER_TEMP/core-evidence/cargo-version.txt"
+          rustc "+$toolchain" --version --verbose > "$RUNNER_TEMP/core-evidence/rustc-version.txt"
+          timeout -k 30 4200 cargo "+$toolchain" test --release --locked --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve --no-fail-fast \
+            2>&1 | tee "$RUNNER_TEMP/core-evidence/tests.log"
+          while IFS= read -r case_name; do
+            grep -Eq "^test ([[:alnum:]_]+::)*$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \
+              || { echo "::error::missing executed library control: $case_name"; exit 1; }
+          done < .github/distributed-controls.txt
+      - name: distributed library binaries and integration targets compile
+        id: retained-all-targets
+        if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-evidence"
+          toolchain="$(cat "$GITHUB_WORKSPACE/pins/toolchain")"
+          timeout -k 30 1100 cargo "+$toolchain" check --release --locked --keep-going --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve \
+            2>&1 | tee "$RUNNER_TEMP/core-evidence/all-targets.log"
+      - name: keep all retained library evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: distributed-core-evidence
+          path: ${{ runner.temp }}/core-evidence
+          if-no-files-found: warn
+
