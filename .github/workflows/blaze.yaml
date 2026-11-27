@@ -1,4 +1,4 @@
-name: PR 81 isolate later source protocol suites
+name: PR 81 collect protocol crash receipts
 on:
   workflow_dispatch:
     inputs:
@@ -10,11 +10,6 @@ on:
         description: Workflow run that sealed the exact source compiler
         type: string
         required: true
-      suite:
-        description: Protocol packages to exercise
-        type: choice
-        options: [wire-and-serve, local, serve-abort]
-        default: wire-and-serve
 permissions:
   actions: read
   contents: read
@@ -24,15 +19,23 @@ defaults:
 env:
   BLAZE_CORES: "2"
   BLAZE_TESTS: verify
-  RUST_BACKTRACE: "0"
+  RUST_BACKTRACE: "1"
 jobs:
   protocol:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 42
+    timeout-minutes: 32
     strategy:
       fail-fast: false
       matrix:
-        package: ${{ fromJSON(inputs.suite == 'local' && '["blaze-dist-local"]' || inputs.suite == 'serve-abort' && '["blaze-serve"]' || '["blaze-wire", "blaze-serve"]') }}
+        include:
+          - name: final-refusal
+            filter: a_final_compiler_or_output_refusal_cannot_fall_back
+          - name: transient-accept
+            filter: transient_accept_errors_leave_the_reactor_available_to_healthy_clients
+          - name: reconnect
+            filter: reconnect_subscribe_replay_cancel_and_deadline_preserve_interests
+          - name: full
+            filter: ""
     steps:
       - uses: actions/checkout@v7
         with:
@@ -42,7 +45,7 @@ jobs:
       - uses: ./.github/actions/reflink
       - uses: ./.github/actions/apt
         with:
-          packages: strace bubblewrap
+          packages: strace bubblewrap gdb
       - name: Enable sandbox user namespaces
         run: |
           if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
@@ -54,31 +57,48 @@ jobs:
           path: ${{ runner.temp }}/source-package
           run-id: ${{ inputs.source_run }}
           github-token: ${{ github.token }}
-      - name: Verify exact source and execute its protocol tests
+      - name: Verify the exact compiler and run the selected protocol cases
         env:
-          PACKAGE: ${{ matrix.package }}
-          SUITE: ${{ inputs.suite }}
+          CASE_NAME: ${{ matrix.name }}
+          TEST_FILTER: ${{ matrix.filter }}
         run: |
-          mkdir -p "$RUNNER_TEMP/source-binaries" "$RUNNER_TEMP/source-shelf"
+          mkdir -p "$RUNNER_TEMP/source-binaries" "$RUNNER_TEMP/source-shelf" "$RUNNER_TEMP/cores"
           timeout 45 tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries"
           timeout 45 tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$RUNNER_TEMP/source-shelf"
           timeout 90 python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+          prior_pattern=$(timeout 10 cat /proc/sys/kernel/core_pattern)
+          trap 'timeout 10 sudo sysctl -w "kernel.core_pattern=$prior_pattern"' EXIT
+          timeout 10 sudo sysctl -w "kernel.core_pattern=$RUNNER_TEMP/cores/core.%e.%p"
+          printf '0x33\n' > /proc/self/coredump_filter
+          ulimit -c 524288
           # shellcheck disable=SC2016
           timeout 20 jq -n --arg blaze "$RUNNER_TEMP/source-binaries/blaze" --arg cwd "$GITHUB_WORKSPACE" \
             --arg home "$RUNNER_TEMP/blaze-fs/protocol-home" --arg out "$RUNNER_TEMP/package-evidence" \
-            --arg shelf "$RUNNER_TEMP/source-shelf/toolchain" --arg package "$PACKAGE" --arg suite "$SUITE" \
-            '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:2070,commands:
-              (if $suite == "serve-abort" then
-                [range(0; 12) | {name:("serve-" + tostring),args:["test","-p","blaze-serve","--","--run-all","--format","pretty"]}]
-              else [{name:$package,args:["test","-p",$package,"--view","json","--","--run-all","--format","json"]}] end)}' \
+            --arg shelf "$RUNNER_TEMP/source-shelf/toolchain" --arg name "$CASE_NAME" --arg filter "$TEST_FILTER" \
+            '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:700,commands:
+              (if $name == "full" then
+                ["blaze-dist","blaze-dist-local"] | map({name:.,args:["test","-p",.,"--view","json","--","--run-all","--format","json"]})
+              else [{name:$name,args:["test","-p","blaze-dist-local","--view","json","--","--run-all","--format","json","--nocapture",$filter]}] end)}' \
             > "$RUNNER_TEMP/package-input.json"
           status=0
-          timeout -k 20 2130 python3 harness/v2/exec_observer.py "$RUNNER_TEMP/package-input.json" || status=$?
+          timeout -k 20 1470 python3 harness/v2/exec_observer.py "$RUNNER_TEMP/package-input.json" || status=$?
           timeout 90 python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
           exit "$status"
+      - name: Read signal stacks from any test core
+        if: always()
+        run: |
+          shopt -s nullglob
+          evidence="$RUNNER_TEMP/package-evidence"
+          mkdir -p "$evidence"
+          for core in "$RUNNER_TEMP/cores"/core.*; do
+            label=${core##*/}
+            timeout -k 5 90 gdb -batch -nx -iex 'set auto-load off' -iex 'set debuginfod enabled off' \
+              -iex 'set print frame-arguments none' -c "$core" -ex 'info proc mappings' \
+              -ex 'thread apply all bt 24' > "$evidence/$label.stack" 2>&1 || true
+          done
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: ${{ matrix.package }}-observed
+          name: ${{ matrix.name }}-observed
           path: ${{ runner.temp }}/package-evidence
           if-no-files-found: warn
