@@ -35,8 +35,8 @@ jobs:
             commit: b27cf1f45e912e28b0ef75edf88020d374f0b0cb
             tree: 66c9087a8acd04e7dad9d2c64c823cab4f8cea7e
           - arm: new-production-plus-control
-            commit: 8e4d6d4f160a9f400b70ac00617b5cb6edd9b124
-            tree: 8e5a46ba331e1716a062344daf3ffe2f58d53ba1
+            commit: 089b5f009ab48241a0c0e0fdfc22d9b08edf9398
+            tree: 659b50805f637c8b34414173b73848deae807f6a
     env:
       BLAZE_TESTS: verify
       SOURCE_JSON: ${{ toJSON(matrix.source) }}
@@ -297,8 +297,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 150
     env:
-      AUDIT_SOURCE_SHA: 8e4d6d4f160a9f400b70ac00617b5cb6edd9b124
-      AUDIT_SOURCE_TREE: 8e5a46ba331e1716a062344daf3ffe2f58d53ba1
+      AUDIT_SOURCE_SHA: 089b5f009ab48241a0c0e0fdfc22d9b08edf9398
+      AUDIT_SOURCE_TREE: 659b50805f637c8b34414173b73848deae807f6a
     steps:
       - name: Require the final immutable candidate identity
         timeout-minutes: 1
@@ -495,4 +495,5 @@ jobs:
             ${{ runner.temp }}/source-toolchain.tar.gz
           if-no-files-found: error
           retention-days: 7
+
 
