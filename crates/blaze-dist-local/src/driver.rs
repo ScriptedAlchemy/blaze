@@ -391,7 +391,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::sys::{SystemClock, current_thread_id, sleep};
+    use crate::sys::{Receiver, SystemClock, current_thread_id};
 
     const FOUND: WorkName = WorkName([7; 32]);
 
@@ -401,15 +401,17 @@ mod tests {
 
     // The real exporter also holds non-Send semantic state. These tests prove
     // its compile and release methods stay on the thread where it was created.
-    struct SlowCompiler {
+    struct TestCompiler {
         active: Arc<AtomicBool, WireAlloc>,
+        // Set for cases that must keep a compile in flight until a particular reply.
+        finish: Option<Receiver<()>>,
         released: WireVec<WorkName>,
         caller: u64,
         calls: Rc<Cell<usize>, WireAlloc>,
         alloc: WireAlloc,
     }
 
-    impl BatchCompiler for SlowCompiler {
+    impl BatchCompiler for TestCompiler {
         type Error = Infallible;
 
         fn compile(&mut self, plan: &Plan) -> Result<Compiled, Self::Error> {
@@ -417,7 +419,11 @@ mod tests {
             assert_eq!(current_thread_id(), self.caller);
             self.calls.set(self.calls.get() + 1);
             self.active.store(true, Ordering::SeqCst);
-            sleep(Duration::from_millis(120));
+            if let Some(finish) = self.finish.take() {
+                finish
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("the driver observes a heartbeat during compilation");
+            }
             self.active.store(false, Ordering::SeqCst);
             let mut found = Vec::new_in(alloc);
             found.push(Found { name: FOUND, tuple: [10; 32] });
@@ -478,8 +484,10 @@ mod tests {
         let (mut holder, roots, grant) = test_holder(alloc);
         let active = Arc::new_in(AtomicBool::new(false), alloc);
         let during = Arc::new_in(AtomicUsize::new(0), alloc);
-        let mut compiler = SlowCompiler {
+        let (release_compile, finish) = channel(alloc);
+        let mut compiler = TestCompiler {
             active: active.clone(),
+            finish: Some(finish),
             released: Vec::new_in(alloc),
             caller: current_thread_id(),
             calls: Rc::new_in(Cell::new(0), alloc),
@@ -505,6 +513,7 @@ mod tests {
                         if active.load(Ordering::SeqCst)
                             && during.fetch_add(1, Ordering::SeqCst) >= 1
                         {
+                            release_compile.send(()).expect("the cancelled compile can finish");
                             Reply::Events(Ok(WorkersEventsAnswer::CANCEL))
                         } else {
                             Reply::Events(Ok(WorkersEventsAnswer::CONTINUE))
@@ -535,8 +544,10 @@ mod tests {
         let alloc = test_alloc();
         let (mut holder, roots, grant) = test_holder(alloc);
         let active = Arc::new_in(AtomicBool::new(false), alloc);
-        let mut compiler = SlowCompiler {
+        let (release_compile, finish) = channel(alloc);
+        let mut compiler = TestCompiler {
             active: active.clone(),
+            finish: Some(finish),
             released: Vec::new_in(alloc),
             caller: current_thread_id(),
             calls: Rc::new_in(Cell::new(0), alloc),
@@ -557,9 +568,13 @@ mod tests {
             &AtomicBool::new(false),
             alloc,
             |call, _| match call {
-                Call::Events(_) if active.load(Ordering::SeqCst) => Err(Error::Protocol(
-                    WireString::from_str_in("carrier disconnected while compiling", alloc),
-                )),
+                Call::Events(_) if active.load(Ordering::SeqCst) => {
+                    release_compile.send(()).expect("the interrupted compile can finish");
+                    Err(Error::Protocol(WireString::from_str_in(
+                        "carrier disconnected while compiling",
+                        alloc,
+                    )))
+                }
                 Call::Events(_) => Ok(Reply::Events(Ok(WorkersEventsAnswer::CONTINUE))),
                 Call::Join(_) => {
                     Ok(Reply::Join(Ok(WorkJoinAnswer { roots: roots.clone(), fixed: true })))
@@ -582,8 +597,9 @@ mod tests {
         let alloc = test_alloc();
         let (mut holder, roots, grant) = test_holder(alloc);
         let active = Arc::new_in(AtomicBool::new(false), alloc);
-        let mut compiler = SlowCompiler {
+        let mut compiler = TestCompiler {
             active,
+            finish: None,
             released: Vec::new_in(alloc),
             caller: current_thread_id(),
             calls: Rc::new_in(Cell::new(0), alloc),
