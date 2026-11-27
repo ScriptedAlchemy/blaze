@@ -11,7 +11,7 @@ use blaze_int::Int as _;
 use blaze_own::{Vec, format_in};
 use blaze_sha256::digest as sha256_digest;
 use blaze_wire::json::hex;
-use blaze_wire::{Digest, Limits, WireAlloc, WireString};
+use blaze_wire::{Digest, Limits, PackRef, WireAlloc, WireString};
 
 use crate::Error;
 use crate::pack::Pack;
@@ -36,12 +36,6 @@ fn response_body_limit(method: &str, path: &str, status: u16, pack_ceiling: Opti
 /// Minimal byte-stream reader so HTTP response framing can be tested without real sockets.
 trait ByteRead {
     fn read_bytes(&mut self, buf: &mut [u8]) -> Result<usize, IoError>;
-}
-
-impl ByteRead for TcpStream {
-    fn read_bytes(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
-        self.read(buf)
-    }
 }
 
 struct DeadlineRead {
@@ -94,7 +88,7 @@ fn lossy_text(mut bytes: &[u8], alloc: WireAlloc) -> WireString {
 pub struct Blobs {
     /// The server's address.
     pub address: SocketAddr,
-    /// How long one read or write of a request may stall.
+    /// Total time allowed for one connection, request, and response.
     pub timeout: Duration,
     /// Allocator used for error messages and wire scratch.
     pub alloc: WireAlloc,
@@ -124,14 +118,14 @@ impl Blobs {
         previous: Option<&Digest>,
         alloc: A,
     ) -> Result<(u16, Vec<u8, A>), Error> {
-        let mut stream = TcpStream::connect_timeout(self.address, self.timeout)?;
-        stream.set_read_timeout(Some(self.timeout))?;
-        stream.set_write_timeout(Some(self.timeout))?;
+        let deadline = TcpDeadline::after(self.timeout)?;
+        let mut stream = TcpStream::connect_until(self.address, deadline)?;
         stream.set_nodelay(true)?;
         let head = self.request_head(method, path, body.len(), previous);
-        stream.write_all(head.as_bytes())?;
-        stream.write_all(body)?;
-        read_response(&mut stream, method, path, None, alloc, self.alloc)
+        stream.write_all_until(head.as_bytes(), deadline)?;
+        stream.write_all_until(body, deadline)?;
+        let mut reader = DeadlineRead { stream, deadline };
+        read_response(&mut reader, method, path, None, alloc, self.alloc)
     }
 
     fn request_head(&self, method: &str, path: &str, length: usize, previous: Option<&Digest>) -> WireString {
@@ -168,6 +162,16 @@ impl Blobs {
     /// The bytes of the pack named `digest`; `None` if the server has none.
     pub fn pack<A: Allocator>(&self, digest: &Digest, alloc: A) -> Result<Option<Vec<u8, A>>, Error> {
         self.read_pack(digest, None, alloc)
+    }
+
+    /// Reads a committed pack without allowing its response to exceed the committed size.
+    /// The reference travels to the fetch boundary before any payload is buffered.
+    pub fn committed_pack<A: Allocator>(
+        &self,
+        reference: &PackRef,
+        alloc: A,
+    ) -> Result<Option<Vec<u8, A>>, Error> {
+        self.pack_until(&reference.pack, reference.size, TcpDeadline::after(self.timeout)?, alloc)
     }
 
     /// Reads a committed pack under one deadline. Its declared length must fit both `ceiling`
@@ -929,6 +933,25 @@ mod tests {
             blobs.published_until(&[0; 32], TcpDeadline::at_monotonic_nanos(0), alloc),
             Err(Error::Io(why)) if why.is_timed_out()
         ));
+    }
+
+    #[test]
+    fn ordinary_blob_requests_reject_an_expired_budget_before_connecting() {
+        let alloc = test_alloc();
+        let blobs = Blobs {
+            address: SocketAddr::from(([127, 0, 0, 1], 0)),
+            timeout: Duration::ZERO,
+            alloc,
+        };
+        let pack = Pack::of(Vec::new_in(alloc), alloc).unwrap();
+        for error in [
+            blobs.published(&[0; 32], alloc).unwrap_err(),
+            blobs.pack(&pack.reference.pack, alloc).unwrap_err(),
+            blobs.committed_pack(&pack.reference, alloc).unwrap_err(),
+            blobs.put_pack(&pack, alloc).unwrap_err(),
+        ] {
+            assert!(matches!(error, Error::Io(why) if why.is_timed_out()));
+        }
     }
 
     #[test]

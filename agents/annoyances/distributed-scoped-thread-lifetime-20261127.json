@@ -1,0 +1,19 @@
+{
+  "id": "distributed-scoped-thread-lifetime-20261127",
+  "date": "2026-11-27",
+  "who": "GPT-6 Astra Pro, distributed transport review lane",
+  "where": "crates/blaze-dist-local/src/sys.rs",
+  "what": "The scoped-thread API relied on a returned JoinHandle's destructor to contain borrowed callbacks. Safe mem::forget could release the scope before its callback finished. Independently, pthread_join errors were ignored after marking a handle joined; a thread receiving its own handle could free its live result slot before the trampoline wrote it.",
+  "cost": "Safe callers could cause use-after-free through forgotten borrowed handles or self-join/self-drop. An incomplete counter-only correction also risked waiting forever after allocation or payload-destruction unwinding during thread setup.",
+  "cause": "Lifetime obligations belonged to a forgettable caller handle, and attempted OS joins were treated as proof of completion regardless of their result.",
+  "whys": [
+    "The scope itself had no record of callbacks still holding its borrows.",
+    "A destructor is not guaranteed to run because forgetting a value is safe Rust.",
+    "The join flag recorded an attempt before pthread_join had supplied a successful completion proof.",
+    "Thread-start errors and unwinding require the same release obligation as successful callback completion."
+  ],
+  "class": "a lifetime proof depends on a forgettable handle or an unchecked completion result",
+  "prevention": "A private completion ticket follows the existing trampoline payload and releases its obligation on return, failed setup or unwinding. One allocation-free Arc share per callback keeps its atomic count alive through the final wake, without a completion queue or disconnect errors. A scope guard waits for all registered callbacks before returning. Only a successful OS join permits reclaiming the shared result slot.",
+  "fix": "Added deterministic simulation of production tickets with a planted handle-ownership failure and native regressions for forgotten borrows, explicit join/drop, nested spawn, parent/setup unwind and self-join/self-drop. Public API signatures and the existing callback panic boundary are unchanged.",
+  "state": "Implemented; exact-tree validation is coordinated by the main lane."
+}

@@ -1,0 +1,19 @@
+{
+  "id": "distributed-transfer-bounds-20261127",
+  "date": "2026-11-27",
+  "who": "GPT-6 Astra Pro, distributed transport review lane",
+  "where": "crates/blaze-dist-local/src/agent.rs and blobs.rs; crates/blaze-wire/src/pack_list.rs",
+  "what": "Ordinary imports passed only a pack digest to the HTTP fetch and could buffer up to the 4 GiB blob ceiling before discovering that a manifest committed a much smaller length. Read-ahead already enforced the committed length. Ordinary cache requests also used separate blocking socket timeouts, so continuing partial progress could repeatedly restart the allowance.",
+  "cost": "A malformed response could consume multi-GiB memory for a small committed pack; slow partial transfers could outlive the configured request timeout.",
+  "cause": "The importer erased the size commitment at its fetch callback, and ordinary requests used a separate IO path from the bounded read-ahead operations.",
+  "whys": [
+    "The pack decoder checked length only after the HTTP body was buffered.",
+    "The ordinary fetch callback received a digest without its committed length.",
+    "Only the read-ahead path called the existing bounded pack reader.",
+    "The API made the unbounded form shorter even when the caller held a complete PackRef."
+  ],
+  "class": "resource bounds are discarded between a commitment and the IO that consumes its bytes",
+  "prevention": "The importer fetch callback requires PackRef, committed_pack passes its size to the bounded HTTP reader, native manifest lengths obey the blob ceiling, and ordinary request phases share one absolute deadline.",
+  "fix": "Added causal ordinary-import socket coverage, exact manifest boundary coverage and expired-budget controls; retained the existing fragmented-response and allocation oracles.",
+  "state": "Implemented; exact-tree native validation is pending with the main lane."
+}

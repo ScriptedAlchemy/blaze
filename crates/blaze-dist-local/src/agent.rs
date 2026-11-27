@@ -626,21 +626,21 @@ pub fn import<A: AllocatorClone>(
     packs: &[PackRef],
     alloc: A,
 ) -> Result<BTreeMap<Digest, (u8, Vec<u8, A>), A>, Error> {
-    import_using(packs, |digest| blobs.pack(digest, &alloc), alloc.clone(), blobs.alloc)
+    import_using(packs, |reference| blobs.committed_pack(reference, &alloc), alloc.clone(), blobs.alloc)
 }
 
 /// The retrieval boundary is injected so loss and corruption of a committed pack can be
 /// tested without replacing the real pack decoder or requiring a live cache server.
 fn import_using<A: AllocatorClone, B: Allocator>(
     packs: &[PackRef],
-    mut fetch: impl FnMut(&Digest) -> Result<Option<Vec<u8, B>>, Error>,
+    mut fetch: impl FnMut(&PackRef) -> Result<Option<Vec<u8, B>>, Error>,
     alloc: A,
     error_alloc: WireAlloc,
 ) -> Result<BTreeMap<Digest, (u8, Vec<u8, A>), A>, Error> {
     let mut values: BTreeMap<Digest, (u8, Vec<u8, A>), A> = BTreeMap::new_in(alloc.clone());
     for reference in packs {
         let name = hex(&reference.pack);
-        let bytes = fetch(&reference.pack)
+        let bytes = fetch(reference)
             .map_err(|error| {
                 Error::Committed(format_in!(
                     error_alloc,
@@ -758,11 +758,11 @@ impl ExportBudget<'_> {
         if let Some(Publication { packs, mut first }) = published {
             let values = import_using(
                 &packs,
-                |digest| {
-                    if first.as_ref().is_some_and(|pack| &pack.key == digest) {
+                |reference| {
+                    if first.as_ref().is_some_and(|pack| pack.key == reference.pack) {
                         return Ok(first.take().map(|BufferedPack { bytes, .. }| bytes));
                     }
-                    config.blobs.pack(digest, alloc)
+                    config.blobs.committed_pack(reference, alloc)
                 },
                 alloc,
                 alloc,
@@ -1728,10 +1728,10 @@ mod tests {
         let alloc = Counted(&counts);
         let values = import_using(
             &references,
-            |digest| {
+            |reference| {
                 Ok(packs
                     .iter()
-                    .find(|pack| &pack.reference.pack == digest)
+                    .find(|pack| pack.reference.pack == reference.pack)
                     .map(|pack| Vec::from_slice_in(pack.bytes.as_slice(), &alloc)))
             },
             &alloc,
@@ -1752,10 +1752,10 @@ mod tests {
         let before = counts.allocations.get();
         let control = import_using(
             &references,
-            |digest| {
+            |reference| {
                 Ok(packs
                     .iter()
-                    .find(|pack| &pack.reference.pack == digest)
+                    .find(|pack| pack.reference.pack == reference.pack)
                     .map(|pack| Vec::from_slice_in(pack.bytes.as_slice(), base_alloc)))
             },
             base_alloc,
@@ -1775,10 +1775,10 @@ mod tests {
         broken[1].keys = [9; 32];
         let refused = import_using(
             &broken,
-            |digest| {
+            |reference| {
                 Ok(packs
                     .iter()
-                    .find(|pack| &pack.reference.pack == digest)
+                    .find(|pack| pack.reference.pack == reference.pack)
                     .map(|pack| Vec::from_slice_in(pack.bytes.as_slice(), &alloc)))
             },
             &alloc,
@@ -1801,11 +1801,11 @@ mod tests {
             let before = counts.allocations.get();
             let refused = import_using(
                 &references,
-                |digest| {
-                    let source = if digest == &packs[0].reference.pack {
+                |reference| {
+                    let source = if reference.pack == packs[0].reference.pack {
                         &packs[0].bytes
                     } else {
-                        assert_eq!(digest, &conflicting.reference.pack);
+                        assert_eq!(reference.pack, conflicting.reference.pack);
                         &conflicting.bytes
                     };
                     Ok(Some(Vec::from_slice_in(source.as_slice(), &alloc)))
@@ -2024,8 +2024,8 @@ mod tests {
         let pack_hex = format_in!(alloc, "{}", hex(&reference.pack));
         let missing = import_using::<WireAlloc, WireAlloc>(
             &[reference.clone()],
-            |name| {
-                assert_eq!(*name, reference.pack);
+            |requested| {
+                assert_eq!(requested, &reference);
                 Ok(None)
             },
             alloc,
