@@ -1,4 +1,4 @@
-name: Distributed compile artifact smoke
+name: Distributed compile artifact smoke and focused controls
 on:
   push:
     branches:
@@ -10,15 +10,18 @@ defaults:
   run:
     shell: bash
 env:
-  AUDIT_SOURCE_SHA: "404873d4719219acb4fe6b3a03a83986e2aa21e1"
-  AUDIT_RUN_ID: "46032696808"
+  AUDIT_SOURCE_SHA: "951ee6f61aa33499310149b623c32d9f3b71816c"
+  AUDIT_RUN_ID: "46047508071"
   RUST_BACKTRACE: "0"
   CARGO_TERM_COLOR: never
   CARGO_BUILD_JOBS: "2"
+  BLAZE_CORES: "2"
+  BLAZE_DAEMON_MEMORY_GB: "2"
+  BLAZE_TESTS: verify
 jobs:
   artifact-smoke:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 65
+    timeout-minutes: 130
     steps:
       - uses: actions/checkout@v7
         timeout-minutes: 5
@@ -63,10 +66,11 @@ jobs:
           binaries="$RUNNER_TEMP/source-binaries"
           timeout 10 mkdir "$binaries"
           timeout -k 5 120 tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$binaries"
-          timeout 10 mkdir -p "$HOME/.blaze/v2"
+          timeout 10 mkdir -p "$HOME/.blaze/v2" "$RUNNER_TEMP/source-shelf" "$RUNNER_TEMP/dist-evidence"
           # The source job generated and checked this shelf before packaging it.
           # Reuse the same compiler and shelf handoff as production-acceptance.
           timeout -k 5 120 tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$HOME/.blaze/v2"
+          timeout -k 5 120 tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$RUNNER_TEMP/source-shelf"
           identity=$(timeout 10 jq -nc --arg bin "$binaries" '{command:"verify",binaries:$bin,services:true}')
           timeout 60 python3 .github/scripts/dist_build_identity.py "$identity" \
             2>&1 | timeout 70 tee "$RUNNER_TEMP/artifact-smoke-evidence/handoff-verify.log"
@@ -98,8 +102,22 @@ jobs:
           test "$(ulimit -l)" = unlimited
           echo "TMPDIR=$short_temp" >> "$GITHUB_ENV"
           echo "AUDIT_SMOKE_WORK=$short_temp/smoke" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/apt
+        timeout-minutes: 15
+        with:
+          packages: strace bubblewrap
+      - name: Enable source test sandbox user namespaces
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          if [ "$(timeout 10 cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
+            timeout 10 sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - uses: ./.github/actions/toolchain
         timeout-minutes: 15
+        with:
+          components: rust-src
+          targets: wasm32-wasip1
       - uses: ./.github/actions/script
         timeout-minutes: 25
         with:
@@ -125,7 +143,81 @@ jobs:
             --arg tree "$tree" '{verify:{quote:$quote,tree:$tree}}')
           timeout -k 5 30 "$BLAZE_SCRIPTS/smoke" "$verify" \
             2>&1 | timeout 40 tee "$evidence/hello-smoke-verify.txt"
-      - name: Verify the unchanged source compiler after smoke
+      - name: Exercise the migration fixture with detached descendant cleanup
+        id: focused_migration
+        if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
+        timeout-minutes: 60
+        run: |
+          set -euo pipefail
+          identity=$(timeout 10 jq -nc --arg bin "$RUNNER_TEMP/source-binaries" '{command:"verify",binaries:$bin,services:true}')
+          timeout 60 python3 .github/scripts/dist_build_identity.py "$identity"
+          input=$(timeout 10 jq -nc --arg blaze "$RUNNER_TEMP/source-binaries/blaze"   --arg modules "$BLAZE_SCRIPTS/proc_macro_modules" --arg source "$GITHUB_WORKSPACE"   --arg scratch "$RUNNER_TEMP/blaze-fs/forkfixes-focused"   '{blaze:$blaze,module_builder:$modules,scratch:$scratch,source:$source,timeout:900,workers:2,only:["a-test-sees-the-library-beside-its-bin"]}')
+          timeout -k 30 3300 python3 harness/forkfixes.py "$input"   2>&1 | timeout 3340 tee "$RUNNER_TEMP/dist-evidence/focused-forkfixes.log"
+          timeout 60 python3 .github/scripts/dist_build_identity.py "$identity"
+      - name: source protocol tests and complete execution observation
+        id: observed
+        if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
+        timeout-minutes: 60
+        run: |
+          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+          jq -n --arg blaze "$RUNNER_TEMP/source-binaries/blaze" --arg cwd "$GITHUB_WORKSPACE" --arg home "$RUNNER_TEMP/blaze-fs/protocol-home" --arg out "$RUNNER_TEMP/dist-evidence/exec" --arg shelf "$RUNNER_TEMP/source-shelf/toolchain" \
+            '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:3300,commands:(["blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"] | map({name:.,args:["test","-p",.,"--view","json","--","--run-all","--format","json"]}))}' \
+            > "$RUNNER_TEMP/dist-evidence/exec-input.json"
+          timeout -k 30 3500 python3 harness/v2/exec_observer.py "$RUNNER_TEMP/dist-evidence/exec-input.json"
+      - name: complete source protocol receipt with unchanged executables
+        id: protocol
+        if: ${{ !cancelled() && steps.observed.outcome == 'success' }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          out = Path(os.environ["RUNNER_TEMP"]) / "dist-evidence/exec"
+          result = json.loads((out / "result.json").read_text())
+          supervisor = json.loads((out / "supervisor.json").read_text())
+          packages = ["blaze-dist", "blaze-dist-local", "blaze-wire", "blaze-serve"]
+          scope = "linux-command-descendants-through-exit"
+          commands = supervisor.get("commands")
+          if (result.get("schema") != 2 or result.get("passed") is not True or result.get("returncode") != 0
+                  or result.get("scope") != scope or result.get("command_status") != 0
+                  or result.get("environment", {}).get("BLAZE_NO_DAEMON") != "1"
+                  or supervisor.get("schema") != 2 or supervisor.get("scope") != scope
+                  or supervisor.get("complete") is not True or "stop" in supervisor
+                  or not isinstance(commands, list) or len(commands) != len(packages)
+                  or any(not isinstance(row, dict) or set(row) != {"name","pid","returncode","timed_out"}
+                         or row["name"] != name or type(row["pid"]) is not int or row["pid"] <= 0
+                         or row["returncode"] != 0 or row["timed_out"] is not False
+                         for row, name in zip(commands, packages))
+                  or result.get("commands") != commands):
+              raise SystemExit("missing complete source protocol launch, exit and descendant evidence")
+          passed = []
+          for package in packages:
+              rows = [json.loads(line) for line in (out / (package + ".log")).read_text().splitlines() if line.strip()]
+              summaries = [row for row in rows if row.get("event") == "summary"]
+              tests = [row for row in rows if row.get("event") == "test"]
+              if len(summaries) != 1:
+                  raise SystemExit(f"{package}: no one source test summary")
+              summary = summaries[0]
+              ran = summary.get("ran")
+              if (summary.get("result") != "ok" or type(ran) is not int or ran <= 0
+                      or summary.get("passed") != ran or len(tests) != ran
+                      or any(summary.get(key, 0) != 0 for key in ("failed","reused","filtered_out","flaky","not_built"))
+                      or any(row.get("outcome") != "passed" or row.get("ran_because") != "run_all"
+                             or row.get("failure") is not None or row.get("basis") is not None for row in tests)):
+                  raise SystemExit(f"{package}: source tests did not all execute and pass")
+              for row in tests:
+                  path = row.get("path")
+                  parts = path.split("/") if isinstance(path, str) else []
+                  if len(parts) != 3 or parts[0] != package or not parts[1] or not parts[2]:
+                      raise SystemExit(f"{package}: invalid source test path {path!r}")
+                  passed.append(parts[2])
+          required = Path(".github/distributed-controls.txt").read_text().splitlines()
+          missing = [name for name in required if not any(path == name or path.endswith("::" + name) for path in passed)]
+          if not required or missing:
+              raise SystemExit(f"missing executed source protocol controls: {missing}")
+          PY
+          python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
+          echo 'accepted=true' >> "$GITHUB_OUTPUT"
+      - name: Verify the unchanged source compiler after smoke and focused controls
         if: ${{ !cancelled() && steps.handoff.outcome == 'success' && steps.smoke.outcome != 'skipped' }}
         timeout-minutes: 2
         run: |
@@ -155,6 +247,10 @@ jobs:
         timeout-minutes: 10
         with:
           name: distributed-artifact-smoke-arm64
-          path: ${{ runner.temp }}/artifact-smoke-evidence
+          path: |
+            ${{ runner.temp }}/artifact-smoke-evidence
+            ${{ runner.temp }}/dist-evidence
+            ${{ runner.temp }}/blaze-fs/forkfixes-focused/*.json
+            ${{ runner.temp }}/blaze-fs/forkfixes-focused/evidence
           if-no-files-found: warn
           retention-days: 7

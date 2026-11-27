@@ -133,6 +133,8 @@ mod callee_value;
 mod callee_value_tests;
 #[cfg(test)]
 mod closure_requirements_tests;
+#[cfg(test)]
+mod closure_object_tests;
 
 mod variance;
 pub use variance::Variance;
@@ -1099,6 +1101,9 @@ pub enum Plant {
     UnknownUnified,
     /// A closure's captures are not lowered: the closure value holds no loan and moves nothing.
     NoCaptures,
+    /// Every captured region slot is required to outlive a closure object's lifetime,
+    /// including the quantified predicate slots inside a captured trait object.
+    CapturePredicatesOutlive,
     /// A call of a head with a hidden input takes the coarse path as before sig-assoc-per-call
     /// (hidden_call.rs): `take::<Foo>(&local)` with `type Out = &'static S` is accepted.
     HiddenCoarse,
@@ -6237,7 +6242,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             return Ok(UnsizeDone::Fallback);
         };
         // Exact closure-to-`dyn Fn*(Args) -> Ret + 'q` unsizing (both HRTB and non-HRTB):
-        // `'r_src: 'r_dst` (when `&`/`&mut`), every capture slot outlives `'q` (one-way), and every
+        // `'r_src: 'r_dst` (when `&`/`&mut`), each captured value outlives `'q` (one-way), and every
         // `dyn` `Fn*` / `FnOnce::Output` predicate slot equates with the closure's corresponding
         // signature slot (`SigSlot::Owner` / `SigSlot::Static`).
         if let PNode::Closure { owner, ordinal, .. } = self.node(from_inner, e)?
@@ -6294,9 +6299,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                             self.b.subset(self.origs[s.start as usize], d0);
                         }
                         let q = self.origs[(d.start + ref_skip) as usize];
-                        for j in 0..ncap {
-                            self.b.subset(self.origs[(s.start + ref_skip + j) as usize], q);
-                        }
+                        self.capture_outlives(ce, PInfo { start: s.start + ref_skip, len: ncap, ..s }, q, e)?;
                         let nsig_usize = usize::try_from(nsig).unwrap_or(0);
                         let mut tied: Vec<bool, A> = Vec::with_capacity_in(nsig_usize, self.alloc);
                         tied.resize(nsig_usize, false);
