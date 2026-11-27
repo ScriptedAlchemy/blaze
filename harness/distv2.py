@@ -868,9 +868,9 @@ def cache_overlap(given: Input) -> None:
                     "miss_before_pack": held.miss_before_pack, "expired": held.expired, "error": held.error,
                     "released_ns": time.monotonic_ns(),
                 }, indent=2) + "\n")
-        replay_code = run.wait(replay)
-        replay_output = Path(replay_log).read_text()
-        require_build(replay_code, replay_output, "replay finishes after releasing the cached body", Path(replay_log))
+            replay_code = run.wait(replay)
+            replay_output = Path(replay_log).read_text()
+            require_build(replay_code, replay_output, "replay finishes after releasing the cached body", Path(replay_log))
         check(run.behaviour("replay") == wanted, "overlap replay artifact equals solo in bytes and behavior")
         replay_plan = run.plan("replay")
         check(replay_plan is not None, "replay reported its complete plan")
