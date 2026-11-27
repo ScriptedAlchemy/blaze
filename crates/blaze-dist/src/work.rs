@@ -257,7 +257,7 @@ pub enum Effect {
         /// The other's.
         other: Digest,
     },
-    /// An entry exported under a name that became a conflict or was rejected by the lead:
+    /// An exported or cached entry under a name that became a conflict or was rejected by the lead:
     /// the lead bans it.
     ExportInvalidated {
         /// The name.
@@ -631,7 +631,7 @@ impl WorkSet {
         for name in &self.rejected {
             let Some(slot) = self.names.get_mut(name) else { continue };
             if let Slot::Done(Terminal::Committed {
-                outcome: ItemOutcome::Exported(entry), ..
+                outcome: ItemOutcome::Exported(entry) | ItemOutcome::FromStore(entry), ..
             }) = &slot.state
             {
                 out.push(Effect::ExportInvalidated { name: *name, entry: entry.entry });
@@ -1072,7 +1072,7 @@ impl WorkSet {
                 // taken, and an entry exported under it is banned. Acknowledge that the
                 // name must be dropped even when this result could not resolve it.
                 conflicts.insert(name);
-                if let ItemOutcome::Exported(entry) = &item.outcome {
+                if let ItemOutcome::Exported(entry) | ItemOutcome::FromStore(entry) = &item.outcome {
                     out.push(Effect::ExportInvalidated { name, entry: entry.entry });
                 }
                 return;
@@ -1163,8 +1163,9 @@ impl WorkSet {
         }
         self.counters.conflicts += 1;
         out.push(Effect::Conflict { name, first: slot.tuple, other: found.tuple });
-        if let Slot::Done(Terminal::Committed { outcome: ItemOutcome::Exported(entry), .. }) =
-            &slot.state
+        if let Slot::Done(Terminal::Committed {
+            outcome: ItemOutcome::Exported(entry) | ItemOutcome::FromStore(entry), ..
+        }) = &slot.state
         {
             out.push(Effect::ExportInvalidated { name, entry: entry.entry });
         }

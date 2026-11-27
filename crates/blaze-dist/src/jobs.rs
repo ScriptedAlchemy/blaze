@@ -509,10 +509,14 @@ impl Execution {
                 self.alloc,
             )));
         }
-        self.heard.insert(WireString::from_str_in(from, self.alloc), now);
         let work = self.work.as_mut().ok_or(Refusal::NotJoined)?;
         let mut log = Vec::new_in(out.allocator().clone());
         let answer = call(work, &mut log);
+        // An unjoined or incompatible worker can keep sending refused requests.
+        // Only an accepted call makes it a recently heard lead replacement.
+        if answer.is_ok() {
+            self.heard.insert(WireString::from_str_in(from, self.alloc), now);
+        }
         out.extend(log.into_iter().map(Effect::Work));
         self.after_work(now, out);
         answer
@@ -1914,3 +1918,6 @@ mod publication_tests;
 
 #[cfg(test)]
 mod retirement_tests;
+
+#[cfg(test)]
+mod liveness_tests;
