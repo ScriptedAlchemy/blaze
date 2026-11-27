@@ -642,7 +642,8 @@ pub fn import<A: AllocatorClone>(
     import_using(packs, |reference| blobs.committed_pack(reference, &alloc), alloc.clone(), blobs.alloc)
 }
 
-pub(crate) fn import_until<A: AllocatorClone>(
+/// Bounded imports use a copyable handle; comparison-only callers borrow their allocator.
+pub(crate) fn import_until<A: AllocatorClone + Copy>(
     blobs: &Blobs,
     packs: &[PackRef],
     deadline: TcpDeadline,
@@ -651,7 +652,7 @@ pub(crate) fn import_until<A: AllocatorClone>(
     import_using(
         packs,
         |reference| blobs.pack_until(&reference.pack, reference.size, deadline, &alloc),
-        alloc.clone(),
+        alloc,
         blobs.alloc,
     )
 }
