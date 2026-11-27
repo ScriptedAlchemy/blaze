@@ -30,7 +30,7 @@ use super::super::published::folder::{self, Order};
 use super::super::published;
 use super::super::published_e2e_tests::{N, Planted, SEED, TOOLCHAIN, contains, developer_home, path, plant, planted, set_name, set_path};
 use super::super::roots::RootName;
-use super::super::{CommandLent, FolderOrigin};
+use super::super::{CommandLent, CommandStore, FolderOrigin, NamedOrigin, Store as _};
 use super::{FRESH_NS, How, SegmentWhy, TakeError, TakePlant, Taken, take_from};
 
 /// Payload bytes a segment of the test's set holds at most: the records' 80 to 600 bytes make
@@ -197,6 +197,47 @@ fn a_set_signed_by_a_key_blaze_does_not_carry_is_refused_with_no_key_named() {
     );
     assert!(!rooted(&lent), "a refused set was rooted");
     assert!(world.records.public.iter().all(|(key, _)| lent.get(&CasKey(*key)).expect("a get").is_none()), "a refused set's record was put");
+
+    world.take(&cx, &lent, TakePlant::NONE).expect("take under the granted key");
+    assert!(matches!(world.take_trusting(&cx, &lent, &[], TakePlant::NONE),
+        Err(TakeError::Read(Unfetched::Refused(Refused::Signature { why: SignatureWhy::UnknownSigner, .. })))));
+}
+
+#[test]
+fn one_record_from_a_new_generation_does_not_complete_its_take() {
+    let world = world(69);
+    let cx = world.cx();
+    let (_b, lent) = developer_home(&world.io, &cx, "/b", 6);
+    assert_eq!(world.take(&cx, &lent, TakePlant::NONE).expect("take the first set").generation, 1);
+
+    let next = planted(0..N + 2, 0);
+    let (_a, publisher) = plant(&world.io, &cx, "/second-publisher", &next, false);
+    publish_sized(&world.io, &cx, &publisher, "o", SMALL_SEGMENTS);
+
+    let hex = TOOLCHAIN.hex();
+    let set = set_name(&hex);
+    let fs = world.io.need_fs().expect("files");
+    let key = Signer::from_seed(&SEED).public().to_string();
+    let origin = NamedOrigin::published(&cx, &fs, None, "o", Some(&key), Default::default(), set, &lent).expect("the published origin");
+    let clock = world.io.need_clock().expect("a clock");
+    let err = world.io.need_err().expect("err");
+    let erased = blaze_own::Erased::new(cx.frame());
+    let mut store = CommandStore::new(&cx, &lent, false, 0, Some(&origin), clock, &err, erased.handle()).expect("the command store");
+    let (requested, expected) = &next.public[N as usize];
+    assert_eq!(store.get(&cx, blaze_drive::Key(*requested)).expect("the range read").expect("one new record").bytes, expected.as_slice());
+    lent.commit().expect("the range read's commit");
+    let seen = published::seen(&lent, &set_id()).expect("the range read's floor");
+    assert_eq!(seen.generation, 2);
+    assert!(seen.taken.is_none(), "a range read recorded a complete take");
+
+    let (missing, expected) = &next.public[N as usize + 1];
+    assert!(lent.get(&CasKey(*missing)).expect("the other new record").is_none());
+    let taken = world.take(&cx, &lent, TakePlant::NONE).expect("take the second set whole");
+    assert_eq!((taken.generation, taken.how, taken.records), (2, How::Took, 1));
+    assert_eq!(lent.get(&CasKey(*missing)).expect("the second record").expect("adopted").bytes, expected.as_slice());
+    let seen = published::seen(&lent, &set_id()).expect("the whole take's floor");
+    assert_eq!(seen.generation, 2);
+    assert_eq!(seen.taken.expect("the adoption receipt").signer, Signer::from_seed(&SEED).public());
 }
 
 fn harness(what: &str, error: impl core::fmt::Display) -> Broke {
@@ -326,6 +367,10 @@ fn interrupted(tape: &Tape, root_each_segment: bool) -> Result<(), Broke> {
     match named_by_root(&lent, &world.records)? {
         Some(n) if n != N as usize => return Err(Broke::Oracle(format!("half a root: the toolchain's root names {n} of the set's {N} records"))),
         _ => {}
+    }
+    let seen = published::seen(&lent, &set_id()).map_err(|why| harness("the floor after the crash", why))?;
+    if seen.taken.is_some() != rooted(&lent) {
+        return Err(Broke::Oracle("the full-take receipt and toolchain root did not commit together".into()));
     }
     let taken = world.take(&cx, &lent, TakePlant::NONE).map_err(|why| Broke::Oracle(format!("the next command did not finish the take: {why}")))?;
     if named_by_root(&lent, &world.records)? != Some(N as usize) {

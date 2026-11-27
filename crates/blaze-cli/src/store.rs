@@ -1046,12 +1046,12 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
                 self.place.put_record(key, false, tag, bytes)?;
                 remote.kept += 1;
                 remote.kept_bytes += u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                // The set's floor rises to the head just taken, once a command (the rollback
-                // rule: blaze-remote published/set.rs).
+                // The authenticated head raises the rollback floor. An individual record
+                // carries no receipt for the rest of that generation.
                 if let (Some(set), Some(head), false) = (remote.named.check.set, remote.reader.head(), remote.floored)
                     && head.generation > set.seen
                 {
-                    published::keep_floor(&mut self.place, &set.id, head.generation, clock.wall().as_ns())?;
+                    published::keep_floor(&mut self.place, &set.id, published::Seen { generation: head.generation, taken: None })?;
                     remote.floored = true;
                 }
                 true

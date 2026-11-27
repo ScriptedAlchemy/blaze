@@ -5,12 +5,11 @@
 //!   each record it keeps, with the record's own tag and namespace, for blaze-remote `lay_out_bound`
 //!   (whose predicate keeps the public ones). A key a root names that the store does not hold, or
 //!   a record of the wrong tag where an index belongs, stops the walk by name: nothing is skipped.
-//! - THE FLOOR ([`seen`], [`floor`], [`keep_floor`]): the highest generation of a set this home
-//!   has taken, and when (the wall clock) its head was last asked, one record under the root
-//!   `pubf.<set id>` (store/roots.rs `RootName::published_floor`), kept as long as the toolchain's
-//!   records. A reader's [`SetCheck`](blaze_remote::published::set::SetCheck) refuses a head below
-//!   the generation: an older set served again is a rollback, refused by name. The time is the
-//!   freshness window's (store/take.rs `FRESH_NS`).
+//! - THE FLOOR ([`seen`], [`floor`], [`keep_floor`]): the highest authenticated generation, with
+//!   a receipt when the whole set at that generation was taken. Both are kept under
+//!   `pubf.<set id>` (store/roots.rs `RootName::published_floor`). A reader's
+//!   [`SetCheck`](blaze_remote::published::set::SetCheck) refuses a lower generation. Only a
+//!   receipt for a currently trusted signer can grant the freshness window.
 //! - THE FOLDER WRITE ([`folder`], in a trusted builder's blaze: blaze-cli's `publish` feature,
 //!   which turns on blaze-remote's `sign`; D136): the set laid out at the generation after its
 //!   folder's head, every object named by a digest written first, then `prefix`, then `head`,
@@ -23,6 +22,7 @@ use blaze_cas::plain::{Lent, LentError, Namespace, Tag};
 use blaze_keyed::kind::{ReservedTag, TagReach, reach_of};
 use blaze_core::Driver;
 use blaze_ids::ContentId;
+use blaze_remote::trust::PublicKey;
 use blaze_toolchain::ToolchainId;
 
 use super::plain_place::{PlaceError, PlainPlace, StoreAlloc};
@@ -31,15 +31,25 @@ use super::roots::{RootName, TOOLCHAIN_LIFE_NS};
 // A floor record is filed under [`ReservedTag::Floor`] (blaze-keyed's registry).
 const FLOOR_DOMAIN: &str = "blaze-cli published floor 1";
 const FLOOR_MAGIC: [u8; 4] = *b"BLPF";
-/// A floor record: the magic, the set's id, the generation, the wall time its head was last
-/// asked (ns since the Unix epoch; both little-endian).
+const TAKEN_MAGIC: [u8; 4] = *b"BLPT";
+/// A floor without a receipt uses the original format. Its wall time is disregarded because
+/// the old writer used the same layout for whole-set takes and individual range reads.
 const FLOOR_LEN: usize = 4 + 32 + 8 + 8;
+/// A complete receipt adds the signed head's digest and signer to the floor.
+const TAKEN_LEN: usize = FLOOR_LEN + 32 + 32;
 
-/// What this home holds of a published set: the highest generation it has taken (0: none), and
-/// when its head was last asked, by the command's wall clock (0: never).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// What this home knows about a published set, under its signed set identity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct Seen {
     pub generation: u64,
+    pub taken: Option<TakenHead>,
+}
+
+/// The exact signed head of the set this home committed whole, and when it was checked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct TakenHead {
+    pub digest: ContentId,
+    pub signer: PublicKey,
     pub asked_wall_ns: u64,
 }
 
@@ -153,17 +163,16 @@ pub(crate) fn folder_only(origin: &str) -> Result<&str, PublishedError> {
     Ok(origin)
 }
 
-/// The highest generation of `set` this home has taken; 0 when it has taken none.
+/// The highest authenticated generation of `set` this home has seen, or zero.
 pub(crate) fn floor<D: Driver>(lent: &Lent<D, StoreAlloc>, set: &ContentId) -> Result<u64, PublishedError> {
     Ok(seen(lent, set)?.generation)
 }
 
-/// What this home holds of `set`: its floor and when its head was last asked; zeros when it
-/// has taken none.
+/// The set's rollback floor and any full-take receipt for that generation.
 pub(crate) fn seen<D: Driver>(lent: &Lent<D, StoreAlloc>, set: &ContentId) -> Result<Seen, PublishedError> {
     let root = RootName::published_floor(set);
     let store = |why| PublishedError::Store { root, why };
-    let Some(at) = lent.root_named(root.as_str()) else { return Ok(Seen { generation: 0, asked_wall_ns: 0 }) };
+    let Some(at) = lent.root_named(root.as_str()) else { return Ok(Seen::default()) };
     // A root's record is the keys it names: one, the floor record's.
     let Some(named) = lent.get(&at).map_err(store)? else { return Err(PublishedError::Gone { root, key: at }) };
     if named.bytes.len() != 32 {
@@ -172,7 +181,9 @@ pub(crate) fn seen<D: Driver>(lent: &Lent<D, StoreAlloc>, set: &ContentId) -> Re
     let key = key_of(named.bytes);
     let Some(record) = lent.get(&key).map_err(store)? else { return Err(PublishedError::Gone { root, key }) };
     let bytes = record.bytes;
-    if !ReservedTag::Floor.is(record.tag) ||bytes.len() != FLOOR_LEN || bytes[..4] != FLOOR_MAGIC || bytes[4..36] != set.0 {
+    let incomplete = bytes.len() == FLOOR_LEN && bytes[..4] == FLOOR_MAGIC;
+    let complete = bytes.len() == TAKEN_LEN && bytes[..4] == TAKEN_MAGIC;
+    if !ReservedTag::Floor.is(record.tag) || !(incomplete || complete) || bytes[4..36] != set.0 {
         return Err(PublishedError::Floor { root, len: bytes.len() });
     }
     let word = |at: usize| {
@@ -180,20 +191,31 @@ pub(crate) fn seen<D: Driver>(lent: &Lent<D, StoreAlloc>, set: &ContentId) -> Re
         word.copy_from_slice(&bytes[at..at + 8]);
         u64::from_le_bytes(word)
     };
-    Ok(Seen { generation: word(36), asked_wall_ns: word(44) })
+    let taken = complete.then(|| TakenHead {
+        digest: ContentId(bytes[52..84].try_into().expect("the head digest is 32 bytes")),
+        signer: PublicKey(bytes[84..116].try_into().expect("the signer key is 32 bytes")),
+        asked_wall_ns: word(44),
+    });
+    Ok(Seen { generation: word(36), taken })
 }
 
-/// Keeps `generation` as the floor of `set` from the next commit on, its head asked at
-/// `asked_wall_ns` (the command's wall clock): a `LOCAL` record (this home's fact, never
-/// published) under the root `pubf.<set>`.
-pub(crate) fn keep_floor<D: Driver>(place: &mut PlainPlace<'_, D>, set: &ContentId, generation: u64, asked_wall_ns: u64) -> Result<(), PublishedError> {
-    let mut bytes = [0u8; FLOOR_LEN];
-    bytes[..4].copy_from_slice(&FLOOR_MAGIC);
+/// Keeps the rollback floor and its optional adoption receipt under the local `pubf.<set>` root.
+pub(crate) fn keep_floor<D: Driver>(place: &mut PlainPlace<'_, D>, set: &ContentId, seen: Seen) -> Result<(), PublishedError> {
+    let mut bytes = [0u8; TAKEN_LEN];
     bytes[4..36].copy_from_slice(&set.0);
-    bytes[36..44].copy_from_slice(&generation.to_le_bytes());
-    bytes[44..].copy_from_slice(&asked_wall_ns.to_le_bytes());
-    let key = ContentId::of(FLOOR_DOMAIN, &bytes);
-    place.put_record(blaze_drive::Key(key), false, ReservedTag::Floor.tag(), &bytes).map_err(PublishedError::Place)?;
+    bytes[36..44].copy_from_slice(&seen.generation.to_le_bytes());
+    let bytes = if let Some(taken) = seen.taken {
+        bytes[..4].copy_from_slice(&TAKEN_MAGIC);
+        bytes[44..52].copy_from_slice(&taken.asked_wall_ns.to_le_bytes());
+        bytes[52..84].copy_from_slice(&taken.digest.0);
+        bytes[84..116].copy_from_slice(&taken.signer.0);
+        bytes.as_slice()
+    } else {
+        bytes[..4].copy_from_slice(&FLOOR_MAGIC);
+        &bytes[..FLOOR_LEN]
+    };
+    let key = ContentId::of(FLOOR_DOMAIN, bytes);
+    place.put_record(blaze_drive::Key(key), false, ReservedTag::Floor.tag(), bytes).map_err(PublishedError::Place)?;
     let root = RootName::published_floor(set);
     place.lent().root_for(root.as_str(), &[CasKey(key)], TOOLCHAIN_LIFE_NS).map_err(|why| PublishedError::Store { root, why })?;
     Ok(())

@@ -82,6 +82,18 @@ Which keys a reader trusts: today the keys its caller gives (`Ed25519Keys`). Whe
 key list signed by an anchor, blaze-remote `trust`; or a key pinned in the toolchain's own manifest)
 is the next piece, not this one.
 
+### Whole-set adoption
+
+The local rollback floor records the highest authenticated generation. A range read may advance
+that floor after one record arrives. Whole-set adoption attaches the exact signed head's digest,
+signer and last verification time in the commit that publishes the toolchain root. Only a complete
+receipt under a currently trusted signer grants the freshness window. After the window, compare the
+verified head with the receipt before reusing the root. Older floor records preserve their generation
+and require a fresh whole-set verification. The extra cost is one local record of fixed size, with
+the same number of origin reads for a fresh home and for a home with a matching receipt. The
+adoption simulation checks the receipt and records across interrupted writes, including a rollback
+floor advanced by a range read and a change in signer trust.
+
 ## 4. The reader's waves
 
 A fresh home checking a small project, its keys computed from text before anything is fetched (rule

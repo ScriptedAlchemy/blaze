@@ -6,17 +6,15 @@
 //! ([`before_first_phase`], one line in engine_check.rs), and every record of it is then a local
 //! hit for every worker, as if this home had made it.
 //!
-//! WHEN. A take runs when an origin is named and the home's `tool.<toolchain>` root is absent or
-//! older than the set's generation. What the home holds of the set (store/published.rs `Seen`):
-//! the generation it took (its rollback floor) and when the head was last asked, by the
-//! command's handed wall clock (rule 75).
+//! WHEN. A take runs when an origin is named and the home cannot prove it holds the set whole.
+//! The rollback floor also advances on authenticated range reads. The full-take receipt binds
+//! the rooted generation to the signed head and its signer (store/published.rs `Seen`).
 //!
 //! THE FRESHNESS WINDOW ([`FRESH_NS`], ten minutes). The origin's head is asked at most once per
-//! window: a command whose home holds the toolchain's root and took the set's generation with its
-//! head asked less than a window ago asks the origin NOTHING. Past the window (or with the wall
-//! clock stepped back past the last ask) it asks the head once: the same generation takes
-//! nothing and starts the window again; a later one takes the set whole. So a second command
-//! reads the head at most once, and none within the window.
+//! window for a home with both the toolchain root and a full-take receipt under a signer the
+//! command trusts. Past the window (or with the wall clock stepped back past the last ask) it
+//! asks the head once. The same verified head starts the window again. A different verified
+//! head requires a complete take, including when its generation equals the rollback floor.
 //!
 //! WHAT A TAKE DOES, in this order, each step stopping the command by name on a refusal:
 //!
@@ -72,7 +70,7 @@ use bstd::out::Out;
 use bstd::par::{self, Grain};
 
 use super::plain_place::{PlaceError, PlainPlace, StoreAlloc};
-use super::published::{self, PublishedError};
+use super::published::{self, PublishedError, Seen, TakenHead};
 use super::roots::{self, RootError, RootName};
 use super::{FolderOrigin, HttpOrigin, NamedOrigin, Opened, OriginAt};
 use crate::CliError;
@@ -358,12 +356,17 @@ fn take_from_inner<D: Driver, O: Origin + ?Sized>(
     let rooted = lent.root_named(RootName::toolchain(toolchain).as_str()).is_some();
     let mut taken = Taken { set, generation: seen.generation, how: How::Current, records: 0, bytes: 0, already: 0, take_ns: 0, verify_ns: 0, head_reads: 0, reads: 0 };
     // The window: a wall clock stepped back past the last ask asks again.
-    if rooted && seen.generation > 0 && wall >= seen.asked_wall_ns && wall - seen.asked_wall_ns < FRESH_NS {
-        taken.how = How::Fresh { asked_ago_ns: wall - seen.asked_wall_ns };
+    if rooted
+        && let Some(receipt) = seen.taken
+        && blaze_remote::trust::trusted_for(&receipt.signer, keys)
+        && let Some(asked_ago_ns) = wall.checked_sub(receipt.asked_wall_ns)
+        && asked_ago_ns < FRESH_NS
+    {
+        taken.how = How::Fresh { asked_ago_ns };
         return Ok(taken);
     }
     let mut origin = Counted { origin, heads: 0, reads: 0 };
-    let result = take_counted(cx, &mut origin, keys, set, lent, toolchain, clock, lan_peer, plant, (seen.generation, wall, rooted), &mut taken);
+    let result = take_counted(cx, &mut origin, keys, set, lent, toolchain, clock, lan_peer, plant, (seen, wall, rooted), &mut taken);
     taken.head_reads = origin.heads;
     taken.reads = origin.reads;
     taken.take_ns = now_ns(clock).saturating_sub(began);
@@ -381,7 +384,7 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
     clock: &Clock,
     lan_peer: Option<LanSegzPeer<'_>>,
     plant: TakePlant,
-    (floor, wall, rooted): (u64, u64, bool),
+    (seen, wall, rooted): (Seen, u64, bool),
     taken: &mut Taken,
 ) -> Result<(), TakeError> {
     // The plant is read in a test alone.
@@ -395,15 +398,22 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
     //      `How::Current` transfers zero prefix bytes.
     //    - On a fresh or unrooted home, fetch `Object::Prefix` directly in 1 RTT and parse its
     //      leading `HEAD_LEN` bytes as `Head` (1 Ed25519 verification, rule 74).
-    let (head, checked) = if rooted && floor > 0 {
+    let check = SetCheck { set, keys, seen: seen.generation };
+    let receipt = |head: &Head, checked: &[u8]| TakenHead {
+        digest: ContentId::of("blaze-cli adopted published head 1", checked),
+        signer: head.signer,
+        asked_wall_ns: wall,
+    };
+    let (head, checked) = if rooted && let Some(prior) = seen.taken {
         let mut head_bytes = [0u8; HEAD_LEN + 1];
         let n = read_at(origin, Object::Head, 0, &mut head_bytes, clock)?;
-        let head = Head::decode(&head_bytes[..n], Namespace::PUBLIC, &SetCheck { set, keys, seen: floor }).map_err(refused)?;
+        let head = Head::decode(&head_bytes[..n], Namespace::PUBLIC, &check).map_err(refused)?;
         let mut checked = [0u8; HEAD_LEN];
         checked.copy_from_slice(&head_bytes[..HEAD_LEN]);
-        if head.generation == floor {
+        let current = receipt(&head, &checked);
+        if current.digest == prior.digest {
             // Current: the window starts again; nothing else is read.
-            published::keep_floor(&mut place, &set, floor, wall).map_err(TakeError::Published)?;
+            published::keep_floor(&mut place, &set, Seen { generation: head.generation, taken: Some(current) }).map_err(TakeError::Published)?;
             place.commit().map_err(TakeError::Place)?;
             taken.how = How::Current;
             return Ok(());
@@ -416,7 +426,7 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
     } else {
         read_to_end(origin, Object::Prefix, PREFIX_MOST, &mut bytes, clock)?;
         let head_slice = bytes.get(..HEAD_LEN).unwrap_or(bytes.as_slice());
-        let head = Head::decode(head_slice, Namespace::PUBLIC, &SetCheck { set, keys, seen: floor }).map_err(refused)?;
+        let head = Head::decode(head_slice, Namespace::PUBLIC, &check).map_err(refused)?;
         let mut checked = [0u8; HEAD_LEN];
         checked.copy_from_slice(head_slice);
         (head, checked)
@@ -733,7 +743,7 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
     kept.sort_unstable();
     kept.dedup();
     roots::keep_toolchain(lent, toolchain, &kept, &[]).map_err(TakeError::Root)?;
-    published::keep_floor(&mut place, &set, head.generation, wall).map_err(TakeError::Published)?;
+    published::keep_floor(&mut place, &set, Seen { generation: head.generation, taken: Some(receipt(&head, &checked)) }).map_err(TakeError::Published)?;
     place.commit().map_err(TakeError::Place)?;
     taken.generation = head.generation;
     taken.how = How::Took;
