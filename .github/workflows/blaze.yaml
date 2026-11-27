@@ -6,6 +6,10 @@ on:
         description: Exact source commit to test
         type: string
         required: true
+      control:
+        description: Optional publisher-only commit for the withholding control
+        type: string
+        required: false
 permissions:
   contents: read
 defaults:
@@ -18,6 +22,7 @@ env:
 jobs:
   signed-take:
     name: signed-set adoption and trust
+    if: inputs.control == ''
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 48
     steps:
@@ -43,4 +48,85 @@ jobs:
         with:
           name: signed-take-evidence
           path: ${{ runner.temp }}/signed-take.log
+          if-no-files-found: warn
+  signed-https:
+    name: exact release signed scope reuse over HTTPS
+    if: inputs.control != ''
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Keep the acceptance harness
+        run: timeout 10s install harness/v2/signed_origin.py "$RUNNER_TEMP/signed_origin.py"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source }}
+          persist-credentials: false
+      - uses: ./.github/actions/locked-memory
+      - uses: ./.github/actions/reflink
+      - uses: ./.github/actions/toolchain
+      - uses: ./.github/actions/script
+        with:
+          job: source-compiler
+      - uses: ./.github/actions/toolchain-shelf
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
+          enable-cache: false
+      - name: Build the exact compiler release
+        timeout-minutes: 72
+        env:
+          SOURCE: ${{ inputs.source }}
+        run: |
+          test "$(timeout 10s git rev-parse HEAD)" = "$SOURCE"
+          timeout 10s git rev-parse HEAD 'HEAD^{tree}'
+          tc=$(timeout 10s cat pins/toolchain)
+          for role in publisher developer; do
+            features=()
+            if [[ $role == publisher ]]; then features=(--features blaze-cli/publish); fi
+            timeout -k 20s 2050s cargo +"$tc" build --locked --release --bins -p blaze-cli -p blaze-launcher "${features[@]}"
+            dest="$RUNNER_TEMP/$role"
+            timeout 10s mkdir "$dest"
+            for bin in blaze blaze-launcher blaze-fact-shim; do
+              timeout 10s install -m 755 "${CARGO_TARGET_DIR}/release/$bin" "$dest/$bin"
+            done
+          done
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.control }}
+          persist-credentials: false
+      - name: Build the withholding publisher
+        timeout-minutes: 33
+        env:
+          SOURCE: ${{ inputs.source }}
+          CONTROL: ${{ inputs.control }}
+        run: |
+          test "$(timeout 10s git rev-parse HEAD)" = "$CONTROL"
+          timeout 10s git rev-parse HEAD 'HEAD^{tree}'
+          test "$(timeout 10s git diff --name-only "$SOURCE" "$CONTROL")" = crates/blaze-cli/src/store/publish_command.rs
+          timeout 10s git diff "$SOURCE" "$CONTROL" -- crates/blaze-cli/src/store/publish_command.rs
+          tc=$(timeout 10s cat pins/toolchain)
+          timeout -k 20s 1880s cargo +"$tc" build --locked --release -p blaze-cli --bin blaze --features publish
+          timeout 10s mkdir "$RUNNER_TEMP/control"
+          timeout 10s install -m 755 "${CARGO_TARGET_DIR}/release/blaze" "$RUNNER_TEMP/control/blaze"
+      - name: Prove named scope reuse in clean homes
+        timeout-minutes: 18
+        run: |
+          input=$(timeout 10s jq -cn --arg publisher "$RUNNER_TEMP/publisher/blaze" \
+            --arg developer "$RUNNER_TEMP/developer/blaze" --arg control "$RUNNER_TEMP/control/blaze" \
+            --arg shelf "$HOME/.blaze/v2/toolchain" --arg scratch "$RUNNER_TEMP/blaze-fs/signed-origin" \
+            '{blaze:$publisher,alternate_blaze:$developer,control_publisher:$control,shelf:$shelf,scratch:$scratch,timeout:240}')
+          timeout -k 15s 990s uv run --frozen --no-dev python "$RUNNER_TEMP/signed_origin.py" "$input"
+      - if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: signed-https-evidence
+          path: |
+            ${{ runner.temp }}/blaze-fs/signed-origin/*.stdout
+            ${{ runner.temp }}/blaze-fs/signed-origin/*.stderr
+            ${{ runner.temp }}/blaze-fs/signed-origin/*.profile.txt
+            ${{ runner.temp }}/blaze-fs/signed-origin/*.json
           if-no-files-found: warn
