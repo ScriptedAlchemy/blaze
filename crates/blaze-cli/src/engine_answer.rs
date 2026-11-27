@@ -2854,7 +2854,7 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
                 && let Some(&payload) = kept.records.get(&name)
                 && row.reads.iter().all(|(id, _)| !owed_cells.contains_key(id))
             {
-                crate::store::scope_cache::keep(cx, store, lent, toolchain, name, row, payload, blaze_own::Alloc::from(frame))?;
+                crate::store::scope_cache::keep(cx, store, lent, toolchain, name, row, payload, blaze_own::Alloc::from(alloc))?;
             }
         }
     }
