@@ -106,8 +106,9 @@ distributed configuration.
 | Variable | Current behavior |
 |---|---|
 | `BLAZE_DIST_EVENTS` | Path for append-only JSON lines of actual agent and coordinator transitions. Each append holds a file lock, with a two-second lock bound, so processes do not interleave records. Write failure is logged as a warning; the acceptance harness separately rejects missing evidence. With the variable absent, no event file is opened. |
-| `BLAZE_DIST_TEST_RESULT_GATE` | Acceptance-only path to a fresh, already-created, empty absolute directory. The agent enables this only for a current lead and supplies a positive finite timeout. It captures one real result and pauses that sender's heartbeats until a `release` file appears or the deadline expires. |
+| `BLAZE_DIST_TEST_RESULT_GATE` | Absolute path to a fresh acceptance-test directory. The agent holds one real result until a `release` file appears or the deadline expires. A `keepalive` file in the directory allows heartbeats during the hold. |
 | `BLAZE_DIST_TEST_RESULT_UNIT` | Optional planned unit name for the result gate. The gate can be shared by two export processes so the first lead result for that unit is held until its peer commits different work. |
+| `BLAZE_DIST_TEST_RESULT_SCOPE` | Selects which holders can claim the gate. The default, `lead`, captures a lead's result. The three-host test sets `all` and gives each runner its own gate directory so it can capture a result from each helper as well. |
 
 The result gate uses exclusive creation of `claimed` to select one result across callers.
 It writes the real canonical command to `result.cbor` and an accompanying `ready.json`

@@ -865,6 +865,28 @@ def host_test_held(index: int) -> dict:
 
 
 class HostProof(unittest.TestCase):
+    def test_host_helpers_enable_the_result_gate_for_all_holders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request = h.HostWorker(
+                checkout=directory, scratch=str(root / "helper"), blaze="/blaze", python=sys.executable,
+                runner="helper", socket="/coordinator", blobs="127.0.0.1:80", role="helper",
+                namespace="selfcheck", cores=1, timeout=1,
+            )
+            with (
+                patch.object(h, "host_worker_env", return_value={}),
+                patch.object(h, "host_node_identity", return_value={}),
+                patch.object(h, "HostMessages"),
+                patch.object(h, "host_send"),
+                patch.object(h, "host_run_export", side_effect=e.Failed("capture launch")) as launch,
+                self.assertRaisesRegex(e.Failed, "capture launch"),
+            ):
+                h.host_worker(request)
+            environment = launch.call_args.args[3]
+            self.assertEqual(environment["BLAZE_DIST_TEST_RESULT_GATE"], str(root / "helper" / "gate"))
+            self.assertEqual(environment["BLAZE_DIST_TEST_RESULT_UNIT"], h.HOST_PACKAGE)
+            self.assertEqual(environment["BLAZE_DIST_TEST_RESULT_SCOPE"], "all")
+
     def test_distinct_hosts_are_required_independent_of_pid(self):
         template = {"namespace": "run", "commit": "commit", "tree": "tree", "blaze_sha256": "binary",
                     "compiler_seal_sha256": "seal", "workload_sha256": "fixture",

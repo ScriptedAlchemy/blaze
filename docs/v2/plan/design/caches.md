@@ -110,7 +110,8 @@ or overwritten: a changed input makes another key.
 
 The retained protocol's `BLAZE_DIST_SOCKET`, `BLAZE_DIST_BLOBS`, `BLAZE_DIST_LOCAL`,
 `BLAZE_DIST_REPORT`, `BLAZE_DIST_DEADLINE_SECS`, `BLAZE_DIST_PR`, `BLAZE_DIST_SOURCE`,
-`BLAZE_DIST_EVENTS`, `BLAZE_DIST_TEST_RESULT_GATE` and `BLAZE_DIST_TEST_RESULT_UNIT` configure the distributed build
+`BLAZE_DIST_EVENTS`, `BLAZE_DIST_TEST_RESULT_GATE`, `BLAZE_DIST_TEST_RESULT_UNIT` and
+`BLAZE_DIST_TEST_RESULT_SCOPE` configure the distributed build
 carrier, namespace, report, event telemetry and bounded test rendezvous. None selects a
 different local caching path.
 

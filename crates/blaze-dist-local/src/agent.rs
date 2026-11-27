@@ -96,13 +96,31 @@ pub struct Unit {
     pub names: WireVec<Digest>,
 }
 
+/// Which holders may pause at a unit's acceptance-test result gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResultGateScope {
+    /// Only the lead may pause.
+    Lead,
+    /// Each participant may pause in its own gate directory.
+    All,
+}
+
+/// Acceptance-only configuration for a unit's real result.
+#[derive(Clone, Copy, Debug)]
+pub struct TestResultGate<'a> {
+    /// Fresh absolute directory used to record and release the captured result.
+    pub directory: &'a str,
+    /// Which participants may capture a result.
+    pub scope: ResultGateScope,
+}
+
 /// What compiles a grant: on the thread that called [`run`], which may own the front end.
 pub trait Granted {
     /// The compiler/exporter's matchable refusal, retained until the carrier reports it.
     type Error: core::error::Error;
 
-    /// Acceptance-only directory for this unit's real lead result, if configured.
-    fn test_result_gate(&self) -> Option<&str> {
+    /// Acceptance-only gate for this unit's real result, if configured.
+    fn test_result_gate(&self) -> Option<TestResultGate<'_>> {
         None
     }
 
@@ -1384,13 +1402,12 @@ fn hold(
     let leave = AtomicBool::new(false);
     let working = AtomicBool::new(true);
     let driver = DriverConfig {
-        // A lead's intentional silence moves the attempt. A same-attempt helper can
-        // legitimately receive Ended after the survivor finishes, which is not the
-        // stale-attempt refusal this acceptance probe is intended to demonstrate.
+        // The stale-attempt probe gates the lead because its intentional silence moves
+        // the attempt. The shared-execution probe gates every participating holder.
         result_gate: granted
             .test_result_gate()
-            .filter(|_| lead)
-            .map(|dir| crate::result_gate::ResultGate::new(WireString::from_str_in(dir, alloc), gate_timeout, alloc))
+            .filter(|gate| lead || gate.scope == ResultGateScope::All)
+            .map(|gate| crate::result_gate::ResultGate::new(WireString::from_str_in(gate.directory, alloc), gate_timeout, alloc))
             .transpose()?,
         ..DriverConfig::default()
     };

@@ -201,7 +201,7 @@ struct Holder<'s, 'p, 'h, 'm, D: Driver, B> {
     alloc: Alloc<'s>,
     wire: WireAlloc,
     heap: &'static Heap,
-    result_gate: Option<&'s str>,
+    result_gate: Option<agent::TestResultGate<'s>>,
 }
 
 fn side(store: &mut dyn CodeStore, data: &[Side<'_>]) -> Result<(), StoreError> {
@@ -285,7 +285,7 @@ where
 {
     type Error = DistError;
 
-    fn test_result_gate(&self) -> Option<&str> {
+    fn test_result_gate(&self) -> Option<agent::TestResultGate<'_>> {
         self.result_gate
     }
 
@@ -419,8 +419,7 @@ where
             for (index, krate) in plans.iter().enumerate() {
                 let next = plans.get(index + 1).filter(|plan| !plan.product).map(|plan| plan.unit.spec);
                 let result_gate = dist.result_gate.as_ref()
-                    .filter(|gate| gate.unit.as_ref().is_none_or(|unit| unit.as_str() == krate.name))
-                    .map(|gate| gate.directory.as_str());
+                    .and_then(|gate| gate.for_unit(krate.name));
                 let mut holder = Holder { krate, work, backend, store: &mut store, alloc, wire, heap: request.heap, result_gate };
                 let arrived = match budget.run_with_next(&krate.unit, next, &mut holder, &cancelled) {
                     Ok(arrived) => arrived,

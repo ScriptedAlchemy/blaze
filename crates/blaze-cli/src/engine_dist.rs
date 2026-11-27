@@ -39,7 +39,7 @@ use blaze_ladder::run::RunError;
 use blaze_ladder::run::make_one::{MOST_WALKED, Maker, NamesRecords, RecordsProgram, Typing};
 use blaze_ladder::run::special::{EntryForm, ProductRoots};
 use blaze_ladder::symbols::{encode_instance, fn_symbol_of_name};
-use blaze_own::{AString, AVec, Alloc, BTreeMap, BTreeSet, String, Vec};
+use blaze_own::{AString, AVec, Alloc, BTreeMap, BTreeSet, String, Vec, format_in};
 use blaze_scope::items_record::{ItemsRecord, TextSpan};
 use blaze_surface::ItemKind;
 use blaze_typeck::{ItemKey, List, PortableTys};
@@ -75,6 +75,7 @@ const PR_VAR: &str = "BLAZE_DIST_PR";
 const SOURCE_VAR: &str = "BLAZE_DIST_SOURCE";
 const RESULT_GATE_VAR: &str = "BLAZE_DIST_TEST_RESULT_GATE";
 const RESULT_UNIT_VAR: &str = "BLAZE_DIST_TEST_RESULT_UNIT";
+const RESULT_SCOPE_VAR: &str = "BLAZE_DIST_TEST_RESULT_SCOPE";
 
 /// Default execution budget.
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(3_600);
@@ -88,7 +89,7 @@ pub(crate) const KIND_POINTER: u8 = 1;
 pub(crate) enum DistError {
     /// The worker has no LLVM or fold emitter for distributed release export.
     ReleaseBackendUnavailable,
-    /// A test result selector is missing its directory or names no planned unit.
+    /// A test result selector has an invalid scope, is missing its directory, or names no planned unit.
     BadResultGate { shown: AString<'static> },
     /// A distributed option was supplied without `BLAZE_DIST_SOCKET`.
     OptionWithoutSocket { name: &'static str, value: AString<'static> },
@@ -212,6 +213,16 @@ pub(crate) struct DistConfig {
 struct TestResultGate {
     directory: AString<'static>,
     unit: Option<AString<'static>>,
+    scope: agent::ResultGateScope,
+}
+
+impl TestResultGate {
+    fn for_unit(&self, name: &str) -> Option<agent::TestResultGate<'_>> {
+        self.unit.as_ref().is_none_or(|unit| unit.as_str() == name).then_some(agent::TestResultGate {
+            directory: self.directory.as_str(),
+            scope: self.scope,
+        })
+    }
 }
 
 impl DistConfig {
@@ -225,7 +236,7 @@ impl DistConfig {
         let alloc = heap.alloc();
         let wire_alloc = heap.shared();
         let Some(socket) = env_get(env, SOCKET_VAR) else {
-            for name in [BLOBS_VAR, LOCAL_VAR, REPORT_VAR, ARTIFACT_KEYS_VAR, DEADLINE_VAR, PR_VAR, SOURCE_VAR, RESULT_GATE_VAR, RESULT_UNIT_VAR] {
+            for name in [BLOBS_VAR, LOCAL_VAR, REPORT_VAR, ARTIFACT_KEYS_VAR, DEADLINE_VAR, PR_VAR, SOURCE_VAR, RESULT_GATE_VAR, RESULT_UNIT_VAR, RESULT_SCOPE_VAR] {
                 if let Some(val) = env_get(env, name) {
                     return Err(DistError::OptionWithoutSocket { name, value: own_str(val, alloc) });
                 }
@@ -294,10 +305,18 @@ impl DistConfig {
         let report = env_get(env, REPORT_VAR).map(|p| own_str(p, alloc));
         let artifact_keys = env_get(env, ARTIFACT_KEYS_VAR).map(|p| own_str(p, alloc));
         let unit = env_get(env, RESULT_UNIT_VAR).map(|name| own_str(name, alloc));
+        let scope_value = env_get(env, RESULT_SCOPE_VAR);
+        let scope = match scope_value {
+            None | Some("lead") => agent::ResultGateScope::Lead,
+            Some("all") => agent::ResultGateScope::All,
+            Some(value) => return Err(DistError::BadResultGate {
+                shown: format_in!(alloc, "{RESULT_SCOPE_VAR} needs lead or all, got {value}"),
+            }),
+        };
         let result_gate = match env_get(env, RESULT_GATE_VAR) {
-            Some(dir) => Some(TestResultGate { directory: own_str(dir, alloc), unit }),
-            None if unit.is_some() => return Err(DistError::BadResultGate {
-                shown: own_str("BLAZE_DIST_TEST_RESULT_UNIT requires BLAZE_DIST_TEST_RESULT_GATE", alloc),
+            Some(dir) => Some(TestResultGate { directory: own_str(dir, alloc), unit, scope }),
+            None if unit.is_some() || scope_value.is_some() => return Err(DistError::BadResultGate {
+                shown: format_in!(alloc, "{} requires {RESULT_GATE_VAR}", if unit.is_some() { RESULT_UNIT_VAR } else { RESULT_SCOPE_VAR }),
             }),
             None => None,
         };
@@ -912,13 +931,13 @@ struct UnitExecutor<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>> {
     tail_instances: usize,
     tail_compiled_keys: WireVec<Digest>,
     ran_complete: bool,
-    result_gate: Option<&'a str>,
+    result_gate: Option<agent::TestResultGate<'a>>,
 }
 
 impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 'b, '_, '_, D, T> {
     type Error = DistError;
 
-    fn test_result_gate(&self) -> Option<&str> {
+    fn test_result_gate(&self) -> Option<agent::TestResultGate<'_>> {
         self.result_gate
     }
 
@@ -1165,8 +1184,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
                 tail_compiled_keys: WireVec::new_in(wire_alloc),
                 ran_complete: false,
                 result_gate: dist.result_gate.as_ref()
-                    .filter(|gate| gate.unit.as_ref().is_none_or(|unit| unit.as_str() == plan.unit_name.as_str()))
-                    .map(|gate| gate.directory.as_str()),
+                    .and_then(|gate| gate.for_unit(plan.unit_name.as_str())),
             };
             let arrived = match budget.run_with_next(&plan.unit, next, &mut exec, &cancelled) {
                 Ok(arrived) => arrived,

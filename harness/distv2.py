@@ -1692,7 +1692,8 @@ def host_worker(given: HostWorker) -> None:
     env.update(BLAZE_DIST_SOCKET=given.socket, BLAZE_DIST_BLOBS=given.blobs,
                BLAZE_DIST_REPORT=str(report_path), BLAZE_DIST_EVENTS=str(events_path),
                BLAZE_DIST_DEADLINE_SECS=str(given.timeout),
-               BLAZE_DIST_TEST_RESULT_GATE=str(gate), BLAZE_DIST_TEST_RESULT_UNIT=HOST_PACKAGE)
+               BLAZE_DIST_TEST_RESULT_GATE=str(gate), BLAZE_DIST_TEST_RESULT_UNIT=HOST_PACKAGE,
+               BLAZE_DIST_TEST_RESULT_SCOPE="all")
     if given.role == "primary":
         env["BLAZE_DIST_ARTIFACT_KEYS"] = str(artifact_keys_path)
     started = time.monotonic_ns()
