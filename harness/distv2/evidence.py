@@ -322,14 +322,55 @@ def cached(rows: list[dict]) -> None:
         require(row["grants"] == 0 and row["stored_for_work"] == 0 and not compiled(row), f"{row['unit']}: cold build did work")
 
 
-def no_local_emission(phase: str, output: str) -> None:
+def overlap_accepted(events: list[dict], grant: dict) -> int | None:
+    """The result committed a nonempty part of this exact earlier grant."""
+    token = lease(grant)
+    issued = False
+    for at, event in enumerate(events):
+        if event["event"] == "grant" and lease(event) == token:
+            require(all(event[key] == grant[key] for key in ("pid", "unit_digest", "work")),
+                    "the earlier grant has conflicting execution evidence")
+            issued = True
+        if event["event"] == "result_accepted" and lease(event) == token:
+            require(issued and set(event["work"]) <= set(grant["work"]),
+                    "the earlier commit did not follow its exact issued grant")
+            if event["work"]:
+                return at
+    return None
+
+
+def overlap_publication(blobs: Path, gate: Path, row: dict, grant: dict, events: list[dict]) -> None:
+    require(row["source"] == "executed" and row["joined"] and row["unit_digest"] == grant["unit_digest"]
+            and row["execution"] == grant["execution"] and row["publication_attempt"] == grant["attempt"],
+            "the earlier miss did not publish from the captured execution and attempt")
+    committed_at = overlap_accepted(events, grant)
+    require(committed_at is not None, "the earlier batch did not commit while the later body was held")
+    require(any(at > committed_at and event["event"] == "published"
+                and event["unit_digest"] == row["unit_digest"] and event["execution"] == row["execution"]
+                and event["attempt"] == row["publication_attempt"] for at, event in enumerate(events)),
+            "the earlier full publication did not follow the committed batch")
+    publication(blobs, [row], events[committed_at + 1:])
+    # `held_result` already checks the product-written command view against its preserved
+    # carrier identity. Here read that batch's PackRefs and check the emitted keys in its bytes.
+    capture = json.loads((gate / "ready.json").read_text())
+    try:
+        refs = capture["command"][1]["2"]["3"]
+        names = [reference["0"] for reference in refs]
+    except (KeyError, TypeError, IndexError) as why:
+        raise Failed("the captured earlier Result has no native pack references") from why
+    values = logical_outputs(blobs, names)
+    require(bool(set(row["work_compiled_keys"]).intersection(values)),
+            "the committed earlier batch contains no record compiled by its holder")
+
+
+def no_local_emission(phase: str, output: str, *, already_compiled: int = 0) -> None:
     """The worker reports do not cover emission in the final artifact assembly walk."""
     prefix = "export stats: "
     rows = [line.removeprefix(prefix).split() for line in output.splitlines() if line.startswith(prefix)]
     require(len(rows) == 1, f"{phase} export did not report exactly one final stats line")
-    for name in ("compiled", "unkeyed", "lto"):
+    for name, count in (("compiled", already_compiled), ("unkeyed", 0), ("lto", 0)):
         values = [field.removeprefix(name + "=") for field in rows[0] if field.startswith(name + "=")]
-        require(len(values) == 1 and values[0] == "0", f"{phase} export requires {name}=0 in final stats, saw {values}")
+        require(values == [str(count)], f"{phase} export requires {name}={count} in final stats, saw {values}")
 
 
 def held_result(gate: Path, events: list[dict], pid: int) -> dict | None:
