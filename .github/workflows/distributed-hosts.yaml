@@ -276,7 +276,9 @@ jobs:
           PermitUserEnvironment no
           CONF
           timeout 10s sudo /usr/sbin/sshd -t -f "$sshdir/sshd_config"
-          timeout 10s sudo /usr/sbin/sshd -f "$sshdir/sshd_config" -E "$RUNNER_TEMP/host-evidence/sshd.log"
+          log="$RUNNER_TEMP/host-evidence/sshd.log"
+          timeout 10s install -m 0600 /dev/null "$log"
+          timeout 10s sudo /usr/sbin/sshd -f "$sshdir/sshd_config" -E "$log"
 
       - name: Pin and verify this attempt's two helper SSH hosts
         if: matrix.role == 'primary'
