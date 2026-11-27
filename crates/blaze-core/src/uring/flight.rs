@@ -444,7 +444,7 @@ impl Uring {
     /// Shows the kernel what was written to the ring, waking its thread where it sleeps.
     pub(super) fn submit_ring(&mut self) {
         if self.ring.unsubmitted > 0
-            && let Err(error) = self.ring.enter(None, &Monotonic::since(self.start))
+            && let Err(error) = self.ring.enter(None, &self.clock)
         {
             self.fail_unsubmitted(&error);
         }
@@ -1512,7 +1512,7 @@ impl Drop for Uring {
             }
             *left > 0
         });
-        let clock = Monotonic::since(self.start);
+        let clock = self.clock();
         let deadline = Deadline::after(clock.now(), LETTING_GO);
         let mut posted = Vec::new(); // alloc: the driver's drop, once.
         let cancel = Sqe {

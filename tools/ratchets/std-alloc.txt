@@ -32,7 +32,7 @@ blaze-columns	29	0	1	23
 blaze-comptime/rungs/derive-hello	0	1	0	0
 blaze-cond	1	0	0	11
 blaze-consteval	30	0	4	64
-blaze-core	890	1	19	1199
+blaze-core	889	1	19	1195
 blaze-data	3	0	4	0
 blaze-dbsp	14	1	0	36
 blaze-deflate	11	0	1	6
@@ -111,7 +111,7 @@ blaze-spin	2	1	0	0
 blaze-sql	0	0	15	115
 blaze-sqlite	4	1	0	14
 blaze-squeeze	21	0	2	67
-blaze-std	44	0	148	500
+blaze-std	44	0	147	497
 blaze-store-check	17	1	1	11
 blaze-surface	2	0	0	1
 blaze-swiss	2	0	1	5

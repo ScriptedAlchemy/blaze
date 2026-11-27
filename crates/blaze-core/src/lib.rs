@@ -2018,6 +2018,14 @@ impl Done {
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub struct IoError(pub String);
 
+impl IoError {
+    #[cfg(target_os = "linux")]
+    fn from_display(why: &impl fmt::Display) -> Self {
+        let text = blaze_mem::format_in!(std::alloc::Global, "{why}");
+        Self(String::from(blaze_mem::text::into_std_boxed_str(text)))
+    }
+}
+
 impl fmt::Display for IoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -2088,6 +2096,12 @@ pub trait Driver {
     /// io_uring until its ring per worker). Asked once, as the asker's world is made; an
     /// inline call's `Done` is the queued call's (`inline_and_queued_calls_end_equal`).
     fn inline_files(&self) -> Option<threads::inline::Inline> {
+        None
+    }
+
+    /// Descriptor-relative file operations provided by native Unix drivers. They need a kernel
+    /// confinement guarantee even where ordinary file I/O runs through a queue.
+    fn confined_files(&self) -> Option<fs::ConfinedFiles> {
         None
     }
 }

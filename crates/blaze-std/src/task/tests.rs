@@ -395,12 +395,14 @@ fn a_second_entry_into_a_slot_on_one_worker_stops() {
 
 /// Writers keep each slot's two halves equal except mid-write; `folds` folds look for a slot
 /// whose halves differ. The number of torn slots seen.
-fn torn_folds(plant: FoldPlant, folds: u32) -> u64 {
+fn torn_folds(folds: u32) -> u64 {
     let running = flat(4);
     let io = Io::sim(23);
     let cx = root_on(&io, running.pool());
     all_parked(running.pool());
-    let slots = PerWorker::new_racy_in(cx.workers(), Global, |_| (AtomicU64::new(0), AtomicU64::new(0))).planted(plant);
+    let slots = PerWorker::new_racy_in(cx.workers(), blaze_own::testing::heap().shared(), |_| {
+        (AtomicU64::new(0), AtomicU64::new(0))
+    });
     let stop = AtomicBool::new(false);
     let torn = AtomicU64::new(0);
     let next = AtomicU64::new(0);
@@ -464,13 +466,41 @@ fn torn_folds(plant: FoldPlant, folds: u32) -> u64 {
 
 #[test]
 fn a_fold_never_sees_a_half_written_slot() {
-    assert_eq!(torn_folds(FoldPlant::None, 500), 0, "each slot read on its own worker, between its tasks");
+    assert_eq!(torn_folds(500), 0, "each slot read on its own worker, between its tasks");
 }
 
 #[test]
 fn the_fold_control_reading_slots_directly_sees_one_torn() {
-    let torn = torn_folds(FoldPlant::ReadsDirectly, 20_000);
-    assert!(torn > 0, "the planted fold read every slot from its own thread and never saw a write half done");
+    let running = flat(2);
+    let io = Io::sim(23);
+    let cx = root_on(&io, running.pool());
+    all_parked(running.pool());
+    let slots = PerWorker::new_racy_in(cx.workers(), blaze_own::testing::heap().shared(), |_| {
+        (AtomicU64::new(0), AtomicU64::new(0))
+    }).planted(FoldPlant::ReadsDirectly);
+    let (wrote_first, first_written) = blaze_core::chan::bounded(1);
+    let (read_slot, slot_read) = blaze_core::chan::bounded(1);
+    let scope = cx.scope();
+    let writer = scope.must_overlap("write", TASK_FRAME, {
+        let slots = &slots;
+        move |cx| -> Result<(), &'static str> {
+            slots.with(cx, |(a, b)| {
+                a.store(1, Ordering::Relaxed);
+                wrote_first.try_send(()).map_err(|_| "could not signal the first slot write")?;
+                slot_read.recv_timeout(Duration::from_secs(5)).map_err(|_| "the fold did not acknowledge the slot read")?;
+                b.store(1, Ordering::Relaxed);
+                Ok(())
+            }).map_err(|_| "the writer could not enter its worker slot")?
+        }
+    }).expect("a parked worker for the writer");
+    first_written.recv_timeout(Duration::from_secs(5)).expect("the writer stored the first half");
+    let folded = slots.fold(&cx, 0u64, |(a, b)| u64::from(a.load(Ordering::Relaxed) != b.load(Ordering::Relaxed)), |sum, it| sum + it);
+    read_slot.try_send(()).expect("let the writer store the second half");
+    writer.join(&cx).expect("the writer");
+    scope.join(&cx).expect("the writer's scope");
+    assert_eq!(folded.expect("the planted fold"), 1, "a direct read inside the write sees one torn slot");
+    drop(cx);
+    stopped(running);
 }
 
 /// How many times [`counted`] started each worker's thread: only the lazy-start test's pools

@@ -1742,6 +1742,10 @@ impl<S: Split, O: Opening> Driver for Kqueue<S, O> {
         // clone: two counts, once per asker's world.
         Some(crate::threads::inline::Inline::new(Arc::clone(&self.root), Arc::clone(&self.descriptors)))
     }
+
+    fn confined_files(&self) -> Option<crate::fs::ConfinedFiles> {
+        Some(crate::fs::ConfinedFiles::new(&self.root))
+    }
 }
 
 impl<S: Split, O: Opening> Kqueue<S, O> {
