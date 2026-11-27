@@ -265,10 +265,8 @@ impl From<TakeError> for CliError {
     }
 }
 
-/// The engine's one call (engine_check.rs, before the first phase): with `--origin` named, the
-/// set of this blaze's toolchain and target taken into `opened`'s store as the module says, its
-/// line on `err` when records were taken and in the profile (`phases`) always. With no
-/// `--origin`, nothing.
+/// Takes the signed toolchain set before the first phase and returns its opened origin for
+/// subsequent lookups. The take is reported in the profile and on `err` when records are taken.
 #[expect(clippy::too_many_arguments, reason = "the take's edge: each argument one specific capability or handle")]
 pub(crate) fn before_first_phase(
     cx: &Cx,
@@ -277,22 +275,22 @@ pub(crate) fn before_first_phase(
     net: Option<&bstd::net::Net>,
     opened: &Opened,
     toolchain: ToolchainId,
+    tls: blaze_core::trust::Places<'_>,
     phases: &mut crate::phases::Phases,
     err: &Out,
-) -> Result<(), CliError> {
-    // A command given no argument list (a test's check called directly) names no origin.
-    let Some(args) = args else { return Ok(()) };
+) -> Result<Option<NamedOrigin>, CliError> {
+    let Some(args) = args else { return Ok(None) };
     let flags = crate::flags(args)?;
     let Some(origin) = flags.origin else {
         if flags.origin_key.is_some() {
             return Err(CliError::Usage("--origin-key names the key of an --origin: name the origin too"));
         }
-        return Ok(());
+        return Ok(None);
     };
     let hex = toolchain.hex();
     let set = SetName::new(hex.as_str(), crate::graph::TRIPLE).map_err(TakeError::Set)?;
     let id = set.id();
-    let named = NamedOrigin::published(cx, fs, net, origin, flags.origin_key, set, &opened.lent)?;
+    let mut named = NamedOrigin::published(cx, fs, net, origin, flags.origin_key, tls, set, &opened.lent)?;
     let clock = phases.clock().clone();
     let lan_peer = match (&named.at, net) {
         (OriginAt::Http(_), Some(net)) if !cx.is_simulated() => Some(LanSegzPeer {
@@ -303,11 +301,14 @@ pub(crate) fn before_first_phase(
         _ => None,
     };
     let taken = take_with_lan_peer(cx, &named, id, &opened.lent, toolchain, &clock, lan_peer, TakePlant::NONE)?;
+    if let Some(set) = &mut named.check.set {
+        set.seen = set.seen.max(taken.generation);
+    }
     if taken.how == How::Took {
         err.line(cx, format_args!("blaze: {taken}"))?;
     }
     phases.published = Some(taken);
-    Ok(())
+    Ok(Some(named))
 }
 
 /// [`take_from`] over the origin `named` reaches: its folder, or its `http://` / `https://` base.

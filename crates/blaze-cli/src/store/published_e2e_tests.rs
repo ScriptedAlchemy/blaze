@@ -177,7 +177,7 @@ fn only_the_published_class_leaves_and_a_second_home_reads_each_record_once() {
     let (_home_b, lent_b) = developer_home(&io, &cx, "/b", 6);
     let hex = TOOLCHAIN.hex();
     let set = set_name(&hex);
-    let origin = NamedOrigin::published(&cx, &fs, None, "o", Some(signer.public().to_string().as_str()), set, &lent_b).expect("the published origin");
+    let origin = NamedOrigin::published(&cx, &fs, None, "o", Some(signer.public().to_string().as_str()), Default::default(), set, &lent_b).expect("the published origin");
     let (clock, err) = (io.need_clock().expect("a clock"), io.need_err().expect("err"));
     let erased_b = blaze_own::Erased::new(cx.frame());
     let mut store = CommandStore::new(&cx, &lent_b, false, 0, Some(&origin), clock, &err, erased_b.handle()).expect("B's store");
