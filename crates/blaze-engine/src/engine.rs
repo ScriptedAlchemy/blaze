@@ -1685,7 +1685,7 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
     fn reuse_selected<E: From<EngineError>>(&mut self, phase: Phase, reuse: &mut Reuse<'_, 'a, L, E>) -> Result<(), E> {
         let mut kept = 0;
         for at in 0..self.tasks.len() {
-            let task = self.tasks[at];
+            let task = *self.tasks.get(at).ok_or(EngineError::OutOfTurn)?;
             if self.planned.contains_key(&task.planned.name)
                 && let Some(done) = reuse(Admission { task, view: self.view() })?.map(|proved| proved.done)
             {
@@ -1697,8 +1697,9 @@ impl<'a, S: Scope, L: LastAnswer, R: ReaderIndex<'a>> Engine<'a, S, L, R> {
                 self.report.reused += 1;
                 continue;
             }
-            self.tasks[kept] = task;
-            self.opened[kept] = self.opened[at];
+            let cause = *self.opened.get(at).ok_or(EngineError::OutOfTurn)?;
+            *self.tasks.get_mut(kept).ok_or(EngineError::OutOfTurn)? = task;
+            *self.opened.get_mut(kept).ok_or(EngineError::OutOfTurn)? = cause;
             kept += 1;
         }
         self.tasks.truncate(kept);

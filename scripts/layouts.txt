@@ -74,8 +74,10 @@ crates/blaze-cli/src/seal.rs	SEAL_MAGIC	none
 crates/blaze-cli/src/start_list.rs	MAGIC	none
 crates/blaze-cli/src/start_list.rs	VERSION	none
 crates/blaze-cli/src/store/published.rs	FLOOR_MAGIC	none
+crates/blaze-cli/src/store/published.rs	TAKEN_MAGIC	none
 crates/blaze-cli/src/store/record_codec.rs	MAGIC	test previous_bzr1_layout_is_refused_by_name
 crates/blaze-cli/src/store/record_codec.rs	VERSION	test previous_bzr1_layout_is_refused_by_name
+crates/blaze-cli/src/store/scope_cache.rs	MAGIC	none
 crates/blaze-cli/src/sweep.rs	LEAVES_MAGIC	none
 crates/blaze-cli/src/test_bins.rs	MH_MAGIC_64	not persisted: Mach-O image magic defined by the platform
 crates/blaze-cli/src/test_bins.rs	STUB_SLOT_MAGIC	none

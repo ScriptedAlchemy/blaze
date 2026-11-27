@@ -37,8 +37,8 @@ impl<'m> Directory<'m> {
     }
 
     pub(super) fn find(self, task: Key) -> Option<Key> {
-        let at = self.rows.binary_search_by(|row| row[..32].cmp(&task.0.0)).ok()?;
-        Some(Key(ContentId(self.rows[at][32..].try_into().expect("a directory row holds two keys"))))
+        let at = self.rows.binary_search_by(|row| row.split_at(32).0.cmp(&task.0.0)).ok()?;
+        Some(Key(ContentId(*self.rows.get(at)?.last_chunk()?)))
     }
 }
 
@@ -77,7 +77,7 @@ fn keep_reach<D: Driver>(lent: &Lent<D, StoreAlloc>, entry: &Entry<'_>, signed: 
         .map_err(|_| refused(entry.payload, "the scope payload has malformed sections"))?;
     let expansions = expansion_records::Directory::open(parts.expansions)
         .map_err(|_| refused(entry.payload, "the scope payload has a malformed expansion directory"))?;
-    let count = expansions.records() as usize;
+    let count = expansions.record_keys().len();
     if count > blaze_cas::plain::INDEX_KEYS_MOST {
         return Err(refused(entry.payload, "the scope's expansion directory exceeds the reach index limit"));
     }

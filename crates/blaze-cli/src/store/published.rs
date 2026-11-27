@@ -182,46 +182,58 @@ pub(crate) fn seen<D: Driver>(lent: &Lent<D, StoreAlloc>, set: &ContentId) -> Re
     }
     let key = key_of(named.bytes);
     let Some(record) = lent.get(&key).map_err(store)? else { return Err(PublishedError::Gone { root, key }) };
-    let bytes = record.bytes;
-    let incomplete = bytes.len() == FLOOR_LEN && bytes[..4] == FLOOR_MAGIC;
-    let complete = matches!(bytes.len(), TAKEN_LEN | INDEXED_LEN) && bytes[..4] == TAKEN_MAGIC;
-    if !ReservedTag::Floor.is(record.tag) || !(incomplete || complete) || bytes[4..36] != set.0 {
-        return Err(PublishedError::Floor { root, len: bytes.len() });
-    }
-    let word = |at: usize| {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(&bytes[at..at + 8]);
-        u64::from_le_bytes(word)
+    let decode = || -> Option<Seen> {
+        let mut reader = blaze_format::cursor::Reader::new(record.bytes);
+        let magic = *reader.array().ok()?;
+        if !ReservedTag::Floor.is(record.tag) || reader.array::<32>().ok()? != &set.0 {
+            return None;
+        }
+        let generation = reader.u64().ok()?;
+        let asked_wall_ns = reader.u64().ok()?;
+        let taken = match (magic, record.bytes.len()) {
+            (FLOOR_MAGIC, FLOOR_LEN) => None,
+            (TAKEN_MAGIC, TAKEN_LEN | INDEXED_LEN) => {
+                let digest = ContentId(*reader.array().ok()?);
+                let signer = PublicKey(*reader.array().ok()?);
+                let scope_index = if reader.remaining().is_empty() { None } else {
+                    Some(blaze_drive::Key(ContentId(*reader.array().ok()?)))
+                };
+                Some(TakenHead { digest, signer, asked_wall_ns, scope_index })
+            }
+            _ => return None,
+        };
+        Some(Seen { generation, taken })
     };
-    let taken = complete.then(|| TakenHead {
-        digest: ContentId(bytes[52..84].try_into().expect("the head digest is 32 bytes")),
-        signer: PublicKey(bytes[84..116].try_into().expect("the signer key is 32 bytes")),
-        asked_wall_ns: word(44),
-        scope_index: (bytes.len() == INDEXED_LEN).then(|| blaze_drive::Key(key_of(&bytes[TAKEN_LEN..]).0)),
-    });
-    Ok(Seen { generation: word(36), taken })
+    decode().ok_or(PublishedError::Floor { root, len: record.bytes.len() })
 }
 
 /// Keeps the rollback floor and its optional adoption receipt under the local `pubf.<set>` root.
 pub(crate) fn keep_floor<D: Driver>(place: &mut PlainPlace<'_, D>, set: &ContentId, seen: Seen) -> Result<(), PublishedError> {
     let mut bytes = [0u8; INDEXED_LEN];
-    bytes[4..36].copy_from_slice(&set.0);
-    bytes[36..44].copy_from_slice(&seen.generation.to_le_bytes());
-    let bytes = if let Some(taken) = seen.taken {
-        bytes[..4].copy_from_slice(&TAKEN_MAGIC);
-        bytes[44..52].copy_from_slice(&taken.asked_wall_ns.to_le_bytes());
-        bytes[52..84].copy_from_slice(&taken.digest.0);
-        bytes[84..116].copy_from_slice(&taken.signer.0);
+    let (header, rest) = bytes.split_at_mut(FLOOR_LEN);
+    let (magic, header) = header.split_at_mut(4);
+    let (set_bytes, header) = header.split_at_mut(32);
+    let (generation, asked_wall) = header.split_at_mut(8);
+    set_bytes.copy_from_slice(&set.0);
+    generation.copy_from_slice(&seen.generation.to_le_bytes());
+    let used = if let Some(taken) = seen.taken {
+        magic.copy_from_slice(&TAKEN_MAGIC);
+        asked_wall.copy_from_slice(&taken.asked_wall_ns.to_le_bytes());
+        let (digest, rest) = rest.split_at_mut(32);
+        let (signer, scope_index) = rest.split_at_mut(32);
+        digest.copy_from_slice(&taken.digest.0);
+        signer.copy_from_slice(&taken.signer.0);
         if let Some(index) = taken.scope_index {
-            bytes[TAKEN_LEN..].copy_from_slice(&index.0.0);
-            bytes.as_slice()
+            scope_index.copy_from_slice(&index.0.0);
+            INDEXED_LEN
         } else {
-            &bytes[..TAKEN_LEN]
+            TAKEN_LEN
         }
     } else {
-        bytes[..4].copy_from_slice(&FLOOR_MAGIC);
-        &bytes[..FLOOR_LEN]
+        magic.copy_from_slice(&FLOOR_MAGIC);
+        FLOOR_LEN
     };
+    let (bytes, _) = bytes.split_at(used);
     let key = ContentId::of(FLOOR_DOMAIN, bytes);
     place.put_record(blaze_drive::Key(key), false, ReservedTag::Floor.tag(), bytes).map_err(PublishedError::Place)?;
     let root = RootName::published_floor(set);

@@ -403,7 +403,7 @@ fn interrupted_scope_directory(tape: &Tape, root_each_segment: bool) -> Result<(
     let out = ContentId([3; 32]);
     let task = Key(ContentId([4; 32]));
     let records = planted(0..0, 0);
-    let candidate = {
+    let (candidate, objects) = {
         let cx = io.cx(BUDGET, TASK_FRAME).map_err(|why| harness("the publishing context", why))?;
         let body = crate::names::sections::write(0, [&[]; crate::names::sections::SECTIONS]);
         let payload = crate::engine_store::record_key(task, out, &[], &body);
@@ -415,7 +415,8 @@ fn interrupted_scope_directory(tape: &Tape, root_each_segment: bool) -> Result<(
         wire.extend_from_slice(&body);
         let hex = TOOLCHAIN.hex();
         let target = set_name(&hex).dir()[2];
-        let bytes = scope_cache::write(TOOLCHAIN, target, task, name, payload, core::iter::empty(), alloc);
+        let bytes = scope_cache::write(TOOLCHAIN, target, task, name, payload, core::iter::empty(), alloc)
+            .map_err(|why| harness("encode the signed scope entry", why))?;
         let candidate = scope_cache::entry_key(&bytes);
         let (_a, lent) = plant(&io, &cx, "/a", &records, false);
         let mut place = PlainPlace::new(&lent, true);
@@ -427,9 +428,9 @@ fn interrupted_scope_directory(tape: &Tape, root_each_segment: bool) -> Result<(
         if objects.iter().filter(|(name, _)| name.starts_with("segz-")).count() != 2 {
             return Err(Broke::Harness("the scope and entry must be in separate segments".into()));
         }
-        candidate
+        (candidate, objects)
     };
-    let world = World { io, records, objects: std::vec::Vec::new() };
+    let world = World { io, records, objects };
     let check = |lent: &CommandLent| -> Result<bool, Broke> {
         let seen = published::seen(lent, &set_id()).map_err(|why| harness("read the scope receipt", why))?;
         if let Some(key) = seen.taken.and_then(|take| take.scope_index) {

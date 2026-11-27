@@ -722,7 +722,8 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
                 }
                 if ReservedTag::ScopeCandidate.is(tag) {
                     if scope_rows.len() == scope_directory::ENTRIES_MOST {
-                        return Err(TakeError::TooLarge { what: "the set's scope index", len: scope_rows.len() as u64 + 1, most: scope_directory::ENTRIES_MOST as u64 });
+                        let most = u64::try_from(scope_directory::ENTRIES_MOST).unwrap_or(u64::MAX);
+                        return Err(TakeError::TooLarge { what: "the set's scope index", len: most.saturating_add(1), most });
                     }
                     let candidate = Key(key);
                     let task = scope_directory::check_entry(payload, candidate, set, toolchain)?;

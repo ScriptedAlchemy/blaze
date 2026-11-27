@@ -103,10 +103,13 @@ impl<'b> Entry<'b> {
 }
 
 fn read_witness(bytes: &[u8; WITNESS_BYTES]) -> (CellId, ContentId) {
-    let (subject, rest) = bytes.split_first_chunk::<32>().expect("a witness holds its owner's subject");
-    let (cell, rest) = rest.split_first_chunk::<16>().expect("a witness holds its cell");
-    let digest = rest.first_chunk::<32>().expect("a witness holds the digest it saw");
-    (CellId { of: Name::new(Kind::CrateScope, ContentId(*subject)), cell: Cell(*cell) }, ContentId(*digest))
+    let (subject_bytes, rest) = bytes.split_at(32);
+    let (cell_bytes, digest_bytes) = rest.split_at(16);
+    let (mut subject, mut cell, mut digest) = ([0; 32], [0; 16], [0; 32]);
+    subject.copy_from_slice(subject_bytes);
+    cell.copy_from_slice(cell_bytes);
+    digest.copy_from_slice(digest_bytes);
+    (CellId { of: Name::new(Kind::CrateScope, ContentId(subject)), cell: Cell(cell) }, ContentId(digest))
 }
 
 fn scope_witness(scope: Name, id: CellId, digest: ContentId) -> bool {
@@ -125,8 +128,8 @@ pub(super) fn write<'a>(
     payload: Key,
     reads: impl ExactSizeIterator<Item = (CellId, ContentId)>,
     alloc: Alloc<'a>,
-) -> AVec<'a, u8> {
-    let target_length = u8::try_from(target.len()).expect("the target triple fits the candidate's header");
+) -> Result<AVec<'a, u8>, ScopeError> {
+    let target_length = u8::try_from(target.len()).map_err(|_| ScopeError::Target)?;
     let mut bytes = AVec::with_capacity_in(HEAD_BYTES + target.len() + reads.len() * WITNESS_BYTES, alloc);
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&toolchain.0);
@@ -140,7 +143,7 @@ pub(super) fn write<'a>(
         bytes.extend_from_slice(&input.cell.0);
         bytes.extend_from_slice(&digest.0);
     }
-    bytes
+    Ok(bytes)
 }
 
 /// Files a candidate beside its verified public owner in the save that keeps the toolchain's
@@ -187,8 +190,12 @@ pub(crate) fn keep<D: Driver, S: Sharing>(
             return Ok(());
         }
     }
-    let reads = row.by_cell.iter().map(|&at| row.reads[usize::try_from(at).expect("a read's index fits in memory")]);
-    let bytes = write(toolchain, crate::graph::TRIPLE, row.key, name, payload, reads, alloc);
+    let reads = row.reads.iter().copied();
+    if reads.clone().zip(reads.clone().skip(1)).any(|(first, second)| first.0 >= second.0) {
+        return Err(invalid("the public scope's read witnesses are out of order").into());
+    }
+    let bytes = write(toolchain, crate::graph::TRIPLE, row.key, name, payload, reads, alloc)
+        .map_err(|_| invalid("the public scope's target does not fit the entry"))?;
     let key = entry_key(&bytes);
     store.put_record(cx, key, ReservedTag::ScopeCandidate.tag(), &[held.bytes], &bytes)?;
     store.keep_with_toolchain(key)
@@ -211,13 +218,13 @@ mod tests {
             (CellId { of: owner, cell: WHOLE }, ContentId([6; 32])),
             (CellId { of: owner, cell: EXPORTS }, ContentId([7; 32])),
         ];
-        let bytes = write(toolchain, target, task, name, payload, reads.into_iter(), frame.into());
+        let bytes = write(toolchain, target, task, name, payload, reads.into_iter(), frame.into()).expect("write the scope candidate");
         let entry = Entry::open(&bytes).expect("the written scope candidate");
         assert_eq!((entry.toolchain, entry.target, entry.task, entry.name, entry.payload), (toolchain, target, task, name, payload));
         assert!(entry.reads().eq(reads));
         assert!(matches!(Entry::open(&bytes[..bytes.len() - 1]), Err(ScopeError::WitnessLength { .. })));
         let reversed = [reads[1], reads[0]];
-        let invalid = write(toolchain, target, task, name, payload, reversed.into_iter(), frame.into());
+        let invalid = write(toolchain, target, task, name, payload, reversed.into_iter(), frame.into()).expect("encode the order control");
         assert!(matches!(Entry::open(&invalid), Err(ScopeError::Witness { at: 1, .. })));
     }
 }

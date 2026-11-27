@@ -27,6 +27,7 @@ or overwritten: a changed input makes another key.
 | `vfs-tree` | file | files and directories by content ID, the Merkle hash of each directory (`subtree`) | the watcher's journal; a directory's hash by its entries | image, then the journal's tail | †not read | none found |
 | `disk-stamps` | file | the content hash of a file outside every view (a toolchain, `/usr/include`), by its path and what `stat` says (length, mtime, ctime, inode, device) | by the stamp, and only a stamp older than `RACY_NS` (2 s) is kept, so no write can share the tick of a kept one (`Stamp::racy`, 2026-11-12) | no (hashed again) | none: `Sharded::intern`, one entry a path and stamp ever seen in the process, never removed | off unix the stamp has no ctime and no inode (`created` stands in), so a rewrite that restores length and mtime is missed there; unbounded; no owner |
 | `plan-queries` | file | manifests, config, lock, the plan, the units, std's units, `blaze tree`: queries over each file read (`blaze-units/src/load`) | as `query-memos` | image | as `query-memos` | †none found |
+| `signed-toolchain-scopes` | unit | a public scope record and the cell values it read, found by the planned scope task key under the full toolchain and target identity | compare task keys and check the witnessed cells | yes, through the verified set's receipt and directory | at most 4,096 entries per signed set | other toolchain task kinds still need entries (D11) |
 | `kept-plans` | checkout | `Roots::plans`: the last plan of each request shape of a checkout (`serve/job.rs:1889`) | replaced when a job of the shape plans | no | `PLANS_KEPT` a checkout; checkouts never leave `Roots` | keyed by the checkout's absolute path and the request's shape: noopkeep |
 | `noop-answers` | checkout | `Roots::answers`: the answer of a build that made nothing, one a request shape | let go when a job of its shape walks | no | `noop::MOST_SHAPES` a checkout | request identity over the whole environment: noopkeep |
 | `request-certificates` | checkout | one store record (`Kind::Query`) a request shape and content (`serve/job/certificate.rs`): every input the answer is a function of, by content (the view's root, package directories' Merkle ids with their reading units, variables read, outside files and probes, outputs' stamps), keyed by (relocated shape, view root, blaze); and one slot a (shape, checkout directory) naming the last certificate's key | by key; checked whole (`Certificate::holds`), failing only for six named reasons | yes | store | a quick first check that nothing moved, no entry's key (rule 65): on a miss it names the group that moved and the walk asks each unit's own records; replaces `noop-answers` when wired: certificate2 (docs/v2/plan/design/certificate.md) |
@@ -174,6 +175,8 @@ MD5 and SHA-1 where a debug-info format asks; CRC32 for `.gnu_debuglink`
 (`blaze-ids/src/crc32c.rs`).
 
 ## Domains
+
+- `signed-toolchain-scopes`: `=blaze-cli adopted published head`, `=blaze-cli adopted scope directory`, `=blaze-cli signed scope candidate`
 
 - `test-suite-certificate`: `=blaze test suite cert`, `=blaze test closed crates digest`
 - `native-empty-memo`: `=blaze-cli engine native empty memo`
