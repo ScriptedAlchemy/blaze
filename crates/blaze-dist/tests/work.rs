@@ -582,3 +582,6 @@ fn a_malformed_result_is_refused_and_its_lease_revoked() {
     assert_eq!(g2.roots.as_slice(), &[(0, 2)]);
     assert!(g2.lease.generation > g.lease.generation);
 }
+
+#[path = "work/invalidation.rs"]
+mod invalidation;

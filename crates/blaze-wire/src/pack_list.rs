@@ -33,6 +33,8 @@ pub enum DecodeErrorKind {
     LengthOverflow(ParseIntError),
     /// A pack cannot contain even its header.
     ShortPack,
+    /// A pack exceeds the documented blob byte limit.
+    BlobLimit,
     /// The keys digest field is absent.
     MissingKeys,
     /// The keys digest is not 64 lowercase hexadecimal digits.
@@ -72,6 +74,7 @@ impl fmt::Display for DecodeError {
             DecodeErrorKind::LengthSyntax => "the byte length is not a canonical decimal integer",
             DecodeErrorKind::LengthOverflow(_) => "the byte length exceeds u64",
             DecodeErrorKind::ShortPack => "the byte length is shorter than a pack header",
+            DecodeErrorKind::BlobLimit => "the byte length exceeds the wire blob limit",
             DecodeErrorKind::MissingKeys => "no keys digest",
             DecodeErrorKind::KeysDigest => "the keys digest is not 64 lowercase hex digits",
             DecodeErrorKind::ExtraFields => "unexpected fields after the keys digest",
@@ -168,6 +171,9 @@ pub fn decode<A: Allocator>(bytes: &[u8], alloc: A) -> Result<Vec<PackRef, A>, D
         if size < min_pack {
             return Err(bad(DecodeErrorKind::ShortPack));
         }
+        if size > Limits::DOCUMENTED.blob {
+            return Err(bad(DecodeErrorKind::BlobLimit));
+        }
         let keys = digest(fields.next().ok_or_else(|| bad(DecodeErrorKind::MissingKeys))?)
             .ok_or_else(|| bad(DecodeErrorKind::KeysDigest))?;
         if fields.next().is_some() {
@@ -218,5 +224,25 @@ mod tests {
         assert!(matches!(overflow.kind, DecodeErrorKind::LengthOverflow(_)));
         assert!(overflow.source().is_some());
         assert!(decode(first.as_bytes(), alloc).is_ok());
+    }
+
+    #[test]
+    fn published_pack_lengths_obey_the_blob_limit() {
+        let alloc = blaze_own::testing::heap().shared();
+        let reference = PackRef {
+            pack: [1; 32],
+            size: Limits::DOCUMENTED.blob,
+            keys: [2; 32],
+            packed: None,
+            format: DIST_PACK_FORMAT,
+        };
+        let maximum = encode(core::slice::from_ref(&reference), alloc);
+        assert_eq!(decode(&maximum, alloc).unwrap().as_slice(), &[reference.clone()]);
+        for size in [Limits::DOCUMENTED.blob + 1, u64::MAX] {
+            let oversized = PackRef { size, ..reference.clone() };
+            let error = decode(&encode(&[oversized], alloc), alloc).unwrap_err();
+            assert_eq!(error.line, Some(1));
+            assert_eq!(error.kind, DecodeErrorKind::BlobLimit);
+        }
     }
 }

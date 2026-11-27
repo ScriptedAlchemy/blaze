@@ -1,0 +1,19 @@
+{
+  "id": "distributed-work-admission-20261127",
+  "date": "2026-11-27",
+  "who": "GPT-6 Astra Pro, scheduler correctness review lane",
+  "where": "crates/blaze-dist/src/jobs.rs and work.rs",
+  "what": "Execution::work_call updated the helper liveness table before accepting the request. WorkSet's three entry-invalidation branches matched Exported and omitted the equivalent FromStore outcome.",
+  "cost": "Refused work traffic could refresh a helper's lead-replacement priority. The generic discovery protocol failed to emit an invalidation for a cached entry rejected by the lead or invalidated by a name conflict.",
+  "cause": "A side effect preceded the acceptance boundary, and admission rules classified reusable entries by how their bytes were obtained.",
+  "whys": [
+    "An invalid work request changed the recent-contact table despite returning a refusal.",
+    "The execution wrapper recorded contact before the work set checked the request.",
+    "Tests distinguished assigned and heartbeating helpers but did not exercise refused work traffic.",
+    "Name invalidation matched only the newly compiled outcome; cached results lacked equivalent causal controls."
+  ],
+  "class": "work authority changes outside the acceptance decision that justifies it",
+  "prevention": "Only successful work calls update helper contact. All existing entry-invalidation branches match both reusable entry outcomes. Tape-driven controls cover refused-message ordering, stale liveness and cached entries before and after conflicts or lead rejection.",
+  "fix": "Implemented acceptance-ordered liveness and invalidation symmetry. Added controls that restore premature liveness or drop an invalidation; the cached ordering cases are mandatory reach points.",
+  "state": "Implemented; exact-tree native validation is pending with the main lane. No production importer failure or build-speed improvement is claimed for the generic name-invalidation path."
+}

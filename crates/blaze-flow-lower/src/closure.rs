@@ -78,7 +78,7 @@ use blaze_own::Vec;
 use blaze_typeck::{BodyView, CaptureKind, Checked, ClosureKind, Expr, ExprId, ItemKey, Mutbl, PNode, PTy, Pat, PatId, SigFrom};
 use core::alloc::Allocator;
 
-use crate::{At, ClosureSigWhy, Facts, Form, Lower, Lowered, MOST_POSITIONS, Refusal, Region, Task, TyD, Val, range_of};
+use crate::{At, ClosureSigWhy, Facts, Form, Lower, Lowered, MOST_POSITIONS, PInfo, Plant, Refusal, Region, Task, TyD, Val, range_of};
 
 #[cfg(test)]
 #[path = "closure_requirement_edges_tests.rs"]
@@ -752,6 +752,120 @@ pub(crate) fn node_kind(n: PNode) -> &'static str {
 }
 
 impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'b, 'c, F, A, R> {
+    /// A closure object's lifetime bounds its captured values, not every slot in their
+    /// representation. In particular, `dyn Tr + 'o: 'q` requires only `'o: 'q`; predicate
+    /// slots (including a callable object's `for<..>` arguments) are not outlives components.
+    /// Walk the same capture layout as `closure_value`, retaining by-reference capture slots
+    /// and nested value structure. A nested closure's signature follows its captures but is
+    /// not part of what the closure owns. The position grain has no predicate slots to skip.
+    pub(crate) fn capture_outlives(&mut self, closure: ExprId, source: PInfo, into: Origin, e: ExprId) -> Result<(), Refusal> {
+        use blaze_borrow::{Columns, RegionTypes};
+        use crate::one_call::FactsArity;
+
+        let Some(end) = source.start.checked_add(source.len) else { return self.refuse(Form::Bound, e) };
+        if !<R::Grain as crate::grain::Grain>::SLOTS || self.plant == Plant::CapturePredicatesOutlive {
+            for at in source.start..end {
+                let Some(&origin) = self.origs.get(to_usize(at)) else { return self.refuse(Form::Malformed, e) };
+                self.b.subset(origin, into);
+            }
+            return Ok(());
+        }
+        if source.len == 0 {
+            return Ok(());
+        }
+        enum Step {
+            Type(PTy),
+            Captures(ExprId),
+            Own(u32),
+            Skip(u32),
+        }
+        let facts: &'b F = self.facts;
+        let ck: &'c Checked<'c> = self.ck;
+        let arity = FactsArity { facts };
+        let types = Columns::new(self.tys, &arity, &arity);
+        let mut todo = Vec::new_in(self.alloc);
+        todo.push(Step::Captures(closure));
+        let mut at = source.start;
+        let mut steps = 0u32;
+        while let Some(step) = todo.pop() {
+            let own = match step {
+                Step::Captures(expr) => {
+                    let first = todo.len();
+                    for field in ck.env_fields_by::<blaze_typeck::Places>(expr) {
+                        let Some(ty) = field.place_ty(ck) else { return self.refuse(Form::Malformed, e) };
+                        if field.how != CaptureKind::ByValue {
+                            todo.push(Step::Own(1));
+                        }
+                        todo.push(Step::Type(ty));
+                    }
+                    todo[first..].reverse();
+                    continue;
+                }
+                Step::Own(own) => own,
+                Step::Skip(count) => {
+                    at = match at.checked_add(count) {
+                        Some(next) if next <= end => next,
+                        _ => return self.refuse(Form::Malformed, e),
+                    };
+                    continue;
+                }
+                Step::Type(ty) => {
+                    // Charge the structural walk, not the administrative reference and
+                    // signature steps: a by-reference scalar capture still costs one node.
+                    steps += 1;
+                    if steps > MOST_POSITIONS {
+                        return self.refuse(Form::Bound, e);
+                    }
+                    let node = self.node(ty, e)?;
+                    match node {
+                        PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
+                            let Some(&expr) = ck.closures.column::<0>().get(to_usize(ordinal)) else { return self.refuse(Form::Malformed, e) };
+                            todo.push(Step::Skip(self.owner_sig_count(to_usize(ordinal), e)?));
+                            todo.push(Step::Captures(expr));
+                            continue;
+                        }
+                        PNode::Future(expr, _, _) => {
+                            todo.push(Step::Captures(expr));
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let own = match types.own(ty) {
+                        Ok(n) => n.get(),
+                        Err(why) => return self.uncounted(why, e),
+                    };
+                    if matches!(node, PNode::Dynamic(_)) {
+                        let Some(rest) = self.npos(ty, e)?.checked_sub(own) else { return self.refuse(Form::Malformed, e) };
+                        todo.push(Step::Skip(rest));
+                    } else {
+                        let kids = match types.kids(ty) {
+                            Ok(kids) => kids,
+                            Err(why) => return self.uncounted(why, e),
+                        };
+                        for k in (0..kids.len()).rev() {
+                            let Some(child) = kids.get(k) else { return self.refuse(Form::Malformed, e) };
+                            todo.push(Step::Type(child));
+                        }
+                    }
+                    own
+                }
+            };
+            let next = match at.checked_add(own) {
+                Some(next) if next <= end => next,
+                _ => return self.refuse(Form::Malformed, e),
+            };
+            for slot in at..next {
+                let Some(&origin) = self.origs.get(to_usize(slot)) else { return self.refuse(Form::Malformed, e) };
+                self.b.subset(origin, into);
+            }
+            at = next;
+        }
+        if at != end {
+            return self.refuse(Form::Malformed, e);
+        }
+        Ok(())
+    }
+
     /// What each position of the signature of closure row `row` (`Checked::closures`) is, into
     /// `out`: its inputs' positions, then its output's, each as `npos` counts it (the module
     /// doc, THE SIGNATURE'S REGIONS).

@@ -841,6 +841,7 @@ name = "blaze-dist"
 version = "0.0.0"
 dependencies = [
  "blaze-own",
+ "blaze-sim",
  "blaze-wire",
 ]
 
@@ -854,6 +855,7 @@ dependencies = [
  "blaze-rng",
  "blaze-serve",
  "blaze-sha256",
+ "blaze-sim",
  "blaze-sys",
  "blaze-wire",
 ]

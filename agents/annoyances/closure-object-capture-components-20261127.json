@@ -1,0 +1,20 @@
+{
+  "id": "closure-object-capture-components-20261127",
+  "date": "2026-11-27",
+  "who": "GPT-6 Astra Pro, compiler_worker_bridge and scheduler_correctness lanes",
+  "where": "crates/blaze-flow-lower/src/lib.rs: Lower::unsize_to_object; crates/blaze-sim/src/check.rs: replace_hook",
+  "what": "The source-built distributed protocol suite ran 126 passing cases but could not build four new simulation cases: replace_hook reported two captured higher-ranked argument lifetimes required to outlive static at panic::set_hook.",
+  "cost": "Four required protocol cases were not executed, and the production acceptance gate correctly failed.",
+  "cause": "Closure object unsizing treated every slot in a captured value's representation as an outlives component. Slot grain includes a trait object's predicates after its own object lifetime, so the captured static panic hook leaked its quantified argument origins into the enclosing closure's static requirement.",
+  "whys": [
+    "The closure value stores captures as flat origin columns for later structural relations.",
+    "Object unsizing reused that complete storage column as the set of captured outlives components.",
+    "The earlier position grain counted only a trait object's own lifetime; moving to full region slots made the flattening stronger than the type-outlives rule.",
+    "Existing callable-object closure coverage checked the nested closure body and signature ties, not an enclosing owner coercing a closure that itself captures a higher-ranked object."
+  ],
+  "class": "Representation slots substituted for the semantic outlives components of captured values.",
+  "prevention": "Walk actual capture types with the same field order and slot counts as closure_value. Keep capture-reference and object-lifetime obligations; skip object predicate subtrees and nested closure signature suffixes. Parent-body fixtures derive the forwarding closure's actual DynPlaceholder requirements before checking a static higher-ranked capture, the old flattening plant, and genuinely short captured object/reference controls.",
+  "workaround": "none; the shared simulation hook and required distributed tests stay unchanged",
+  "fix": "Bounded structural capture_outlives lowering. Pinned nightly-2026-10-27 release Cargo passed all five closure_object_tests and all 144 blaze-flow-lower library tests, with zero failures or ignored cases. The old flattening plant rejects the valid static hook; the production path accepts it and still rejects short captured object lifetimes, a later borrowed value and a by-reference hook capture. Source-built distributed protocol acceptance remains to be rerun on the published final tree.",
+  "state": "fixed; native causal regression and full crate passed; source acceptance pending"
+}

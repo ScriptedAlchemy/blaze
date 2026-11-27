@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::time::Duration;
 
 use blaze_int::Int as _;
-use blaze_own::{Arc, Box, String, Vec, VecDeque, format_in};
+use blaze_own::{Arc, Box, Share, String, Vec, VecDeque, format_in};
 pub(crate) use blaze_sys::posix::io::{OwnedFd, PollEvents, PollFd};
 use blaze_sys::posix::io::{
     CWD, ClockId, OpenFlags, Timeval, clock_gettime as sys_read_clock, nanosleep, openat,
@@ -1624,13 +1624,33 @@ struct ChannelInner<T> {
     signal: AtomicU32,
 }
 
+fn wake_counter(counter: &AtomicU32) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = futex_wake(counter, u32::MAX);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = counter;
+    }
+}
+
+fn wait_on_counter(counter: &AtomicU32, observed: u32) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = futex_wait_bitset(counter, observed, None, u32::MAX);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (counter, observed);
+        let _ = nanosleep(Timespec { sec: 0, nsec: 200_000 });
+    }
+}
+
 impl<T> ChannelInner<T> {
     fn notify(&self) {
         let _ = self.signal.fetch_add(1, Ordering::Release);
-        #[cfg(target_os = "linux")]
-        {
-            let _ = futex_wake(&self.signal, u32::MAX);
-        }
+        wake_counter(&self.signal);
     }
 }
 
@@ -1718,15 +1738,7 @@ impl<T> Receiver<T> {
                     return Err(RecvError);
                 }
             }
-            #[cfg(target_os = "linux")]
-            {
-                let _ = futex_wait_bitset(&self.inner.signal, seq, None, u32::MAX);
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let _ = seq;
-                let _ = nanosleep(Timespec { sec: 0, nsec: 200_000 });
-            }
+            wait_on_counter(&self.inner.signal, seq);
         }
     }
 
@@ -1807,7 +1819,7 @@ pub fn current_thread_id() -> u64 {
     }
 }
 
-/// Error returned when joining a thread whose closure exited abnormally (without storing a result).
+/// The OS refused the join, or the joined callback did not store a result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThreadFailed;
 
@@ -1831,17 +1843,22 @@ unsafe impl<T: Send> Sync for JoinHandle<'_, T> {}
 struct Trampoline<F, T> {
     func: F,
     result_slot: *mut Option<T>,
+    completed: Option<ScopeCompletion>,
     alloc: WireAlloc,
 }
 
-fn spawn_raw<'scope, F, T>(func: F, alloc: WireAlloc) -> Result<JoinHandle<'scope, T>, IoError>
+fn spawn_raw<'scope, F, T>(
+    func: F,
+    completed: Option<ScopeCompletion>,
+    alloc: WireAlloc,
+) -> Result<JoinHandle<'scope, T>, IoError>
 where
     F: FnOnce() -> T + Send + 'scope,
     T: Send + 'scope,
 {
     let slot_box = Box::new_in(None::<T>, alloc);
     let (slot_ptr, _) = Box::into_raw_with_allocator(slot_box);
-    let payload = Box::new_in(Trampoline { func, result_slot: slot_ptr, alloc }, alloc);
+    let payload = Box::new_in(Trampoline { func, result_slot: slot_ptr, completed, alloc }, alloc);
     let (payload_ptr, _) = Box::into_raw_with_allocator(payload);
 
     extern "C" fn entry<F: FnOnce() -> T + Send, T: Send>(raw: *mut c_void) -> *mut c_void {
@@ -1851,12 +1868,15 @@ where
             let alloc = (*ptr).alloc;
             Box::from_raw_in(ptr, alloc)
         };
-        let Trampoline { func, result_slot, .. } = Box::into_inner(boxed);
+        let Trampoline { func, result_slot, completed, .. } = Box::into_inner(boxed);
         let value = func();
         // SAFETY: `result_slot` remains uniquely owned until `JoinHandle::join`.
         unsafe {
             *result_slot = Some(value);
         }
+        // `func` and its captures are gone and the result is stored before the scope may
+        // release borrowed data. The completion ticket owns its counter through the final wake.
+        drop(completed);
         core::ptr::null_mut()
     }
 
@@ -1920,31 +1940,39 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    spawn_raw(func, alloc)
+    spawn_raw(func, None, alloc)
 }
 
 impl<T> JoinHandle<'_, T> {
-    fn join_raw(&self) {
-        if self.joined.swap(true, Ordering::AcqRel) {
-            return;
+    fn join_raw(&self) -> Result<(), ThreadFailed> {
+        if self.joined.load(Ordering::Acquire) {
+            return Ok(());
         }
         #[cfg(target_os = "linux")]
-        {
+        let result = {
             // SAFETY: `self.handle` is a live joinable pthread joined at most once.
-            let _ = unsafe { pthread_join(self.handle, core::ptr::null_mut()) };
-        }
+            unsafe { pthread_join(self.handle, core::ptr::null_mut()) }
+        };
         #[cfg(target_os = "macos")]
-        {
+        let result = {
             // SAFETY: `self.handle` is a live joinable pthread joined at most once.
-            let _ = unsafe {
-                blaze_sys::macos::cold::pthread_join(self.handle, core::ptr::null_mut())
-            };
+            unsafe { blaze_sys::macos::cold::pthread_join(self.handle, core::ptr::null_mut()) }
+        };
+        if result != 0 {
+            return Err(ThreadFailed);
         }
+        self.joined.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Joins the thread and returns its output.
     pub fn join(mut self) -> Result<T, ThreadFailed> {
-        self.join_raw();
+        if self.join_raw().is_err() {
+            // The OS has not proved that the callback stopped. Keep its result slot alive,
+            // and do not retry the refused join through this handle's destructor.
+            core::mem::forget(self);
+            return Err(ThreadFailed);
+        }
         let slot_ptr = core::mem::replace(&mut self.result_slot, core::ptr::null_mut());
         if slot_ptr.is_null() {
             return Err(ThreadFailed);
@@ -1957,7 +1985,12 @@ impl<T> JoinHandle<'_, T> {
 
 impl<T> Drop for JoinHandle<'_, T> {
     fn drop(&mut self) {
-        self.join_raw();
+        if self.join_raw().is_err() {
+            // The callback may still write its result. In particular, a thread can receive
+            // its own handle over a channel and get EDEADLK here. Retain the allocation
+            // rather than freeing memory still owned by that live callback.
+            return;
+        }
         let slot_ptr = core::mem::replace(&mut self.result_slot, core::ptr::null_mut());
         if !slot_ptr.is_null() {
             // SAFETY: the thread has joined, so `slot_ptr` is uniquely owned and can be reclaimed.
@@ -1968,9 +2001,10 @@ impl<T> Drop for JoinHandle<'_, T> {
     }
 }
 
-/// Scope for spawning borrowed threads that are guaranteed to join before [`scope`] returns.
+/// Scope for spawning borrowed threads whose callbacks finish before [`scope`] returns.
 pub struct Scope<'scope, 'env: 'scope> {
     alloc: WireAlloc,
+    threads: Arc<ScopeThreads, WireAlloc>,
     _scope: PhantomData<&'scope mut &'scope ()>,
     _env: PhantomData<&'env mut &'env ()>,
 }
@@ -1978,25 +2012,88 @@ pub struct Scope<'scope, 'env: 'scope> {
 impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
     /// Spawns a thread borrowing data alive for `'scope`.
     ///
-    /// Note: every returned [`JoinHandle`] automatically joins on `Drop` if not joined explicitly,
-    /// ensuring no spawned thread outlives `'scope`.
+    /// The scope retains its own completion obligation even if the returned handle is forgotten.
+    /// A forgotten handle still leaks its result and joinable OS-thread resources; it cannot
+    /// let the callback access borrowed data after the scope has returned.
     pub fn spawn<F, T>(&'scope self, func: F) -> Result<JoinHandle<'scope, T>, IoError>
     where
         F: FnOnce() -> T + Send + 'scope,
         T: Send + 'scope,
     {
-        spawn_raw(func, self.alloc)
+        spawn_raw(func, Some(self.register()?), self.alloc)
+    }
+
+    fn register(&self) -> Result<ScopeCompletion, IoError> {
+        // One allocation-free shared handle per callback keeps the counter alive through
+        // its last wake, even if the scope observes zero and returns before that wake ends.
+        // Share before reserving: no fallible operation separates the count and its ticket.
+        let threads = self.threads.share();
+        threads
+            .pending
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| pending.checked_add(1))
+            .map_err(|_| IoError::from_errno(Errno::Again))?;
+        Ok(ScopeCompletion { threads })
     }
 }
 
-/// Runs `f` with a [`Scope`] whose spawned [`JoinHandle`]s all join before `scope` returns.
+struct ScopeThreads {
+    pending: AtomicU32,
+}
+
+/// The obligation follows the callback payload, never its forgettable join handle.
+struct ScopeCompletion {
+    threads: Arc<ScopeThreads, WireAlloc>,
+}
+
+impl Drop for ScopeCompletion {
+    fn drop(&mut self) {
+        // Failed allocation or pthread creation drops the same ticket as a finished callback.
+        if self.threads.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            wake_counter(&self.threads.pending);
+        }
+    }
+}
+
+struct ScopeWait<'a> {
+    threads: &'a ScopeThreads,
+}
+
+impl Drop for ScopeWait<'_> {
+    fn drop(&mut self) {
+        // A scoped borrow cannot be abandoned on a timeout. Every live callback owns one
+        // count until its completion; a nested spawn adds its count before the parent ends.
+        loop {
+            let pending = self.threads.pending.load(Ordering::Acquire);
+            if pending == 0 {
+                break;
+            }
+            // A completion between the load and wait changes the futex value, so the
+            // kernel refuses to sleep on that old value instead of losing the final wake.
+            wait_on_counter(&self.threads.pending, pending);
+        }
+    }
+}
+
+/// Runs `f` and waits for every scoped callback on return or unwind, including forgotten handles.
 pub fn scope<'env, F, T>(alloc: WireAlloc, f: F) -> T
 where
     F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
 {
-    let scope = Scope { alloc, _scope: PhantomData, _env: PhantomData };
-    f(&scope)
+    let scope = Scope {
+        alloc,
+        threads: Arc::new_in(ScopeThreads { pending: AtomicU32::new(0) }, alloc),
+        _scope: PhantomData,
+        _env: PhantomData,
+    };
+    // Declared after the borrowed scope so unwinding drains callbacks before its fields drop.
+    let wait = ScopeWait { threads: &scope.threads };
+    let result = f(&scope);
+    drop(wait);
+    result
 }
+
+#[cfg(test)]
+mod scope_tests;
 
 // ---------------------------------------------------------------------------------------------
 // Temporary directory helper (respecting TMPDIR, falling back to /tmp)

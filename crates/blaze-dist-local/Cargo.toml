@@ -24,6 +24,7 @@ blaze-wire.workspace = true
 blaze-own = { workspace = true, features = ["testing"] }
 blaze-rng.workspace = true
 blaze-serve.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

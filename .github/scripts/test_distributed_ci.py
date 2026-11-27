@@ -23,6 +23,8 @@ import dist_build_identity as identity
 ROOT = Path(__file__).resolve().parents[2]
 MAIN = ROOT / ".github/workflows/blaze.yaml"
 CONTROLS = (ROOT / ".github/distributed-controls.txt").read_text().splitlines()
+NATIVE_ONLY_CONTROLS = (ROOT / ".github/distributed-native-controls.txt").read_text().splitlines()
+NATIVE_CONTROLS = CONTROLS + NATIVE_ONLY_CONTROLS
 PASSED = "distv2: every check passed\n"
 
 def shell_step(workflow: Path, name: str) -> str:
@@ -240,16 +242,24 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertIn("--no-fail-fast", body)
         for name in ("blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"):
             self.assertIn("-p " + name, body)
-        self.assertIn("done < .github/distributed-controls.txt", body)
+        self.assertIn("for controls in .github/distributed-controls.txt .github/distributed-native-controls.txt", body)
+        self.assertIn('done < "$controls"', body)
         self.assertGreater(len(CONTROLS), 70)
         self.assertEqual(len(CONTROLS),len(set(CONTROLS)))
+        self.assertEqual(len(NATIVE_CONTROLS),len(set(NATIVE_CONTROLS)))
+        self.assertEqual(NATIVE_ONLY_CONTROLS, [
+            "scope_releases_registration_when_spawn_setup_unwinds",
+            "scope_waits_for_forgotten_callbacks_when_parent_unwinds",
+        ])
         self.assertIn("--workspace --exclude blaze-std --all-targets",text)
 
     def test_native_controls_must_execute_and_pipeline_failure_is_not_hidden_by_tee(self):
-        for omit, code in ((None,0),(CONTROLS[0],0),(CONTROLS[-1],0),(None,23),("all",0)):
+        cases = [(None,0),(CONTROLS[0],0),(CONTROLS[-1],0),(None,23),("all",0)]
+        cases.extend((name,0) for name in NATIVE_ONLY_CONTROLS)
+        for omit, code in cases:
             with self.subTest(omit=omit,code=code), tempfile.TemporaryDirectory() as directory:
                 root=Path(directory);env=self.fixture(root)
-                reported=[] if omit == "all" else [name for name in CONTROLS if name != omit]
+                reported=[] if omit == "all" else [name for name in NATIVE_CONTROLS if name != omit]
                 log=root/"tests.txt"
                 log.write_text("".join(f"test tests::{name} ... ok\n" for name in reported))
                 for name in ("cargo","rustc"):
