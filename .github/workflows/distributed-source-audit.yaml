@@ -1,0 +1,237 @@
+name: Distributed compile source audit
+on:
+  push:
+    branches:
+      - validation/distributed-compile-audit-source
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+env:
+  RUST_BACKTRACE: "0"
+  BLAZE_CORES: all
+  CARGO_TERM_COLOR: never
+  AUDIT_SOURCE_SHA: 836829acc2ed4da10ab4b32cdcfbb5a65e1954db
+jobs:
+  distributed-core:
+    name: distributed library controls with pinned Cargo (partial)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "2"
+      BLAZE_TESTS: verify
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.AUDIT_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: ./.github/actions/locked-memory
+      # This Cargo job has no later swap allocation. Keep its existing memory/swap
+      # policy; the canonical filesystem action budgets the backing disk after it.
+      - name: runner memory before reflink allocation
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-evidence"
+          timeout 10s swapon --show --bytes | tee "$RUNNER_TEMP/core-evidence/runner-swap.txt"
+          timeout 10s free -b | tee "$RUNNER_TEMP/core-evidence/runner-memory.txt"
+      - uses: ./.github/actions/reflink
+      - name: short native test paths on the verified reflink filesystem
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          test_temp="$RUNNER_TEMP/blaze-fs/tmp"
+          mkdir "$test_temp"
+          short_temp=$(mktemp -d /tmp/bz.XXXXXX)
+          timeout 10s sudo mount --bind "$test_temp" "$short_temp"
+          store_device=$(stat -Lc %d "$BLAZE_HOME/v2/store")
+          target_device=$(stat -Lc %d "$CARGO_TARGET_DIR")
+          temp_device=$(stat -Lc %d "$short_temp")
+          [ "$temp_device" = "$store_device" ] && [ "$temp_device" = "$target_device" ] \
+            || { echo '::error::native test temporary files, store and target must share the verified reflink device'; exit 1; }
+          printf 'TMPDIR=%s\nstore_device=%s\ntarget_device=%s\ntemp_device=%s\n' \
+            "$short_temp" "$store_device" "$target_device" "$temp_device" \
+            | tee "$RUNNER_TEMP/core-evidence/native-filesystem.txt"
+          timeout 10s findmnt -T "$short_temp"
+          echo "TMPDIR=$short_temp" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/toolchain
+        id: pinned-cargo
+      - name: distributed library models and planted controls with pinned Cargo
+        id: retained-tests
+        shell: bash
+        timeout-minutes: 75
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-evidence"
+          toolchain="$(cat "$GITHUB_WORKSPACE/pins/toolchain")"
+          cp "$GITHUB_WORKSPACE/pins/toolchain" "$RUNNER_TEMP/core-evidence/toolchain-pin.txt"
+          cargo "+$toolchain" --version --verbose > "$RUNNER_TEMP/core-evidence/cargo-version.txt"
+          rustc "+$toolchain" --version --verbose > "$RUNNER_TEMP/core-evidence/rustc-version.txt"
+          timeout -k 30 4200 cargo "+$toolchain" test --release --locked --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve --no-fail-fast \
+            2>&1 | tee "$RUNNER_TEMP/core-evidence/tests.log"
+          while IFS= read -r case_name; do
+            grep -Eq "^test ([[:alnum:]_]+::)*$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \
+              || { echo "::error::missing executed library control: $case_name"; exit 1; }
+          done < .github/distributed-controls.txt
+      - name: distributed library binaries and integration targets compile
+        id: retained-all-targets
+        if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          mkdir -p "$RUNNER_TEMP/core-evidence"
+          toolchain="$(cat "$GITHUB_WORKSPACE/pins/toolchain")"
+          timeout -k 30 1100 cargo "+$toolchain" check --release --locked --keep-going --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve \
+            2>&1 | tee "$RUNNER_TEMP/core-evidence/all-targets.log"
+      - name: keep all retained library evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: distributed-core-evidence
+          path: ${{ runner.temp }}/core-evidence
+          if-no-files-found: warn
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v7
+        timeout-minutes: 5
+        with:
+          ref: ${{ env.AUDIT_SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        timeout-minutes: 5
+        with:
+          python-version: "3.13"
+      - name: Confirm ARM64 and establish bounded commands
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          test "$(python3 -c 'import subprocess; print(subprocess.check_output(["uname", "-s", "-m"], text=True, timeout=10).strip())')" = "Darwin arm64"
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          python3 -c 'import subprocess; subprocess.run(["brew", "install", "coreutils"], check=True, timeout=360)'
+          coreutils=$(python3 -c 'import subprocess; print(subprocess.check_output(["brew", "--prefix", "coreutils"], text=True, timeout=15).strip())')
+          test -x "$coreutils/libexec/gnubin/timeout"
+          export PATH="$coreutils/libexec/gnubin:$PATH"
+          echo "$coreutils/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/blaze-target" >> "$GITHUB_ENV"
+          timeout 10 mkdir -p "$RUNNER_TEMP/mac-evidence"
+          test "$(timeout 20 git rev-parse HEAD)" = "$AUDIT_SOURCE_SHA"
+          test -z "$(timeout 20 git status --porcelain)"
+          timeout 20 git rev-parse HEAD 'HEAD^{tree}' > "$RUNNER_TEMP/mac-evidence/source.txt"
+          timeout 10 df -h "$RUNNER_TEMP"
+      - uses: ./.github/actions/toolchain
+        timeout-minutes: 15
+        with:
+          components: rust-src
+          targets: wasm32-wasip1
+      - name: Install pinned Darwin LLVM
+        timeout-minutes: 13
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/pinned-llvm"
+          input=$(timeout 10 jq -nc --arg prefix "$prefix" '{command:"fetch",target:"aarch64-apple-darwin",dir:$prefix}')
+          timeout -k 15 720 python3 .github/scripts/llvm.py "$input" 2>&1 | timeout 750 tee "$RUNNER_TEMP/mac-evidence/llvm.log"
+          echo "LLVM_SYS_231_PREFIX=$prefix" >> "$GITHUB_ENV"
+      - name: Build pinned tools and the source release CLI
+        id: source_build
+        timeout-minutes: 65
+        run: |
+          set -euo pipefail
+          tc=$(timeout 10 cat pins/toolchain)
+          timeout -k 30 3600 nice -n 10 cargo +"$tc" build -j 6 --release --locked \
+            --features blaze-cli/llvm \
+            -p blaze-cli -p blaze-launcher -p scripts --bin blaze --bin blaze-fact-shim \
+            --bin blaze-launcher --bin toolchain_cut --bin proc_macro_modules --bin smoke \
+            --bin invariants --bin docs \
+            2>&1 | timeout 3650 tee "$RUNNER_TEMP/mac-evidence/build.log"
+          install_dir="$RUNNER_TEMP/source-binaries"
+          timeout 10 mkdir -p "$install_dir"
+          for name in blaze blaze-launcher blaze-fact-shim toolchain_cut proc_macro_modules smoke invariants docs; do
+            timeout 30 install -m 0755 "$CARGO_TARGET_DIR/release/$name" "$install_dir/$name"
+          done
+          timeout 60 sha256sum "$install_dir"/* > "$RUNNER_TEMP/mac-evidence/binaries.txt"
+          echo "BLAZE_SCRIPTS=$install_dir" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/toolchain-shelf
+        timeout-minutes: 42
+      - name: Record and verify the clean exact-tree hello smoke
+        id: smoke
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          input=$(timeout 10 jq -nc --arg bin "$BLAZE_SCRIPTS" --arg work "$RUNNER_TEMP/mac-hello-smoke" '{blaze:($bin+"/blaze"),work:$work}')
+          timeout -k 20 480 "$BLAZE_SCRIPTS/smoke" "$input" 2>&1 | timeout 510 tee "$RUNNER_TEMP/mac-evidence/hello-smoke.txt"
+          tree=$(timeout 20 git rev-parse 'HEAD^{tree}')
+          verify=$(timeout 10 jq -nc --rawfile quote "$RUNNER_TEMP/mac-evidence/hello-smoke.txt" --arg tree "$tree" '{verify:{quote:$quote,tree:$tree}}')
+          timeout -k 5 30 "$BLAZE_SCRIPTS/smoke" "$verify" 2>&1 | timeout 40 tee "$RUNNER_TEMP/mac-evidence/hello-smoke-verify.txt"
+      - name: Execute all three distributed CLI regressions
+        if: ${{ !cancelled() && steps.source_build.outcome == 'success' }}
+        timeout-minutes: 32
+        run: |
+          set -euo pipefail
+          tc=$(timeout 10 cat pins/toolchain)
+          log="$RUNNER_TEMP/mac-evidence/distributed-cli-tests.log"
+          timeout -k 20 1800 nice -n 10 cargo +"$tc" test -j 6 --locked --release \
+            -p blaze-cli --features llvm --bin blaze engine_dist::tests:: -- --test-threads=1 \
+            2>&1 | timeout 1830 tee "$log"
+          expected=(
+            engine_dist::tests::distributed_written_pointers_export_their_cached_targets
+            engine_dist::tests::distributed_local_records_are_borrowed_and_failed_writes_keep_the_previous_value
+            engine_dist::tests::distributed_accepted_pointers_supersede_temporary_peer_values
+          )
+          for name in "${expected[@]}"; do
+            timeout 10 grep -Fx "test $name ... ok" "$log"
+          done
+          timeout 10 grep -E '^test result: ok\. 3 passed; 0 failed; 0 ignored;' "$log"
+      - name: Execute macOS thread-scope regressions
+        if: ${{ !cancelled() && steps.source_build.outcome == 'success' }}
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          tc=$(timeout 10 cat pins/toolchain)
+          log="$RUNNER_TEMP/mac-evidence/thread-scope-tests.log"
+          timeout -k 20 600 nice -n 10 cargo +"$tc" test -j 6 --release --locked \
+            -p blaze-dist-local --lib sys::scope_tests:: -- --test-threads=1 \
+            2>&1 | timeout 630 tee "$log"
+          timeout 10 grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"
+          # Replace with the final fully qualified test names before publishing.
+          expected=(
+            sys::scope_tests::scope_completion_obligations_survive_handle_disposition_and_failed_starts
+            sys::scope_tests::the_oracle_catches_completion_owned_by_a_forgotten_handle
+            sys::scope_tests::scope_waits_for_forgotten_borrowed_callbacks
+            sys::scope_tests::scope_preserves_explicit_join_drop_and_nested_spawn
+            sys::scope_tests::scope_releases_registration_when_spawn_setup_unwinds
+            sys::scope_tests::scope_waits_for_forgotten_callbacks_when_parent_unwinds
+            sys::scope_tests::failed_self_join_does_not_mark_a_live_thread_joined
+            sys::scope_tests::self_join_and_self_drop_keep_the_callback_result_slot_alive
+          )
+          for name in "${expected[@]}"; do
+            timeout 10 grep -Fx "test $name ... ok" "$log"
+          done
+      - name: Regenerate and check canonical metadata after clean smoke
+        if: ${{ !cancelled() && steps.smoke.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/mac-evidence"
+          timeout 10 mkdir -p "$evidence/generated/docs/v2/plan"
+          timeout -k 5 120 "$BLAZE_SCRIPTS/invariants" '{"command":"write"}' 2>&1 | timeout 130 tee "$evidence/invariants-write.log"
+          timeout 10 cp docs/v2/plan/invariants.md "$evidence/generated/docs/v2/plan/invariants.md"
+          timeout -k 5 120 "$BLAZE_SCRIPTS/docs" write 2>&1 | timeout 130 tee "$evidence/docs-write.log"
+          timeout 10 cp docs/README.md "$evidence/generated/docs/README.md"
+          timeout 20 git diff -- docs/v2/plan/invariants.md docs/README.md tools/python-allowed.txt > "$evidence/generated-metadata.diff"
+          timeout -k 5 120 "$BLAZE_SCRIPTS/invariants" '{"command":"check"}' 2>&1 | timeout 130 tee "$evidence/invariants-check.log"
+          timeout -k 5 120 "$BLAZE_SCRIPTS/docs" check 2>&1 | timeout 130 tee "$evidence/docs-check.log"
+      - name: Keep source identity, test logs and generated metadata
+        if: always()
+        uses: actions/upload-artifact@v7
+        timeout-minutes: 10
+        with:
+          name: distributed-source-audit-macos-arm64
+          path: |
+            ${{ runner.temp }}/mac-evidence
+            ${{ runner.temp }}/toolchain-cut
+          if-no-files-found: warn
+          retention-days: 7
