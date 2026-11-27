@@ -1,0 +1,1999 @@
+//! The blocking calls behind the effects, for [`crate::threads::Threads`]'s threads and for what
+//! [`crate::uring::Uring`] does where it is submitted; and [`Mapped`], every crate's read-only
+//! file mapping.
+
+#[allow(unsafe_code, reason = "mmap and MapViewOfFile, and the byte view of what they map")]
+mod mapped;
+
+pub(crate) mod beneath;
+pub use beneath::{ConfinedEntries, ConfinedFiles};
+
+pub(crate) use mapped::{map, map_extent, map_write};
+pub use mapped::{Advice, MapOptions, Mapped, MappedWrite, granularity};
+
+mod private;
+
+pub(crate) use private::private;
+
+/// macOS's listing of a directory with its stamps, in one call per buffer of entries.
+#[cfg(target_os = "macos")]
+mod bulk;
+
+#[cfg(target_os = "macos")]
+pub(crate) use bulk::entries;
+/// The file effects' calls on Linux, on blaze-sys: no `libc`, no `std::fs`.
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
+
+/// The calls WASI makes its own way or has none of (the wasm32-wasip1 seed).
+#[cfg(target_os = "wasi")]
+mod wasi;
+
+#[cfg(target_os = "wasi")]
+pub(crate) use wasi::{clone, copy_data, entries, seal, set_mode, set_times, stamps};
+
+#[cfg(any(unix, target_os = "wasi"))]
+use std::{fs::File, io::Write as _};
+use std::{
+    fs::OpenOptions,
+    io,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::UNIX_EPOCH,
+};
+
+use blaze_own::Share;
+use crate::{FileName, Meta};
+#[cfg(unix)]
+use crate::{Names, Stamp};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use blaze_sys::{Errno, Fd, posix::{io as sys_io, proc as sys_proc}};
+
+static TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
+/// A name next to `path` no other write of this process or another uses.
+#[cfg(any(unix, windows))]
+pub(crate) fn temporary_next_to(path: &Path) -> PathBuf {
+    // alloc: once per caller that keeps the name (a listen's socket).
+    let mut temporary = PathBuf::new();
+    temporary_into(path, &mut temporary);
+    temporary
+}
+
+/// [`temporary_next_to`] into `into`, which is emptied first: a name made in a reused buffer.
+fn temporary_into(path: &Path, into: &mut PathBuf) {
+    use std::fmt::Write as _;
+    let n = TEMPORARY.fetch_add(1, Ordering::Relaxed);
+    into.as_mut_os_string().clear();
+    if let Some(parent) = path.parent() {
+        into.push(parent);
+    }
+    let name = path.file_name().map(|it| it.to_string_lossy()).unwrap_or_default();
+    blaze_mem::scratch::with_string(|file| {
+        _ = write!(file, ".{name}.{}-{n}.tmp", writer());
+        into.push(&*file);
+    });
+}
+
+/// What tells this process's temporary names from every other's: its id.
+#[cfg(not(target_os = "wasi"))]
+fn writer() -> u32 {
+    std::process::id()
+}
+
+/// What tells this process's temporary names from every other's: WASI has no process ids
+/// (`std::process::id` panics there), so 64 random bits, drawn for each name.
+#[cfg(target_os = "wasi")]
+fn writer() -> u64 {
+    std::random::random(..)
+}
+
+/// `f` of a NUL-terminated copy of `path`, made in the thread's byte buffer.
+#[cfg(unix)]
+fn with_c_path<R>(path: &Path, f: impl FnOnce(&std::ffi::CStr) -> io::Result<R>) -> io::Result<R> {
+    use std::os::unix::ffi::OsStrExt as _;
+    blaze_mem::scratch::with_bytes(|bytes| {
+        bytes.extend_from_slice(path.as_os_str().as_bytes());
+        bytes.push(0);
+        let path = std::ffi::CStr::from_bytes_with_nul(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"))?;
+        f(path)
+    })
+}
+
+/// The [`FileName`] `{dir}/{name}`, or an error naming `path` where `name` is not UTF-8 or
+/// makes no name. The name is joined in the thread's string buffer, so only the `FileName` is
+/// made.
+fn child_name(
+    dir: &FileName,
+    name: &std::ffi::OsStr,
+    path: impl FnOnce() -> PathBuf,
+) -> io::Result<FileName> {
+    use std::fmt::Write as _;
+    let file = blaze_mem::scratch::with_string(|joined| {
+        let name = name.to_str()?;
+        _ = write!(joined, "{dir}/{name}");
+        FileName::new(joined)
+    });
+    match file {
+        Some(file) => Ok(file),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            // alloc: an error path.
+            format!("{}: a name that is not UTF-8", path().display()),
+        )),
+    }
+}
+
+/// The name of the entry `name` directly in the driver's root, as [`child_name`] names one in a
+/// directory.
+fn root_child(name: &std::ffi::OsStr, path: impl FnOnce() -> PathBuf) -> io::Result<FileName> {
+    match name.to_str().and_then(FileName::new) {
+        Some(file) => Ok(file),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            // alloc: an error path.
+            format!("{}: a name that is not UTF-8", path().display()),
+        )),
+    }
+}
+
+/// The directories above `path` that are not there made, for any effect that makes a file
+/// there (the folders rule, on [`crate::Effect`]): each made from the top, and its parent
+/// synced after it, so a name made in the last of them, once synced into it, is reachable
+/// after a crash. `create_dir_all` syncs none: a file synced, its name synced into a folder
+/// whose own name was never synced into its parent, is lost with the folder. Before
+/// 2026-11-20 every such file was, the durable `Write` and `Rename` included, and bstd's
+/// `publish_synced`, `close_synced`, kv puts and `Reserve` too where an earlier unsynced
+/// effect of theirs (a truncate, an append, a map) had made the folder: only the making knows
+/// it made one (the model's scenario (5), `sim/host/dir_names/tests.rs`). One directory sync
+/// per directory made, none where all are there.
+#[cfg(any(unix, target_os = "wasi"))]
+pub(crate) fn make_parent(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent().filter(|it| !it.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    // How many of `parent` and the directories above it are missing: up to the first there.
+    let mut missing = 0;
+    for dir in parent.ancestors().take_while(|it| !it.as_os_str().is_empty()) {
+        match std::fs::symlink_metadata(dir) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing += 1,
+            Err(error) => return Err(error),
+        }
+    }
+    for depth in (0..missing).rev() {
+        let dir = parent.ancestors().nth(depth).expect("counted above");
+        match std::fs::create_dir(dir) {
+            Ok(()) => {}
+            // Made by another effect meanwhile: it is there, and its name is synced below
+            // all the same, so this effect's promise does not rest on the other's sync.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        sync_dir_of(dir)?;
+    }
+    Ok(())
+}
+
+/// [`make_parent`] where no directory can be synced (Windows: [`crate::Effect::SyncDir`]
+/// fails there, naming that): the directories made, none durable.
+#[cfg(not(any(unix, target_os = "wasi")))]
+pub(crate) fn make_parent(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
+        _ => Ok(()),
+    }
+}
+
+/// What `make` makes at `path`, asked again once `path`'s directories are made where it
+/// failed for want of one: they are looked up only when missing, not before every call.
+pub(crate) fn making_parent<T>(
+    path: &Path,
+    mut make: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    match make() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            make_parent(path)?;
+            make()
+        }
+        other => other,
+    }
+}
+
+/// Whether `from`, a rename's source, is there: a rename's `ENOENT` is of a missing source or
+/// of a missing directory of its target, and only the second makes directories (a rename of
+/// nothing fails and makes nothing, as [`crate::Effect::Rename`] says).
+#[cfg(any(unix, target_os = "wasi"))]
+pub(crate) fn source_there(from: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(from) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// The file at `path` cut (or grown with zeros) to `len` bytes: made, with its directories,
+/// where it is missing. Opened by its name each time, never through a descriptor kept from an
+/// earlier request: the name may be another file by now (a build directory removed and made
+/// again by `blaze clean` and the next build).
+pub(crate) fn truncate(path: &Path, len: u64) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let cut = linux::truncate(path, len);
+    #[cfg(not(target_os = "linux"))]
+    let cut = {
+        let open = || OpenOptions::new().write(true).create(true).truncate(false).open(path);
+        making_parent(path, open).and_then(|file| file.set_len(len))
+    };
+    cut
+        // alloc: an error path.
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cutting {} to {len} bytes: {error}", path.display()),
+            )
+        })
+}
+
+/// `bytes` as the whole of `path`: written to a temporary file next to it, synced, renamed over
+/// it, and the directory synced, so the new name survives a crash.
+#[cfg(any(unix, target_os = "wasi"))]
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    blaze_mem::scratch::with_path(|temporary| {
+        temporary_into(path, temporary);
+        let written = (|| {
+            let open = || OpenOptions::new().write(true).create_new(true).open(&*temporary);
+            let mut file = making_parent(path, open)?;
+            file.write_all(bytes)?;
+            // durable: `write_atomically` is `Effect::Write` carried out: the bytes are on disk before the rename
+            file.sync_all()
+        })();
+        if let Err(error) = written {
+            _ = std::fs::remove_file(&*temporary);
+            return Err(error);
+        }
+        commit_rename(temporary, path)
+    })
+}
+
+/// [`crate::Effect::WriteUnsynced`]: `bytes` as the whole of `path`, written to a temporary
+/// file next to it and renamed over it, with no sync of the file or the directory. A reader
+/// sees the old file or the new; a crash may leave either, or the new name over any part of
+/// the bytes.
+#[cfg(any(unix, target_os = "wasi"))]
+pub fn write_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    blaze_mem::scratch::with_path(|temporary| {
+        temporary_into(path, temporary);
+        let written = (|| {
+            let open = || OpenOptions::new().write(true).create_new(true).open(&*temporary);
+            making_parent(path, open)?.write_all(bytes)
+        })();
+        let renamed = written.and_then(|()| std::fs::rename(&*temporary, path));
+        if renamed.is_err() {
+            _ = std::fs::remove_file(&*temporary);
+        }
+        renamed
+    })
+}
+
+/// [`crate::Effect::RenameUnsynced`]: `from` renamed over `to`, neither directory synced;
+/// `from` is left as it was when the rename fails.
+#[cfg(any(unix, target_os = "wasi"))]
+pub(crate) fn rename_unsynced(from: &Path, to: &Path) -> io::Result<()> {
+    match std::fs::rename(from, to) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound && source_there(from)? => {
+            make_parent(to)?;
+            std::fs::rename(from, to)
+        }
+        other => other,
+    }
+}
+
+/// `from` renamed to `to`, and `to`'s directory synced.
+#[cfg(any(unix, target_os = "wasi"))]
+pub(crate) fn commit_rename(from: &Path, to: &Path) -> io::Result<()> {
+    if let Err(error) = std::fs::rename(from, to) {
+        _ = std::fs::remove_file(from);
+        return Err(error);
+    }
+    sync_dir_of(to)
+}
+
+/// `from` renamed over `to`, made the new name durably; `from` is left as it was when the
+/// rename fails.
+#[cfg(any(unix, target_os = "wasi"))]
+pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    match std::fs::rename(from, to) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound && source_there(from)? => {
+            make_parent(to)?;
+            std::fs::rename(from, to)?;
+        }
+        other => other?,
+    }
+    sync_dir_of(to)?;
+    match (from.parent(), to.parent()) {
+        (Some(was), Some(is)) if was != is => sync_dir_of(from),
+        _ => Ok(()),
+    }
+}
+
+/// [`crate::Effect::Read`]: up to `len` bytes of the file at `path` from `at`, fewer only at
+/// its end.
+#[cfg(target_os = "linux")]
+pub(crate) fn read(path: &Path, at: u64, len: usize) -> io::Result<Vec<u8>> {
+    linux::read(path, at, len)
+}
+
+/// [`crate::Effect::Read`]: up to `len` bytes of the file at `path` from `at`, fewer only at
+/// its end. Reads directly into uninitialized spare capacity via `pread` (zero `memset(0)`).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read(path: &Path, at: u64, len: usize) -> io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    // alloc: the read's payload (uninitialized until kernel `pread` fills it).
+    let mut bytes = Vec::with_capacity(len);
+    let spare = &mut bytes.spare_capacity_mut()[..len];
+    let mut filled = 0;
+    while filled < len {
+        let n = beneath::read_at_uninit(&file, &mut spare[filled..], at + filled as u64)?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    #[expect(unsafe_code, reason = "pread initialized exactly `filled` bytes within reserved capacity `len`")]
+    unsafe {
+        bytes.set_len(filled);
+    }
+    Ok(bytes)
+}
+
+/// [`crate::Effect::ReadAll`] into the asker's memory
+/// ([`crate::threads::inline::Inline::read_all_lent`]): open, one `fstat` for the length, the
+/// room asked of `room` for the length and ONE byte more, `pread` into it, close. No `Vec` is
+/// made and nothing is copied after the kernel's copy into the room.
+///
+/// The byte past the stated length says the file grew between the `fstat` and the read; a
+/// read that ends short of it says it shrank: either is [`LentRead::Moved`], never the bytes as
+/// they happened to be (see `LentRead::Moved` for why not a second read). A read of a regular
+/// file returns fewer bytes than asked only at its end (or at the kernel's cap on one call,
+/// `INT_MAX` on macOS, where the loop goes on), so a whole file is one `pread` and the length's
+/// check costs no call. A missing file is an empty read, as `ReadAll`'s queued route answers it.
+pub(crate) fn read_whole_into<'b>(
+    path: &Path,
+    room: impl FnOnce(u64) -> Option<&'b mut [u8]>,
+) -> io::Result<crate::threads::inline::LentRead> {
+    use crate::threads::inline::LentRead;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(LentRead::Read { len: 0 }),
+        Err(error) => return Err(error),
+    };
+    let stated = file.metadata()?.len();
+    let Some(into) = room(stated) else { return Ok(LentRead::NoRoom { len: stated }) };
+    let mut filled = 0usize;
+    while filled < into.len() {
+        let n = read_at(&file, &mut into[filled..], filled as u64)?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+        // Short of the room after reaching the stated length: the file's end (the room is one
+        // byte longer, so a full room says it grew).
+        if filled as u64 >= stated && filled < into.len() {
+            break;
+        }
+    }
+    let read = filled as u64;
+    if read != stated {
+        return Ok(LentRead::Moved { stated, read });
+    }
+    Ok(LentRead::Read { len: stated })
+}
+
+/// [`crate::Effect::Append`]: `bytes` at the end of the file at `path`, made with its
+/// directories where it is missing.
+pub(crate) fn append(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::append(path, bytes);
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::io::Write as _;
+        let open = || OpenOptions::new().create(true).append(true).open(path);
+        making_parent(path, open)?.write_all(bytes)
+    }
+}
+
+/// [`crate::Effect::Sync`]: the file at `path`, made where it is missing, synced to the
+/// device. Off Linux, `sync_all` is `F_FULLFSYNC` on Apple's systems, where `fsync` leaves
+/// the bytes in the drive's cache. Opened read-only where it is there ([`to_sync`]).
+pub(crate) fn sync(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    return linux::sync(path);
+    #[cfg(not(target_os = "linux"))]
+    // durable: the effect is the sync its caller asked for.
+    return to_sync(path)?.sync_all();
+}
+
+/// The file at `path` opened to be synced ([`sync`], [`barrier`]). On a Unix read-only where
+/// it is there: `fsync`, `F_FULLFSYNC` and `F_BARRIERFSYNC` need no write access, and a file
+/// sealed read-only (a placed output, mode 0444) refuses an open for writing with `EACCES`.
+/// Made, opened to append as an append makes it, only where it is missing (the contract of a
+/// sync and a barrier: "made where it is missing"). Linux's is `linux::to_sync`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn to_sync(path: &Path) -> io::Result<File> {
+    match File::open(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            OpenOptions::new().append(true).create(true).open(path)
+        }
+        opened => opened,
+    }
+}
+
+/// [`to_sync`] where the system is no Unix: opened to append, as Windows' `FlushFileBuffers`
+/// needs a handle with write access (`GENERIC_WRITE`) and WASI's `fd_sync` a descriptor with
+/// the right to sync, which a read-only open does not carry. On Windows a file sealed
+/// read-only (its read-only attribute) refuses that open, so its sync fails, naming it: a
+/// sealed file is synced there before it is sealed, or not at all. WASI seals nothing.
+#[cfg(not(unix))]
+fn to_sync(path: &Path) -> io::Result<std::fs::File> {
+    OpenOptions::new().append(true).create(true).open(path)
+}
+
+/// [`crate::Effect::Barrier`] on Linux: `fdatasync`, the cheapest call there that orders a
+/// file's bytes before later writes (it is durable too: Linux has no barrier without the
+/// drive's flush).
+#[cfg(target_os = "linux")]
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    linux::barrier(path)
+}
+
+/// [`crate::Effect::Barrier`] on Apple's systems: `fcntl(F_BARRIERFSYNC)` (85, in
+/// `<sys/fcntl.h>`: "fsync + issue barrier to drive"), which writes the file out and orders
+/// it before later writes with no flush of the drive's cache. `F_FULLFSYNC` waits for that
+/// flush, tens of milliseconds a call on Apple's own drives; the barrier is the call their
+/// file systems make for their own journals. A file system that has no barrier fails the
+/// call, and the effect with it, naming the file: nothing else is tried in its place.
+#[cfg(target_os = "macos")]
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let file = to_sync(path)?;
+    sys_io::barrier_fsync(Fd::new(file.as_raw_fd()))
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
+}
+
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+#[expect(unsafe_code, reason = "fcntl(F_BARRIERFSYNC), the one call that orders a file's bytes without the drive's flush")]
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let file = to_sync(path)?;
+    // SAFETY: an open descriptor, and a command that takes no argument.
+    match unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } {
+        -1 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+/// [`crate::Effect::Barrier`] where the system has neither a barrier nor Linux's calls: the
+/// file's data synced, which orders it (and is durable).
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+pub(crate) fn barrier(path: &Path) -> io::Result<()> {
+    // durable: the effect is the ordering its caller asked for; this system's one call for it waits for the device.
+    to_sync(path)?.sync_data()
+}
+
+/// [`crate::Effect::WriteBack`]: the data of the file at `path` that is only in memory written
+/// to its device, waited for here (on a driver's thread; the effect's asker waits for
+/// nothing). Opened to read, so a file sealed read-only is written back too. Nothing of the
+/// file is made durable: no metadata is committed and no drive cache flushed.
+#[cfg(target_os = "linux")]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    linux::write_back(path)
+}
+
+/// [`crate::Effect::WriteBack`] on Apple's systems and the other Unixes: `fsync`, which writes
+/// the file's data out and, on Apple's, leaves it in the drive's cache (`F_FULLFSYNC` is the
+/// durable one, and is not asked for).
+#[cfg(target_os = "macos")]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let file = File::open(path)?;
+    sys_io::fsync(Fd::new(file.as_raw_fd()))
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[expect(unsafe_code, reason = "fsync, the one call that writes a file's data back")]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let file = File::open(path)?;
+    // SAFETY: an open descriptor.
+    match unsafe { libc::fsync(file.as_raw_fd()) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// [`crate::Effect::WriteBack`] where the system has no write-back short of a sync (Windows,
+/// WASI): the file's data synced. Opened to write, as a flush of a handle there needs.
+#[cfg(not(unix))]
+pub(crate) fn write_back(path: &Path) -> io::Result<()> {
+    OpenOptions::new().write(true).open(path)?.sync_data()
+}
+
+/// [`crate::Effect::Prewarm`]: the parts of `like` the page cache holds asked to be read into
+/// `file`'s cache, up to `most` bytes from the start; the bytes asked for. `like` is mapped to
+/// be asked about (`mincore`), never read through the mapping, and each run of pages it holds
+/// is handed to the system's read-ahead for `file` (`F_RDADVISE` on Apple's systems,
+/// `posix_fadvise(POSIX_FADV_WILLNEED)` on Linux), which returns once the read is begun.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[expect(unsafe_code, reason = "mmap, mincore and the read-ahead call, which std does not wrap")]
+pub(crate) fn prewarm(like: &Path, file: &Path, most: u64) -> io::Result<u64> {
+    use std::os::fd::AsRawFd as _;
+    let file = File::open(file)?;
+    // A `like` that is not there (the first file placed at a path) holds nothing in memory.
+    let like = match File::open(like) {
+        Ok(like) => like,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    // What both hold: a range past either's end is no page of `like` to ask about or no byte
+    // of `file` to read.
+    let len = like.metadata()?.len().min(file.metadata()?.len());
+    let Ok(len) = usize::try_from(len) else {
+        return Err(io::Error::other("a file longer than this machine's address space"));
+    };
+    if len == 0 {
+        return Ok(0);
+    }
+    // SAFETY: `sysconf` reads a constant of the system.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let Ok(page) = usize::try_from(page) else { return Err(io::Error::last_os_error()) };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // SAFETY: the kernel chooses the address, and nothing accesses the shared file through a reference.
+    let at = unsafe {
+        sys_io::mmap(None, len, sys_io::Prot::READ, sys_io::MapFlags::SHARED, Some(Fd::new(like.as_raw_fd())), 0)
+    }.map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    // SAFETY: a new read-only mapping of an open file at an address the kernel picks; nothing
+    // is read or written through it, and it is unmapped below before this returns.
+    let at = unsafe {
+        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, like.as_raw_fd(), 0)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    if at == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    // alloc: a byte a page of the file, once a prewarm (10 KiB for 158 MB of 16 KiB pages)
+    let mut held = vec![0u8; len.div_ceil(page)];
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // SAFETY: the whole mapping is live and `held` has one writable byte per page.
+    let asked = unsafe { sys_io::mincore(at, len, &mut held) }
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())));
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    // SAFETY: `at` maps `len` bytes, and `held` has a byte for each page of them, which is
+    // what `mincore` writes.
+    let asked = unsafe { libc::mincore(at, len, held.as_mut_ptr().cast()) };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let asked = match asked {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // SAFETY: the mapping made above, whole, used by nothing after this.
+    let _ = unsafe { sys_io::munmap(at, len) };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    // SAFETY: the mapping made above, whole, used by nothing after this.
+    unsafe { libc::munmap(at, len) };
+    asked?;
+    // Each run of pages the cache holds, asked for in `file`, inside `like`'s data extents
+    // only: a hole of `like` is a hole of its clone, which reads as zeros with no read of the
+    // device, so a read-ahead of it only fills the cache with zero pages. Measured
+    // 2026-11-12 on xfs (hello world's 158 MB dev executable): the first edit after a place
+    // read ahead 158 MB, the whole file, of which 134 MB are its two 64 MiB reserves of
+    // zeros, holes on the disk. Bounded: one turn a page of the data, and one an extent.
+    let mut bytes = 0u64;
+    data_extents(&like, len as u64, |data, hole| {
+        let (mut next, end) = ((data as usize) / page, (hole as usize).div_ceil(page).min(held.len()));
+        while next < end && bytes < most {
+            if held[next] & 1 == 0 {
+                next += 1;
+                continue;
+            }
+            let first = next;
+            while next < end && held[next] & 1 != 0 {
+                next += 1;
+            }
+            let (from, to) = ((first * page).max(data as usize), (next * page).min(hole as usize));
+            // One call takes a count that fits its integer, and no more than is left of `most`.
+            let run = ((to - from) as u64).min(most - bytes).min(1 << 30);
+            read_ahead(file.as_raw_fd(), from as u64, run)?;
+            bytes += run;
+        }
+        Ok(())
+    })?;
+    Ok(bytes)
+}
+
+/// The system's read-ahead asked for `len` bytes of `fd` at `at`: begun, not waited for.
+#[cfg(target_os = "macos")]
+fn read_ahead(fd: std::os::fd::RawFd, at: u64, len: u64) -> io::Result<()> {
+    // The only caller caps each run at 1 GiB.
+    sys_io::read_advise(Fd::new(fd), at, len as u32)
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
+}
+
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+#[expect(unsafe_code, reason = "fcntl(F_RDADVISE), the read-ahead call of Apple's systems")]
+fn read_ahead(fd: std::os::fd::RawFd, at: u64, len: u64) -> io::Result<()> {
+    let advice = libc::radvisory { ra_offset: at as libc::off_t, ra_count: len as core::ffi::c_int };
+    // SAFETY: an open descriptor and a `radvisory` that outlives the call, which reads it.
+    match unsafe { libc::fcntl(fd, libc::F_RDADVISE, &raw const advice) } {
+        -1 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+/// The system's read-ahead asked for `len` bytes of `fd` at `at`: begun, not waited for.
+#[cfg(target_os = "linux")]
+fn read_ahead(fd: std::os::fd::RawFd, at: u64, len: u64) -> io::Result<()> {
+    use blaze_sys::linux::task::{fadvise64, FileAdvice};
+    fadvise64(Fd::new(fd), at as i64, len as i64, FileAdvice::WillNeed)
+        .map_err(|error| io::Error::from_raw_os_error(i32::from(error.raw())))
+}
+
+/// [`crate::Effect::Prewarm`] where no call that says which ranges of a file the cache holds
+/// is used (Windows, the other Unixes): nothing is asked for, and the completion says 0 bytes.
+/// Both files are opened, so one that is not there fails as elsewhere.
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+pub(crate) fn prewarm(like: &Path, file: &Path, most: u64) -> io::Result<u64> {
+    let _ = (most, like);
+    std::fs::File::open(file)?;
+    Ok(0)
+}
+
+/// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable.
+#[cfg(target_os = "linux")]
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    linux::sync_dir(path)
+}
+
+/// [`crate::Effect::SyncDir`]: the names in the directory at `path` made durable (`sync_all`
+/// is `F_FULLFSYNC` on Apple's systems).
+#[cfg(all(any(unix, target_os = "wasi"), not(target_os = "linux")))]
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    // durable: the effect is the sync its caller asked for.
+    File::open(path)?.sync_all()
+}
+
+/// [`crate::Effect::SyncDir`] on Windows: not built. A directory's names are flushed there
+/// through a handle opened with backup semantics, which this driver does not open yet, and
+/// nothing stands in for it (rule no-fallback).
+#[cfg(windows)]
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        // alloc: an error path.
+        format!(
+            "Effect::SyncDir of {}: this driver has no directory sync on Windows yet \
+             (FlushFileBuffers of a directory handle), and nothing stands in for it",
+            path.display()
+        ),
+    ))
+}
+
+/// `bytes` written at `at` of the file at `path`, which exists.
+#[cfg(target_os = "linux")]
+pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
+    linux::write_at(path, at, bytes)
+}
+
+/// `bytes` written at `at` of the file at `path`, which exists.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    // As `uring.rs`'s `O_DIRECT`: a large aligned write stays out of the unified buffer cache;
+    // macOS keeps it coherent with cached and mapped pages.
+    #[cfg(target_os = "macos")]
+    if bytes.len() >= 1 << 20 && at % 4096 == 0 && bytes.len() % 4096 == 0 {
+        use std::os::fd::AsFd as _;
+        crate::raw::no_cache(file.as_fd())?;
+    }
+    #[cfg(unix)]
+    return std::os::unix::fs::FileExt::write_all_at(&file, bytes, at);
+    #[cfg(target_os = "wasi")]
+    return std::os::wasi::fs::FileExt::write_all_at(&file, bytes, at);
+    #[cfg(windows)]
+    {
+        let mut done = 0;
+        while done < bytes.len() {
+            let n =
+                std::os::windows::fs::FileExt::seek_write(&file, &bytes[done..], at + done as u64)?;
+            if n == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+/// The file at `path`, which exists, opened for [`crate::Effect::ReadInto`] (`write` false) or
+/// [`crate::Effect::WriteFrom`] at offsets: never for appending, which on Linux would put a
+/// positional write at the end. With [`crate::Cache::Bypassed`], around the page cache: Linux
+/// `O_DIRECT`, macOS `F_NOCACHE`, Windows `FILE_FLAG_NO_BUFFERING`; WASI has none, and fails.
+pub(crate) fn open_positional(path: &Path, write: bool, cache: crate::Cache) -> io::Result<std::fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(write);
+    let bypass = cache == crate::Cache::Bypassed;
+    #[cfg(target_os = "linux")]
+    if bypass {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(blaze_sys::linux::OpenFlags::DIRECT.bits() as i32);
+    }
+    #[cfg(windows)]
+    if bypass {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        /// `FILE_FLAG_NO_BUFFERING` (`winbase.h`): reads and writes of whole sectors, around
+        /// the system's cache.
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        options.custom_flags(FILE_FLAG_NO_BUFFERING);
+    }
+    #[cfg(target_os = "wasi")]
+    if bypass {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            // alloc: an error path.
+            format!(
+                "{}: WASI (the wasm32-wasip1 seed) has no read or write around the page cache",
+                path.display()
+            ),
+        ));
+    }
+    let file = options.open(path)?;
+    // macOS opens no file around its cache; `F_NOCACHE` on the descriptor keeps its reads and
+    // writes out of the unified buffer cache from then on.
+    #[cfg(target_os = "macos")]
+    if bypass {
+        use std::os::fd::AsFd as _;
+        crate::raw::no_cache(file.as_fd())?;
+    }
+    _ = bypass;
+    Ok(file)
+}
+
+/// How many times one read or write at an offset is asked again after the system cut it short
+/// with `EINTR` before it fails: a bound on the loop (rule bounded-progress), far past what a
+/// signal storm makes of a regular file's read.
+pub(crate) const INTERRUPTS: u32 = 64;
+
+/// `into` filled from `at` of `file` (opened by [`open_positional`]): how many bytes were read,
+/// fewer than `into` only at the end of the file. Around the page cache, a read that ends short
+/// of a whole block is at the end, and none follows it (one at an unaligned offset is refused).
+pub(crate) fn read_into(
+    file: &std::fs::File,
+    into: &mut [u8],
+    at: u64,
+    cache: crate::Cache,
+) -> io::Result<usize> {
+    let (mut read, mut interrupted) = (0, 0);
+    while read < into.len() {
+        match read_at(file, &mut into[read..], at + read as u64) {
+            Ok(0) => break,
+            Ok(n) => {
+                read += n;
+                if cache == crate::Cache::Bypassed && read as u64 % crate::DIRECT_ALIGN != 0 {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted && interrupted < INTERRUPTS => {
+                interrupted += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(read)
+}
+
+/// All of `from` written at `at` of `file` (opened by [`open_positional`] to write).
+pub(crate) fn write_from(file: &std::fs::File, from: &[u8], at: u64) -> io::Result<()> {
+    let (mut done, mut interrupted) = (0, 0);
+    while done < from.len() {
+        match write_at_once(file, &from[done..], at + done as u64) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(n) => done += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted && interrupted < INTERRUPTS => {
+                interrupted += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buffer, at)
+}
+
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buffer, at)
+}
+
+#[cfg(target_os = "wasi")]
+fn read_at(file: &std::fs::File, buffer: &mut [u8], at: u64) -> io::Result<usize> {
+    std::os::wasi::fs::FileExt::read_at(file, buffer, at)
+}
+
+#[cfg(unix)]
+fn write_at_once(file: &std::fs::File, bytes: &[u8], at: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::write_at(file, bytes, at)
+}
+
+#[cfg(windows)]
+fn write_at_once(file: &std::fs::File, bytes: &[u8], at: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_write(file, bytes, at)
+}
+
+#[cfg(target_os = "wasi")]
+fn write_at_once(file: &std::fs::File, bytes: &[u8], at: u64) -> io::Result<usize> {
+    std::os::wasi::fs::FileExt::write_at(file, bytes, at)
+}
+
+/// [`crate::Effect::Mode`]: `path`'s permission bits set to `mode`, through a symbolic link
+/// (`chmod`).
+#[cfg(unix)]
+pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+/// [`crate::Effect::Seal`]: `path` opened `O_NOFOLLOW` (a symbolic link fails with `ELOOP`;
+/// `O_NONBLOCK` keeps a FIFO from blocking the open), refused unless a regular file, and its
+/// bits set on the descriptor (`fchmod`). No `fchmodat` with a flag, which glibc 2.39 and
+/// later make the `fchmodat2` call that older seccomp filters refuse with `EPERM`. An error
+/// names `path`.
+#[cfg(unix)]
+pub(crate) fn seal(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let flags = sys_io::OpenFlags::NO_FOLLOW.with(sys_io::OpenFlags::NONBLOCK).bits() as i32;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let loop_code = i32::from(Errno::Loop.raw());
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let loop_code = libc::ELOOP;
+    // alloc: an error path.
+    let named = |error: io::Error| {
+        io::Error::new(error.kind(), format!("{}: sealing it: {error}", path.display()))
+    };
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(loop_code) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                // alloc: an error path.
+                format!("{} {}", path.display(), crate::SEAL_THROUGH_A_LINK),
+            ));
+        }
+        // A socket fails its open before any `fstat`: refused naming it, as one that opens.
+        Err(error) => match error.raw_os_error().and_then(|code| no_file_after_open(path, code)) {
+            Some(kind) => return Err(not_sealed(path, kind)),
+            None => return Err(named(error)),
+        },
+    };
+    let kind = file.metadata().map_err(named)?.file_type();
+    if !kind.is_file() {
+        return Err(not_sealed(path, kind_of(kind)));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(mode)).map_err(named)
+}
+
+#[cfg(unix)]
+fn not_sealed(path: &Path, kind: &str) -> io::Error {
+    // alloc: an error path.
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} ({kind}) {}", path.display(), crate::SEAL_OF_NO_FILE),
+    )
+}
+
+/// The access and modification times of `path` (through a symbolic link) both `modified_ns`
+/// since the epoch, for [`crate::Effect::Times`]: one `utimensat`, the path made in the
+/// thread's byte buffer. An error names `path`.
+#[cfg(unix)]
+pub(crate) fn set_times(path: &Path, modified_ns: u64) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use blaze_sys::posix::types::time_t;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    use libc::time_t;
+    let Ok(seconds) = time_t::try_from(modified_ns / 1_000_000_000) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            // alloc: an error path.
+            format!(
+                "{}: {modified_ns} ns since the epoch is past what this system's time_t holds",
+                path.display()
+            ),
+        ));
+    };
+    let time = crate::raw::timespec(seconds, (modified_ns % 1_000_000_000) as u32);
+    with_c_path(path, |c| crate::raw::utimens(c, &[time, time]))
+        // alloc: an error path.
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+}
+
+#[cfg(windows)]
+pub(crate) use crate::iocp::files::{
+    clone, rename, rename_unsynced, seal, set_mode, set_times, write_atomically, write_unsynced,
+};
+
+#[cfg(any(unix, target_os = "wasi"))]
+fn sync_dir_of(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        // durable: the directory's sync of `Effect::Write` and `Effect::Rename`: the new name survives a crash
+        Some(parent) if !parent.as_os_str().is_empty() => File::open(parent)?.sync_all(),
+        _ => Ok(()),
+    }
+}
+
+/// [`crate::Effect::Stat`], through a symbolic link, or with `follow` false
+/// [`crate::Effect::Lstat`], of the link itself.
+pub(crate) fn stat(path: &Path, follow: bool) -> io::Result<Option<Meta>> {
+    let meta = match follow {
+        true => std::fs::metadata(path),
+        false => std::fs::symlink_metadata(path),
+    };
+    match meta {
+        Ok(meta) => Ok(Some(meta_of(&meta))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn meta_of(meta: &std::fs::Metadata) -> Meta {
+    #[cfg(unix)]
+    let (changed_ns, ino, dev) = {
+        use std::os::unix::fs::MetadataExt as _;
+        let ns = |s: i64, n: i64| (s as u64).wrapping_mul(1_000_000_000).wrapping_add(n as u64);
+        (ns(meta.ctime(), meta.ctime_nsec()), meta.ino(), meta.dev())
+    };
+    // Windows' file index and volume serial are not on std's stable `Metadata`, nor WASI's.
+    #[cfg(not(unix))]
+    let (changed_ns, ino, dev) = (0, 0, 0);
+    Meta {
+        len: meta.len(),
+        dir: meta.is_dir(),
+        modified_ns: meta
+            .modified()
+            .ok()
+            .and_then(|it| it.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX)),
+        changed_ns,
+        ino,
+        dev,
+    }
+}
+
+/// The name of the entry `leaf` directly in `parent`, the root's or a directory's.
+fn name_under(
+    parent: &crate::DirName,
+    leaf: &std::ffi::OsStr,
+    path: impl FnOnce() -> PathBuf,
+) -> io::Result<FileName> {
+    match parent {
+        crate::DirName::Named(dir) => child_name(dir, leaf, path),
+        crate::DirName::Root => root_child(leaf, path),
+    }
+}
+
+/// Every file and directory under `dir` (named `name` under the root, or the root itself),
+/// sorted by name, each with its [`Meta`] from the listing's own call: on macOS one
+/// `getattrlistbulk` per buffer of a directory's entries ([`bulk::listed`]), on the other
+/// Unixes an `fstatat` of each entry relative to its open directory. Symbolic links are not
+/// followed; an entry gone between the listing and its stat is left out.
+pub(crate) fn list(dir: &Path, name: &crate::DirName) -> io::Result<Vec<(FileName, Meta)>> {
+    // alloc: the listing's payload.
+    let mut found: Vec<(FileName, Meta)> = Vec::new();
+    // Each directory still to read, by its index in `found`; `None` for `dir` itself.
+    let mut todo: Vec<Option<usize>> = Vec::with_capacity(16); // alloc: once per listing.
+    todo.push(None);
+    while let Some(at) = todo.pop() {
+        let parent = match at {
+            // clone: the directory's name, a refcount: `found` grows under it.
+            Some(at) => crate::DirName::Named(found[at].0.share()),
+            None => name.share(),
+        };
+        let first = found.len();
+        blaze_mem::scratch::with_path(|path| {
+            path.push(dir);
+            if let crate::DirName::Named(inner) = &parent
+                && at.is_some()
+            {
+                path.push(&inner.as_str()[name.start()..]);
+            }
+            listed(path, &parent, &mut found)
+        })?;
+        todo.extend((first..found.len()).filter(|it| found[*it].1.dir).map(Some));
+    }
+    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    Ok(found)
+}
+
+#[cfg(target_os = "macos")]
+use bulk::listed;
+
+/// The folders above `root`, at most `most`, nearest first ([`crate::Effect::Ancestors`]):
+/// for each, the name in it of the folder on the way down, from the root's real path
+/// (`realpath`, so a root reached through a link has the parents its `..` reaches). Read when
+/// asked; a folder name that is not UTF-8 is refused, naming the root.
+pub(crate) fn ancestors(root: &Path, most: u8) -> io::Result<crate::Ancestors> {
+    // alloc: the root's real path, once per ask.
+    let real = std::fs::canonicalize(root)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: the start folder's path: {error}", root.display())))?;
+    // alloc: the names, the answer's payload.
+    let mut toward: Vec<std::sync::Arc<str>> = Vec::new();
+    for part in real.components().rev() {
+        let std::path::Component::Normal(name) = part else { continue };
+        if toward.len() == usize::from(most) {
+            break;
+        }
+        let Some(name) = name.to_str() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: a folder above the start folder has a name that is not UTF-8", real.display()),
+            ));
+        };
+        // alloc: one name of the answer.
+        toward.push(std::sync::Arc::from(name));
+    }
+    Ok(crate::Ancestors::answered(toward, most))
+}
+
+/// `op` on `name`, above `root` ([`crate::Effect::Above`]): reads only.
+pub(crate) fn above(root: &Path, op: crate::AboveOp, name: &crate::Above) -> io::Result<crate::Done> {
+    let named = |error: io::Error| io::Error::new(error.kind(), format!("{name}: {error}"));
+    blaze_mem::scratch::with_path(|path| {
+        path.push(root);
+        path.push(name.relative());
+        match op {
+            crate::AboveOp::Stat => stat(path, false).map(crate::Done::Stat).map_err(named),
+            // alloc: the read's payload.
+            crate::AboveOp::Read => std::fs::read(&*path).map(crate::Done::Read).map_err(named),
+            crate::AboveOp::List => {
+                // alloc: the listing's payload.
+                let mut found = Vec::new();
+                listed(path, &crate::DirName::Root, &mut found).map_err(named)?;
+                found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                Ok(crate::Done::Listed(found))
+            }
+        }
+    })
+}
+
+/// What is directly in `dir` (named `parent`), each with its [`Meta`], appended to `out`:
+/// one `fstatat` of each entry relative to the open directory, which gives the device too.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn listed(dir: &Path, parent: &crate::DirName, out: &mut Vec<(FileName, Meta)>) -> io::Result<()> {
+    use std::os::fd::AsFd as _;
+    let fd = open_dir(dir)?;
+    // alloc: once per directory, std's handle of it.
+    let read = std::fs::read_dir(dir)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())))?;
+    for entry in read {
+        let entry = entry?;
+        // alloc: std's copy of the entry's name.
+        let leaf = entry.file_name();
+        let stat = match with_c_path(Path::new(&leaf), |it| crate::raw::stat_at(fd.as_fd(), it)) {
+            Ok(stat) => stat,
+            // Removed since it was listed: not in the listing.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            // alloc: an error path.
+            Err(error) => return Err(io::Error::new(error.kind(), format!("{}: {error}", entry.path().display()))),
+        };
+        // alloc: the name, the listing's payload.
+        let file = name_under(parent, &leaf, || entry.path())?;
+        #[allow(clippy::unnecessary_cast, reason = "st_dev is u64 on Linux, narrower on other Unixes")]
+        let dev = stat.st_dev as u64;
+        out.push((file, Meta::of(&stamp_of(&stat), dev)));
+    }
+    Ok(())
+}
+
+/// What is directly in `dir` (named `parent`), each with its [`Meta`] as std's listing has it,
+/// appended to `out`.
+#[cfg(not(unix))]
+fn listed(dir: &Path, parent: &crate::DirName, out: &mut Vec<(FileName, Meta)>) -> io::Result<()> {
+    // alloc: once per directory, std's handle of it.
+    let read = std::fs::read_dir(dir)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())))?;
+    for entry in read {
+        let entry = entry?;
+        // Of the entry itself, not followed through a symlink.
+        let meta = entry.metadata()?;
+        // alloc: std's copy of the entry's name, and the name, the listing's payload.
+        let file = name_under(parent, &entry.file_name(), || entry.path())?;
+        out.push((file, meta_of(&meta)));
+    }
+    Ok(())
+}
+
+/// `path` gone, a file or symbolic link unlinked, an empty directory removed; one call for a
+/// file, the directory looked up only once its unlink fails.
+pub(crate) fn remove(path: &Path) -> io::Result<()> {
+    let removed = match std::fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.is_dir() => std::fs::remove_dir(path),
+                _ => Err(error),
+            }
+        }
+        other => other,
+    };
+    match removed {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+pub(crate) fn link(from: &Path, to: &Path) -> io::Result<()> {
+    making_parent(to, || std::fs::hard_link(from, to))
+}
+
+/// `to` made sharing `from`'s blocks, or an error that says the file system cannot.
+#[cfg(unix)]
+pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
+    making_parent(to, || clone_file(from, to)).map_err(|error| match error.raw_os_error() {
+        Some(code) if refuses_sharing(code) => io::Error::new(
+            io::ErrorKind::Unsupported,
+            // alloc: an error path.
+            format!(
+                "the file system of {} ({}) cannot share blocks with {} ({}): {error}; blaze \
+                 does not copy instead",
+                to.display(),
+                volume_of(to.parent().unwrap_or(to)),
+                from.display(),
+                volume_of(from)
+            ),
+        ),
+        _ => error,
+    })
+}
+
+/// [`crate::Effect::CopyData`]: `to` made new (it must not be there) with `from`'s length, and
+/// each extent of `from` that holds data copied at its own offset: a hole of `from` stays a
+/// hole of `to`, and the bytes copied, the completion's, are `from`'s data, not its length
+/// (hello world's dev executable is 158 MB of which 134 MB are two 64 MiB reserves of
+/// zeros: until 2026-11-12 a patched place on tmpfs and ext4 wrote them all as data,
+/// 308,808 blocks a path, 164 to 330 ms). Linux: `lseek` with `SEEK_DATA` and `SEEK_HOLE`
+/// for the extents and `copy_file_range` for each, through no memory of this process
+/// (`blaze_sys`). macOS: the same `lseek`s, each extent read and written through one
+/// buffer of [`COPY_BUFFER`] bytes (`pread`, `pwrite`); not `clonefile`, since a volume
+/// that clones (APFS) is placed by [`crate::Effect::Clone`] and this is the route of one
+/// that does not (HFS+, exFAT, a network volume), and not `fcopyfile`, whose sparse copy
+/// says nothing of the bytes it copied. The source is opened as a clone's is: a symbolic
+/// link refused ([`crate::CLONE_THROUGH_A_LINK`]), and what is no regular file
+/// ([`crate::CLONE_OF_NO_FILE`]). A `to` left part made by a failure is removed; the
+/// error names both files.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn copy_data(from: &Path, to: &Path) -> io::Result<u64> {
+    making_parent(to, || {
+        let source = open_source(from)?;
+        let len = source.metadata()?.len();
+        let target = OpenOptions::new().write(true).create_new(true).open(to)?;
+        // The length first, so what no extent writes is a hole of `to`.
+        let copied = target.set_len(len).and_then(|()| {
+            let mut bytes = 0u64;
+            data_extents(&source, len, |data, hole| {
+                bytes += copy_extent(&source, &target, data, hole)?;
+                Ok(())
+            })?;
+            Ok(bytes)
+        });
+        copied.map_err(|error| {
+            drop(target);
+            _ = std::fs::remove_file(to);
+            // alloc: an error path.
+            io::Error::new(
+                error.kind(),
+                format!("copying the data of {} to {}: {error}", from.display(), to.display()),
+            )
+        })
+    })
+}
+
+/// The most bytes [`copy_data`] holds of a file at once on macOS, where each extent goes
+/// through this process: one buffer, whatever the file's length.
+#[cfg(target_os = "macos")]
+const COPY_BUFFER: usize = 1 << 20;
+
+/// `each(data, hole)` of every extent of `file`'s first `len` bytes that holds data, in order:
+/// `lseek` with `SEEK_DATA` from where the last ended, then `SEEK_HOLE` from there (the file's
+/// end counts as a hole). A file system that keeps no record of holes says the whole file is
+/// one extent of data, which is true of it. Bounded: each pass moves past one extent, or ends.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn data_extents(file: &File, len: u64, mut each: impl FnMut(u64, u64) -> io::Result<()>) -> io::Result<()> {
+    let mut at = 0u64;
+    while at < len {
+        let Some(data) = seek_extent(file, at, true)? else { break };
+        if data >= len {
+            break;
+        }
+        let hole = seek_extent(file, data, false)?.unwrap_or(len).min(len);
+        if hole <= data {
+            // alloc: an error path.
+            return Err(io::Error::other(format!(
+                "the file's data at {data} ends at {hole}, before it begins: it changed while it was copied"
+            )));
+        }
+        each(data, hole)?;
+        at = hole;
+    }
+    Ok(())
+}
+
+/// Where `file`'s next data (`data`) or next hole begins at or after `at`; `None` where there
+/// is none (`ENXIO`: `at` is at or past the end, or only a hole is left).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn seek_extent(file: &File, at: u64, data: bool) -> io::Result<Option<u64>> {
+    use sys_io::{Whence, lseek};
+    use std::os::fd::AsRawFd as _;
+    #[cfg(target_os = "macos")]
+    if blaze_sys::posix::types::off_t::try_from(at).is_err() {
+        return Err(io::Error::other("an offset past what the system's offsets hold"));
+    }
+    let whence = if data { Whence::Data } else { Whence::Hole };
+    match lseek(blaze_sys::Fd::new(file.as_raw_fd()), at, whence) {
+        Ok(found) => Ok(Some(found)),
+        Err(blaze_sys::Errno::Nxio) => Ok(None),
+        Err(errno) => Err(io::Error::from_raw_os_error(i32::from(errno.raw()))),
+    }
+}
+
+/// Where `file`'s next data (`data`) or next hole begins at or after `at`; `None` where there
+/// is none (`ENXIO`). Darwin's `SEEK_HOLE` is 3 and `SEEK_DATA` 4 (`<sys/unistd.h>`).
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+#[expect(unsafe_code, reason = "lseek with SEEK_DATA and SEEK_HOLE, which std does not wrap")]
+fn seek_extent(file: &File, at: u64, data: bool) -> io::Result<Option<u64>> {
+    use std::os::fd::AsRawFd as _;
+    let whence = if data { 4 } else { 3 };
+    let Ok(at) = libc::off_t::try_from(at) else {
+        return Err(io::Error::other("an offset past what the system's offsets hold"));
+    };
+    // SAFETY: an open descriptor; the call takes numbers and no memory.
+    match unsafe { libc::lseek(file.as_raw_fd(), at, whence) } {
+        -1 => match io::Error::last_os_error() {
+            error if error.raw_os_error() == Some(libc::ENXIO) => Ok(None),
+            error => Err(error),
+        },
+        found => Ok(Some(found as u64)),
+    }
+}
+
+/// The bytes of `from` from `data` to `hole` copied to `to` at the same offsets by the kernel
+/// (`copy_file_range`, a short copy continued, an interruption made again up to
+/// [`linux::INTERRUPTS_MOST`] times); the bytes copied. A copy that moves nothing before
+/// `hole` is the source cut short while it was copied: the error.
+#[cfg(target_os = "linux")]
+fn copy_extent(from: &File, to: &File, data: u64, hole: u64) -> io::Result<u64> {
+    use std::os::fd::AsRawFd as _;
+    let (source, target) = (blaze_sys::Fd::new(from.as_raw_fd()), blaze_sys::Fd::new(to.as_raw_fd()));
+    let (mut at, mut interrupted) = (data, 0);
+    // Bounded: each pass copies at least one byte, is one of at most `INTERRUPTS_MOST`
+    // interruptions in a row, or ends.
+    while at < hole {
+        match blaze_sys::linux::copy_file_range(source, at, target, at, hole - at) {
+            Ok(0) => {
+                // alloc: an error path.
+                return Err(io::Error::other(format!(
+                    "it ended at {at}, inside data that ran to {hole}: it was cut while it was copied"
+                )));
+            }
+            Ok(copied) => (at, interrupted) = (at + copied as u64, 0),
+            Err(blaze_sys::Errno::Intr) if interrupted < linux::INTERRUPTS_MOST => interrupted += 1,
+            Err(errno) => return Err(io::Error::from_raw_os_error(i32::from(errno.raw()))),
+        }
+    }
+    Ok(hole - data)
+}
+
+/// The bytes of `from` from `data` to `hole` read and written to `to` at the same offsets
+/// through one buffer of at most [`COPY_BUFFER`] bytes (`pread`, `pwrite`); the bytes copied.
+#[cfg(target_os = "macos")]
+fn copy_extent(from: &File, to: &File, data: u64, hole: u64) -> io::Result<u64> {
+    use std::os::unix::fs::FileExt as _;
+    // alloc: one buffer an extent, at most `COPY_BUFFER` bytes
+    let mut buffer = vec![0u8; ((hole - data) as usize).min(COPY_BUFFER)];
+    let mut at = data;
+    // Bounded: each pass copies at least one byte or ends.
+    while at < hole {
+        let want = ((hole - at) as usize).min(buffer.len());
+        let read = from.read_at(&mut buffer[..want], at)?;
+        if read == 0 {
+            // alloc: an error path.
+            return Err(io::Error::other(format!(
+                "it ended at {at}, inside data that ran to {hole}: it was cut while it was copied"
+            )));
+        }
+        to.write_all_at(&buffer[..read], at)?;
+        at += read as u64;
+    }
+    Ok(hole - data)
+}
+
+/// [`crate::Effect::CopyData`] where no call copies a file's data extents is used here
+/// (Windows, the other Unixes): refused naming both files; nothing copies through memory
+/// instead. Windows would take `FSCTL_QUERY_ALLOCATED_RANGES` and a copy of each range.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "wasi")))]
+pub(crate) fn copy_data(from: &Path, to: &Path) -> io::Result<u64> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        // alloc: an error path.
+        format!(
+            "copying the data of {} to {}: this system has no call blaze uses to copy a file's \
+             data extents, and blaze does not copy it through memory instead",
+            from.display(),
+            to.display()
+        ),
+    ))
+}
+
+/// The volume that holds `path`, for an error: where it is mounted and its file system on
+/// macOS; the file system's type and the device on Linux. Two different devices are what a
+/// cross-volume clone (`EXDEV`) refuses.
+#[cfg(unix)]
+pub(crate) fn volume_of(path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use sys_proc::{major, minor};
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    use libc::{major, minor};
+    // alloc: an error path.
+    let device = match std::fs::metadata(path) {
+        Ok(meta) => {
+            format!("device {}:{}", major(meta.dev() as _), minor(meta.dev() as _))
+        }
+        Err(error) => format!("device unknown: {error}"),
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    match with_c_path(path, crate::raw::statfs) {
+        Ok(stat) => format!("{}, {device}", file_system(&stat)),
+        Err(error) => format!("statfs failed: {error}, {device}"),
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    device
+}
+
+#[cfg(target_os = "macos")]
+fn file_system(stat: &libc::statfs) -> String {
+    let text = |chars: &[blaze_sys::posix::types::c_char]| {
+        let bytes: Vec<u8> = chars.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect(); // alloc: an error path.
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    // alloc: an error path.
+    format!("{} on {}", text(&stat.f_fstypename), text(&stat.f_mntonname))
+}
+
+#[cfg(target_os = "linux")]
+fn file_system(stat: &libc::statfs) -> String {
+    // `f_type`'s magic numbers, of `linux/magic.h`.
+    let magic = stat.f_type as u32;
+    let name = match magic {
+        0x9123_683e => "btrfs",
+        0x5846_5342 => "xfs",
+        0xca45_1a4e => "bcachefs",
+        0xef53 => "ext2/3/4",
+        0xf2f5_2010 => "f2fs",
+        0x2fc1_2fc1 => "zfs",
+        0x0102_1994 => "tmpfs",
+        0x794c_7630 => "overlayfs",
+        0x6573_5546 => "fuse or virtiofs",
+        0x0102_1997 => "9p",
+        0x6969 => "nfs",
+        _ => "a file system",
+    };
+    // alloc: an error path.
+    format!("{name} (magic {magic:#x})")
+}
+
+#[cfg(target_os = "linux")]
+fn refuses_sharing(code: i32) -> bool {
+    [Errno::OpNotSupp, Errno::XDev, Errno::Inval].iter().any(|errno| i32::from(errno.raw()) == code)
+}
+
+#[cfg(target_os = "macos")]
+fn refuses_sharing(code: i32) -> bool {
+    [Errno::NotSup, Errno::XDev].iter().any(|errno| i32::from(errno.raw()) == code)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn refuses_sharing(_: i32) -> bool {
+    false
+}
+
+/// The source of a clone opened, a symbolic link refused ([`crate::CLONE_THROUGH_A_LINK`]):
+/// `O_NOFOLLOW` fails a link at the last name with `ELOOP`. `O_NONBLOCK` keeps a FIFO put
+/// there from blocking the open; a regular file ignores it. Anything else that is no regular
+/// file (a FIFO, a socket, a device) is refused naming it, never reported as a file system
+/// that cannot share blocks.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_source(from: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(sys_io::OpenFlags::NO_FOLLOW.with(sys_io::OpenFlags::NONBLOCK).bits() as i32)
+        .open(from)
+        .map_err(|error| match error.raw_os_error() {
+            // alloc: an error path.
+            Some(code) if code == i32::from(Errno::Loop.raw()) => io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} {}", from.display(), crate::CLONE_THROUGH_A_LINK),
+            ),
+            Some(code) => match no_file_after_open(from, code) {
+                // alloc: an error path.
+                Some(kind) => io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{} ({kind}) {}", from.display(), crate::CLONE_OF_NO_FILE),
+                ),
+                None => error,
+            },
+            None => error,
+        })?;
+    let kind = file
+        .metadata()
+        // alloc: an error path.
+        .map_err(|error| {
+            io::Error::new(error.kind(), format!("{}: reading what it is: {error}", from.display()))
+        })?
+        .file_type();
+    match kind.is_file() {
+        true => Ok(file),
+        false => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            // alloc: an error path.
+            format!("{} ({}) {}", from.display(), kind_of(kind), crate::CLONE_OF_NO_FILE),
+        )),
+    }
+}
+
+/// Where the open of a clone's source failed with `code`: what the name is, when that is no
+/// regular file. A socket fails its open before any `fstat` (`ENXIO` on Linux, `EOPNOTSUPP` on
+/// macOS), and so does a device with no driver behind it (`ENXIO`, `ENODEV`); the name is then
+/// looked at without following a link, so it is refused with [`crate::CLONE_OF_NO_FILE`] and
+/// written again, never reported as the open's error. `None` for any other code, or where the
+/// name is gone or a regular file again.
+#[cfg(unix)]
+pub(crate) fn no_file_after_open(from: &Path, code: i32) -> Option<&'static str> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let inspect = [Errno::Nxio, Errno::NoDev, Errno::OpNotSupp].iter().any(|errno| i32::from(errno.raw()) == code);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let inspect = matches!(code, libc::ENXIO | libc::ENODEV | libc::EOPNOTSUPP);
+    if !inspect {
+        return None;
+    }
+    let kind = std::fs::symlink_metadata(from).ok()?.file_type();
+    (!kind.is_file()).then(|| kind_of(kind))
+}
+
+/// What a file is from its `st_mode` type bits (`S_IFMT`), for an error (uring's clone, which
+/// keeps only those bits).
+#[cfg(target_os = "linux")]
+pub(crate) fn kind_of_mode(mode: u32) -> &'static str {
+    match mode & sys_proc::S_IFMT {
+        sys_proc::S_IFREG => "a regular file",
+        sys_proc::S_IFDIR => "a directory",
+        sys_proc::S_IFLNK => "a symbolic link",
+        sys_proc::S_IFIFO => "a FIFO",
+        sys_proc::S_IFSOCK => "a socket",
+        sys_proc::S_IFBLK | sys_proc::S_IFCHR => "a device",
+        _ => "an unknown kind of file",
+    }
+}
+
+/// What a file that is no regular file is, for an error.
+#[cfg(unix)]
+fn kind_of(kind: std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt as _;
+    match () {
+        () if kind.is_dir() => "a directory",
+        () if kind.is_symlink() => "a symbolic link",
+        () if kind.is_fifo() => "a FIFO",
+        () if kind.is_socket() => "a socket",
+        () if kind.is_block_device() || kind.is_char_device() => "a device",
+        () => "an unknown kind of file",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::fd::AsFd as _;
+    let source = open_source(from)?;
+    let target = OpenOptions::new().write(true).create_new(true).open(to)?;
+    let Err(error) = crate::raw::ficlone(target.as_fd(), source.as_fd()) else {
+        return Ok(());
+    };
+    drop(target);
+    _ = std::fs::remove_file(to);
+    Err(error)
+}
+
+/// The source is opened `O_NOFOLLOW` (a symbolic link refused, as on Linux) and cloned from
+/// its descriptor (`fclonefileat`), so no link swapped in between is followed or cloned.
+/// `fclonefileat` copies the source's mode, owner, flags and times onto the clone: a store's
+/// placed copy is read-only (0o444) and as old as its first write, so the clone is given a new
+/// file's mode (0o666 less the umask) and the time now, as Linux's `FICLONE` into a new file
+/// and a `Write` leave it, each set on the name `to` without following a link there.
+#[cfg(target_os = "macos")]
+fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::fd::AsFd as _;
+    let source = open_source(from)?;
+    with_c_path(to, |target| crate::raw::fclonefileat(source.as_fd(), target))?;
+    drop(source);
+    let made = created_mode()
+        .and_then(|mode| with_c_path(to, |target| crate::raw::chmod_no_follow(target, mode)))
+        .and_then(|()| with_c_path(to, crate::raw::touch));
+    if let Err(error) = made {
+        _ = std::fs::remove_file(to);
+        // alloc: an error path.
+        return Err(io::Error::new(
+            error.kind(),
+            format!("{}: giving the clone a new file's mode and time: {error}", to.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// The mode a file this process creates with 0o666 is given: 0o666 less the umask. Read once,
+/// from a file made and removed in the temporary directory, as `umask(2)` can only be read by
+/// setting it, which would race every other thread's creates.
+#[cfg(target_os = "macos")]
+fn created_mode() -> io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+    static MODE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if let Some(&mode) = MODE.get() {
+        return Ok(mode);
+    }
+    let probe = temporary_next_to(&crate::temp::base().join("blaze-umask"));
+    let made = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|file| file.metadata());
+    _ = std::fs::remove_file(&probe);
+    let mode = made
+        .map_err(|error| {
+            // alloc: an error path.
+            io::Error::new(
+                error.kind(),
+                format!("reading the umask from {}: {error}", probe.display()),
+            )
+        })?
+        .permissions()
+        .mode()
+        & 0o777;
+    Ok(*MODE.get_or_init(|| mode))
+}
+
+/// The [`Stamp`] of a `stat` of a name, not followed through a symlink.
+#[cfg(unix)]
+pub(crate) fn stamp_of(stat: &libc::stat) -> Stamp {
+    let ns = |s: i64, n: i64| (s as u64).wrapping_mul(1_000_000_000).wrapping_add(n as u64);
+    Stamp {
+        ino: stat.st_ino as u64,
+        size: stat.st_size as u64,
+        mtime_ns: ns(stat.st_mtime as i64, stat.st_mtime_nsec as i64),
+        ctime_ns: ns(stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+        // As `meta_of` (std's `MetadataExt::dev`) and the listing's `Meta` widen it.
+        #[allow(clippy::unnecessary_cast, reason = "st_dev is u64 on Linux, narrower on other Unixes")]
+        dev: stat.st_dev as u64,
+        #[allow(clippy::useless_conversion, reason = "st_mode is u16 on macOS, u32 on Linux")]
+        mode: u32::from(stat.st_mode),
+    }
+}
+
+/// The root's directory, opened once for a batch of `fstatat`s relative to it.
+#[cfg(unix)]
+fn open_dir(root: &Path) -> io::Result<std::os::fd::OwnedFd> {
+    with_c_path(root, crate::raw::open_dir)
+        // alloc: an error path.
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", root.display())))
+}
+
+/// One name's stamp, relative to the directory `dir`.
+#[cfg(unix)]
+pub(crate) fn stamp_at(dir: std::os::fd::BorrowedFd<'_>, name: &core::ffi::CStr) -> Stamp {
+    match crate::raw::stat_at(dir, name) {
+        Ok(stat) => stamp_of(&stat),
+        Err(error) => match error.raw_os_error() {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Some(code) if code == i32::from(Errno::NoEnt.raw()) || code == i32::from(Errno::NotDir.raw()) => Stamp::GONE,
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Some(libc::ENOENT | libc::ENOTDIR) => Stamp::GONE,
+            _ => Stamp::UNKNOWN,
+        },
+    }
+}
+
+/// How many names one thread of a sweep stamps.
+#[cfg(unix)]
+const SWEEP_CHUNK: usize = 256;
+
+/// How many threads stamp `names` names: one per [`SWEEP_CHUNK`] of them, at most one per core.
+/// Measured by `examples/stat_cost.rs` on APFS (macOS arm64, warm, 870 names): one thread at a
+/// chunk of 2,048 took a median 673 µs (0.77 µs a name); four at 256 take 544 µs (0.63 µs), the
+/// spawns costing back much of the split, for about three times the CPU.
+#[cfg(unix)]
+fn sweepers(names: usize, cores: usize) -> usize {
+    names.div_ceil(SWEEP_CHUNK).clamp(1, cores.max(1))
+}
+
+/// Every name's stamp, in order: [`crate::Effect::Stamp`] where the system has no batched
+/// stat, as `fstatat`s relative to the root on [`sweepers`] threads at once. Fails only when
+/// the root cannot be opened.
+#[cfg(unix)]
+pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
+    use std::os::fd::AsFd as _;
+    let dir = open_dir(root)?;
+    let dir = dir.as_fd();
+    // alloc: the batch's payload.
+    let mut out = vec![Stamp::GONE; names.len()];
+    let threads =
+        sweepers(names.len(), std::thread::available_parallelism().map_or(1, |it| it.get()));
+    if threads == 1 {
+        for (at, stamp) in out.iter_mut().enumerate() {
+            *stamp = stamp_at(dir, names.c_str(at));
+        }
+        return Ok(out);
+    }
+    let each = names.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (n, stamps) in out.chunks_mut(each).enumerate() {
+            scope.spawn(move || {
+                for (at, stamp) in stamps.iter_mut().enumerate() {
+                    *stamp = stamp_at(dir, names.c_str(n * each + at));
+                }
+            });
+        }
+    });
+    Ok(out)
+}
+
+/// What is directly in `dir` (named `name` under the root), each with its stamp, sorted by
+/// name; symbolic links are stamped themselves. macOS lists with `getattrlistbulk`
+/// ([`bulk::entries`]).
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn entries(dir: &Path, name: &crate::DirName) -> io::Result<crate::Listing> {
+    use std::os::{fd::AsFd as _, unix::ffi::OsStrExt as _};
+    let fd = open_dir(dir)?;
+    // clone: the listing's directory, a refcount.
+    let mut found = crate::ListingBuilder::new(name.share());
+    // alloc: once per listing, std's handle of the directory.
+    let read = std::fs::read_dir(dir)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())));
+    for entry in read? {
+        let entry = entry?;
+        // alloc: std's copy of the entry's name.
+        let leaf = entry.file_name();
+        let stamp = with_c_path(Path::new(&leaf), |leaf| Ok(stamp_at(fd.as_fd(), leaf)))?;
+        found.push(leaf.as_bytes(), stamp)?;
+    }
+    Ok(found.finish()?)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn clone_file(_: &Path, _: &Path) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "no call that shares blocks on this system"))
+}
+
+/// Invariant: a sync and a barrier of a file sealed read-only (mode 0444, as the store
+/// seals a placed output) succeed on the real file system through `driver`, which runs at
+/// `root`, a directory of the test's own; a sync or a barrier of a missing file makes it, as
+/// before; and a file a sync kept (`uring.rs`'s `Kept::read_only`) is appended to after it.
+/// The control: the open the drivers made before, for writing, of the sealed file is refused
+/// with permission denied, and so is an append to it through `driver` (an open for writing,
+/// as a sync's was before). As root, whom the kernel lets write any file, both are granted, and asserted so.
+/// For each driver's own test (`kqueue.rs`, `uring.rs`, `threads.rs` through either).
+#[cfg(all(test, unix))]
+pub(crate) fn assert_syncs_a_sealed_file(driver: &mut impl crate::Driver, root: &Path) {
+    use crate::{Done, Effect, IoError, Tag};
+    let name = |it: &str| FileName::new(it).unwrap();
+    let mut one = |effect: Effect| {
+        let mut seen = Vec::new();
+        crate::run_until_idle(&mut *driver, &mut vec![effect], |done, _| seen.push(done.done))
+            .expect("the effect ends");
+        let [done] = &seen[..] else { panic!("{seen:?}") };
+        done.clone()
+    };
+    std::fs::create_dir_all(root.join("sealed")).unwrap();
+    let sealed = root.join("sealed/out");
+    std::fs::write(&sealed, b"placed").unwrap();
+    seal(&sealed, 0o444).unwrap();
+    let out = name("sealed/out");
+    assert_eq!(one(Effect::Sync { file: out.clone(), tag: Tag(1) }), Done::Synced);
+    assert_eq!(one(Effect::Barrier { file: out.clone(), tag: Tag(2) }), Done::Ordered);
+    assert_eq!(one(Effect::Sync { file: out.clone(), tag: Tag(3) }), Done::Synced);
+
+    let root_user = crate::raw::euid() == 0;
+    let before = OpenOptions::new().append(true).create(true).open(&sealed);
+    match root_user {
+        false => assert_eq!(
+            before.as_ref().map(|_| ()).map_err(io::Error::kind),
+            Err(io::ErrorKind::PermissionDenied),
+            "the control: the write-open a sync made before is refused"
+        ),
+        true => assert!(before.is_ok(), "root opens a read-only file for writing: {before:?}"),
+    }
+    drop(before);
+    let append = one(Effect::Append { file: out.clone(), bytes: b"!".to_vec(), tag: Tag(4) });
+    match root_user {
+        false => assert!(
+            matches!(&append, Done::Failed(IoError(why)) if why.contains("Permission denied")),
+            "the control: an append to the sealed file is refused: {append:?}"
+        ),
+        true => assert_eq!(append, Done::Appended),
+    }
+    if !root_user {
+        assert_eq!(std::fs::read(&sealed).unwrap(), b"placed");
+    }
+
+    // Missing: made, as a sync and a barrier always made it.
+    assert_eq!(one(Effect::Sync { file: name("sealed/new"), tag: Tag(5) }), Done::Synced);
+    assert_eq!(std::fs::read(root.join("sealed/new")).unwrap(), b"");
+    assert_eq!(one(Effect::Barrier { file: name("sealed/barrier"), tag: Tag(6) }), Done::Ordered);
+    assert!(root.join("sealed/barrier").is_file());
+
+    // A writable file a sync opened first is appended to after it, through a descriptor that
+    // can write.
+    std::fs::write(root.join("sealed/plain"), b"plain").unwrap();
+    let plain = name("sealed/plain");
+    assert_eq!(one(Effect::Sync { file: plain.clone(), tag: Tag(7) }), Done::Synced);
+    let more = Effect::Append { file: plain.clone(), bytes: b" more".to_vec(), tag: Tag(8) };
+    assert_eq!(one(more), Done::Appended);
+    assert_eq!(one(Effect::Sync { file: plain, tag: Tag(9) }), Done::Synced);
+    assert_eq!(std::fs::read(root.join("sealed/plain")).unwrap(), b"plain more");
+    // Writable again, so the test's directory can be removed.
+    set_mode(&sealed, 0o644).unwrap();
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// The invariant: on the file calls every driver but the ring's makes,
+    /// [`sync`] and [`barrier`] of a file sealed read-only succeed, and of a
+    /// missing one make it. The control: the write-open they made before is refused.
+    #[test]
+    fn the_oracle_catches_a_sync_opening_a_sealed_file_for_write() {
+        let root = dir("sync-sealed");
+        let sealed = root.join("sealed");
+        std::fs::write(&sealed, b"placed").unwrap();
+        seal(&sealed, 0o444).unwrap();
+        sync(&sealed).unwrap();
+        barrier(&sealed).unwrap();
+        write_back(&sealed).unwrap();
+        let before = OpenOptions::new().append(true).create(true).open(&sealed);
+        match crate::raw::euid() {
+            // Root, whom the kernel lets write any file.
+            0 => assert!(before.is_ok(), "{before:?}"),
+            _ => assert_eq!(
+                before.map(|_| ()).map_err(|error| error.kind()),
+                Err(io::ErrorKind::PermissionDenied),
+                "the control: the write-open a sync made before is refused"
+            ),
+        }
+        sync(&root.join("made")).unwrap();
+        assert_eq!(std::fs::read(root.join("made")).unwrap(), b"");
+        barrier(&root.join("ordered")).unwrap();
+        assert!(root.join("ordered").is_file());
+        set_mode(&sealed, 0o644).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A new empty directory for the test `name`, removed when the guard drops.
+    fn dir(name: &str) -> crate::temp::TempDir {
+        crate::temp::TempDir::for_test(&format!("blaze-fs-{name}-"))
+    }
+
+    /// Pins C1 of review 4: a seal of a symbolic link is refused, naming the link, and the
+    /// file it points to keeps its mode (the seal acts on the descriptor of the name itself,
+    /// never through the link).
+    #[test]
+    fn a_seal_of_a_symbolic_link_is_refused_and_leaves_the_target_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = dir("seal-link");
+        let target = root.join("target");
+        std::fs::write(&target, b"bytes").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let refused = seal(&link, 0o444).unwrap_err().to_string();
+        assert!(refused.contains(crate::SEAL_THROUGH_A_LINK), "{refused}");
+        assert!(refused.contains(&*link.to_string_lossy()), "{refused}");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o644);
+        seal(&target, 0o444).unwrap();
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o444);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// [`prewarm`] asks for what the cache holds of `like`, and no more than `most`: a file
+    /// just written is held whole, so all of it is asked for in the other; a `most` under its
+    /// length is all that is asked for; a file that holds nothing in memory to learn from (it
+    /// is empty, or is not there) asks for nothing; and a file to read ahead in that is not
+    /// there fails.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn a_prewarm_asks_for_what_the_cache_holds_up_to_its_most() {
+        let root = dir("prewarm");
+        let (like, file) = (root.join("like"), root.join("file"));
+        let bytes: Vec<u8> = (0..1u32 << 20).map(|n| (n % 251) as u8).collect();
+        std::fs::write(&like, &bytes).unwrap();
+        std::fs::write(&file, &bytes).unwrap();
+        assert_eq!(prewarm(&like, &file, u64::MAX).unwrap(), bytes.len() as u64);
+        assert_eq!(prewarm(&like, &file, 4096).unwrap(), 4096);
+        // What both hold: a shorter `file` is asked for no more than its length.
+        std::fs::write(&file, &bytes[..12345]).unwrap();
+        assert_eq!(prewarm(&like, &file, u64::MAX).unwrap(), 12345);
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(prewarm(&like, &file, u64::MAX).unwrap(), 0);
+        // A `like` that is not there holds nothing; a `file` that is not there fails.
+        assert_eq!(prewarm(&root.join("none"), &file, u64::MAX).unwrap(), 0);
+        assert!(prewarm(&like, &root.join("none"), u64::MAX).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A seal of a FIFO is refused as no regular file, without blocking on its open
+    /// (`O_NONBLOCK`): a test that hangs here is that fix undone.
+    #[test]
+    fn a_seal_of_a_fifo_is_refused_without_blocking() {
+        let root = dir("seal-fifo");
+        let fifo = root.join("fifo");
+        // std's `mkfifo` is unstable, and this module makes no raw calls.
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let refused = seal(&fifo, 0o444).unwrap_err().to_string();
+        assert!(
+            refused.contains(crate::SEAL_OF_NO_FILE) && refused.contains("a FIFO"),
+            "{refused}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Pins C1 of review 5: a socket fails its open before any `fstat` (`ENXIO`, `EOPNOTSUPP`);
+    /// a clone from it and a seal of it are still refused as no regular file, naming it, so the
+    /// store writes the file again rather than failing the place with the open's error.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_socket_is_refused_as_no_regular_file_by_a_clone_and_a_seal() {
+        let root = dir("socket");
+        let socket = root.join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let refused = open_source(&socket).unwrap_err().to_string();
+        assert!(
+            refused.contains(crate::CLONE_OF_NO_FILE) && refused.contains("a socket"),
+            "{refused}"
+        );
+        let refused = seal(&socket, 0o444).unwrap_err().to_string();
+        assert!(
+            refused.contains(crate::SEAL_OF_NO_FILE) && refused.contains("a socket"),
+            "{refused}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Pins C3 of review 4: a stat that does not follow ([`crate::Effect::Lstat`]) gives a
+    /// symbolic link's own length; one that follows ([`crate::Effect::Stat`]) the target's.
+    #[test]
+    fn a_stat_not_followed_gives_the_link_its_own_length() {
+        let root = dir("lstat");
+        let target = root.join("target");
+        std::fs::write(&target, vec![7u8; 100_000]).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let own = stat(&link, false).unwrap().expect("there");
+        assert_eq!(own.len, target.as_os_str().len() as u64, "the link's own length");
+        assert!(!own.dir);
+        assert_eq!(stat(&link, true).unwrap().expect("there").len, 100_000);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A write, rename or link whose directories are missing makes them and is done; one
+    /// whose directory is there is done as asked. A rename of nothing fails and makes
+    /// nothing, no directory of its target either (`Effect::Rename`; the conformance suite's
+    /// `a_rename_of_nothing`, `conform/fs.rs`: before 2026-11-20 it made them and then failed).
+    #[test]
+    fn missing_directories_are_made_where_a_call_needs_them() {
+        let root = dir("parents");
+        write_atomically(&root.join("a/b/whole"), b"whole").unwrap();
+        assert_eq!(std::fs::read(root.join("a/b/whole")).unwrap(), b"whole");
+        write_atomically(&root.join("a/b/whole"), b"again").unwrap();
+        assert_eq!(std::fs::read(root.join("a/b/whole")).unwrap(), b"again");
+        rename(&root.join("a/b/whole"), &root.join("c/d/moved")).unwrap();
+        assert_eq!(std::fs::read(root.join("c/d/moved")).unwrap(), b"again");
+        link(&root.join("c/d/moved"), &root.join("e/linked")).unwrap();
+        assert_eq!(std::fs::read(root.join("e/linked")).unwrap(), b"again");
+        let missing = rename(&root.join("nothing"), &root.join("f/to")).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(!root.join("f").exists(), "a rename of nothing made its target's directory");
+        let appended = root.join("g/h");
+        let opened = making_parent(&appended, || {
+            OpenOptions::new().create(true).append(true).open(&appended)
+        });
+        std::io::Write::write_all(&mut opened.unwrap(), b"line").unwrap();
+        assert_eq!(std::fs::read(root.join("g/h")).unwrap(), b"line");
+        let under_a_file = write_atomically(&root.join("e/linked/under"), b"x").unwrap_err();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(under_a_file.raw_os_error(), Some(i32::from(blaze_sys::Errno::NotDir.raw())));
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(under_a_file.raw_os_error(), Some(libc::ENOTDIR));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A remove unlinks a file or symbolic link, removes an empty directory, is done when
+    /// nothing is there, and fails on a directory that is not empty, leaving it.
+    #[test]
+    fn a_remove_takes_files_links_and_empty_directories() {
+        let root = dir("remove");
+        std::fs::write(root.join("file"), b"x").unwrap();
+        std::fs::create_dir(root.join("empty")).unwrap();
+        std::fs::create_dir_all(root.join("full/in")).unwrap();
+        std::os::unix::fs::symlink(root.join("full"), root.join("link")).unwrap();
+        for it in ["file", "empty", "link", "missing"] {
+            remove(&root.join(it)).unwrap();
+            assert!(std::fs::symlink_metadata(root.join(it)).is_err(), "{it}");
+        }
+        assert!(remove(&root.join("full")).is_err());
+        assert!(root.join("full/in").is_dir());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A sweep takes a thread per [`SWEEP_CHUNK`] names, never more than the cores and never
+    /// none; the chunks the threads take cover every name once.
+    #[test]
+    fn a_sweep_takes_a_thread_per_chunk_up_to_the_cores() {
+        assert_eq!(sweepers(0, 16), 1);
+        assert_eq!(sweepers(SWEEP_CHUNK, 16), 1);
+        assert_eq!(sweepers(SWEEP_CHUNK + 1, 16), 2);
+        assert_eq!(sweepers(50_000, 16), 16);
+        assert_eq!(sweepers(50_000, 256), 50_000usize.div_ceil(SWEEP_CHUNK));
+        assert_eq!(sweepers(50_000, 0), 1);
+        for names in [1, SWEEP_CHUNK, SWEEP_CHUNK + 1, 50_000, 1 << 20] {
+            for cores in [1, 3, 8, 16, 64, 256] {
+                let threads = sweepers(names, cores);
+                let each = names.div_ceil(threads);
+                assert!(threads <= cores.max(1) && (threads - 1) * each < names, "{names} {cores}");
+            }
+        }
+    }
+
+    /// A sweep over more names than one thread takes gives each name its own stamp, in order:
+    /// the files are there, the rest gone.
+    #[test]
+    fn a_sweep_on_many_threads_keeps_each_stamp_in_its_place() {
+        use std::os::fd::AsFd as _;
+        let root = dir("sweep");
+        let count = 3 * SWEEP_CHUNK + 5;
+        let mut names = Names::default();
+        for at in 0..count {
+            let name = format!("f{at}");
+            if at % 3 == 0 {
+                std::fs::write(root.join(&name), vec![b'x'; at % 7]).unwrap();
+            }
+            assert!(names.push_str(&name));
+        }
+        let swept = stamps(&root, &names).unwrap();
+        assert_eq!(swept.len(), count);
+        let one = open_dir(&root).unwrap();
+        for (at, stamp) in swept.iter().enumerate() {
+            assert_eq!(*stamp, stamp_at(one.as_fd(), names.c_str(at)), "name {at}");
+            match at % 3 {
+                0 => assert_eq!(stamp.size, (at % 7) as u64, "name {at}"),
+                _ => assert_eq!(*stamp, Stamp::GONE, "name {at}"),
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

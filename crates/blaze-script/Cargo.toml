@@ -1,0 +1,33 @@
+[package]
+name = "blaze-script"
+description = "What a repository script needs and nothing of blaze's: the one typed JSON input, JSON written as the Python scripts wrote it, a program run with its output captured. Built by the pinned released blaze, so it depends on no crate of crates/ (docs/v2/plan/design/scripts.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-data.workspace = true
+blaze-toml.workspace = true
+# The user's home directory (`blaze_core::home`), the one answer to it.
+blaze-core.workspace = true
+# Both keep a JSON object's and a table's keys in the order they were written, as Python's do.
+serde_json = { workspace = true, features = ["preserve_order"] }
+# `\d` of a pattern (`regex`) is Unicode Nd.
+blaze-unicode.workspace = true
+# The pinned nightly's name (`RUSTUP_TOOLCHAIN` of a run).
+blaze-pins.workspace = true
+
+[dev-dependencies]
+# The property test of `regex` against a backtracking reference.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

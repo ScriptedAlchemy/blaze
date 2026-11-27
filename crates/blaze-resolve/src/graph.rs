@@ -4,16 +4,22 @@
 //! point is cheap.
 
 use std::borrow::Borrow;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::hash::Hash;
+
+use blaze_hash::{FixedState, Set, SetOpts};
+use std::alloc::Global;
+
+use crate::persistent;
 
 pub struct Graph<N: Clone, E: Clone> {
-    nodes: im_rc::OrdMap<N, im_rc::OrdMap<N, E>>,
+    nodes: persistent::OrdMap<N, persistent::OrdMap<N, E>>,
 }
 
 impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
     pub fn new() -> Graph<N, E> {
-        Graph { nodes: im_rc::OrdMap::new() }
+        Graph { nodes: persistent::OrdMap::new() }
     }
 
     pub fn add(&mut self, node: N) {
@@ -55,27 +61,40 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
     }
 
     /// A topological sort of the `Graph`
-    pub fn sort(&self) -> Vec<N> {
-        let mut ret = Vec::new();
-        let mut marks = BTreeSet::new();
+    pub fn sort(&self) -> Vec<N>
+    where
+        N: Hash,
+    {
+        let mut ret = Vec::with_capacity(self.nodes.len());
+        let alloc = Global;
+        let mut marks =
+            Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(self.nodes.len()) });
+        let mut stack = blaze_own::Vec::new_in(alloc);
 
         for node in self.nodes.keys() {
-            self.sort_inner_visit(node, &mut ret, &mut marks);
+            if !marks.insert(node) {
+                continue;
+            }
+            let children = self.nodes.get(node).map(persistent::OrdMap::keys);
+            stack.push((node, children));
+            while let Some(top) = stack.last_mut() {
+                match top.1.as_mut().and_then(Iterator::next) {
+                    Some(child) => {
+                        if marks.insert(child) {
+                            let child_iter = self.nodes.get(child).map(persistent::OrdMap::keys);
+                            stack.push((child, child_iter));
+                        }
+                    }
+                    None => {
+                        if let Some((cur, _)) = stack.pop() {
+                            ret.push(cur.clone());
+                        }
+                    }
+                }
+            }
         }
 
         ret
-    }
-
-    fn sort_inner_visit(&self, node: &N, dst: &mut Vec<N>, marks: &mut BTreeSet<N>) {
-        if !marks.insert(node.clone()) {
-            return;
-        }
-
-        for child in self.nodes[node].keys() {
-            self.sort_inner_visit(child, dst, marks);
-        }
-
-        dst.push(node.clone());
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &N> {
@@ -87,9 +106,12 @@ impl<N: Eq + Ord + Clone, E: Default + Clone> Graph<N, E> {
     }
 
     /// Checks if there is a path from `from` to `to`.
-    pub fn is_path_from_to<'a>(&'a self, from: &'a N, to: &'a N) -> bool {
+    pub fn is_path_from_to<'a>(&'a self, from: &'a N, to: &'a N) -> bool
+    where
+        N: Hash,
+    {
         let mut stack = vec![from];
-        let mut seen = BTreeSet::new();
+        let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         seen.insert(from);
         while let Some(iter) = stack.pop().and_then(|p| self.nodes.get(p)) {
             for p in iter.keys() {
@@ -218,6 +240,33 @@ fn reverse() {
     assert_eq!(new.reversed(), expected);
 }
 
+#[test]
+fn sort_is_post_order_in_node_order() {
+    let mut new: Graph<i32, ()> = Graph::new();
+    new.link(5, 1);
+    new.link(5, 3);
+    new.link(3, 2);
+    new.link(1, 2);
+    new.link(2, 4);
+    new.link(4, 2);
+    new.add(0);
+    assert_eq!(new.sort(), vec![0, 4, 2, 1, 3, 5]);
+}
+
+#[test]
+fn path_from_to() {
+    let mut new: Graph<i32, ()> = Graph::new();
+    new.link(0, 1);
+    new.link(1, 2);
+    new.link(2, 1);
+    new.link(3, 0);
+    assert!(new.is_path_from_to(&0, &2));
+    assert!(new.is_path_from_to(&3, &2));
+    assert!(new.is_path_from_to(&1, &1));
+    assert!(!new.is_path_from_to(&2, &0));
+    assert!(!new.is_path_from_to(&0, &3));
+}
+
 impl<N: Eq + Ord + Clone, E: Default + Clone> Default for Graph<N, E> {
     fn default() -> Graph<N, E> {
         Graph::new()
@@ -256,7 +305,7 @@ impl<N: Eq + Ord + Clone, E: Clone> Graph<N, E> {
             .nodes
             .keys()
             .chain(self.nodes.values().flat_map(|vs| vs.keys()))
-            .collect::<BTreeSet<_>>()
+            .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
         let mut new = Graph::new();

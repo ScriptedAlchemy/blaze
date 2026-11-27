@@ -1,0 +1,20 @@
+{
+  "id": "v2-catalog-post-rewrite",
+  "date": "2026-11-21",
+  "who": "GPT-6 Astra Pro, repair_catalogs lane",
+  "where": "docs/v2/plan/design/caches.md; scripts/layouts.txt; crates/hir-ty-codegen/fncache.rs; CI job 137071597006",
+  "what": "The native domain check reported 343 findings and the layout check 122 after the upstream item-layer rewrite. The inventories still named deleted daemon/query producers while omitting replacement libraries. The only reported changed persisted constant, fncache FORMAT 1 to 2 against the PR base, had no previous-format control.",
+  "cost": "Both strict native gates failed after the validation tools were successfully restored; documentation describing deleted cache producers also remained misleading.",
+  "cause": "Source declarations and their handwritten inventories evolved separately. The function-cache key constructor was embedded in a compiler module whose front-end dependencies are now parked, preventing a focused active-library test of its namespace boundary.",
+  "whys": [
+    "deleting old producers left their catalog entries behind and new producers lacked entries",
+    "the inventory was written as a pre-rewrite audit rather than reconciled with current ownership",
+    "the strict checks exposed the drift once the upstream sync and bootstrap repairs allowed all validation groups to execute",
+    "the persisted key formula had no independent compilation seam, so a format change lacked a runnable narrow control"
+  ],
+  "class": "metadata inventory drift across an architectural rewrite, with pure persisted-key logic coupled to an inactive integration crate",
+  "prevention": "Keep both inventory checks strict and two-way. The current cache inventory names 516 source domain stems, 88 environment variables and every scanned non-BLAKE3 hasher, with parked consumers explicit. The layout inventory adds 72 declarations and removes 49 deleted declarations without inventing migration coverage. The exact production fncache key constructor is shared by the parked compiler and an active blaze-ids integration target, with a stated namespace invariant and a format-omission negative control.",
+  "workaround": "none; compiler exclusions and gate thresholds are unchanged",
+  "fix": "Static lexical reconciliation reports no missing or stale domain, environment, hasher or layout rows. FORMAT remains 2 and its existing key bytes are preserved by extraction. The shared tests cover previous-format namespace separation, unchanged format-2 identity, all compilation inputs and framing; root owns their native CI execution and the generated indexes.",
+  "state": "implemented; static reconciliation passed, native validation pending"
+}

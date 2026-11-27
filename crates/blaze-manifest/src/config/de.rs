@@ -4,23 +4,34 @@
 
 use std::vec;
 
-use rustc_hash::FxHashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use serde::de::{self, IntoDeserializer};
+use std::alloc::Global;
 
-use super::error::ConfigError;
+use super::error::{ConfigError, ConfigWhat};
 use super::key::{ArrayItemKeyPath, ConfigKey};
 use super::value;
 use super::{Config, ConfigValue as CV, Definition, Value};
+use crate::files::Files;
 
-#[derive(Clone)]
-pub(crate) struct Deserializer<'c> {
-    pub(crate) config: &'c Config,
+pub(crate) struct Deserializer<'c, F: Files> {
+    pub(crate) config: &'c Config<F>,
     /// The key being deserialized.
     pub(crate) key: ConfigKey,
     /// Whether a variable that starts with this key's can stand for a table under it: true for
     /// `CARGO_PROFILE_DEV_BUILD_OVERRIDE_*`, false for `CARGO_BUILD_TARGET`, which would
     /// otherwise take `CARGO_BUILD_TARGET_DIR` for one.
     pub(crate) env_prefix_ok: bool,
+}
+
+impl<F: Files> Clone for Deserializer<'_, F> {
+    fn clone(&self) -> Self {
+        Deserializer {
+            config: self.config,
+            key: self.key.clone(),
+            env_prefix_ok: self.env_prefix_ok,
+        }
+    }
 }
 
 macro_rules! deserialize_method {
@@ -35,7 +46,7 @@ macro_rules! deserialize_method {
     };
 }
 
-impl<'de> de::Deserializer<'de> for Deserializer<'_> {
+impl<'de, F: Files> de::Deserializer<'de> for Deserializer<'_, F> {
     type Error = ConfigError;
 
     fn deserialize_any<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
@@ -129,10 +140,7 @@ impl<'de> de::Deserializer<'de> for Deserializer<'_> {
                 res.extend(val.split_whitespace().map(|s| CV::String(s.to_owned(), def.clone())))
             }
             Some(val) => {
-                return Err(self
-                    .config
-                    .expected("string or array of strings", &self.key, &val)
-                    .into());
+                return Err(self.config.expected("string or array of strings", &self.key, &val));
             }
             None => {}
         }
@@ -169,8 +177,8 @@ impl<'de> de::Deserializer<'de> for Deserializer<'_> {
     }
 }
 
-struct ConfigMapAccess<'c> {
-    de: Deserializer<'c>,
+struct ConfigMapAccess<'c, F: Files> {
+    de: Deserializer<'c, F>,
     fields: Vec<KeyKind>,
     field_index: usize,
 }
@@ -189,8 +197,8 @@ impl KeyKind {
     }
 }
 
-impl<'c> ConfigMapAccess<'c> {
-    fn new_map(de: Deserializer<'c>) -> Result<ConfigMapAccess<'c>, ConfigError> {
+impl<'c, F: Files> ConfigMapAccess<'c, F> {
+    fn new_map(de: Deserializer<'c, F>) -> Result<ConfigMapAccess<'c, F>, ConfigError> {
         let mut fields = Vec::new();
         if let Some(v) = de.config.get_table(&de.key)? {
             let mut keys: Vec<String> = v.val.into_keys().collect();
@@ -202,9 +210,9 @@ impl<'c> ConfigMapAccess<'c> {
     }
 
     fn new_struct(
-        de: Deserializer<'c>,
+        de: Deserializer<'c, F>,
         given_fields: &'static [&'static str],
-    ) -> Result<ConfigMapAccess<'c>, ConfigError> {
+    ) -> Result<ConfigMapAccess<'c, F>, ConfigError> {
         let table = de.config.get_table(&de.key)?;
         if let Some(v) = table.as_ref() {
             let mut unused: Vec<_> =
@@ -219,7 +227,7 @@ impl<'c> ConfigMapAccess<'c> {
             }
         }
 
-        let mut fields = FxHashSet::default();
+        let mut fields = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         for field in given_fields {
             let mut field_key = de.key.clone();
             field_key.push(field);
@@ -244,7 +252,7 @@ impl<'c> ConfigMapAccess<'c> {
     }
 }
 
-impl<'de> de::MapAccess<'de> for ConfigMapAccess<'_> {
+impl<'de, F: Files> de::MapAccess<'de> for ConfigMapAccess<'_, F> {
     type Error = ConfigError;
 
     fn next_key_seed<K: de::DeserializeSeed<'de>>(
@@ -311,11 +319,11 @@ struct ConfigSeqAccess {
 }
 
 impl ConfigSeqAccess {
-    fn new(de: Deserializer<'_>) -> Result<ConfigSeqAccess, ConfigError> {
+    fn new<F: Files>(de: Deserializer<'_, F>) -> Result<ConfigSeqAccess, ConfigError> {
         let mut res = Vec::new();
         match de.config.get_cv(&de.key)? {
             Some(CV::List(val, _)) => res.extend(val),
-            Some(val) => return Err(de.config.expected("list", &de.key, &val).into()),
+            Some(val) => return Err(de.config.expected("list", &de.key, &val)),
             None => {}
         }
         de.config.get_env_list(&de.key, &mut res);
@@ -342,15 +350,15 @@ impl<'de> de::SeqAccess<'de> for ConfigSeqAccess {
     }
 }
 
-enum ValueSource<'c, 'err> {
+enum ValueSource<'c, 'err, F: Files> {
     /// A value addressed by its key.
-    Deserializer { de: Deserializer<'c>, definition: Definition },
+    Deserializer { de: Deserializer<'c, F>, definition: Definition },
     /// A value inside an array, which no key addresses.
     ConfigValue { cv: CV, key_path: &'err mut ArrayItemKeyPath },
 }
 
-impl<'c> ValueSource<'c, '_> {
-    fn with_deserializer(de: Deserializer<'c>) -> Result<Self, ConfigError> {
+impl<'c, F: Files> ValueSource<'c, '_, F> {
+    fn with_deserializer(de: Deserializer<'c, F>) -> Result<Self, ConfigError> {
         let env = de.key.as_env_key();
         let env_def = Definition::Environment(env.to_owned());
         let definition = match (de.config.env(env).is_some(), de.config.get_cv(&de.key)?) {
@@ -369,13 +377,13 @@ impl<'c> ValueSource<'c, '_> {
     }
 }
 
-struct ValueDeserializer<'c, 'err> {
+struct ValueDeserializer<'c, 'err, F: Files> {
     hits: u32,
-    source: ValueSource<'c, 'err>,
+    source: ValueSource<'c, 'err, F>,
 }
 
-impl<'c, 'err> ValueDeserializer<'c, 'err> {
-    fn new(source: ValueSource<'c, 'err>) -> Self {
+impl<'c, 'err, F: Files> ValueDeserializer<'c, 'err, F> {
+    fn new(source: ValueSource<'c, 'err, F>) -> Self {
         Self { hits: 0, source }
     }
 
@@ -387,7 +395,7 @@ impl<'c, 'err> ValueDeserializer<'c, 'err> {
     }
 }
 
-impl<'de> de::MapAccess<'de> for ValueDeserializer<'_, '_> {
+impl<'de, F: Files> de::MapAccess<'de> for ValueDeserializer<'_, '_, F> {
     type Error = ConfigError;
 
     fn next_key_seed<K: de::DeserializeSeed<'de>>(
@@ -416,17 +424,18 @@ impl<'de> de::MapAccess<'de> for ValueDeserializer<'_, '_> {
                 }
             };
         }
+        let place = value::Place::pack(self.definition().place());
         match self.definition() {
-            Definition::BuiltIn => seed.deserialize(0.into_deserializer()),
-            Definition::Path(path) => {
-                seed.deserialize(Tuple2Deserializer(1i32, path.to_string_lossy()))
+            Definition::BuiltIn => seed.deserialize(Tuple3Deserializer(0u32, "", place)),
+            Definition::Path(path, _) => {
+                seed.deserialize(Tuple3Deserializer(1u32, path.to_string_lossy(), place))
             }
             Definition::Environment(env) => {
-                seed.deserialize(Tuple2Deserializer(2i32, env.as_str()))
+                seed.deserialize(Tuple3Deserializer(2u32, env.as_str(), place))
             }
-            Definition::Cli(path) => {
+            Definition::Cli(path, _) => {
                 let s = path.as_ref().map(|p| p.to_string_lossy()).unwrap_or_default();
-                seed.deserialize(Tuple2Deserializer(3i32, s))
+                seed.deserialize(Tuple3Deserializer(3u32, s, place))
             }
         }
     }
@@ -448,7 +457,11 @@ impl<'de> de::Deserializer<'de> for ArrayItemDeserializer<'_> {
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
         if name == value::NAME && fields == value::FIELDS {
-            let source = ValueSource::ConfigValue { cv: self.cv, key_path: self.key_path };
+            // `F` is the files of the other variant's deserializer; an array item has none.
+            let source = ValueSource::<'_, '_, crate::files::Disk>::ConfigValue {
+                cv: self.cv,
+                key_path: self.key_path,
+            };
             return visitor.visit_map(ValueDeserializer::new(source));
         }
         visitor.visit_map(ArrayItemMapAccess::with_struct(self.cv, fields, self.key_path))
@@ -547,36 +560,40 @@ impl<'de> de::MapAccess<'de> for ArrayItemMapAccess<'_> {
                 Some(cv) => seed
                     .deserialize(ArrayItemDeserializer { cv: cv.clone(), key_path: self.key_path })
                     .inspect_err(|_| self.key_path.push_key(key)),
-                None => Err(ConfigError::new(
-                    format!("missing config key `{key}`"),
+                None => Err(ConfigError::defined(
+                    ConfigWhat::Missing { key },
                     self.cv.definition().clone(),
                 )),
             },
-            _ => Err(ConfigError::new("expected table".to_owned(), self.cv.definition().clone())),
+            _ => Err(ConfigError::defined(ConfigWhat::ExpectedTable, self.cv.definition().clone())),
         }
     }
 }
 
-/// Two values deserialized as a tuple, as serde's `StrDeserializer` is one.
-struct Tuple2Deserializer<T, U>(T, U);
+/// Three values deserialized as a tuple, as serde's `StrDeserializer` is one: a definition's
+/// variant, its path or name, and its packed place.
+struct Tuple3Deserializer<T, U, W>(T, U, W);
 
-impl<'de, T, U> de::Deserializer<'de> for Tuple2Deserializer<T, U>
+impl<'de, T, U, W> de::Deserializer<'de> for Tuple3Deserializer<T, U, W>
 where
     T: IntoDeserializer<'de, ConfigError>,
     U: IntoDeserializer<'de, ConfigError>,
+    W: IntoDeserializer<'de, ConfigError>,
 {
     type Error = ConfigError;
 
     fn deserialize_any<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, ConfigError> {
-        struct SeqVisitor<T, U> {
+        struct SeqVisitor<T, U, W> {
             first: Option<T>,
             second: Option<U>,
+            third: Option<W>,
         }
 
-        impl<'de, T, U> de::SeqAccess<'de> for SeqVisitor<T, U>
+        impl<'de, T, U, W> de::SeqAccess<'de> for SeqVisitor<T, U, W>
         where
             T: IntoDeserializer<'de, ConfigError>,
             U: IntoDeserializer<'de, ConfigError>,
+            W: IntoDeserializer<'de, ConfigError>,
         {
             type Error = ConfigError;
 
@@ -590,11 +607,15 @@ where
                 if let Some(second) = self.second.take() {
                     return seed.deserialize(second.into_deserializer()).map(Some);
                 }
+                if let Some(third) = self.third.take() {
+                    return seed.deserialize(third.into_deserializer()).map(Some);
+                }
                 Ok(None)
             }
         }
 
-        visitor.visit_seq(SeqVisitor { first: Some(self.0), second: Some(self.1) })
+        let seq = SeqVisitor { first: Some(self.0), second: Some(self.1), third: Some(self.2) };
+        visitor.visit_seq(seq)
     }
 
     serde::forward_to_deserialize_any! {

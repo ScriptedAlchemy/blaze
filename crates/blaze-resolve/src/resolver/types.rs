@@ -1,6 +1,7 @@
 use super::CargoResult;
 use super::features::{CliFeatures, RequestedFeatures};
 use crate::interning::InternedString;
+use crate::persistent;
 use crate::{Dependency, PackageId, SourceId, Summary};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -97,7 +98,7 @@ pub(super) type FeaturesSet = Rc<BTreeSet<InternedString>>;
 
 /// Resolver behavior, used to opt-in to new behavior that is
 /// backwards-incompatible via the `resolver` field in the manifest.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub enum ResolveBehavior {
     /// V1 is the original resolver behavior.
     V1,
@@ -113,20 +114,16 @@ impl ResolveBehavior {
             "1" => Ok(ResolveBehavior::V1),
             "2" => Ok(ResolveBehavior::V2),
             "3" => Ok(ResolveBehavior::V3),
-            s => anyhow::bail!(
-                "`resolver` setting `{}` is not valid, valid options are \"1\", \"2\" or \"3\"",
-                s
-            ),
+            s => Err(crate::ResolveError::ResolverSetting { value: s.to_owned() }),
         }
     }
 
-    pub fn to_manifest(&self) -> String {
+    pub fn to_manifest(&self) -> &'static str {
         match self {
             ResolveBehavior::V1 => "1",
             ResolveBehavior::V2 => "2",
             ResolveBehavior::V3 => "3",
         }
-        .to_owned()
     }
 }
 
@@ -141,6 +138,9 @@ pub struct ResolveOpts {
     /// Set of features requested on the command-line.
     pub features: RequestedFeatures,
 }
+
+impl blaze_own::Share for ResolveOpts {}
+impl blaze_own::LocalShare for ResolveOpts {}
 
 impl ResolveOpts {
     /// Creates a `ResolveOpts` that resolves everything.
@@ -190,8 +190,8 @@ pub enum SemverCompatibility {
     Patch(u64),
 }
 
-impl From<&semver::Version> for SemverCompatibility {
-    fn from(ver: &semver::Version) -> Self {
+impl From<&crate::Version> for SemverCompatibility {
+    fn from(ver: &crate::Version) -> Self {
         if let Some(m) = NonZeroU64::new(ver.major) {
             return SemverCompatibility::Major(m);
         }
@@ -268,12 +268,12 @@ pub(super) struct RemainingDeps {
     /// the data is augmented by the insertion time.
     /// This insures that no two items will cmp eq.
     /// Forcing the `OrdSet` into a multi set.
-    data: im_rc::OrdSet<(DepsFrame, u32)>,
+    data: persistent::OrdSet<(DepsFrame, u32)>,
 }
 
 impl RemainingDeps {
     pub(super) fn new() -> RemainingDeps {
-        RemainingDeps { time: 0, data: im_rc::OrdSet::new() }
+        RemainingDeps { time: 0, data: persistent::OrdSet::new() }
     }
     pub(super) fn push(&mut self, x: DepsFrame) {
         let insertion_time = self.time;
@@ -311,7 +311,7 @@ pub(super) type DepInfo = (Dependency, Rc<[Summary]>, FeaturesSet);
 /// We maintain a list of conflicts for error reporting as well as backtracking
 /// purposes. Each reason here is why candidates may be rejected or why we may
 /// fail to resolve a dependency.
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 pub enum ConflictReason {
     /// There was a semver conflict, for example we tried to activate a package
     /// 1.0.2 but 1.1.0 was already activated (aka a compatible semver version
@@ -357,6 +357,7 @@ impl ConflictReason {
 /// If resolving a dependency fails then this represents an incompatibility,
 /// that dependency will never be resolve while all of these packages are active.
 /// This is useless if the packages can't be simultaneously activated for other reasons.
+// BTreeMap: the conflict trie is keyed by these keys in order, and errors list them in order.
 pub(super) type ConflictMap = BTreeMap<PackageId, ConflictReason>;
 
 pub(super) struct RcVecIter<T> {
@@ -388,6 +389,9 @@ impl<T> RcVecIter<T> {
 // Not derived to avoid `T: Clone`
 impl<T> Clone for RcVecIter<T> {
     fn clone(&self) -> RcVecIter<T> {
-        RcVecIter { vec: self.vec.clone(), offset: self.offset }
+        RcVecIter { vec: Rc::clone(&self.vec), offset: self.offset }
     }
 }
+
+impl<T> blaze_own::Share for RcVecIter<T> {}
+impl<T> blaze_own::LocalShare for RcVecIter<T> {}

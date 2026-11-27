@@ -1,6 +1,6 @@
 [package]
 name = "blaze-manifest"
-description = "Cargo.toml and .cargo/config.toml read as cargo 1.99 reads them"
+description = "Cargo.toml and .cargo/config.toml read as the pinned nightly's cargo reads them"
 publish = false
 
 version.workspace = true
@@ -13,28 +13,85 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[features]
+default = ["cargo"]
+# The cargo-compatible reader (`Config`, `Workspace`, `metadata`, the profiles, the schema),
+# which still rests on serde, serde_json and url. Without it the crate is `layout` alone, the
+# sans-IO workspace reader the new `blaze` takes, on blaze's own crates only
+# (`default-features = false`).
+cargo = [
+    "dep:blaze-data",
+    "dep:blaze-core",
+    "dep:blaze-hash",
+    "dep:blaze-ids",
+    "dep:blaze-resolve",
+    "dep:blaze-source",
+    "dep:blaze-text",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:stdx",
+    "dep:url",
+]
+
 [dependencies]
-anyhow.workspace = true
-# The version cargo 1.99 renders its manifest diagnostics with, so that they read the same.
-annotate-snippets = "=0.12.16"
-cargo-platform = "0.3.3"
-# cargo 1.99's own schema of Cargo.toml, so that what deserializes and the messages of what does
-# not are cargo's: docs/resolve.md, "Decisions".
-cargo-util-schemas = "=0.14.3"
-glob = "0.3.3"
-pathdiff = "0.2.3"
-rustc-hash.workspace = true
-semver.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-serde-untagged = "0.1.9"
-# The versions cargo 1.99 prints `cargo config get` with.
-shell-escape = "=0.1.5"
-toml_edit = { version = "=0.25.12", default-features = false, features = ["display"] }
-# `preserve_order`: `package.metadata` and `workspace.metadata` keep the manifest's order, as
-# cargo's do.
-toml = { workspace = true, features = ["preserve_order"] }
-url.workspace = true
+blaze-own.workspace = true
+# The pinned cargo's version, as its messages name it (`features`; pins/rust.txt).
+blaze-pins.workspace = true
+# Cargo.toml and .cargo/config.toml, read with every key's byte range (`schema`, `layout`), and
+# the `cargo config get` output written in cargo's spelling.
+blaze-toml.workspace = true
+# `rustflags`: a `--cfg` spec read as one cfg atom, and a `target.'cfg(..)'` table matched, by
+# the one cfg grammar and evaluator (rustflags.rs).
+blaze-cond.workspace = true
+# The blaze editions and their spellings, shared with the front end (`edition = "blaze-2026.11"`).
+edition.workspace = true
+# `workspace.members` globs, matched as cargo's glob crate matches them.
+blaze-glob.workspace = true
+# `package.metadata` and `workspace.metadata`, kept in the manifest's order as cargo's are.
+blaze-data = { workspace = true, optional = true }
+# Package versions and requirements, with cargo's matching (`lock` reads every version with it).
+blaze-semver.workspace = true
+# The user's home directory (`blaze_core::home`), the one answer to it.
+blaze-core = { workspace = true, optional = true }
+blaze-hash = { workspace = true, optional = true }
+blaze-ids = { workspace = true, optional = true }
+blaze-resolve = { workspace = true, optional = true }
+blaze-source = { workspace = true, optional = true }
+blaze-text = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+stdx = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `Alloc::global()` in tests (the `std` feature), and `expected.json` read for the layout's test.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# `Root`: the root heap a test makes at its top (src/layout/meta_tests.rs), its handles borrowed.
+blaze-mem.workspace = true
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-sim.workspace = true
+
+# The old layer's `cargo` reader's tests; the bare crate (`layout`, `lock`) is tested without it.
+[[test]]
+name = "cargo_features"
+required-features = ["cargo"]
+
+[[test]]
+name = "config_get"
+required-features = ["cargo"]
+
+[[test]]
+name = "config_typed"
+required-features = ["cargo"]
+
+[[test]]
+name = "fixtures"
+required-features = ["cargo"]
+
+[[test]]
+name = "profiles"
+required-features = ["cargo"]
 
 [lints]
 workspace = true

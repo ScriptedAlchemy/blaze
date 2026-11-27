@@ -1,0 +1,95 @@
+# The gate: every check the tree is held to without compiling the workspace, one row a check, in
+# order. Both `just lint` and blaze.yaml's `scripts` job run this exact list via
+# scripts/src/bin/gate.rs.
+#
+# A row:  name | seconds | base | command
+#   name     unique, what the run prints
+#   seconds  its timeout (rule 69): an expiry is its failure, named, never retried
+#   base     `base`: appends `"base": "<sha>"` to the trailing JSON object; `-`: takes none
+#   command  bash, run from the checkout's root; `$BLAZE_SCRIPTS` is the built scripts' directory
+
+# The repository's Python workspace (pyproject.toml, uv.lock) lints. Some scripts
+# ask rustc for the host when imported: in the workspace's Python, with its helpers.
+python lint | 300 | - | uv run --frozen ruff check
+python types | 300 | - | uv run --frozen pyright
+python imports | 300 | - | uv run --frozen python harness/imports.py
+# Fork controls remain mandatory while the source compiler/worker bridge is brought forward.
+# These test refusals and evidence; only the hosted source/production jobs issue acceptance.
+script cache controls | 120 | - | bun .github/actions/script/test-key.mjs
+distributed oracle controls | 120 | - | uv run --frozen python harness/distv2/selfcheck.py
+source identity and CI controls | 120 | - | uv run --frozen python -m unittest discover -s .github/scripts -p test_distributed_ci.py
+workspace test runner selftest | 120 | - | "$BLAZE_SCRIPTS/ci_test" selftest
+workspace storage evidence selftest | 120 | - | "$BLAZE_SCRIPTS/ci_storage" selftest
+source CLI smoke controls | 120 | - | uv run --frozen python -m unittest discover -s .github/scripts -p test_blaze_cli.py
+native Bun preparation controls | 120 | - | uv run --frozen python -I .github/scripts/test_bunprep.py
+benchmark evidence reader controls | 120 | - | uv run --frozen python -m unittest discover -s harness -p test_bench.py
+kernel execution observation controls | 120 | - | uv run --frozen python -m unittest discover -s harness/v2 -p test_exec_observer.py
+distributed objective adapter controls | 120 | - | uv run --frozen python harness/v2/test_distributed.py
+seed readiness and shutdown controls | 120 | - | uv run --frozen python -I -B .github/scripts/test_seed_preflight.py
+fork migration oracle controls | 120 | - | uv run --frozen python -m unittest discover -s harness/forkfixes -p 'test_*.py'
+fork migration receipt controls | 120 | - | uv run --frozen python -m unittest discover -s .github/scripts -p test_forkfixes_ci.py
+Nix graph process and isolation controls | 120 | - | uv run --frozen python -m unittest discover -s .github/scripts -p test_refresh_nix_graphs.py
+# The list of tests that may fail holds together and is as its recorder writes it.
+failures selftest | 120 | - | uv run --frozen python harness/failures.py selftest
+# A row or a test run counts only with proof that it ran (harness/v2/ran.py).
+ran selftest | 120 | - | uv run --frozen python harness/v2/ran.py selftest
+# library/DIGEST is the digest of library/ as it is (a stale one stops every fresh home).
+library digest | 120 | - | uv run --frozen python harness/library.py check '{}'
+# The agent rules: tools/agents/rules.ts type-checks (under bun: tsc's script asks for node), and
+# AGENTS.md and the rules in .agents/skills/*/SKILL.md are what it generates. The site's lock is
+# installed as it is (`--frozen-lockfile` refuses a stale one).
+site packages | 300 | - | bun install --frozen-lockfile --cwd site
+agent rules types | 300 | - | bun site/node_modules/.bin/tsc -p tools/agents
+agent rules | 120 | - | bun tools/agents/rules.ts --check
+# Docs front matter, index (docs/README.md), and Python allowlist (only shrinks).
+docs selftest | 120 | - | "$BLAZE_SCRIPTS/docs" selftest
+docs | 300 | - | "$BLAZE_SCRIPTS/docs" check
+# No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
+rustc sites | 300 | - | "$BLAZE_SCRIPTS/rustcsites"
+# The objectives ledger's rows are well formed and its table is current.
+ledger selftest | 120 | - | "$BLAZE_SCRIPTS/ledger" selftest
+ledger | 120 | - | "$BLAZE_SCRIPTS/ledger" '{"command": "check"}'
+# Which packages a change touches.
+changed selftest | 120 | - | "$BLAZE_SCRIPTS/changed" selftest
+# Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them.
+invariants selftest | 120 | - | "$BLAZE_SCRIPTS/invariants" selftest
+invariants | 300 | - | "$BLAZE_SCRIPTS/invariants" '{"command": "check"}'
+# The Lean proof sources (pure Rust port: zero Python).
+lean sources selftest | 120 | - | "$BLAZE_SCRIPTS/lean_gate" selftest
+lean sources | 300 | - | "$BLAZE_SCRIPTS/lean_gate" '{"command": "sources"}'
+# blaze's registry of rustc's lints matches library/UPSTREAM.
+lint table selftest | 120 | - | "$BLAZE_SCRIPTS/lint_table" selftest
+lint table | 300 | - | "$BLAZE_SCRIPTS/lint_table" '{"command": "check"}'
+# Each hash domain in crates/ is written once outside tests and documented in caches.md.
+hash domains | 300 | - | "$BLAZE_SCRIPTS/domains" '{"root": "."}'
+# The ratchets: global heap, untyped errors, third-party packages, manifests, sys imports,
+# std/alloc, sans-io, stops, clones, casts, recursion, dups, layouts.
+global heap selftest | 120 | - | "$BLAZE_SCRIPTS/allocs" selftest
+global heap | 300 | base | "$BLAZE_SCRIPTS/allocs" '{"command": "check"}'
+untyped errors selftest | 120 | - | "$BLAZE_SCRIPTS/untyped" selftest
+untyped errors | 300 | base | "$BLAZE_SCRIPTS/untyped" '{"command": "check"}'
+third party selftest | 120 | - | "$BLAZE_SCRIPTS/thirdparty" selftest
+third party (and reached) | 300 | base | "$BLAZE_SCRIPTS/thirdparty" '{"command": "check"}'
+manifests | 120 | - | "$BLAZE_SCRIPTS/thirdparty" '{"command": "manifests-check"}'
+third party reach | 300 | - | m=$(mktemp) && trap 'rm -f "$m"' EXIT && { timeout 240 cargo fetch --locked --quiet && timeout 240 cargo metadata --format-version 1 --offline --locked > "$m" || { echo 'third party reach: `cargo metadata --offline --locked` refused (its error above): a stale Cargo.lock is refused, not updated (update it with the network and commit it)' >&2; exit 1; }; } && "$BLAZE_SCRIPTS/thirdparty" "{\"command\": \"reach-check\", \"metadata\": \"$m\"}"
+sys imports selftest | 120 | - | "$BLAZE_SCRIPTS/sys_imports" selftest
+ambient selftest | 120 | - | "$BLAZE_SCRIPTS/ambient" selftest
+std and alloc | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "check"}'
+sans-io and bare | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "sansio-check"}'
+std and alloc in tests | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "tests-check"}'
+heap from nowhere | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "heap-check"}'
+ambient reach | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "reach-check"}'
+producer strings | 300 | base | "$BLAZE_SCRIPTS/ambient" '{"command": "producers-check"}'
+stops selftest | 120 | - | "$BLAZE_SCRIPTS/stops" selftest
+stops | 300 | base | "$BLAZE_SCRIPTS/stops" '{"command": "check"}'
+clones selftest | 120 | - | "$BLAZE_SCRIPTS/clones" selftest
+clones | 300 | base | "$BLAZE_SCRIPTS/clones" '{"command": "check"}'
+casts selftest | 120 | - | "$BLAZE_SCRIPTS/casts" selftest
+casts | 300 | base | "$BLAZE_SCRIPTS/casts" '{"command": "check"}'
+recursion selftest | 120 | - | "$BLAZE_SCRIPTS/recursion" selftest
+recursion | 300 | base | "$BLAZE_SCRIPTS/recursion" '{"command": "check"}'
+dups selftest | 120 | - | "$BLAZE_SCRIPTS/dups" selftest
+layouts selftest | 120 | - | "$BLAZE_SCRIPTS/layouts" selftest
+layouts | 300 | base | "$BLAZE_SCRIPTS/layouts" '{"command": "check"}'
+# The runner's own selftest.
+gate selftest | 120 | - | "$BLAZE_SCRIPTS/gate" selftest

@@ -1,0 +1,313 @@
+"""D11 adapter controls. Synthetic executables are never run; no Blaze process is started.
+
+The success controls test adapter wiring only. Failure controls also enter the real
+distv2.main, with its external services/build outcome controlled, and require its genuine
+acceptance and finally-cleanup failures to make the ledger result fail.
+"""
+
+import contextlib
+import io
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import distributed as d
+
+
+class DistributedLedgerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.source: dict[str, str] = {"commit": "11" * 20, "tree": "22" * 20}
+
+        def current_source() -> dict[str, str]:
+            return dict(self.source)
+
+        source = patch.object(d.identity, "source", side_effect=current_source)
+        source.start()
+        self.addCleanup(source.stop)
+        for name in ("blaze", "blaze-launcher", "blaze-fact-shim", "blaze-dist-local", "blaze-serve", "proc_macro_modules"):
+            path = self.bin / name
+            path.write_text(f"synthetic {name}; never executed\n")
+            path.chmod(0o700)
+        self.seal()
+        self.reflink = patch.object(d.clone_out, "selftest", return_value=None)
+        self.reflink.start()
+        self.addCleanup(self.reflink.stop)
+        for patcher in (patch.object(d.report, "host", return_value={}),
+                        patch.object(d.report, "commit", return_value=self.source["commit"])):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.given = d.Input(str(self.bin / "blaze"), str(self.root / "result.json"),
+                             cores=2, daemon_memory_gb=6)
+
+    def seal(self, services: bool = True) -> dict[str, object]:
+        record: dict[str, object] = d.identity.identity(self.bin, services)
+        (self.bin / d.identity.MANIFEST).write_text(json.dumps(record))
+        return record
+
+    def invoke(self, given: d.Input | None = None, code: int = 1) -> dict[str, Any]:
+        given = given or self.given
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as ended:
+            d.main(given)
+        self.assertEqual(ended.exception.code, code)
+        return json.loads(Path(given.out).read_text())
+
+    def probe_reply(self) -> subprocess.CompletedProcess[str]:
+        # The real capability parser must run before the deliberately failed build.
+        # Only the subprocess result is supplied: no synthetic program is executable proof.
+        return subprocess.CompletedProcess(
+            [str(self.bin / "blaze"), "toolchain", "--json"], 0,
+            json.dumps({"host": "fixture-only-unknown-linux-gnu"}), "")
+
+    def test_complete_profiles_reuse_the_sealed_programs_and_separate_fresh_scratch(self) -> None:
+        seen: list[Any] = []
+
+        def complete(given: Any) -> None:
+            scratch = Path(given.scratch)
+            self.assertFalse(scratch.exists())
+            scratch.mkdir()
+            (scratch / "synthetic-wiring-only").write_text("not distributed acceptance\n")
+            seen.append(given)
+
+        with patch.object(d.distv2, "main", side_effect=complete), \
+                patch.object(d, "verified_build", wraps=d.verified_build) as verified:
+            result = self.invoke(code=0)
+        self.assertEqual(verified.call_count, 5)  # Initial seal, then before/after each main.
+        self.assertEqual([it.profile for it in seen], ["debug", "release"])
+        self.assertEqual([it.args for it in seen], [(), ("--release",)])
+        self.assertEqual([it.release_fold for it in seen], [False, True])
+        evidence = Path(self.given.out + ".distv2")
+        self.assertEqual([Path(it.scratch) for it in seen], [evidence / "dev", evidence / "release"])
+        for it in seen:
+            self.assertTrue(it.faults)
+            self.assertEqual((it.cores, it.daemon_memory_gb), (2, 6))
+            self.assertEqual(it.blaze, str(self.bin / "blaze"))
+            self.assertEqual(it.dist_local, str(self.bin / "blaze-dist-local"))
+            self.assertEqual(it.serve, str(self.bin / "blaze-serve"))
+            self.assertEqual(it.module_builder, str(self.bin / "proc_macro_modules"))
+            self.assertEqual(it.env, {"BLAZE_LOCK": "write", "XDG_CACHE_HOME": str(Path(it.scratch) / "machine-cache")})
+        self.assertEqual([(it["name"], it["verdict"]) for it in result["outcomes"]],
+                         [("distv2-dev", "pass"), ("distv2-release", "pass")])
+        self.assertEqual(set(result["extra"]["build_identity"]["binaries"]),
+                         {"blaze", "blaze-launcher", "blaze-fact-shim", "blaze-dist-local", "blaze-serve"})
+        self.assertEqual(json.loads((evidence / "build-identity.json").read_text()),
+                         result["extra"]["build_identity"])
+
+    def test_missing_fixture_producer_is_refused_before_acceptance(self) -> None:
+        (self.bin / "proc_macro_modules").unlink()
+        with patch.object(d.distv2, "main") as acceptance:
+            result = self.invoke()
+        acceptance.assert_not_called()
+        self.assertIn("module_builder is not an executable file", result["outcomes"][0]["detail"])
+        self.assertIn(str(self.bin / "proc_macro_modules"), result["outcomes"][0]["detail"])
+
+    def test_input_cannot_filter_profiles_disable_faults_or_replace_sealed_services(self) -> None:
+        base = {"blaze": self.given.blaze, "out": self.given.out, "cores": 2, "daemon_memory_gb": 6}
+        for name, value in (("profile", "debug"), ("faults", False), ("release_fold", False),
+                            ("dist_local", "another-program"), ("serve", "another-program")):
+            with self.subTest(name=name), self.assertRaisesRegex(SystemExit, "no field"):
+                d.parse(d.Input, json.dumps({**base, name: value}), d.SCRIPT)
+        with self.assertRaisesRegex(SystemExit, "cores"):
+            d.parse(d.Input, json.dumps({**base, "cores": True}), d.SCRIPT)
+
+    def test_resources_are_required_and_cannot_take_ambient_values(self) -> None:
+        base = {"blaze": self.given.blaze, "out": self.given.out, "cores": 2, "daemon_memory_gb": 6}
+        with patch.dict(os.environ, {"BLAZE_CORES": "99", "BLAZE_DAEMON_MEMORY_GB": "99"}):
+            for name in ("cores", "daemon_memory_gb"):
+                with self.subTest(name=name), self.assertRaisesRegex(SystemExit, f"field {name} is required"):
+                    d.parse(d.Input, json.dumps({key: value for key, value in base.items() if key != name}), d.SCRIPT)
+                with self.subTest(name=name), self.assertRaisesRegex(SystemExit, name):
+                    d.parse(d.Input, json.dumps({**base, name: None}), d.SCRIPT)
+                for value in (None, 0, -1, True):
+                    with self.subTest(name=name, value=value), self.assertRaises((ValueError, d.distv2.Failed)):
+                        d.profile_input(replace(self.given, **{name: value}), self.bin / "blaze", self.root, "dev")
+            profile = d.profile_input(self.given, self.bin / "blaze", self.root, "dev")
+            run: Any = object.__new__(d.distv2.Run)  # Only its real child-environment construction.
+            run.given, run.root = profile, Path(profile.scratch)
+            run.root.mkdir()
+            run.socket, run.port = self.root / "unused.sock", 1
+            child: dict[str, str] = run.env("a", True)
+            self.assertEqual(child["BLAZE_CORES"], "2")
+            self.assertNotIn("BLAZE_DAEMON_MEMORY_GB", child)
+
+    def test_each_sealed_program_and_the_services_manifest_are_required_before_acceptance(self) -> None:
+        for name in ("blaze", "blaze-launcher", "blaze-fact-shim", "blaze-dist-local", "blaze-serve"):
+            with self.subTest(name=name):
+                path = self.bin / name
+                original = path.read_bytes()
+                path.unlink()
+                with patch.object(d.distv2, "main") as acceptance:
+                    result = self.invoke(replace(self.given, out=str(self.root / f"missing-{name}.json")))
+                acceptance.assert_not_called()
+                self.assertEqual(result["counts"], {"error": 1})
+                path.write_bytes(original)
+                path.chmod(0o700)
+        self.seal(services=False)
+        with patch.object(d.distv2, "main") as acceptance:
+            result = self.invoke()
+        acceptance.assert_not_called()
+        self.assertIn("executable set", result["outcomes"][0]["detail"])
+
+    def test_a_different_source_or_a_dirty_source_cannot_start_acceptance(self) -> None:
+        self.source["commit"] = "33" * 20
+        with patch.object(d.distv2, "main") as acceptance:
+            result = self.invoke()
+        acceptance.assert_not_called()
+        self.assertIn("build source", result["outcomes"][0]["detail"])
+        with patch.object(d.identity, "source", side_effect=d.identity.Refused("source checkout has changes")), \
+                patch.object(d.distv2, "main") as acceptance:
+            result = self.invoke(replace(self.given, out=str(self.root / "dirty.json")))
+        acceptance.assert_not_called()
+        self.assertIn("source checkout has changes", result["outcomes"][0]["detail"])
+
+    def test_resealing_changed_launcher_bytes_between_profiles_cannot_change_this_runs_identity(self) -> None:
+        def replace_launcher(_given: object) -> None:
+            (self.bin / "blaze-launcher").write_text("different launcher, still never executed\n")
+            self.seal()  # The current manifest is internally valid, but is a different build.
+
+        with patch.object(d.distv2, "main", side_effect=replace_launcher) as acceptance:
+            result = self.invoke()
+        self.assertEqual(acceptance.call_count, 1)
+        self.assertEqual(result["counts"], {"fail": 1, "error": 1})
+        self.assertIn("identity after dev cleanup", result["outcomes"][0]["detail"])
+        self.assertIn("build binaries differ", result["outcomes"][0]["detail"])
+
+    def test_reused_evidence_or_report_is_refused_and_the_earlier_bytes_remain(self) -> None:
+        evidence = Path(self.given.out + ".distv2")
+        evidence.mkdir()
+        retained = evidence / "earlier-evidence"
+        retained.write_bytes(b"keep this evidence")
+        with patch.object(d.distv2, "main") as acceptance:
+            result = self.invoke()
+        acceptance.assert_not_called()
+        self.assertIn("already exists", result["outcomes"][0]["detail"])
+        self.assertEqual(retained.read_bytes(), b"keep this evidence")
+        earlier_report = Path(self.given.out).read_bytes()
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, "report .* already exists"):
+            d.main(self.given)
+        self.assertEqual(Path(self.given.out).read_bytes(), earlier_report)
+
+    def test_a_copy_instead_of_shared_clone_blocks_is_refused_before_acceptance(self) -> None:
+        self.reflink.stop()
+
+        def private_bytes(path: Path) -> int:
+            return path.stat().st_size
+
+        # Enter the real clone oracle. A copying backend keeps every byte private and
+        # must not become a supported-volume fallback merely because the bytes match.
+        with patch.object(d.clone_out, "clone", side_effect=shutil.copyfile), \
+                patch.object(d.clone_out, "private_bytes", side_effect=private_bytes), \
+                patch.object(d.distv2, "main") as acceptance:
+            result = self.invoke()
+        acceptance.assert_not_called()
+        self.assertIn("did not prove reflink placement", result["outcomes"][0]["detail"])
+        self.assertIn("a clone shares every block", result["outcomes"][0]["detail"])
+
+    def test_an_exit_or_nonzero_return_from_acceptance_is_never_a_pass(self) -> None:
+        for ordinal, exit_or_return in enumerate((SystemExit(23), 23)):
+            with self.subTest(exit_or_return=exit_or_return):
+                supplied = replace(self.given, out=str(self.root / f"exit-{ordinal}.json"))
+                arguments: dict[str, Any] = (
+                    {"side_effect": exit_or_return} if isinstance(exit_or_return, SystemExit)
+                    else {"return_value": exit_or_return}
+                )
+                with patch.object(d.distv2, "main", **arguments) as acceptance:
+                    result = self.invoke(supplied)
+                self.assertEqual(acceptance.call_count, 1)
+                self.assertEqual(result["counts"], {"fail": 1, "error": 1})
+                self.assertIn("23", result["outcomes"][0]["detail"])
+
+    def test_real_distv2_main_propagates_a_failed_build_and_runs_its_cleanup(self) -> None:
+        stopped: list[Path] = []
+        original_stop: Callable[[Any], None] = d.distv2.Run.stop
+
+        def stop(run: Any) -> None:
+            original_stop(run)
+            stopped.append(run.root)
+
+        with patch.object(d.distv2, "free_port", return_value=1), \
+                patch.object(d.distv2, "source_state", return_value=(self.source["commit"], self.source["tree"], b"")), \
+                patch.object(d.distv2.subprocess, "run", return_value=self.probe_reply()) as probe, \
+                patch.object(d.distv2.Run, "start_services", return_value=None), \
+                patch.object(d.distv2.Run, "build", return_value=(23, "controlled build failure")) as build, \
+                patch.object(d.distv2.Run, "stop", new=stop):
+            result = self.invoke()
+        probe.assert_called_once()
+        self.assertEqual(probe.call_args.args[0], self.probe_reply().args)
+        self.assertEqual(build.call_count, 1)
+        self.assertEqual(stopped, [Path(self.given.out + ".distv2") / "dev"])
+        observed = json.loads((stopped[0] / "logs/worker-protocol-probe.json").read_text())
+        self.assertEqual(observed, {"argv": self.probe_reply().args, "returncode": 0,
+                                    "stdout": self.probe_reply().stdout, "stderr": ""})
+        self.assertEqual(result["counts"], {"fail": 1, "error": 1})
+        detail = result["outcomes"][0]["detail"]
+        self.assertIn("solo builds: exit 23; full log:", detail)
+        self.assertIn("logs/solo.0.log", detail)
+        self.assertIn("controlled build failure", detail)
+        log = Path(result["outcomes"][0]["numbers"]["log"]).read_text()
+        self.assertIn("Failed: solo builds: exit 23; full log:", log)
+        self.assertIn("controlled build failure", log)
+
+    def test_real_distv2_finally_failure_and_post_cleanup_identity_failure_are_both_reported(self) -> None:
+        original_stop: Callable[[Any], None] = d.distv2.Run.stop
+
+        def stop(run: Any) -> None:
+            original_stop(run)
+            (self.bin / "blaze-fact-shim").write_text("changed during cleanup; never executed\n")
+            raise d.distv2.Failed("controlled owned-process cleanup failure")
+
+        with patch.object(d.distv2, "free_port", return_value=1), \
+                patch.object(d.distv2, "source_state", return_value=(self.source["commit"], self.source["tree"], b"")), \
+                patch.object(d.distv2.subprocess, "run", return_value=self.probe_reply()) as probe, \
+                patch.object(d.distv2.Run, "start_services", return_value=None), \
+                patch.object(d.distv2.Run, "build", return_value=(23, "controlled build failure")) as build, \
+                patch.object(d.distv2.Run, "stop", new=stop):
+            result = self.invoke()
+        probe.assert_called_once()
+        self.assertEqual(build.call_count, 1)
+        self.assertEqual(result["counts"], {"fail": 1, "error": 1})
+        detail = result["outcomes"][0]["detail"]
+        self.assertIn("controlled owned-process cleanup failure", detail)
+        self.assertIn("identity after dev cleanup", detail)
+        self.assertIn("build binaries differ", detail)
+
+    def test_the_registered_d11_resources_drive_both_profiles(self) -> None:
+        # The Rust ledger selftest owns input injection, dispatch and status judgement.
+        # Keep this side of the boundary on the registered row and the real adapter.
+        rows: dict[str, Any] = json.loads((d.ROOT / "docs/v2/plan/objectives.json").read_text())
+        row = next(it for it in rows["rows"] if it["id"] == "D11")
+        self.assertEqual(len(row["checks"]), 1)
+        check = row["checks"][0]
+        self.assertEqual(check["script"], "harness/v2/distributed.py")
+        self.assertEqual(check["command"], "")
+        self.assertEqual(check["takes"], ["blaze", "out"])
+        work = self.root / "ledger-work"
+        work.mkdir()
+        out = work / "D11-0.json"
+        given = d.parse(d.Input, json.dumps({**check["input"], "blaze": self.given.blaze, "out": str(out)}), d.SCRIPT)
+        with patch.object(d.distv2, "main", return_value=None) as acceptance:
+            result = self.invoke(given, code=0)
+        self.assertEqual((given.cores, given.daemon_memory_gb), (2, 6))
+        self.assertEqual(acceptance.call_count, 2)
+        self.assertEqual(result["counts"], {"pass": 2})
+        for call in acceptance.call_args_list:
+            profile = call.args[0]
+            self.assertEqual(profile.blaze, given.blaze)
+            self.assertEqual(profile.module_builder, str(self.bin / "proc_macro_modules"))
+            self.assertEqual((profile.cores, profile.daemon_memory_gb), (2, 6))
+
+
+if __name__ == "__main__":
+    unittest.main()

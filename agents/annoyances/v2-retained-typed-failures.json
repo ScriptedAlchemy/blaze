@@ -1,0 +1,19 @@
+{
+  "id": "v2-retained-typed-failures",
+  "date": "2026-11-21",
+  "who": "GPT-6 Astra Pro, repair-ratchets lane",
+  "where": "retained distributed libraries, source ownership helpers and the harness UI error boundaries",
+  "what": "The imported untyped-error ratchet refused 12 crate/column groups. Native pack validation, compiler callbacks and service startup had flattened distinct failures into String or anyhow, and new source/metadata/UI helpers repeated that contract.",
+  "cost": "CI could not accept the retained V2 libraries; callers could only classify several data-integrity and startup failures by parsing their rendered messages.",
+  "cause": "The public interfaces described presentation text rather than the operation's failure data, so each implementation discarded the original cause before its caller could inspect it.",
+  "whys": [
+    "The gate found untyped errors in newly retained APIs.",
+    "The APIs required rendered strings or a fully erased error.",
+    "Compiler callback trait signatures forced every implementation to erase its own error type.",
+    "Neither the type boundary nor the earlier branch's checks required a matchable refusal with its input context."
+  ],
+  "class": "error interfaces erase failure identity before the reporting boundary",
+  "prevention": "Compiler callbacks require an associated std::error::Error type and retain trait-object support. Pack, manifest, publication, admission, metadata and UI refusals carry typed causes and their digest, location, address or path. Existing strict untyped-error checks remain enabled; no allowance was raised.",
+  "fix": "Implemented the typed interfaces and all callers. Existing refusal tests now match variants; new controls exercise manifest parsing causes and a real occupied listening address. Existing driver and grant controls explicitly pass typed-error trait objects. The full native library and all-target compile checks are requested from the main lane.",
+  "state": "Native run 44982739668 at 47ef316 passed the strict untyped-error gate with every crate at its exact existing row. All 119 distributed library tests passed, including the two new typed-refusal controls. All 47 memo integration tests, three shared-source compiler cache-key controls and three standalone browser-origin tests passed. The expanded all-target compile exposed an unrelated missing Ack import in the Unix integration test; that import is repaired for the next run. Full desktop and parked-compiler compilation remains unestablished."
+}

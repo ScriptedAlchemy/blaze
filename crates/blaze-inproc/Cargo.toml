@@ -1,0 +1,32 @@
+[package]
+name = "blaze-inproc"
+description = "blaze v2's dev runs patched with one store: the executable its build placed started by the kernel, its code laid over before main by a code memory mapped writable in the daemon and executable in the run, fences for running threads, and the channel between them"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-inproc-rt.workspace = true
+blaze-mem.workspace = true
+# The one channel (`blaze_core::chan`); a test sleeps mid-write through `blaze_core::wait`.
+blaze-core.workspace = true
+
+[dev-dependencies]
+blaze-ids.workspace = true
+blaze-inproc-rt = { workspace = true, features = ["testing"] }
+blaze-spin.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+blaze-sys.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

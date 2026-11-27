@@ -14,15 +14,18 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-anyhow.workspace = true
-rustc-hash.workspace = true
-cargo-platform = "0.3.3"
-im-rc = "15.1.0"
-semver.workspace = true
+blaze-own.workspace = true
+blaze-toml.workspace = true
+blaze-semver.workspace = true
+blaze-core.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-source.workspace = true
+imbl.workspace = true
 serde = { workspace = true, features = ["derive"] }
-toml.workspace = true
-tracing.workspace = true
-unicode-ident.workspace = true
+stdx.workspace = true
+blaze-trace.workspace = true
+blaze-unicode.workspace = true
 url.workspace = true
 
 [dev-dependencies]

@@ -1,0 +1,3 @@
+type: LocalPolicy
+cbor: 8201f6
+digest: ad46d3d82f8a02b0101fbddd59edb5d3e0b7f0b25c841fda613a58df094d0f98

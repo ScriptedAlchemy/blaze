@@ -1,0 +1,30 @@
+[package]
+name = "blaze-units"
+description = "Typed quantities (D184): authored lengths as whole nanometres and angles as whole micro-arcseconds, so one value has one key however it was computed; areas, volumes, masses and densities in f64 base units; integer telemetry (`Nanos<Wall>`, `Bytes<Resident>`, `Count<K>`) with named checked or saturating arithmetic and no operation across kinds; printing for people in one place; `no_std`, no `alloc`"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Show`, `Put` and `Writes`: the one place quantities are printed for people, and its
+# `duration` and `byte_count` for the telemetry kinds.
+blaze-text.workspace = true
+# The plant seam of the rounding controls (`Plants`, `Planted`, `NoPlant`).
+blaze-own.workspace = true
+
+[dev-dependencies]
+# Properties: algebra identities on drawn values, round trips through every unit, printing;
+# with a planted-bug control.
+blaze-sim.workspace = true
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+# io_uring charges every zero-copy send's requested pages to RLIMIT_MEMLOCK until
+# its notification completes. A partial send can be submitted again while earlier
+# notifications still hold their charges. The native driver tests need the same
+# locked-memory prerequisite as the released daemon, including when Cargo builds
+# them without running the blaze installation action.
+name: locked memory
+description: the established io_uring locked-memory limit, inherited by later Linux steps
+runs:
+  using: composite
+  steps:
+    # Each later step's shell is a child of Runner.Worker, so raise that process's
+    # limit, not this shell's. Record the prior limit and the running kernel so a
+    # native ENOMEM has the actual host prerequisite in its evidence.
+    - name: locked memory
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        uname -sr
+        worker=$(pgrep -o -f Runner.Worker) || { echo "::error::locked memory: no Runner.Worker process to raise RLIMIT_MEMLOCK of"; exit 1; }
+        prlimit --pid "$worker" --memlock
+        sudo prlimit --pid "$worker" --memlock=unlimited:unlimited
+        prlimit --pid "$worker" --memlock
+    - name: locked memory is raised
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        prlimit --pid "$$" --memlock
+        [ "$(ulimit -l)" = unlimited ] || { echo "::error::locked memory: RLIMIT_MEMLOCK is $(ulimit -l) KiB in a step after it was raised"; exit 1; }

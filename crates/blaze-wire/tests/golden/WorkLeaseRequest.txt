@@ -1,0 +1,3 @@
+type: WorkLeaseRequest
+cbor: a2001b000001579f4d51c0011a30ccd826
+digest: 9d6f39b7d708e0591ab17def6ac27bab925dacf300c1fd1d9c8f119615d456bf

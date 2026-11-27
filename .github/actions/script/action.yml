@@ -1,0 +1,47 @@
+name: script
+description: the repository scripts built with the pinned Cargo toolchain and a complete source key
+inputs:
+  job:
+    description: the job requesting the source-keyed scripts
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: "1.4.5"
+    - id: key
+      shell: bash
+      run: |
+        key=$("$GITHUB_ACTION_PATH/key.sh")
+        echo "key=$key" >> "$GITHUB_OUTPUT"
+        echo "dir=$RUNNER_TEMP/blaze-scripts" >> "$GITHUB_OUTPUT"
+    - id: restore
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
+    - if: steps.restore.outputs.cache-hit == 'true'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/check.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'
+    # key.sh already required the full checkout: source closure is part of the cache identity.
+    # A miss installs the pinned Rust toolchain unless a step before installed it.
+    - id: need
+      if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        tc=$(cat pins/toolchain)
+        echo "install=$(cargo +"$tc" --version >/dev/null 2>&1 && echo false || echo true)" >> "$GITHUB_OUTPUT"
+    - if: steps.need.outputs.install == 'true'
+      uses: ./.github/actions/toolchain
+    - name: build missing scripts
+      if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/build.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'
+    - if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
+    - shell: bash
+      run: echo "BLAZE_SCRIPTS=${{ steps.key.outputs.dir }}" >> "$GITHUB_ENV"

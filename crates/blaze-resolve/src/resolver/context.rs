@@ -4,12 +4,13 @@ use super::errors::ActivateResult;
 use super::types::{ActivationsKey, ConflictMap, ConflictReason, FeaturesSet, ResolveOpts};
 use crate::graph::Graph;
 use crate::interning::InternedString;
-use crate::resolver::HashMap;
-use crate::resolver::HashSet;
+use crate::persistent;
+use crate::resolver::{FixedState, Map, Set};
 use crate::{Dependency, PackageId, Registry, Summary};
-use anyhow::format_err;
+use std::alloc::Global;
 use std::collections::BTreeSet;
-use tracing::debug;
+use blaze_own::Share;
+use blaze_trace::debug;
 
 // A `Context` is basically a bunch of local resolution information which is
 // kept around for all `BacktrackFrame` instances. As a result, this runs the
@@ -20,13 +21,13 @@ pub(super) struct ResolverContext {
     pub age: ContextAge,
     pub activations: Activations,
     /// list the features that are activated for each package
-    pub resolve_features: im_rc::HashMap<PackageId, FeaturesSet, rustc_hash::FxBuildHasher>,
+    pub resolve_features: persistent::HashMap<PackageId, FeaturesSet, blaze_hash::FixedState>,
     /// get the package that will be linking to a native library by its links attribute
-    pub links: im_rc::HashMap<InternedString, PackageId, rustc_hash::FxBuildHasher>,
+    pub links: persistent::HashMap<InternedString, PackageId, blaze_hash::FixedState>,
 
     /// a way to look up for a package in activations what packages required it
     /// and all of the exact deps that it fulfilled.
-    pub parents: Graph<PackageId, im_rc::HashSet<Dependency, rustc_hash::FxBuildHasher>>,
+    pub parents: Graph<PackageId, persistent::HashSet<Dependency, blaze_hash::FixedState>>,
 }
 
 /// When backtracking it can be useful to know how far back to go.
@@ -41,16 +42,16 @@ pub(super) type ContextAge = usize;
 /// semver compatible version of each crate.
 /// This all so stores the `ContextAge`.
 pub(super) type Activations =
-    im_rc::HashMap<ActivationsKey, (Summary, ContextAge), rustc_hash::FxBuildHasher>;
+    persistent::HashMap<ActivationsKey, (Summary, ContextAge), blaze_hash::FixedState>;
 
 impl ResolverContext {
     pub(super) fn new() -> ResolverContext {
         ResolverContext {
             age: 0,
-            resolve_features: im_rc::HashMap::default(),
-            links: im_rc::HashMap::default(),
+            resolve_features: persistent::HashMap::default(),
+            links: persistent::HashMap::default(),
             parents: Graph::new(),
-            activations: im_rc::HashMap::default(),
+            activations: persistent::HashMap::default(),
         }
     }
 
@@ -70,26 +71,20 @@ impl ResolverContext {
         let id = summary.package_id();
         let age: ContextAge = self.age;
         match self.activations.entry(id.as_activations_key()) {
-            im_rc::hashmap::Entry::Occupied(o) => {
+            persistent::Entry::Occupied(o) => {
                 debug_assert_eq!(
                     &o.get().0,
                     summary,
                     "cargo does not allow two semver compatible versions"
                 );
             }
-            im_rc::hashmap::Entry::Vacant(v) => {
+            persistent::Entry::Vacant(v) => {
                 if let Some(link) = summary.links()
                     && self.links.insert(link, id).is_some()
                 {
-                    return Err(format_err!(
-                        "Attempting to resolve a dependency with more than \
-                             one crate with links={}.\nThis will not build as \
-                             is. Consider rebuilding the .lock file.",
-                        &*link
-                    )
-                    .into());
+                    return Err(crate::ResolveError::LinksTwice { links: link }.into());
                 }
-                v.insert((summary.clone(), age));
+                v.insert((summary.share(), age));
 
                 // If we've got a parent dependency which activated us, *and*
                 // the dependency has a different source id listed than the
@@ -110,7 +105,7 @@ impl ResolverContext {
                     && dep.source_id() != id.source_id()
                 {
                     let key = ActivationsKey::new(id.name(), id.version().into(), dep.source_id());
-                    let prev = self.activations.insert(key, (summary.clone(), age));
+                    let prev = self.activations.insert(key, (summary.share(), age));
                     if let Some((previous_summary, _)) = prev {
                         return Err((previous_summary.package_id(), ConflictReason::Semver).into());
                     }
@@ -169,15 +164,15 @@ impl ResolverContext {
     pub(super) fn resolve_replacements(
         &self,
         registry: &RegistryQueryer<'_, impl Registry>,
-    ) -> HashMap<PackageId, PackageId> {
+    ) -> Map<PackageId, PackageId, FixedState, Global> {
         self.activations
             .values()
             .filter_map(|(s, _)| registry.used_replacement_for(s.package_id()))
             .collect()
     }
 
-    pub(super) fn graph(&self) -> Graph<PackageId, HashSet<Dependency>> {
-        let mut graph: Graph<PackageId, HashSet<Dependency>> = Graph::new();
+    pub(super) fn graph(&self) -> Graph<PackageId, Set<Dependency, FixedState, Global>> {
+        let mut graph: Graph<PackageId, Set<Dependency, FixedState, Global>> = Graph::new();
         self.activations.values().for_each(|(r, _)| graph.add(r.package_id()));
         for i in self.parents.iter() {
             graph.add(*i);

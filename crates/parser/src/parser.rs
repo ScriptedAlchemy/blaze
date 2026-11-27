@@ -1,0 +1,744 @@
+//! See [`Parser`].
+
+use std::borrow::Cow;
+
+use crate::{
+    Edition,
+    SyntaxKind::{self, EOF, ERROR},
+    T, TokenSet,
+    event::Events,
+    input::Tokens,
+    sink::{EventSink, Sink},
+};
+
+/// `Parser` struct provides the low-level API for
+/// navigating through the stream of tokens and
+/// constructing the parse tree. The actual parsing
+/// happens in the [`grammar`](super::grammar) module.
+///
+/// What it makes is not a real tree: each step (a node opened, a token taken, a node
+/// finished as a kind) goes to its [`Sink`], `S`. With the [`EventSink`] that is a flat stream
+/// of events of the form "start expression, consume number literal, finish expression"; see
+/// `Event` docs for more.
+pub(crate) struct Parser<'t, S: Sink = EventSink> {
+    /// The tokens, an [`crate::Input`]'s or a token tree's words where they lie.
+    inp: Tokens<'t>,
+    pos: usize,
+    /// Where every step of the parse goes.
+    sink: S,
+    /// Nodes started and errors made since the last token was consumed. A loop that consumes
+    /// nothing still starts a node or makes an error each turn (or asks to bump at `EOF`), so
+    /// counting those, and not every kind test, catches it.
+    steps: u32,
+    /// Whether `fn` bodies are skipped as lazy nodes ([`crate::outline`]).
+    outline: bool,
+    /// Which tokens are a `{` some `}` closes ([`Parser::curly_closes`]), made when first asked.
+    closed_curlies: Option<Vec<bool>>,
+    /// Whether a path type followed by the contextual `is` is a bare pattern type `T is PAT`
+    /// (`#![blaze::pattern_types]`, docs/v2/plan/design/edition.md, section 8). True for a
+    /// whole file or expansion, where `T is` was never valid; false for a macro fragment
+    /// (`$t:ty`), so a `macro_rules!` matcher takes exactly the tokens it took before.
+    bare_pattern_types: bool,
+    /// Whether a type here may be an error union `A | B` (`#![blaze::error_unions]`): whether
+    /// some token of the input has the extension, off while a type is read where Rust lets a
+    /// `|` follow one (a closure's parameters, after `as`) and inside one union's members
+    /// ([`Parser::with_unions`]). The `|` itself must have it ([`Parser::union_bar_gate`]).
+    unions: bool,
+    /// Whether the type being read is the base of a `builtin#pattern_type(T is PAT)`
+    /// (`core::pattern_type!`), outside any delimiter within it: there the `is` after a path is
+    /// the builtin's own, never a bare pattern type's, so `u8 is 1..` and `*const T is !null`
+    /// are read as rustc reads them ([`Parser::with_pattern_base`]).
+    pattern_base: bool,
+    /// Whether an `IDENT_PAT` or `WILDCARD_PAT` may carry a union member type ascription
+    /// (`Err(e: FsError)`, `Err(_: Stopped)`, `match e { x: FsError => .. }` under
+    /// `#![blaze::error_unions]`). Enabled inside `match` arms and nested pattern delimiters
+    /// (tuples, tuple structs, slices, parens); false at top-level `let`, `fn`, and closure
+    /// parameter bindings where `:` belongs to the surrounding item.
+    typed_pats: bool,
+}
+
+const PARSER_STEP_LIMIT: usize = if cfg!(debug_assertions) { 150_000 } else { 15_000_000 };
+
+impl<'t> Parser<'t> {
+    pub(super) fn new(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
+        let inp = inp.into();
+        Parser::with_sink(inp, false, EventSink::for_tokens(inp.len()))
+    }
+
+    /// A parser for a macro fragment: a bare `T is PAT` is not taken as a type
+    /// ([`Parser::bare_pattern_types`]).
+    pub(super) fn new_fragment(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
+        Parser { bare_pattern_types: false, ..Parser::new(inp) }
+    }
+
+    pub(super) fn new_outline(inp: impl Into<Tokens<'t>>) -> Parser<'t> {
+        Parser { outline: true, ..Parser::new(inp) }
+    }
+
+    pub(crate) fn finish(self) -> (blaze_mem::scratch::Lent<Events>, Vec<Cow<'static, str>>) {
+        (self.sink.events, self.sink.errors)
+    }
+}
+
+impl<'t, S: Sink> Parser<'t, S> {
+    /// A parser of `inp` whose steps go to `sink`; `outline` is whether `fn` bodies are
+    /// skipped as lazy nodes ([`crate::outline`]).
+    pub(super) fn with_sink(inp: Tokens<'t>, outline: bool, sink: S) -> Parser<'t, S> {
+        Parser {
+            inp,
+            pos: 0,
+            sink,
+            steps: 0,
+            outline,
+            closed_curlies: None,
+            bare_pattern_types: true,
+            unions: inp.any_extensions().error_unions(),
+            pattern_base: false,
+            typed_pats: false,
+        }
+    }
+
+    /// The parse done: its sink.
+    pub(super) fn into_sink(self) -> S {
+        self.sink
+    }
+
+    /// The index of the next token, as a [`Sink`] is told it.
+    #[inline]
+    fn at_token(&self) -> u32 {
+        self.pos as u32
+    }
+
+    /// Whether a bare `T is PAT` is a type here (`#![blaze::pattern_types]`).
+    pub(crate) fn bare_pattern_types(&self) -> bool {
+        self.bare_pattern_types && !self.pattern_base
+    }
+
+    /// Runs `parse` on the base type of a `builtin#pattern_type(T is PAT)`: until a delimiter
+    /// opens ([`Parser::with_unions`] with `true`), the `is` after a path type is left for the
+    /// builtin.
+    pub(crate) fn with_pattern_base(&mut self, parse: impl FnOnce(&mut Parser<'t, S>)) {
+        let before = std::mem::replace(&mut self.pattern_base, true);
+        parse(self);
+        self.pattern_base = before;
+    }
+
+    /// Whether a type parsed here may be an error union `A | B`.
+    pub(crate) fn unions(&self) -> bool {
+        self.unions
+    }
+
+    /// Whether the current token, the `|` after a type, is of a crate that says
+    /// `#![blaze::error_unions]`: only then does it go on with an error union. A `|` another
+    /// crate wrote (a macro's own, expanded here) ends the type, as in Rust.
+    pub(crate) fn union_bar_gate(&self) -> bool {
+        self.inp.extensions_at(self.pos).error_unions()
+    }
+
+    /// Whether the current token, a `{`, is of a crate that says `#![blaze::records]`: only then
+    /// does the grammar read it as a record type, value or pattern
+    /// (docs/v2/plan/design/records.md). A `{` another crate wrote (a macro's own, expanded
+    /// here) is Rust's.
+    pub(crate) fn records_gate(&self) -> bool {
+        self.inp.extensions_at(self.pos).records()
+    }
+
+    /// Whether a typed binding pattern (`e: FsError`, `_: Stopped`) is permitted here under
+    /// `#![blaze::error_unions]`.
+    pub(crate) fn typed_pat_gate(&self) -> bool {
+        self.typed_pats && self.inp.extensions_at(self.pos).error_unions()
+    }
+
+    /// Runs `parse` with typed binding patterns allowed or disallowed, then restores the prior
+    /// setting.
+    pub(crate) fn with_typed_pats(&mut self, allowed: bool, parse: impl FnOnce(&mut Parser<'t, S>)) {
+        let before = core::mem::replace(&mut self.typed_pats, allowed);
+        parse(self);
+        self.typed_pats = before;
+    }
+
+    /// Runs `parse` with error unions allowed (`true`, inside a delimiter: only when some
+    /// token of the input has the extension) or not (`false`), then puts back what was allowed
+    /// before. Inside a delimiter a type is also no longer the base of a
+    /// `builtin#pattern_type` ([`Parser::with_pattern_base`]): `Foo<E is E::A>` there is a bare
+    /// pattern type again.
+    pub(crate) fn with_unions(&mut self, allowed: bool, parse: impl FnOnce(&mut Parser<'t, S>)) {
+        let pattern_base = self.pattern_base && !allowed;
+        let pattern_base_before = std::mem::replace(&mut self.pattern_base, pattern_base);
+        let allowed = allowed && self.inp.any_extensions().error_unions();
+        let before = std::mem::replace(&mut self.unions, allowed);
+        parse(self);
+        self.unions = before;
+        self.pattern_base = pattern_base_before;
+    }
+
+    /// In an outline, the number of tokens of the `fn` body at the current `{` when it can be
+    /// left unparsed ([`crate::outline::lazy_block_len`]). A body the lexer made one
+    /// [`SyntaxKind::LAZY_BODY`] token ([`crate::LexedStr::new_outline`]; a `{` whose contextual
+    /// kind says so) has no tokens to parse: it is that one token, lazy in any parse.
+    pub(crate) fn lazy_body(&self) -> Option<u32> {
+        if self.inp.kind(self.pos) == T!['{']
+            && self.inp.contextual_kind(self.pos) == SyntaxKind::LAZY_BODY
+        {
+            return Some(1);
+        }
+        if !self.outline {
+            return None;
+        }
+        crate::outline::lazy_block_len(self.inp, self.pos)
+    }
+
+    /// Skips the next `n_input_tokens` tokens as one lazy node of `kind`.
+    pub(crate) fn bump_lazy(&mut self, kind: SyntaxKind, n_input_tokens: u32) {
+        let at = self.at_token();
+        self.pos += n_input_tokens as usize;
+        self.steps = 0;
+        self.sink.lazy(kind, n_input_tokens, at);
+    }
+
+    /// Runs `parse` with every body in it parsed, in an outline too.
+    pub(crate) fn in_full(&mut self, parse: impl FnOnce(&mut Parser<'t, S>)) {
+        let outline = std::mem::replace(&mut self.outline, false);
+        parse(self);
+        self.outline = outline;
+    }
+
+    /// Whether the sink has all it reads of this parse ([`Sink::satisfied`]).
+    #[inline]
+    pub(crate) fn satisfied(&self) -> bool {
+        self.sink.satisfied()
+    }
+
+    /// Returns the kind of the current token.
+    /// If parser has already reached the end of input,
+    /// the special `EOF` kind is returned.
+    pub(crate) fn current(&self) -> SyntaxKind {
+        self.nth(0)
+    }
+
+    /// Lookahead operation: returns the kind of the next nth
+    /// token.
+    pub(crate) fn nth(&self, n: usize) -> SyntaxKind {
+        assert!(n <= 3);
+        self.inp.kind(self.pos + n)
+    }
+
+    /// The index of the current token, for [`Parser::curly_closes`].
+    pub(crate) fn token_index(&self) -> usize {
+        self.pos
+    }
+
+    /// Whether a `}` closes the `{` at token `open` before the input ends, each `}` closing the
+    /// nearest `{` before it not yet closed, as rustc's token trees pair them.
+    pub(crate) fn curly_closes(&mut self, open: usize) -> bool {
+        let inp = self.inp;
+        let closed = self.closed_curlies.get_or_insert_with(|| {
+            let mut closed = vec![false; inp.len()]; // alloc: once a parse, an error path
+            let mut unclosed = Vec::new(); // alloc: once a parse, an error path
+            for at in 0..inp.len() {
+                match inp.kind(at) {
+                    // A whole body in one token ([`Parser::lazy_body`]): closed by itself.
+                    T!['{'] if inp.contextual_kind(at) == SyntaxKind::LAZY_BODY => {
+                        closed[at] = true
+                    }
+                    T!['{'] => unclosed.push(at),
+                    T!['}'] => {
+                        if let Some(it) = unclosed.pop() {
+                            closed[it] = true;
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            closed
+        });
+        closed.get(open).copied().unwrap_or(false)
+    }
+
+    /// Counts one step that consumed no token, and panics when there have been too many: the
+    /// grammar is in a loop that makes no progress.
+    #[inline]
+    fn step(&mut self) {
+        assert!((self.steps as usize) < PARSER_STEP_LIMIT, "the parser seems stuck");
+        self.steps += 1;
+    }
+
+    /// Whether the current token starts a fragment a macro transcribed, which goes on no
+    /// expression before it.
+    pub(crate) fn at_fragment_start(&self) -> bool {
+        self.inp.is_fragment_start(self.pos)
+    }
+
+    /// Checks if the current token is `kind`.
+    pub(crate) fn at(&self, kind: SyntaxKind) -> bool {
+        self.nth_at(0, kind)
+    }
+
+    pub(crate) fn nth_at(&self, n: usize, kind: SyntaxKind) -> bool {
+        match kind {
+            T![-=] => self.at_composite2(n, T![-], T![=]),
+            T![->] => self.at_composite2(n, T![-], T![>]),
+            T![::] => self.at_composite2(n, T![:], T![:]),
+            T![!=] => self.at_composite2(n, T![!], T![=]),
+            T![..] => self.at_composite2(n, T![.], T![.]),
+            T![*=] => self.at_composite2(n, T![*], T![=]),
+            T![/=] => self.at_composite2(n, T![/], T![=]),
+            T![&&] => self.at_composite2(n, T![&], T![&]),
+            T![&=] => self.at_composite2(n, T![&], T![=]),
+            T![%=] => self.at_composite2(n, T![%], T![=]),
+            T![^=] => self.at_composite2(n, T![^], T![=]),
+            T![+=] => self.at_composite2(n, T![+], T![=]),
+            T![<<] => self.at_composite2(n, T![<], T![<]),
+            T![<=] => self.at_composite2(n, T![<], T![=]),
+            T![==] => self.at_composite2(n, T![=], T![=]),
+            T![=>] => self.at_composite2(n, T![=], T![>]),
+            T![>=] => self.at_composite2(n, T![>], T![=]),
+            T![>>] => self.at_composite2(n, T![>], T![>]),
+            T![|=] => self.at_composite2(n, T![|], T![=]),
+            T![||] => self.at_composite2(n, T![|], T![|]),
+
+            T![...] => self.at_composite3(n, T![.], T![.], T![.]),
+            T![..=] => self.at_composite3(n, T![.], T![.], T![=]),
+            T![<<=] => self.at_composite3(n, T![<], T![<], T![=]),
+            T![>>=] => self.at_composite3(n, T![>], T![>], T![=]),
+
+            _ => self.inp.kind(self.pos + n) == kind,
+        }
+    }
+
+    /// Consume the next token if `kind` matches.
+    pub(crate) fn eat(&mut self, kind: SyntaxKind) -> bool {
+        if !self.at(kind) {
+            return false;
+        }
+        let n_raw_tokens = match kind {
+            T![-=]
+            | T![->]
+            | T![::]
+            | T![!=]
+            | T![..]
+            | T![*=]
+            | T![/=]
+            | T![&&]
+            | T![&=]
+            | T![%=]
+            | T![^=]
+            | T![+=]
+            | T![<<]
+            | T![<=]
+            | T![==]
+            | T![=>]
+            | T![>=]
+            | T![>>]
+            | T![|=]
+            | T![||] => 2,
+
+            T![...] | T![..=] | T![<<=] | T![>>=] => 3,
+            _ => 1,
+        };
+        self.do_bump(kind, n_raw_tokens);
+        true
+    }
+
+    pub(crate) fn eat_contextual_kw(&mut self, kind: SyntaxKind) -> bool {
+        if !self.at_contextual_kw(kind) {
+            return false;
+        }
+        self.bump_remap(kind);
+        true
+    }
+
+    /// This consumes the next token as an identifier, even if it is a strict keyword.
+    pub(crate) fn bump_remap_any_ident(&mut self) {
+        assert!(self.current().is_any_identifier());
+        self.bump_remap(T![ident]);
+    }
+
+    fn at_composite2(&self, n: usize, k1: SyntaxKind, k2: SyntaxKind) -> bool {
+        self.inp.kind(self.pos + n) == k1
+            && self.inp.kind(self.pos + n + 1) == k2
+            && self.inp.is_joint(self.pos + n)
+    }
+
+    fn at_composite3(&self, n: usize, k1: SyntaxKind, k2: SyntaxKind, k3: SyntaxKind) -> bool {
+        self.inp.kind(self.pos + n) == k1
+            && self.inp.kind(self.pos + n + 1) == k2
+            && self.inp.kind(self.pos + n + 2) == k3
+            && self.inp.is_joint(self.pos + n)
+            && self.inp.is_joint(self.pos + n + 1)
+    }
+
+    /// Checks if the current token is in `kinds`.
+    pub(crate) fn at_ts(&self, kinds: TokenSet) -> bool {
+        kinds.contains(self.current())
+    }
+
+    /// Checks if the current token is contextual keyword `kw`.
+    pub(crate) fn at_contextual_kw(&self, kw: SyntaxKind) -> bool {
+        self.inp.contextual_kind(self.pos) == kw
+    }
+
+    /// Checks if the nth token is contextual keyword `kw`.
+    pub(crate) fn nth_at_contextual_kw(&self, n: usize, kw: SyntaxKind) -> bool {
+        self.inp.contextual_kind(self.pos + n) == kw
+    }
+
+    /// Starts a new node in the syntax tree. All nodes and tokens
+    /// consumed between the `start` and the corresponding `Marker::complete`
+    /// belong to the same node.
+    pub(crate) fn start(&mut self) -> Marker {
+        self.step();
+        let at = self.at_token();
+        Marker::new(self.sink.start(at))
+    }
+
+    /// Starts a node that will be completed as `kind`, a list whose children are items,
+    /// variants or fields ([`Sink::start_list`]): never abandoned, never preceded.
+    pub(crate) fn start_list(&mut self, kind: SyntaxKind) -> Marker {
+        self.step();
+        let at = self.at_token();
+        Marker::new(self.sink.start_list(kind, at))
+    }
+
+    /// Consume the next token. Panics if the parser isn't currently at `kind`.
+    pub(crate) fn bump(&mut self, kind: SyntaxKind) {
+        assert!(self.eat(kind));
+    }
+
+    /// Advances the parser by one token
+    pub(crate) fn bump_any(&mut self) {
+        let kind = self.nth(0);
+        if kind == EOF {
+            self.step();
+            return;
+        }
+        self.do_bump(kind, 1);
+    }
+
+    /// Advances the parser by one token
+    pub(crate) fn split_float(&mut self, mut marker: Marker) -> (bool, Marker) {
+        assert!(self.at(SyntaxKind::FLOAT_NUMBER));
+        // `<something>.0.1`: a node is opened around `marker`'s, which ends inside the token;
+        // `<something>. 0. 1`: the return value makes the caller emulate a dot.
+        // The sink splits the token ([`Sink::split_float`]).
+        let ends_in_dot = !self.inp.is_joint(self.pos);
+        if !ends_in_dot {
+            // The node opened around `marker`'s is a step, as every started node is.
+            self.step();
+        }
+        marker.pos = self.sink.split_float(marker.pos, ends_in_dot, self.at_token());
+        self.pos += 1;
+        self.steps = 0;
+        (ends_in_dot, marker)
+    }
+
+    /// Advances the parser by one token, remapping its kind.
+    /// This is useful to create contextual keywords from
+    /// identifiers. For example, the lexer creates a `union`
+    /// *identifier* token, but the parser remaps it to the
+    /// `union` keyword, and keyword is what ends up in the
+    /// final tree.
+    pub(crate) fn bump_remap(&mut self, kind: SyntaxKind) {
+        if self.nth(0) == EOF {
+            // FIXME: panic!?
+            self.step();
+            return;
+        }
+        self.do_bump(kind, 1);
+    }
+
+    /// Emit error with the `message`
+    /// FIXME: this should be much more fancy and support
+    /// structured errors with spans and notes, like rustc
+    /// does.
+    ///
+    /// A failed [`Parser::expect`] and every path of [`Parser::err_recover`] come through
+    /// here, so each counts as a step.
+    /// A fixed message is kept borrowed; only a formatted one is an owned `String`.
+    pub(crate) fn error<T: Into<Cow<'static, str>>>(&mut self, message: T) {
+        self.step();
+        let at = self.at_token();
+        self.sink.error(message.into(), at);
+    }
+
+    /// Consume the next token if it is `kind` or emit an error
+    /// otherwise.
+    pub(crate) fn expect(&mut self, kind: SyntaxKind) -> bool {
+        if self.eat(kind) {
+            return true;
+        }
+        self.error(format!("expected {kind:?}")); // alloc: a syntax error, an error path
+        false
+    }
+
+    /// Create an error node and consume the next token.
+    /// A `{` some `}` closes is taken with everything up to that `}`, each pair inside it in a
+    /// node of its own, so every pair of braces is the first and last child of one node.
+    pub(crate) fn err_and_bump(&mut self, message: &'static str) {
+        let m = self.start();
+        self.error(message);
+        if self.at(T!['{']) && self.curly_closes(self.pos) {
+            // Every `{` after a closed one is closed before it: a stack pairs them.
+            let mut inner = Vec::new(); // alloc: an error path, one marker a nested pair
+            self.bump_any();
+            loop {
+                match self.current() {
+                    T!['{'] => {
+                        inner.push(self.start());
+                        self.bump_any();
+                    }
+                    T!['}'] => {
+                        self.bump_any();
+                        match inner.pop() {
+                            Some(pair) => {
+                                pair.complete(self, ERROR);
+                            }
+                            None => break,
+                        }
+                    }
+                    _ => self.bump_any(),
+                }
+            }
+        } else {
+            self.bump_any();
+        }
+        m.complete(self, ERROR);
+    }
+
+    /// Create an error node and consume the next token unless it is in the recovery set.
+    ///
+    /// Returns true if recovery kicked in.
+    pub(crate) fn err_recover(&mut self, message: &'static str, recovery: TokenSet) -> bool {
+        if matches!(self.current(), T!['{'] | T!['}']) {
+            self.error(message);
+            return true;
+        }
+
+        if self.at_ts(recovery) {
+            self.error(message);
+            return true;
+        }
+
+        let m = self.start();
+        self.error(message);
+        self.bump_any();
+        m.complete(self, ERROR);
+        false
+    }
+
+    fn do_bump(&mut self, kind: SyntaxKind, n_raw_tokens: u8) {
+        self.pos += n_raw_tokens as usize;
+        debug_assert!(self.pos <= self.inp.len(), "a bump past the end of the input");
+        self.steps = 0;
+        self.sink.token(kind, n_raw_tokens);
+    }
+
+    pub(crate) fn current_edition(&self) -> Edition {
+        self.inp.edition(self.pos)
+    }
+
+    /// Whether token `n` from here, a `uniq`, is of a crate that says `#![blaze::uniq]`
+    /// ([`crate::Extensions::uniq`]): only then does `grammar/uniq.rs` take it as a keyword.
+    /// Asked of the `uniq` itself, so one a macro of another crate wrote keeps that crate's
+    /// reading wherever it is expanded.
+    pub(crate) fn uniq_gate(&self, n: usize) -> bool {
+        self.inp.extensions_at(self.pos + n).uniq()
+    }
+}
+
+/// See [`Parser::start`].
+pub(crate) struct Marker {
+    pos: u32,
+    /// Completed, abandoned or taken by `extend_to` or `split_float`: dropping it is fine.
+    done: bool,
+}
+
+impl Drop for Marker {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.done && !std::thread::panicking() {
+            panic!("Marker must be either completed or abandoned");
+        }
+    }
+}
+
+impl Marker {
+    fn new(pos: u32) -> Marker {
+        Marker { pos, done: false }
+    }
+
+    /// Disarms the drop check and hands back the marker's event index so an iterative grammar
+    /// loop can store pending markers in a flat `u32` scratch stack.
+    pub(crate) fn into_raw(mut self) -> u32 {
+        self.done = true;
+        self.pos
+    }
+
+    /// Reconstructs a live [`Marker`] from an index returned by [`Marker::into_raw`].
+    pub(crate) fn from_raw(pos: u32) -> Marker {
+        Marker::new(pos)
+    }
+
+    /// Finishes the syntax tree node and assigns `kind` to it,
+    /// and mark the create a `CompletedMarker` for possible future
+    /// operation like `.precede()` to deal with forward_parent.
+    pub(crate) fn complete<S: Sink>(mut self, p: &mut Parser<'_, S>, kind: SyntaxKind) -> CompletedMarker {
+        self.done = true;
+        let at = p.at_token();
+        let done = p.sink.complete(self.pos, kind, at);
+        CompletedMarker::new(done.start, done.end, kind)
+    }
+
+    /// Abandons the syntax tree node. All its children
+    /// are attached to its parent instead.
+    pub(crate) fn abandon<S: Sink>(mut self, p: &mut Parser<'_, S>) {
+        self.done = true;
+        p.sink.abandon(self.pos, p.at_token());
+    }
+}
+
+pub(crate) struct CompletedMarker {
+    start_pos: u32,
+    end_pos: u32,
+    kind: SyntaxKind,
+}
+
+impl CompletedMarker {
+    fn new(start_pos: u32, end_pos: u32, kind: SyntaxKind) -> Self {
+        CompletedMarker { start_pos, end_pos, kind }
+    }
+
+    /// This method allows to create a new node which starts
+    /// *before* the current one. That is, parser could start
+    /// node `A`, then complete it, and then after parsing the
+    /// whole `A`, decide that it should have started some node
+    /// `B` before starting `A`. `precede` allows to do exactly
+    /// that. See also docs about
+    /// [`Event::Start::forward_parent`](crate::event::Event::Start::forward_parent).
+    ///
+    /// Given completed events `[START, FINISH]` and its corresponding
+    /// `CompletedMarker(pos: 0, _)`.
+    /// Append a new `START` events as `[START, FINISH, NEWSTART]`,
+    /// then mark `NEWSTART` as `START`'s parent with saving its relative
+    /// distance to `NEWSTART` into forward_parent(=2 in this case);
+    pub(crate) fn precede<S: Sink>(self, p: &mut Parser<'_, S>) -> Marker {
+        p.step();
+        let at = p.at_token();
+        Marker::new(p.sink.precede(self.start_pos, at))
+    }
+
+    /// Extends this completed marker *to the left* up to `m`.
+    pub(crate) fn extend_to<S: Sink>(mut self, p: &mut Parser<'_, S>, mut m: Marker) -> CompletedMarker {
+            m.done = true;
+            self.start_pos = p.sink.extend_to(self.start_pos, m.pos);
+            self
+        }
+
+    pub(crate) fn kind(&self) -> SyntaxKind {
+        self.kind
+    }
+
+    pub(crate) fn last_token<S: Sink>(&self, p: &Parser<'_, S>) -> Option<SyntaxKind> {
+        p.sink.last_token(self.end_pos, p.inp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Input;
+
+    fn input(kinds: &[SyntaxKind]) -> Input {
+        let mut input = Input::with_capacity(kinds.len());
+        for &kind in kinds {
+            input.push(kind, Edition::CURRENT);
+        }
+        input
+    }
+
+    #[test]
+    #[should_panic(expected = "Marker must be either completed or abandoned")]
+    fn a_marker_dropped_unfinished_panics() {
+        let input = input(&[T![;]]);
+        let mut p = Parser::new(&input);
+        let _m = p.start();
+    }
+
+    #[test]
+    fn a_finished_marker_drops_quietly() {
+        let input = input(&[T![;], T![;]]);
+        let mut p = Parser::new(&input);
+        let m = p.start();
+        p.bump(T![;]);
+        let done = m.complete(&mut p, ERROR);
+        p.start().abandon(&mut p);
+        let m = done.precede(&mut p);
+        let outer = p.start();
+        p.bump(T![;]);
+        outer.complete(&mut p, ERROR).extend_to(&mut p, m);
+        assert_eq!(p.finish().0.len(), 7);
+    }
+
+    #[test]
+    fn kind_tests_are_not_steps() {
+        let input = input(&[T![;]]);
+        let p = Parser::new(&input);
+        for _ in 0..=PARSER_STEP_LIMIT {
+            assert_eq!(p.current(), T![;]);
+            assert!(p.nth_at(1, EOF));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "the parser seems stuck")]
+    fn starting_nodes_without_consuming_a_token_is_stuck() {
+        let input = input(&[T![;]]);
+        let mut p = Parser::new(&input);
+        loop {
+            p.start().abandon(&mut p);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "the parser seems stuck")]
+    fn bumping_at_eof_is_stuck() {
+        let input = input(&[]);
+        let mut p = Parser::new(&input);
+        loop {
+            p.bump_any();
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "the parser seems stuck")]
+    fn failing_to_expect_is_stuck() {
+        let input = input(&[T![;]]);
+        let mut p = Parser::new(&input);
+        p.steps = PARSER_STEP_LIMIT as u32 - 1;
+        assert!(!p.expect(T![,]));
+        p.expect(T![,]);
+    }
+
+    #[test]
+    #[should_panic(expected = "the parser seems stuck")]
+    fn recovering_at_the_recovery_set_is_stuck() {
+        let input = input(&[T![;]]);
+        let mut p = Parser::new(&input);
+        p.steps = PARSER_STEP_LIMIT as u32 - 1;
+        assert!(p.err_recover("x", TokenSet::new(&[T![;]])));
+        p.err_recover("x", TokenSet::new(&[T![;]]));
+    }
+
+    #[test]
+    fn a_consumed_token_resets_the_count() {
+        let input = input(&[T![;], T![;]]);
+        let mut p = Parser::new(&input);
+        for _ in 0..2 {
+            for _ in 1..PARSER_STEP_LIMIT {
+                p.start().abandon(&mut p);
+            }
+            p.bump(T![;]);
+        }
+        assert_eq!(p.current(), EOF);
+    }
+}

@@ -1,0 +1,8 @@
+name: Linux ARM64 C toolchain
+description: Install the digest-pinned clang runtime and target headers for deferred C compilation.
+runs:
+  using: composite
+  steps:
+    - name: install the Linux ARM64 C compiler and headers
+      shell: bash
+      run: timeout -k 10 900 bash "$GITHUB_ACTION_PATH/install.sh" "$HOME/.blaze/v2/toolchain"

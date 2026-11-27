@@ -1,15 +1,19 @@
+---
+status: current
+summary: How to build, test and change blaze: AI use, where new code goes, rules for code, working in parallel, landing.
+---
 # Contributing
 
 ## AI use
 
 This code was written largely with AI assistance under human direction. The same is true
-of the harnesses, the reports under `docs/reports/` and these documents. The reports are
+of the harnesses, the reports under `fed1eb428d:docs/reports/` and these documents. The reports are
 written in the first person by the session that did the work; "I ran" in a report means
 that session ran it.
 
-What makes that workable is the testing method. Every change is judged by comparing ra-jit's
-output with rustc's on real programs, and a change that makes a harness differ does not
-land. If you contribute with AI assistance, the expectation is the same as without: you
+What makes that workable is the testing method. Every change is judged by real crates' own
+test suites passing under blaze and by tests that state their expected result, and a change
+that breaks one does not land. If you contribute with AI assistance, the expectation is the same as without: you
 understand the change, you ran the gate, and you say what you ran and what you did not.
 
 rust-analyzer has its own AI policy for contributions to rust-analyzer. It applies to what
@@ -17,163 +21,226 @@ you send them, including fixes you find here and want to upstream.
 
 ## Layout of the tree
 
-    crates/ra-jit/             the daemon, the cargo drop-in, the splice, the remote
-    crates/ra-jit/src/bin/     cargo-ra-jit
+The root holds only what a reader needs first or a tool requires there; everything else is
+one level down:
+
+    crates/                   blaze's crates, and the front end's (below)
+    library/                  the standard library blaze builds, upstream's sources with blaze's changes
+    vendor/                   third-party crates blaze patches or builds as dependencies
+    harness/                  the test harnesses and their fixtures
+    tools/                    what builds, releases and measures blaze: agents/ (the agent rules
+                              AGENTS.md is generated from), nix/ (the flake's unit graphs), pgo/
+                              (the pinned PGO profiles), bench/remote-cache/ (the cache gateway's
+                              measurements), remote-cache/ (the cache gateway Worker), typed-input/ (the Python
+                              workspace's shared helper), v2/ (the lanes' scripts and queue)
+    docs/                     these documents; docs/future/ the plans for work not started,
+                              fed1eb428d:docs/reports/ working reports, docs/v2/ the v2 plan and the lanes'
+                              requests
+    demo/                     small projects the harnesses build, and the live-reload demo
+    fuzz/                     the fuzz targets and their corpora (docs/fuzzing.md)
+    site/                     the website, and install.sh, the installer `curl | sh` and CI run
+    licenses/                 NOTICE and the license texts of code blaze includes
+    Cargo.toml, pyproject.toml, flake.nix
+                              the Rust, Python (uv) and Nix workspaces, each with its lock
+
+The crates to know first:
+
+    crates/blaze-engine/       the program `blaze`: what runs before blaze's cargo, and pinning
+    crates/blaze-cargo/        blaze's cargo: the client (`cli`), the daemon (`serve`), the sandbox
     crates/hir-ty-codegen/    the code generator: MIR to Cranelift IR, the producers
-    crates/ra-jit-store/      the disk store of compiled code, which knows nothing about Rust
-    crates/ra-jit-fuzz/       made-up and damaged inputs for the tests of what reads the store
+    crates/blaze-cas/        the content-addressed store of everything blaze keeps, which knows nothing about Rust
+    crates/blaze-fuzz/       made-up and damaged inputs for the tests of what reads the store
     crates/blaze-build-script/ build scripts run as cargo runs them, with no cargo (no-rustc.md, step I)
     crates/blaze-resolve/     cargo's resolver owned by blaze: the package model, Cargo.lock, versions, features
     crates/blaze-registry/    registries read and packages fetched as cargo does, with no cargo
-    crates/ra-jit-wasm/        experiment: the compiler running in a web page (not in the workspace)
-    harness/                  the test harnesses and their fixtures
-    demo/                     small projects the harnesses and the scoreboard build
-    docs/                     these documents
-    docs/reports/             working reports, one per piece of work, as written at the time
-    SECURITY.md               what to know before sharing a store, and how to report a problem
-    vendor/rust-analyzer/     rust-analyzer with ra-jit's changes, a git subtree
-    vendor/rust-analyzer/crates/hir-ty-borrowck/
-                              the borrow checker, a crate next to hir-ty (borrowck.md)
-    vendor/rust-analyzer/lib/rowan/
-                              rowan 0.17.0 with a flat kind of tree behind its cursor (flat-syntax.md)
-    vendor/rustc_abi/         rustc's layout crate, copied from the 1.99.0 tag, a git subtree
-    vendor/proc-macro-srv/    the 1.99.0 release's proc-macro server, built by ra-jit to load
-                              the proc-macro libraries ra-jit links (no-rustc.md, step J1)
-    vendor/subtree.py         moves vendor/ changes to the forks, and the forks and upstream into vendor/
+    .github/SECURITY.md       what to know before sharing a store, and how to report a problem
+    crates/hir-def/, hir-ty/, syntax/, parser/, ...
+                              the front end: crates derived from rust-analyzer (below)
+    crates/hir-ty-borrowck/   the borrow checker, a crate next to hir-ty (borrowck.md)
+    crates/syntax-tree/             rowan 0.17.0 with a flat kind of tree behind its cursor (flat-syntax.md)
+    crates/rustc_abi/         rustc's layout crate at the pinned nightly's commit
     vendor/source.rev         the commit of the old development branch this tree last took from
 
-`crates/hir-ty-codegen` is the code generator, a crate of its own over `hir-ty`'s MIR: what
-it uses of `hir-ty` is public there. Its root is `mod.rs`, the file it was compiled from when
-it was a module of `hir-ty`. Nothing in `vendor/` depends on anything in `crates/`, so the
-fork builds alone ([architecture-split.md](architecture-split.md)).
+`crates/blaze-emit` and `crates/blaze-build` form the code generator over `crates/blaze-body`
+and `crates/blaze-lir`. The front end's crates depend on none of blaze's machinery
+(the code generator, the store, the daemon).
 
 ## rust-analyzer
 
-`vendor/rust-analyzer` is a squashed git subtree of the `ra-jit` branch of
-[indexable-inc/rust-analyzer](https://github.com/indexable-inc/rust-analyzer). That branch is DioxusLabs' `rust-analyzer` branch of rustd (upstream at
-`dd5ed69d4b` with rustd's changes on top), merged with upstream rust-analyzer master, with
-the MIR passes that make rust-analyzer's MIR like rustc's on top
-([`docs/mir-passes.md`](https://github.com/indexable-inc/rust-analyzer/blob/ra-jit/docs/mir-passes.md)
-there). The fork stays the public home of those changes and the place upstream is merged
-in; ra-jit carries the files themselves, so a plain clone builds:
+The front end's crates in `crates/` (`hir-ty`, `hir-def`, `hir-expand`, `syntax`, `parser`,
+`base-db`, `syntax-tree` and the rest) started as a fork of rust-analyzer (DioxusLabs' rustd branch
+merged with upstream master at `0b21bd6596`, with the MIR passes that make its MIR like rustc's
+on top: [mir-passes.md](mir-passes.md)); until 2026-10-28 they were a subtree under vendor/.
+They are no longer synced with upstream or with a fork repository, and keep rust-analyzer's crate
+names. Edit them, build and test from the root, and commit like any other file. A plain clone
+builds:
 
-    git clone https://github.com/indexable-inc/blaze
-    cargo +1.99.0 build -p ra-jit --release
+    git clone https://github.com/indexable-inc/blaze && cd blaze
+    cargo +"$(cat pins/toolchain)" build -p blaze-engine --release   # cargo +nightly-2026-10-27
 
-`vendor/rustc_abi` is a subtree of [indexable-inc/rustc_abi](https://github.com/indexable-inc/rustc_abi)
-(`main`) the same way.
+That is stage 0, `blaze 0.0.0-dev`. The root `Cargo.toml` pins a release of blaze
+(`[workspace.metadata.blaze] version`) for everyone who runs a released `blaze` here, and a
+build of the tree runs itself in any checkout of blaze's tree (told by
+`crates/blaze-engine/Cargo.toml` naming `blaze-engine`, not by path), whatever that pins, so
+stage 0 builds blaze with no flag:
 
-### Changing a rust-analyzer file
+    target/release/blaze build -p blaze-engine --release   # stage 1, built by blaze
 
-Edit the file in `vendor/rust-analyzer`, build and test from the root as usual, and commit
-in ra-jit like any other file: one commit can change MIR lowering and the code generator
-together. A branch that changes vendor/ merges into main like any other branch; there is
-nothing to port and no pointer to bump.
+That holds for a stage 0 built from another checkout or copy of the tree (a worktree, a VM's
+copy at another path, the wasm seed) too. Elsewhere, in a project that pins a release, a build
+of the tree runs that release, saying so on stderr; `blaze --ignore-pin <command>` runs the
+build itself ([cargo.md](cargo.md#pinning-a-release-of-blaze)).
 
-The fork follows main by itself: on every push to main that changes `vendor/`, the
-`fork sync` workflow runs
-
-    vendor/subtree.py push rust-analyzer
-    vendor/subtree.py push rustc_abi
-
-which makes one fork commit for each commit on main's first-parent line that changed the
-directory (its tree under `vendor/<name>`, its author, dates and message, and a line naming
-it) and pushes them to the fork's branch (`ra-jit` for rust-analyzer, `main` for
-rustc_abi). The same commit always makes the same fork commit, so running it by hand
-(`--dry-run` makes the commits and pushes nothing) and in CI agree. It only fast-forwards:
-it never force-pushes, and if the fork holds a change main does not have, it stops, pushes
-nothing and says so. That happens only if someone committed to the fork directly; bring it
-in with `pull` below, merge that into main, and the next push goes through. A fork pushed
-from a branch before its merge, or a main whose history was rewritten since the last push,
-is caught up with one commit that says what it brings, once it is checked that the fork has
-nothing main lacks. The `ra-jit` branch only moves forward; do not rebase or force-push it.
-
-`git subtree split` is not used: it cannot follow `vendor/rustc_abi` past the time it was a
-submodule, and it makes different commits from a branch than from main, so the fork stopped
-being a fast-forward of what main makes.
-
-### Taking a newer fork commit
-
-    vendor/subtree.py pull rust-analyzer
-    # git subtree pull --prefix vendor/rust-analyzer https://github.com/indexable-inc/rust-analyzer ra-jit --squash
-
-That is the whole bump: there is no second pin, and the flake builds from the same files.
-
-### Merging upstream rust-analyzer
-
-    vendor/subtree.py upstream rust-analyzer              # its newest weekly release tag
-    vendor/subtree.py upstream rust-analyzer 2026-10-26   # a tag, a branch (master) or a commit
-
-merges upstream's commit into `vendor/rust-analyzer` on the current branch, with a clean
-tree. The base is the newest upstream commit the fork's history already has (the fork's
-branch and every squashed merge on this branch), so the merge brings exactly upstream's
-changes since then, as merging upstream in the fork would. A clean merge is committed;
-otherwise the conflicts are left in `vendor/rust-analyzer` with the usual markers and
-`git status`, and `git add` and `git commit` finish it (or `git merge --abort`). The merge's
-second parent is a squashed commit of upstream's tree with `git subtree`'s
-`git-subtree-split` line; when main gets the merge, `push` makes upstream's commit a parent
-of the fork's commit, so the fork's history records the upstream merge too.
+`crates/rustc_abi` is rustc's `rustc_abi` at the pinned nightly's commit, patched in for
+crates.io's `ra-ap-rustc_abi`, the same way. The fork repositories
+(indexable-inc/rust-analyzer, indexable-inc/rustc_abi) are archived.
 
 ### Where new code goes
 
-New code that is the language's semantics goes in `vendor/rust-analyzer`: building MIR and
+New code that is the language's semantics goes in the front end's crates: building MIR and
 the passes over it, borrow checking, const evaluation, layout, and the hashes that say what a
-function's code is made from, as salsa queries. These are what rustc keeps in `rustc_middle`,
+function's code is made from, as queries on blaze's own engine (`blaze_query::db`, derived from salsa). These are what rustc keeps in `rustc_middle`,
 `rustc_mir_transform` and `rustc_borrowck`; rust-analyzer could take them, and a query lives
 with the database it reads. Where rust-analyzer's MIR differs from rustc's, the fix goes in
 the fork's lowering or in a pass of its runtime MIR queries, and the code generator relies on
 it: codegen does not compensate.
 
-Inside `vendor/rust-analyzer`, prefer a new crate under `crates/` (or, where the code needs
-private items of `hir-ty`, a new module file declared with one line) over edits spread through
-upstream's files. Every changed line of an upstream file is a line an upstream merge can
-conflict on; a new file conflicts with nothing. Fixes that are simply rust-analyzer bugs are
-the exception, and should be sent upstream, under their rules.
+There, a crate of its own is better than growing `hir-ty` or `hir-def`, which are already the
+longest builds in the workspace.
 
-ra-jit's machinery stays in `crates/`: the code generator's backends, object and debug-info
-writing, the splice, the daemon and its socket, the cargo drop-in, the store and the remote,
-tiers and sampling, the live runtime, and the harnesses. A change there is one ordinary
+A new crate allocates as little as it can and names every allocator from its first line
+(rule `bump-allocate`): it borrows or writes into the caller's buffer where that does, and a
+function that must allocate is handed the allocator (`Vec::new_in(frame)`,
+`Box::new_in(value, alloc)`, a `&Frame` or an `A: Allocator`). No comment keeps an implied
+allocator from `blaze::implicit_allocator`. The gate holds a new crate there: a crate with no row
+in `tools/ratchets/alloc-sites.txt` is held to no `// alloc:` line and no `expect`
+of the lint outside tests (and, once no `// alloc:` line is left anywhere, no line naming
+`Global`), and every other crate's row only shrinks
+(`scripts/src/bin/allocs.rs`).
+
+A function that can fail returns an error type of its module: an enum or struct naming what
+failed and the thing it failed on, with `Display` (rule `errors-name-the-thing`), never
+`Result<_, String>`, `&str`, `Box<dyn Error>` or `anyhow`, which the caller can't match on and
+which can't take an allocator. The gate holds this by crate, from the text, until blaze checks
+its own crates with `blaze::untyped_error`: each crate's signatures with such an error, and its
+type aliases of such a `Result`, equal its row in
+`tools/ratchets/untyped-errors.txt`, which only shrinks, and a crate with no row is
+held to none; a change over its row is refused with the new sites named
+(`scripts/src/bin/untyped.rs`).
+
+blaze depends on no third-party crate in the end: every crate depends only on crates of this
+workspace, and a new crate starts at none (`docs/v2/plan/design/bottom.md`, "Also decided on
+2026-11-15"). The gate holds the way there by crate: each workspace crate's third-party packages
+in its normal and build dependencies, in its dev-dependencies only, and in the closure they reach
+through the workspace's manifests and `Cargo.lock` equal its row in
+`tools/ratchets/third-party.txt`, which only shrinks, and a crate with no row is held to none. A
+fork under `vendor/` counts as third-party unless its manifest says
+`[package.metadata.blaze] ours = true`. A change over its row is refused with the new packages and
+the manifest lines they came in by (`scripts/src/bin/thirdparty.rs`); `docs/v2/plan/third-party.md`
+says what replaces each.
+
+blaze's own code uses no `std` and no `alloc` in the end: a crate is `#![no_std]` on `core`, takes
+its collections from blaze-own and blaze-hash, and is passed its allocator (the same decision; rule
+nothing-ambient). The gate holds the way there by crate, outside test code: the lines naming
+`std` and those naming `alloc` as a path's first segment, 1 when the crate's root lacks
+`#![no_std]`, and the lines naming a `std` or `alloc` collection (`Vec`, `Box`, `String`, `Rc`,
+`Arc`, the `BTree*`, `VecDeque`, `BinaryHeap`, `HashMap`, `HashSet`) written bare and not imported
+from blaze-own, blaze-mem or blaze-hash, or under `std::`/`alloc::`, equal its row in
+`tools/ratchets/std-alloc.txt`, which only shrinks; a crate with no row is held to 0 in every
+column. It reads the text, resolving no names: a rename, `vec!`, `format!` and a prelude use of
+`alloc` with no path are missed, and its usage lists the rest
+(`scripts/src/bin/ambient.rs`); blaze's lints are the definition once blaze checks its own crates.
+
+blaze's machinery stays out of the front end, in crates of its own: the code generator's backends, object and debug-info
+writing, the linker, the daemon and its socket, the cargo drop-in, the store and the remote,
+the sandbox, and the harnesses. A change there is one ordinary
 commit.
 
-New code never adds a path to rustc ([no-rustc.md](no-rustc.md)). ra-jit compiles
+New code never adds a path to rustc ([no-rustc.md](no-rustc.md)). blaze compiles
 everything itself, so a change does not start rustc, rustdoc or a cargo that compiles, does not
 read `RUSTC` or `RUSTDOC`, does not add a reason for a build to go to cargo or a kind of function
 to leave to rustc, and does not use rustc's rlibs, objects, symbols or link line for anything
-new. Where a feature needs what rustc does, the change builds that piece in ra-jit, or waits for
+new. Where a feature needs what rustc does, the change builds that piece in blaze, or waits for
 it. The paths that remain may be fixed where they are wrong, and are otherwise only removed.
-
-### Moving to a newer rust-analyzer
-
-1. On a branch, `vendor/subtree.py upstream rust-analyzer` and resolve the conflicts.
-2. Update `Cargo.toml` and `Cargo.lock` at the root for dependencies rust-analyzer changed.
-3. Build, and run the whole gate under both backends ([harness.md](harness.md)). A newer
-   rust-analyzer changes inference, MIR lowering and layout queries, any of which can
-   change generated code. The corpus with `--layouts`, `breakers.py` and
-   `fuzz/fuzz.py smoke` are the ones that notice first.
-4. Land it on `main` through the merge queue ([Landing a change](#landing-a-change)). The
-   `fork sync` workflow sends the merge to the fork.
-
-This was done once, on 2026-10-20, for upstream `0b21bd6596`. The merge was clean; the one
-API change ra-jit had to follow was `CrateData::is_proc_macro` becoming `target_kind` (a
-`base_db::TargetKind`). Step 3 has not been run on that merge yet.
 
 ### Where the history is
 
 `main` began as a tree generated from a development branch that was rust-analyzer's tree
-with ra-jit's changes made in place. That branch and its history are kept as
-`ra-jit-collate` and `ra-jit-spike`. `publish/split.py` there is what wrote this layout.
+with blaze's changes made in place. That branch and its history are kept as
+`blaze-collate` and `blaze-spike`. `publish/split.py` there is what wrote this layout.
 
-The toolchain is a separate pin. ra-jit is built for Rust 1.99.0 and `vendor/rustc_abi` is
-rustc's crate from that tag. Moving to another Rust version means taking the new
-`rustc_abi`, rechecking everything that mirrors rustc (the Rust ABI in the code generator,
-`vtable.rs`, `type_id.rs`, symbol names in `symbols.rs`), and running rustc's own test
-suites through `uitest.py` and `libsuite.py` again.
+## The toolchain
+
+blaze supports one toolchain, the latest nightly, pinned by date in `pins/toolchain`
+(`nightly-2026-10-27`, which says `rustc 1.101.0-nightly (16d1ffac1 2026-10-26)`). Stable
+Rust is not a separate target: what a stable release builds, the nightly builds. blaze
+itself is built with that nightly by blaze, which brings it (`blaze toolchain`): no rustup, and
+no `cargo` or `rustc` of it is run. The pin is written in that
+one file; everything else reads it or is written from it:
+
+- `pins/rust.txt` (by `harness/toolchain_pins.py '{"write": true}'`): the
+  sha256 and size of each file blaze downloads as its own toolchain, the nightly's `rustc -V`
+  line and its rust-lang/rust commit. A rustc is taken for the pinned one by that whole line,
+  since every nightly of a release has the same number.
+- What mirrors rustc, all from that commit: `crates/rustc_abi` (rustc's `compiler/rustc_abi`),
+  `crates/blaze-proc-macro` (blaze's proc-macro runner, which speaks the pinned
+  `library/proc_macro` bridge's protocol by hand and checks it at load), the answers to rustc's
+  questions (`pins/answers/rustc.json`), and the code written by hand to agree with rustc:
+  the Rust ABI in the code generator, `vtable.rs`, `type_id.rs`, symbol names (v0) in
+  `symbols.rs`, the intrinsics and lang items, the test harness's call into libtest.
+- Rust reads every pinned fact from `crates/blaze-pins` (constants parsed at compile time from
+  `pins/`, [pins/README.md](../pins/README.md)) and Python from `harness/toolchain_pins.py`; no
+  copy of a pinned value is kept anywhere else.
+- `site/install.sh` (which names `pins/toolchain` and lets blaze fetch it), the flake (`rust-bin.nightly.<date>`, for the dev shells and the
+  bench nightly alike) and `Cargo.toml`'s `rust-version`.
+
+### Moving to a newer nightly
+
+The daily workflow does this every day and opens the pull request
+([toolchain.md, "Moving the pin"](toolchain.md#moving-the-pin)); by hand it is for fixing what
+a nightly breaks, on the bump's branch `toolchain/bump`, or for trying a nightly:
+
+    uv run --frozen python harness/toolchain_bump.py '{}'                      # the newest nightly blaze can use
+    uv run --frozen python harness/toolchain_bump.py '{"date": "2026-11-02"}'  # or a given one
+
+picks the nightly (the newest of the last two weeks whose manifest has every component blaze
+needs on every host it ships for, or the date given), writes `pins/toolchain` and
+`pins.txt`, re-vendors `crates/rustc_abi` from rust-lang/rust at the new commit, merges that
+nightly's standard library into `library/` (`harness/library.py merge`: upstream's changes applied three-way, so blaze's own changes to it
+are kept; a conflict stops it and names the files), moves the pin where else it is written (`site/install.sh`, the
+server's version string, `Cargo.toml`, the flake's rust-overlay input) and
+installs the nightly with rustup. Each step names itself when it fails.
+
+What it leaves to a person, and prints at the end:
+
+1. `python3 harness/answers.py --write` on x86-64 Linux, AArch64 Linux and arm64 macOS, since
+   the target specs depend on the host rustc was built for; then
+   `uv run --frozen python tools/cpus.py '{"write": true}'` for the CPU table
+   (`crates/target-features/src/cpus/table.rs`); commit both.
+2. `blaze build -p blaze-engine --release`, fixing what the new `rustc_abi` and standard library
+   ask for, and mirroring by hand what changed in rustc: the Rust ABI, vtables, `TypeId`,
+   symbol names, new intrinsics and lang items. The move to `nightly-2026-10-25` needed
+   `rustc_abi`'s renamed layout calls, vectors of at most 128 bits passed in registers on
+   x86-64 and AArch64, Windows x64's rule for zero-sized types, the `f16b` and `ppcf128`
+   layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
+3. `uv run --frozen python harness/toolchain_bump.py checks '{"stage0": "/path/to/blaze"}'` in an
+   ix VM, with a blaze that builds the tree as stage 0, which has LLVM as every native blaze
+   does: the profile picks the backend, and the harnesses that cover LLVM build the release
+   profile. It builds blaze with that blaze (never cargo) and runs, in parallel,
+   `toolchain_pins.py` and the gate's quick parts.
+4. The full tier re-measured at the new commit: the train and the crates' own test suites.
+5. One commit for the bump, landed like any other change.
+
+A blaze built before the bump refuses the new nightly until it is rebuilt, since the two
+match by the whole version line.
 
 ## Rules for code
 
-1. **rustc is the reference.** If ra-jit's program behaves differently from rustc's, ra-jit
-   is wrong, even where rustc's behaviour looks like an accident. The harnesses run rustc to
-   compare with; ra-jit itself never does ([no-rustc.md](no-rustc.md)).
+1. **rustc is the reference.** If blaze's program behaves differently from rustc's, blaze
+   is wrong, even where rustc's behaviour looks like an accident. That is proven by real
+   crates' own test suites passing under blaze and by tests that state their expected result,
+   not by harnesses that run rustc to compare with (deleted on 2026-10-30); blaze itself never
+   runs rustc ([no-rustc.md](no-rustc.md)).
 2. **Never guess.** Input the code generator has no explicit lowering for is refused with a
    reason (`CodegenError`), not lowered on a best-effort basis. A refusal is visible and
    counted. A wrong guess is a miscompile nobody sees.
@@ -183,112 +250,274 @@ suites through `uitest.py` and `libsuite.py` again.
    a fix. Find what the case is an instance of.
 
 Style follows rust-analyzer's guide
-(`vendor/rust-analyzer/docs/book/src/contributing/style.md`): `cargo fmt`, no new
+([style.md](https://github.com/rust-lang/rust-analyzer/blob/master/docs/book/src/contributing/style.md)): `cargo fmt`, no new
 dependencies without a reason, small focused changes. Comments say what the code is for and
-why, not what was changed. Messages printed to the user say what happened and what ra-jit
+why, not what was changed. Messages printed to the user say what happened and what blaze
 did about it in one line.
+
+When a build is slow, reruns what it should reuse, holds too much memory or a cycle will not
+settle, find out from the profile, not by guessing: the `debugging` skill
+([.agents/skills/debugging/SKILL.md](../.agents/skills/debugging/SKILL.md)) says where its
+files are, what they hold, the DuckDB queries that answer each question and the method.
 
 ## What a change needs
 
-- A reduced case that fails before and passes after: a corpus function for a code
-  generator feature, a breaker for a bug found in real code, a step in the relevant edit
-  harness for a daemon bug. [harness.md](harness.md) says how to add each.
+- A test that fails before and passes after: the real crate's own tests for a bug found in
+  it, a unit test beside the code for one small enough to state, a step in the relevant edit
+  harness for a daemon bug ([harness.md](harness.md#adding-a-test)).
+- For concurrent, durable, crash-recovering, billing or data-deleting code: a deterministic
+  simulation test (`blaze_sim::check`) whose oracle checks the invariant, with a planted bug it
+  catches ([Tests](#tests)). A review does not stand in for it.
 - The gate, under Cranelift and under LLVM, on the platform you have. Say which platforms
-  you did not run. CI's fast tier covers Linux x86-64, Linux AArch64 and macOS on every
-  change; Windows and the slow harnesses run nightly ([harness.md](harness.md#ci)).
-- The LLVM backend builds in the flake's dev shell, against the LLVM it pins:
-  `nix develop -c cargo +1.99.0 build -p ra-jit --release --features llvm`
-  ([LLVM for `--features llvm`](#llvm-for---features-llvm)).
-- `cargo fmt --all -- --check` and
-  `cargo test --release -p hir-ty -p hir-def -p parser -p syntax -p ra-jit`.
+  you did not run. CI's merge gate is the build and the unit tests on Linux AArch64 (on ix runners), and
+  `blaze check --workspace` with the released blaze on Linux AArch64 and macOS, with astlog's
+  rules after it (`tools/astlog/README.md`), and the lint baselines held by the blaze the
+  change builds ([v2/plan/design/lint.md](v2/plan/design/lint.md)); every
+  harness on every platform, Windows too, and the slow ones (`norustc.py`, the store,
+  `blaze_cli.py` on real projects) run in the release train on
+  main after the merge, and a red train opens or adds to the issue "Release train is red",
+  with the commits since the last green one ([harness.md](harness.md#ci)). The gate letting a
+  change through is not the harnesses passing on it.
+- blaze builds blaze, never cargo or rustc: with the release `.github/blaze-version` names as
+  stage 0 (`sh site/install.sh --version "$(cat .github/blaze-version)"`, as
+  `.github/actions/blaze` installs it), `blaze build --release --locked -p blaze-engine`, against
+  the LLVM blaze pins and fetches itself ([LLVM](#llvm)).
+- `blaze fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
+  pull request's diff should be its change), and
+  `blaze test --release --locked -p blaze-engine -p hir-ty -p hir-def -p parser -p syntax` from the root (or
+  `python3 harness/unittests.py`, what CI runs: every test of the workspace, with the failures it expects).
+  A test that fails is new unless `harness/known-failures.toml` lists it:
+  `uv run --frozen harness/failures.py '{"run": {"packages": [...]}}'` runs the
+  crates you touched and says which failures are new ([harness.md](harness.md#ci)).
 - For anything that changes numbers in [results.md](results.md): the command, the commit
   and the machine, so the entry can be replaced and not just appended to.
 
 When you report what you did, separate what you ran from what you inferred. The reports
-under `docs/reports/` do this and it is the reason they can be used.
+under `fed1eb428d:docs/reports/` do this and it is the reason they can be used.
+
+### Checking a change fast
+
+Code is checked as it is written, a commit at a time, on the packages it touched. The
+workspace's build and check take an hour and, with the released blaze, more memory than most
+machines have; when that is the only loop, thousands of lines are written before anything
+compiles them, and the first error (2026-11-10: a shadowed binding, then a struct named like
+its crate) arrives an hour in, with the next one an hour after.
+
+`scripts/src/bin/changed.rs` names what a change touches: the packages its files are in and the
+packages that depend on them, each after what it needs, so the first error is the earliest
+cause.
+
+    blaze check $(blaze run -q -p scripts --bin changed -- '{"base": "origin/main", "print": "args"}') --lib --tests
+
+- The session that integrates agents' work (rule fan-out-write-only) runs that in the lane's
+  VM after each commit it takes, with `"base"` the commit before, in parallel with the build:
+  the check of a few packages does not wait for the build of all of them, and an error goes
+  back to the agent that wrote the code while it still has it in mind. `"dependents": false`
+  checks the touched packages alone, for a first answer; the dependents follow.
+- A change to a file every package's check reads (the root manifest, the lock file,
+  `.clippy.toml`, the pinned toolchain) is the workspace's: the script prints `--workspace`.
+- The gate's workspace check does the same first, so a pull request's first compile error
+  comes in minutes ([harness.md](harness.md#ci)).
+
+### Scripts that run commands
+
+A harness, a lane script or an agent's loop checks the exit status of every command it runs and
+stops at the first that fails, saying which; a command whose failure is expected says so where
+it is run (`|| true` with a comment, a `check=False` whose result is read on the next line). On
+2026-11-10 a script called `blaze daemon stop`, which is no command, for hours: the command line
+said so and exited 101, the script went on, and every measurement after it ran against the
+daemon it believed stopped. In a shell script that is `set -euo pipefail` on its first line; in
+Python, `subprocess.run(..., check=True)` or the harness's own `engine.run(..., check=True)`
+and `Ran.checked`. The command line now names the command meant (`blaze daemon stop`: did you
+mean `blaze stop`), which helps a person; a script is helped only by stopping.
+
+### Tests
+
+How blaze tests its own code is the `testing` skill
+([.agents/skills/testing/SKILL.md](../.agents/skills/testing/SKILL.md)), the one home for it:
+which tests to write and how few, property tests and simulations on blaze's own engine
+(`crates/blaze-sim`; never proptest, quickcheck, arbitrary or bolero), deterministic simulation
+tests on `blaze_core::sim::Sim` and their oracles, and testing a causal claim. Concurrent, durable,
+crash-recovering, billing and data-deleting code is proven by a deterministic simulation test,
+not by a code review (rule `dst-not-review`).
+
+An incremental-build bug gets a regression test ([harness.md](harness.md#adding-a-test)): a
+test in `crates/blaze-cli/tests/` or `crates/blaze-engine` with the project, the edit and what
+must be made again.
+
+## Documents
+
+Every doc under `docs/` opens with front matter saying what it is (`scripts/src/bin/docs.rs` has
+the fields): `current` (how blaze is now, kept true), `plan` (a design not fully built, dated),
+`record` (research, a report or a measurement, true on its date and never brought up to date) or
+`superseded` (with `superseded_by`, what replaced it). [docs/README.md](README.md) is the index,
+generated from it; superseded docs are left out. CI's `blaze run -q -p scripts --bin docs -- check` holds every
+doc's links, and a current doc's anchors, repository paths in backticks and `BLAZE_*` settings,
+against the tree, and every doc that code names. A change that makes a current doc
+untrue fixes it in the same change, or marks it superseded; `blaze run -q -p scripts --bin docs -- write`
+regenerates the index.
 
 ## Working in parallel
 
-Several lanes, people or agents, change ra-jit at once. A lane shares the Mac, `git`'s
-metadata and main with all the others, so:
+Several lanes, people or agents, change blaze at once. A lane shares `git`'s metadata and
+main with all the others, so:
 
-- **Heavy work runs on a dev host.** A release build of a branch, a harness sweep
-  (`cargo_ra_jit.py`, `buildmodel.py`, `keys.py`, the soak), a benchmark or anything longer
-  than a few minutes runs on an AWS dev host. Claim the host with a CLAIMED row in the host
-  ledger (`/Volumes/Projects/nix/scratch/memory/host-ledger.md`; hosts, ssh and the ledger's
-  rules are in the `fleet-ops` skill), work in a directory named for the lane, and add a
-  RELEASED row when done. Ask for a lease as long as the run (`dev-aws renew N <hours>`): an
-  expired lease stops the host mid-run.
-- **The Mac does quick checks only:** one harness, one unit test, `cargo check`, hot reload.
-  It is shared by every lane at once, and a lane that builds a full release there slows all
-  of them.
-- **One worktree per lane, named for it** (`ra-jit-<lane>-<date>`), with its own
-  `CARGO_TARGET_DIR` or a shared sccache. Two lanes building into one target directory wait on
-  each other's lock and overwrite each other's binaries.
+- **Work comes from the ledger.** A lane is one task: an objective of
+  [v2/plan/objectives.md](v2/plan/objectives.md), done when its check passes. How a session
+  picks, briefs, integrates and lands is [the plan's loop](v2/plan.md#how-the-work-is-run).
+- **Linux work runs on the one build VM, `blaze-vm`**, through its one queue
+  (`ix shell blaze-vm --noninteractive -- /root/loop.sh <branch> <command...>`; how-to `H12`
+  under `agents/howto/`); nobody makes a VM per lane, and nothing runs on AWS. The Mac is for
+  what only macOS can show, one build at a time. Where neither can do something, stop and say
+  what is missing (rule `work-in-ix-vms`).
+- **Every command has a timeout** sized to its expected time, and on expiry the status or
+  stall line (`blaze debug inspect`, `blaze slow`) is taken and quoted; a hang is a bug to
+  report, never waited out (rule `every-command-has-a-timeout`).
+- **Lanes write; the main agent compiles.** A lane writes in the one integration directory, in
+  new files or one area's files no other lane touches, with the edit tools or `ast-grep` and
+  never a heredoc, `sed` or a script (rule `edit-rust-by-syntax`), and runs nothing. At most
+  four lanes write in one tree at once; a rewrite gets a fresh core in new crates beside the old
+  code. The main agent compiles each piece within minutes of its report and admits it alone
+  onto the last green head; no new wave of lanes starts while the tree does not compile (rules
+  `fan-out-write-only`, `worktree-per-lane`, `agents-are-a-cost`). A worktree is the exception,
+  for two lanes that must change one file or a variant tree.
 - **Never `git stash`.** The stash is one stack for every worktree of the repository, so a pop
-  can take another lane's changes. Commit work in progress to the lane's branch.
+  can take another lane's changes.
 - **Run harnesses with `RUST_BACKTRACE=0`**, so a test that panics prints its message and
   not a backtrace into what the harness compares.
-- **Land small and often, through the merge queue** ([below](#landing-a-change)). A lane that
-  waits hours for one large merge meets every other lane's changes at once. For anything the
-  fast tier does not cover, run the full tier on the branch first
-  (`gh workflow run ra-jit.yaml --ref <branch> -f tier=full`).
-- **Clean up when done:** remove the worktree (`git worktree remove`), its target directory,
-  and the lane's directories on the dev host; delete the merged branch.
+- **Land small and often, through a pull request** ([below](#landing-a-change)), each merge
+  after the smoke run of its exact merge commit. For anything the fast tier does not cover, run
+  the release train on the branch first (`gh workflow run train.yaml --ref <branch>`:
+  everything, without the release).
+- **Clean up when done:** the lane's `/root/wt/<lane>/` and homes on `blaze-vm`, any blaze
+  process it left running, any worktree (`blaze clean` in it, then `git worktree remove`) and
+  the merged branch (rule `clean-up-lane`).
 
 ## Landing a change
 
-Main moves only through the merge queue: nobody pushes to it or merges into it by hand. Once the
-branch's work is committed and the local gate passed ([What a change needs](#what-a-change-needs)),
-run in the lane's worktree
+Main moves only through pull requests: nobody pushes to it or merges into it by hand. Nothing
+merges, by `land.py` or by an admin, until a release blaze built from the exact merge commit (the
+branch merged into the main it joins) has run the hello-world smoke on the Mac or build VM (a cold run, a
+no-op, a body edit and a comment edit, each under a timeout, each counted only with exit 0 and the
+program's own line, then `blaze check` and `blaze test` with one executed passing assertion) and the result is quoted in the pull request; a compile check is not evidence
+that the binary runs (rule `proof-before-merge`; the `landing` skill has the steps). To make the
+quote, merge origin/main into the branch, build the release `blaze-cli` and `blaze-launcher` of that commit in the same target directory and run
+`cargo +$(cat pins/toolchain) run --locked -q -p scripts --bin smoke -- '{"blaze": "<that blaze>", "work": "<an empty directory>"}' > smoke.txt`
+(`scripts/src/bin/smoke.rs`; it exits 0 only for `verdict ok`). The quote, the block in smoke.txt
+whose first line is `blaze-smoke 2`, goes in the pull request's body, and `land.py` puts it there
+from the file you give it. `land.py` refuses to open, resume or merge a pull request whose quote
+does not name its head's exact tree, clean, with verdict ok, or whose head no longer contains
+main; no flag skips this, and an admin merge needs the quote too. Once the branch's work is
+committed, the local gate passed ([What a change needs](#what-a-change-needs)) and the smoke run,
+run
 
-    python3 .github/scripts/land.py "what the branch does"
+    python3 .github/scripts/land.py '{"what": "what the branch does", "smoke": "smoke.txt"}'
 
-It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") and queues
-it. The queue merges it onto main and whatever is ahead of it, runs CI's fast tier on that
-(about ten minutes, [harness.md](harness.md#ci)) and merges it with a merge commit, as
-`git merge --no-ff` would. `land.py` waits for that and prints the commit, or says why the pull
-request left the queue; then fix the branch and run it again. The waiting runs in a process of
-its own that outlives `land.py`, its terminal and a tool that ends its process group, writing to
-`.git/land/pr-N.log` in the main checkout; `land.py --wait` (or `--wait N`) follows it again, as
-does running `land.py` again on the branch, so nobody polls GitHub by hand. A branch that conflicts with main
-gets `git merge origin/main` first. Once it has merged, GitHub deletes the branch on origin;
+It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") with the
+quote in its body, and starts the waiting that merges it. The pull request's own run is the merge gate, the build and the unit tests on
+Linux x86-64 and the released blaze's `blaze check --workspace` on Linux x86-64 and macOS, with
+astlog's rules after it, and the lint baselines ([harness.md](harness.md#ci)); a failure there ends `land.py`
+with the check's link. The gate also holds the budget smoke's guards with the blaze the change
+built ([harness.md](harness.md#ci)): what a warm no-op build, a comment edit and a
+body edit of two small fixtures may cost, and that blaze runs inside its build-script sandbox. A
+merge that goes around the gate goes around them: on 2026-11-10, with 4 of the last 300 gate
+runs green and merges going around it, every build had been lowering its program anew for days.
+A red gate is fixed or its failure is listed as known with its cause, never passed by. Once it
+passes, the waiting asks `smoke` again about the body's quote and the head GitHub has, and merges
+the branch with a merge commit pinned to that head, as `git merge --no-ff` would. The branch
+must contain main, since the quote is of the tree that becomes main: when main has moved past
+the head, the waiting refuses, and the branch gets `git merge origin/main`, a new build and a new
+smoke. There is no merge queue. `land.py` waits for the merge and prints the commit, or says why
+the pull request did not merge; then fix the branch and run it again. The waiting runs in a
+process of its own that outlives `land.py`, its terminal and a tool that ends its process group,
+writing to `.git/land/pr-N.log` in the main checkout; `land.py '{"follow": true}'` (or
+`'{"follow": N}'`) follows it again, as does running `land.py` again on the branch, so nobody
+polls GitHub by hand. Once it has merged, GitHub deletes the branch on origin;
 remove the worktree and the local branch
 (`git worktree remove <dir> && git branch -D <branch>`).
 
 ## The build that ships
 
-`cargo build --release` is the build to work with: the harnesses, the gate and CI use it, and
-it rebuilds quickly after a change. What users get is one other build: the `dist` profile
-(thin LTO) optimized with the PGO profile `pgo/profiles.json` pins, built by
-`.github/scripts/build_release.py`. The release workflow runs that script, and the flake's
-`dist` runs it inside its derivation with the same profile fetched by its sha256.
-`cargo install --profile dist` builds the same profile without PGO, from the release after 0.1.0.
-[reports/RELEASE-BUILD.md](reports/RELEASE-BUILD.md) has the numbers.
+`blaze build --release` is the build to work with: the harnesses, the gate and CI use it, and
+it rebuilds quickly after a change. What users get is one other build: the `dist` profile,
+built by the stage-0 blaze `.github/blaze-version` names. The release
+workflow and install.yaml build it; blaze builds blaze, never cargo or rustc. `dist`'s
+`lto = "thin"` and `codegen-units = 1` are what blaze's release codegen does anyway (one LLVM unit
+per function with ThinLTO's summaries and imports across the program, [v2-codegen.md](v2/plan/design/codegen.md)).
+reports/RELEASE-BUILD.md has the numbers of the older cargo build.
 
-The PGO profiles are trained by the `pgo` workflow, one per target on the runner its release
-is built on; it uploads them to the `pgo-profiles` release and commits their names and hashes
-to `pgo/profiles.json`. It runs by itself when Cargo.lock, a manifest or `harness/toolchain`
-changes on main: a profile finds each function by its symbol, which carries a hash of the
-whole graph of crates, so after such a change the old one finds almost nothing (the build
-warns, and a release refuses). A profile trained on older code of the same crates still
-applies to every function that has not changed since, and `build_release.py` ends by saying
-how many have: 24 after a one-line edit, about 1,600 for code 23 commits and 6,700 lines older
-(of the 187,000 functions a profile has). Run the workflow by hand when that count passes a
-few thousand and before a release after large changes to the daemon.
+PGO is off: releases build with `"pgo": "off"`. Neither PGO training nor pinned PGO profiles work yet: blaze refuses `-C profile-generate`, since its linker writes no profile sections (`crates/blaze-code`), and the profiles pinned earlier were cargo's.
 
-## LLVM for `--features llvm`
+## LLVM
 
-The LLVM backend builds against one LLVM, the 20.1.8 the flake pins (`flake.lock`), on macOS
-and on Linux alike, in the flake's dev shell:
+blaze builds against one LLVM, 23.1.4 with our fixes, built by blaze for each target it ships on
+and pinned by its commit, version and per-target sha256 in `pins/llvm.json`.
+Every native build of blaze links it (blaze-engine's default `native` feature, through
+hir-ty-codegen's `llvm`): std and every opt-level 2/3 unit are LLVM's, and `blaze-stencil`'s
+build script has it make the stencils. Only the seed (`--no-default-features --features seed`)
+has none. blaze fetches it itself: the root `Cargo.toml` declares it a pinned native input
+(`[workspace.metadata.blaze.native.llvm]`, [cargo.md](cargo.md#pinned-native-inputs)), so the
+first build downloads the archive `llvm.json` names for the target, checks its sha256, keeps it
+in blaze's store and unpacks it read-only under `~/.blaze/native/` (`BLAZE_HOME/native/`), and
+sets `LLVM_SYS_231_PREFIX` to it for llvm-sys's and blaze-stencil's build scripts. A plain
+build on a clean Mac or Linux machine needs no Nix and no variable:
 
-    nix develop -c cargo +1.99.0 build -p ra-jit --release --features llvm
+    blaze build -p blaze-engine --release
 
-CI builds it the same way (`.github/actions/toolchain`). Outside the shell the build stops and
-says to enter it: neither Homebrew's LLVM nor a distribution's is a source. A build without the
-feature needs no LLVM, and neither does what ships. A binary built with it loads `libLLVM`
-from the store by its path, so after a garbage collection `nix develop` brings it back. Windows,
-which has no Nix, gets LLVM's release of the same version in CI.
+The variable blaze sets wins over one your shell has (`nix develop` still sets it to the
+flake's `blaze-llvm`, the same bytes), so a build always links what the pin names. A stage 0
+older than the table (`.github/blaze-version` before this change) ignores it and still needs the
+variable, with the archive somewhere its sandbox lets llvm-sys search, below `/usr/local/lib`
+(`crates/blaze-build-script`), as CI's merge gate does
+(`.github/actions/blaze`):
+
+    sudo mkdir -p /usr/local/lib/blaze-llvm && sudo chown "$USER" /usr/local/lib/blaze-llvm
+    python3 .github/scripts/llvm.py '{"command": "fetch", "target": "<triple>", "dir": "/usr/local/lib/blaze-llvm/<triple>"}'
+    LLVM_SYS_231_PREFIX=/usr/local/lib/blaze-llvm/<triple> blaze build -p blaze-engine --release
+
+Every crate that uses LLVM (`hir-ty-codegen` through inkwell, `blaze-stencil`'s build script)
+links it through llvm-sys, whose build script checks the prefix before anything else
+(`vendor/llvm-sys/pin.rs`): its `blaze-llvm.json` must name the pinned commit and version and
+its `llvm-config --version` must say that version. `LLVM_SYS_231_PREFIX` unset, a stock LLVM
+(no `blaze-llvm.json`) or another build stops the build with one error naming what it found,
+the pin and the fix. Nothing else is searched: not `PATH`, Homebrew's LLVM, a distribution's or
+another `LLVM_SYS_*_PREFIX`. LLVM is linked in statically, and on Linux so
+is libstdc++, so a blaze binary needs no LLVM where it runs. inkwell's llvm-sys
+does the linking (vendored in `vendor/llvm-sys` for the static libstdc++; its SOURCE.md says why
+the libraries must come from a crate below inkwell for GNU ld). CI and Windows
+fetch the archive the same way (`.github/actions/toolchain`).
+
+The archives are built by the `llvm` workflow (`.github/workflows/llvm.yaml`, recipe
+`.github/scripts/llvm.py build`): our fork `indexable-inc/llvm` at the `ix/23.x` commit
+wasm-host's ix-aot pins (LLVM 23.1.4 and our fixes, so both run one LLVM), the X86 and AArch64 targets,
+no zlib, zstd, libxml2 or terminfo, on the release's runners (Ubuntu 22.04 for an old glibc,
+macOS 13 as the deployment target, the static CRT on Windows). For a target `llvm.json` has no
+archive for, run the workflow for it and add the `targets` entry its summary prints. To move the pin, change
+`ref`, `commit` and `version` in `llvm.json`, run the workflow, and write the `targets` its
+summary prints (`llvm.py` with `{"command": "pin", "root": DIR}`), then write the new LLVM's CPU aliases (`apple-m1` of `apple-a14`, which
+`-C target-cpu` takes and `rustc --print target-cpus` leaves out) with
+`uv run --frozen python tools/cpus.py '{"write": true, "fetch_llvm": true}'`, which writes
+crates/target-features/llvm_cpus.json and the CPU table (`target_features::cpus`) from it. LLVM's own release archives do not do: the macOS ones hold
+bitcode, and the Linux ones need zlib, zstd and libxml2.
+
+### The stencil pin
+
+The stencil pin file (`stencils.json` in the stencil generator crate, when enabled) pins the stencil libraries the way `llvm.json` pins LLVM:
+each library's file and its id, the BLAKE3 hash of its bytes with the id field zeroed.
+The build script checks every library it includes against the pin: it checks that
+the library hashes to the id in its header, and that this id is the pinned one:
+
+- A build with LLVM makes the libraries and writes their
+  pin beside them, as `stencils.json` in `OUT_DIR`. When that differs from the
+  tree's pin, the build stops and names each id.
+  If nothing the
+  generator reads changed, the output isn't deterministic, which is a bug (rule 25).
+- The seed profile (`blaze-engine --no-default-features --features seed`) has no LLVM. It
+  uses the prebuilt stencil libraries; no variable points
+  elsewhere. A library whose bytes aren't the pinned ones is refused, and the error names the
+  file, the pinned id and the file's own id.
+
+The code identity (`blaze-codegen-code`) is keyed by the pinned ids.
 
 ## Credit
 
@@ -307,5 +536,5 @@ from in the message too. When a squash or a merge rewrites commits, keep every t
 
 ## Licence
 
-ra-jit is MIT or Apache-2.0, like rust-analyzer. Contributions are accepted under the same
+blaze is MIT or Apache-2.0, like rust-analyzer. Contributions are accepted under the same
 terms.

@@ -1,37 +1,19 @@
 //! Each workspace of `tests/fixtures` read as `cargo metadata --no-deps --format-version 1`
 //! from the directory its `fixture.json` names, against what cargo 1.99 printed for it
-//! (`expected.json`, written by `harness/resolve.py --fixtures`).
+//! (`expected.json`, recorded once and kept as blaze's own expected output).
 
 #[path = "support/paths.rs"]
-#[allow(dead_code)]
 mod fixture_paths;
 
 use std::path::{Path, PathBuf};
 
-use blaze_manifest::diagnostic::ManifestDiagnostic;
 use blaze_manifest::metadata::{export_no_deps, root_manifest};
-use blaze_manifest::{Config, Context, Workspace};
+use blaze_manifest::{Config, Context, ManifestError, Workspace};
 use serde::Serialize;
 
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let name = entry.file_name();
-        if name == "expected.json" || name == "fixture.json" {
-            continue;
-        }
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &to.join(&name));
-        } else {
-            std::fs::copy(entry.path(), to.join(&name)).unwrap();
-        }
-    }
-}
-
-/// The error as cargo prints it, blank lines dropped as `harness/resolve.py` drops them.
-fn error_text(err: &anyhow::Error, cwd: &Path) -> String {
-    if let Some(diagnostic) = err.downcast_ref::<ManifestDiagnostic>() {
+/// The error as cargo prints it, blank lines dropped as they were when `expected.json` was recorded.
+fn error_text(err: &ManifestError, cwd: &Path) -> String {
+    if let Some(diagnostic) = err.diagnostic() {
         return diagnostic
             .render(cwd)
             .lines()
@@ -40,7 +22,7 @@ fn error_text(err: &anyhow::Error, cwd: &Path) -> String {
             .collect::<Vec<_>>()
             .join("\n");
     }
-    let mut lines = Vec::new();
+    let mut lines = vec![];
     for (i, cause) in err.chain().enumerate() {
         if i == 0 {
             let text = format!("error: {cause}");
@@ -58,8 +40,8 @@ fn error_text(err: &anyhow::Error, cwd: &Path) -> String {
 /// What blaze-manifest prints for the fixture, in the form of `expected.json`.
 fn read(fixture: &Path, scratch: &Path) -> String {
     let root = scratch.join(fixture.file_name().unwrap());
-    copy_dir(fixture, &root);
-    let root = root.canonicalize().unwrap();
+    fixture_paths::copy_dir(fixture, &root, &["expected.json", "fixture.json"]);
+    let root = fixture_paths::canonicalize(&root);
     let home = scratch.join("cargo-home");
     std::fs::create_dir_all(&home).unwrap();
     let cwd = match std::fs::read_to_string(fixture.join("fixture.json")) {
@@ -69,16 +51,23 @@ fn read(fixture: &Path, scratch: &Path) -> String {
         }
         Err(_) => root.clone(),
     };
-    let env = [("CARGO_HOME".to_owned(), home.display().to_string())];
-    let result = (|| {
+    // blaze's root, where the workspace's build directory is: `$BLAZE_HOME/build/<name>-<id>`
+    // in what is printed.
+    let blaze_home = scratch.join("blaze-home");
+    let env = [
+        ("CARGO_HOME".to_owned(), home.display().to_string()),
+        ("BLAZE_HOME".to_owned(), blaze_home.display().to_string()),
+    ];
+    let result = (|| -> Result<String, ManifestError> {
         let ctx = Context::new(Config::load(&cwd, env, &[])?);
         let manifest = root_manifest(None, &ctx)?;
         let ws = Workspace::new(&manifest, &ctx)?;
         let mut out = Vec::new();
         let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
-        export_no_deps(&ws)
-            .serialize(&mut serde_json::Serializer::with_formatter(&mut out, formatter))?;
-        anyhow::Ok(String::from_utf8(out)?)
+        export_no_deps(&ws)?
+            .serialize(&mut serde_json::Serializer::with_formatter(&mut out, formatter))
+            .expect("metadata serializes to a Vec");
+        Ok(String::from_utf8(out).expect("serde_json writes UTF-8"))
     })();
     let home = home.canonicalize().unwrap();
     let text = match result {
@@ -93,14 +82,41 @@ fn read(fixture: &Path, scratch: &Path) -> String {
             String::from_utf8(out).unwrap()
         }
     };
+    let builds = blaze_manifest::home::builds(&blaze_home);
+    let text = fixture_paths::normalize_path(&text, &builds, "$BLAZE_HOME/build");
+    // The build directory's id is a digest of where the scratch copy is: `<name>-ID` in what
+    // is kept.
+    let text = workspace_ids(&text);
     fixture_paths::normalize(&text, &root, &home) + "\n"
+}
+
+/// `text` with each `$BLAZE_HOME/build/<name>-<32 hex digits>` as `$BLAZE_HOME/build/<name>-ID`.
+fn workspace_ids(text: &str) -> String {
+    const AT: &str = "$BLAZE_HOME/build/";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(AT) {
+        let (before, after) = rest.split_at(at + AT.len());
+        out.push_str(before);
+        let end = after.find(|it: char| it == '"' || it == '/').unwrap_or(after.len());
+        let name = &after[..end];
+        match name.rsplit_once('-') {
+            Some((prefix, id)) if id.len() == 32 && id.bytes().all(|it| it.is_ascii_hexdigit()) => {
+                out.push_str(prefix);
+                out.push_str("-ID");
+            }
+            _ => out.push_str(name),
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[test]
 fn fixtures_read_as_cargo_reads_them() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    let scratch =
-        std::env::temp_dir().join(format!("blaze-manifest-fixtures-{}", std::process::id()));
+    let scratch = blaze_core::temp::TempDir::for_test("blaze-manifest-fixtures-");
     let mut names: Vec<_> =
         std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
     names.sort();
@@ -108,7 +124,7 @@ fn fixtures_read_as_cargo_reads_them() {
     for name in &names {
         let fixture = dir.join(name);
         let expected = std::fs::read_to_string(fixture.join("expected.json")).unwrap();
-        let got = read(&fixture, &scratch);
+        let got = read(&fixture, scratch.path());
         if got != expected {
             let line = got.lines().zip(expected.lines()).position(|(a, b)| a != b).unwrap_or(0);
             failed.push(format!(
@@ -120,7 +136,6 @@ fn fixtures_read_as_cargo_reads_them() {
             ));
         }
     }
-    let _ = std::fs::remove_dir_all(&scratch);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
     assert!(names.len() >= 4);
 }

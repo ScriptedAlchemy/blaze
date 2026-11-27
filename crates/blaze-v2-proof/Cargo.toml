@@ -1,0 +1,26 @@
+[package]
+name = "blaze-v2-proof"
+description = "What the store, the format and the profile share of the old invalidation oracle: the first difference of two byte strings, the column round trips, a source tree's digest"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-core.workspace = true
+blaze-graph.workspace = true
+blaze-ids.workspace = true
+blaze-store-check.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
+[lints]
+workspace = true

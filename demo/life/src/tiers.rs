@@ -1,17 +1,17 @@
 //! The tiers island under the grid. The daemon samples the window while it runs and compiles
 //! the functions it spends its time in again with LLVM; this shows what it says of that
-//! (`ra_jit_live::tiers`): the hottest functions with the level each runs at, the ladder of
+//! (`blaze_live::tiers`): the hottest functions with the level each runs at, the ladder of
 //! levels, and what the daemon did of late, a promotion lit for a moment as it lands.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Align2, Color32, FontId, Galley, Painter, Rect, Sense, pos2, vec2};
-use ra_jit_live::format::{LEVELS, Tiers};
+use blaze_live::format::{LEVELS, Tiers};
 
 use crate::theme::Theme;
 
-/// How often the daemon's file is read: it writes it a few times a second, not every frame.
+/// How often the daemon is asked: its word changes a few times a second, not every frame.
 const READ_EVERY: Duration = Duration::from_millis(250);
 /// How long a new event stays lit.
 const LIT: Duration = Duration::from_millis(2500);
@@ -28,6 +28,8 @@ pub struct TiersPanel {
     lit: Vec<(u64, Instant)>,
     /// Why there is nothing to wait for, when tiering is off.
     off: Option<String>,
+    /// Why the daemon could not be asked, the last time it was.
+    failed: Option<String>,
 }
 
 impl TiersPanel {
@@ -38,6 +40,7 @@ impl TiersPanel {
             newest: 0,
             lit: Vec::new(),
             off,
+            failed: None,
         }
     }
 
@@ -46,7 +49,10 @@ impl TiersPanel {
             return;
         }
         self.read_at = Instant::now();
-        self.tiers = ra_jit_live::tiers();
+        (self.tiers, self.failed) = match blaze_live::tiers() {
+            Ok(tiers) => (tiers, None),
+            Err(why) => (None, Some(format!("tiering: {why}"))),
+        };
         let now = now_ms();
         if let Some(tiers) = &self.tiers {
             for event in &tiers.events {
@@ -86,7 +92,11 @@ impl TiersPanel {
 
         let body = Rect::from_min_max(pos2(rect.left(), title.bottom() + 8.0), rect.max);
         let Some(tiers) = &self.tiers else {
-            let quiet = self.off.as_deref().unwrap_or("tiering: waiting for the daemon");
+            let quiet = self
+                .failed
+                .as_deref()
+                .or(self.off.as_deref())
+                .unwrap_or("tiering: waiting for the daemon");
             painter.text(body.left_top(), Align2::LEFT_TOP, quiet, text.clone(), t.comment);
             painter.text(
                 body.left_top() + vec2(0.0, row),
@@ -186,7 +196,7 @@ impl TiersPanel {
 
             let level = match function.level {
                 0 => "not compiled by the daemon".to_owned(),
-                level => format!("level {level}, {}", ra_jit_live::format::level_name(level)),
+                level => format!("level {level}, {}", blaze_live::format::level_name(level)),
             };
             let mut about =
                 format!("{}\n{level}   ·   {} samples", function.name, thousands(function.samples));

@@ -2,15 +2,18 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, bail};
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{FixedState, Map, Set, SetOpts};
+use std::alloc::Global;
 
 use crate::dependency::Dependency;
+use crate::error::ResolveError;
 use crate::graph::Graph;
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
 use crate::summary::Summary;
 use crate::version::{PartialVersion, RustVersion};
+
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
 
 /// The encoding of a `Cargo.lock`. A lock file keeps the encoding it was found in until it
 /// changes for another reason, and is then raised to the default.
@@ -68,6 +71,7 @@ impl ResolveVersion {
 }
 
 /// Unrecognized `[metadata]` of a lock file, kept as found.
+// BTreeMap: serialized into the lock file as a map.
 pub type LockfileMetadata = BTreeMap<String, String>;
 
 /// Packages and the edges between them, each edge with the dependencies of `Cargo.toml` it
@@ -75,30 +79,30 @@ pub type LockfileMetadata = BTreeMap<String, String>;
 /// read from a lock file has no dependencies on its edges and no features.
 #[derive(Clone)]
 pub struct Resolve {
-    graph: Graph<PackageId, FxHashSet<Dependency>>,
+    graph: Graph<PackageId, Set<Dependency, FixedState, Global>>,
     /// `[replace]`: the package replaced and its replacement.
-    replacements: FxHashMap<PackageId, PackageId>,
-    reverse_replacements: FxHashMap<PackageId, PackageId>,
-    features: FxHashMap<PackageId, Vec<InternedString>>,
+    replacements: Map<PackageId, PackageId, FixedState, Global>,
+    reverse_replacements: Map<PackageId, PackageId, FixedState, Global>,
+    features: Map<PackageId, Vec<InternedString>, FixedState, Global>,
     /// The sha256 of each package's `.crate`, `None` for sources without one (path, git).
-    checksums: FxHashMap<PackageId, Option<String>>,
+    checksums: Map<PackageId, Option<String>, FixedState, Global>,
     metadata: LockfileMetadata,
     /// `[patch]` entries that matched nothing, kept as `[[patch.unused]]`.
     unused_patches: Vec<PackageId>,
     version: ResolveVersion,
-    summaries: FxHashMap<PackageId, Summary>,
+    summaries: Map<PackageId, Summary, FixedState, Global>,
 }
 
 impl Resolve {
     pub fn new(
-        graph: Graph<PackageId, FxHashSet<Dependency>>,
-        replacements: FxHashMap<PackageId, PackageId>,
-        features: FxHashMap<PackageId, Vec<InternedString>>,
-        checksums: FxHashMap<PackageId, Option<String>>,
+        graph: Graph<PackageId, Set<Dependency, FixedState, Global>>,
+        replacements: Map<PackageId, PackageId, FixedState, Global>,
+        features: Map<PackageId, Vec<InternedString>, FixedState, Global>,
+        checksums: Map<PackageId, Option<String>, FixedState, Global>,
         metadata: LockfileMetadata,
         unused_patches: Vec<PackageId>,
         version: ResolveVersion,
-        summaries: FxHashMap<PackageId, Summary>,
+        summaries: Map<PackageId, Summary, FixedState, Global>,
     ) -> Resolve {
         let reverse_replacements = replacements.iter().map(|(&p, &r)| (r, p)).collect();
         Resolve {
@@ -122,56 +126,14 @@ impl Resolve {
             if mine == cksum {
                 continue;
             }
-            if cksum.is_none() {
-                bail!(
-                    "\
-checksum for `{}` was not previously calculated, but a checksum could now \
-be calculated
-
-this could be indicative of a few possible situations:
-
-    * the source `{}` did not previously support checksums,
-      but was replaced with one that does
-    * newer Cargo implementations know how to checksum this source, but this
-      older implementation does not
-    * the lock file is corrupt
-",
-                    id,
-                    id.source_id()
-                )
+            let package = *id;
+            return Err(if cksum.is_none() {
+                ResolveError::ChecksumNotPreviouslyCalculated { package }
             } else if mine.is_none() {
-                bail!(
-                    "\
-checksum for `{}` could not be calculated, but a checksum is listed in \
-the existing lock file
-
-this could be indicative of a few possible situations:
-
-    * the source `{}` supports checksums,
-      but was replaced with one that doesn't
-    * the lock file is corrupt
-
-unable to verify that `{0}` is the same as when the lockfile was generated
-",
-                    id,
-                    id.source_id()
-                )
+                ResolveError::ChecksumUncomputable { package }
             } else {
-                bail!(
-                    "\
-checksum for `{}` changed between lock files
-
-this could be indicative of a few possible errors:
-
-    * the lock file is corrupt
-    * a replacement source in use (e.g., a mirror) returned a different checksum
-    * the source itself may be corrupt in one way or another
-
-unable to verify that `{0}` is the same as when the lockfile was generated
-",
-                    id
-                );
-            }
+                ResolveError::ChecksumChanged { package }
+            });
         }
         self.metadata = previous.metadata.clone();
         self.version = previous.version;
@@ -196,7 +158,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         self.graph.len()
     }
 
-    pub fn graph(&self) -> &Graph<PackageId, FxHashSet<Dependency>> {
+    pub fn graph(&self) -> &Graph<PackageId, Set<Dependency, FixedState, Global>> {
         &self.graph
     }
 
@@ -204,7 +166,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
     pub fn deps(
         &self,
         pkg: PackageId,
-    ) -> impl Iterator<Item = (PackageId, &FxHashSet<Dependency>)> {
+    ) -> impl Iterator<Item = (PackageId, &Set<Dependency, FixedState, Global>)> {
         self.deps_not_replaced(pkg)
             .map(move |(id, deps)| (self.replacement(id).unwrap_or(id), deps))
     }
@@ -212,7 +174,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
     pub fn deps_not_replaced(
         &self,
         pkg: PackageId,
-    ) -> impl Iterator<Item = (PackageId, &FxHashSet<Dependency>)> {
+    ) -> impl Iterator<Item = (PackageId, &Set<Dependency, FixedState, Global>)> {
         self.graph.edges(&pkg).map(|(id, deps)| (*id, deps))
     }
 
@@ -230,7 +192,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         self.replacements.get(&pkg).cloned()
     }
 
-    pub fn replacements(&self) -> &FxHashMap<PackageId, PackageId> {
+    pub fn replacements(&self) -> &Map<PackageId, PackageId, FixedState, Global> {
         &self.replacements
     }
 
@@ -246,7 +208,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         to: PackageId,
         to_crate_name: &str,
     ) -> Result<(InternedString, Option<InternedString>)> {
-        let empty_set = FxHashSet::default();
+        let empty_set = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         let deps = if from == to { &empty_set } else { self.dependencies_listed(from, to) };
 
         let target_crate_name = || (to_crate_name.to_owned(), None);
@@ -257,17 +219,14 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         });
         let (extern_crate_name, dep_name) = name_pairs.next().unwrap_or_else(target_crate_name);
         for (n, _) in name_pairs {
-            anyhow::ensure!(
-                n == extern_crate_name,
-                "the crate `{}` depends on crate `{}` multiple times with different names",
-                from,
-                to,
-            );
+            if n != extern_crate_name {
+                return Err(ResolveError::CrateNamedTwice { from, to });
+            }
         }
         Ok((InternedString::new(&extern_crate_name), dep_name))
     }
 
-    fn dependencies_listed(&self, from: PackageId, to: PackageId) -> &FxHashSet<Dependency> {
+    fn dependencies_listed(&self, from: PackageId, to: PackageId) -> &Set<Dependency, FixedState, Global> {
         // We've got a dependency on `from` to `to`, but this dependency edge
         // may be affected by [replace]. If the `to` package is listed as the
         // target of a replacement (aka the key of a reverse replacement map)
@@ -306,7 +265,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
             .collect();
     }
 
-    pub fn checksums(&self) -> &FxHashMap<PackageId, Option<String>> {
+    pub fn checksums(&self) -> &Map<PackageId, Option<String>, FixedState, Global> {
         &self.checksums
     }
 
@@ -330,7 +289,7 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         &self.summaries[&pkg_id]
     }
 
-    pub fn summaries(&self) -> &FxHashMap<PackageId, Summary> {
+    pub fn summaries(&self) -> &Map<PackageId, Summary, FixedState, Global> {
         &self.summaries
     }
 }

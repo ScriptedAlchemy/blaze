@@ -1,0 +1,30 @@
+[package]
+name = "stdx"
+version = "0.0.0"
+repository.workspace = true
+description = "Missing batteries for standard libraries for rust-analyzer."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-core.workspace = true
+blaze-trace.workspace = true
+# Think twice before adding anything here
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+stacker.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

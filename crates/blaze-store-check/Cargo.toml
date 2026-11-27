@@ -1,0 +1,25 @@
+[package]
+name = "blaze-store-check"
+description = "blaze v2's store check: BLAZE_VERIFY_STORE recomputes a sampled fraction of store hits and compares their bytes"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-data.workspace = true
+blaze-ids.workspace = true
+blaze-json.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

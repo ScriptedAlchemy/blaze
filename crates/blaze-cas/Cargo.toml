@@ -1,0 +1,34 @@
+[package]
+name = "blaze-cas"
+description = "blaze's store: the plain store, content-keyed records in a few immutable segment files under a two-slot head, read in place with no lock"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-core.workspace = true
+blaze-format.workspace = true
+blaze-hash.workspace = true
+blaze-ids.workspace = true
+blaze-keyed.workspace = true
+blaze-mem.workspace = true
+blaze-own.workspace = true
+libc.workspace = true
+# `store.json`, read as JSON into its typed value.
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-trace.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

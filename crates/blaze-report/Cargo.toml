@@ -1,0 +1,36 @@
+[package]
+name = "blaze-report"
+description = "Everything blaze says to a person or an agent as data (a Report: severity, headline, rule, where, facts, what it blocks, fixes, log, causes) and the one renderer of it: a terminal's, plain lines, JSON"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-data.workspace = true
+blaze-toml.workspace = true
+serde = { workspace = true, features = ["derive"] }
+sonic-rs.workspace = true
+blaze-unicode.workspace = true
+# The frame's highlighting: blaze's own lexer.
+blaze-lex.workspace = true
+# The frame's text and scratch: in the caller's allocator.
+blaze-own.workspace = true
+blaze-text.workspace = true
+
+[dev-dependencies]
+blaze-protocol.workspace = true
+stdx.workspace = true
+# The frame's properties and their planted-bug control.
+blaze-sim.workspace = true
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

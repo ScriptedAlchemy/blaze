@@ -1,0 +1,51 @@
+[package]
+name = "blaze-fmt"
+description = "rustfmt owned by blaze: rustfmt's formatting over rust-analyzer's syntax trees, with no rustc crates"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-own.workspace = true
+blaze-data.workspace = true
+blaze-toml.workspace = true
+blaze-semver.workspace = true
+# The version the pinned nightly's rustfmt is built with (rust-lang/rust's Cargo.lock at
+# 12433c307): the line diff of `--check` is its.
+annotate-snippets.workspace = true
+# The user's home directory (`blaze_core::home`), the one answer to it.
+blaze-core.workspace = true
+diff.workspace = true
+# Widths, legacy grapheme clusters and General_Category=Po, where rustfmt reads unicode-width
+# 0.1.14, unicode-segmentation and unicode-properties.
+blaze-unicode.workspace = true
+# The iterator adaptors rustfmt's code calls (`stdx::iter`); syntax brings stdx in already.
+stdx.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+blaze-trace.workspace = true
+
+blaze-manifest.workspace = true
+intern.workspace = true
+parser.workspace = true
+# The pinned nightly's lexer, cooked into rustc's tokens by `parse::lexer`.
+rustc_lexer.workspace = true
+syntax.workspace = true
+
+# `cargo fmt -q` sends rustfmt's standard output to /dev/null, as cargo-fmt does its child's.
+[target.'cfg(unix)'.dependencies]
+blaze-sys.workspace = true
+
+[dev-dependencies]
+test-utils.workspace = true
+
+[lints]
+workspace = true

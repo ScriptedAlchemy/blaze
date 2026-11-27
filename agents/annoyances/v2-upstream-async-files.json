@@ -1,0 +1,18 @@
+{
+  "id": "v2-upstream-async-files",
+  "date": "2026-11-21",
+  "who": "GPT-6 Astra Pro, main agent",
+  "where": "harness/toolchain_bump.py: vendor; blaze CI scripts job 137040650028",
+  "what": "The imported toolchain-bump helper opened and replaced vendored source files directly inside async vendor(). The scripts gate stopped at Ruff ASYNC230 on its three open() calls before the distributed library tests could start.",
+  "cost": "The scripts prerequisite failed, leaving the partial distributed Cargo library job skipped.",
+  "cause": "Network checkout was asynchronous, but its subsequent synchronous source-copy operation still ran on the event-loop thread.",
+  "whys": [
+    "vendor() mixed awaited checkout with direct file operations",
+    "the filesystem phase had no synchronous helper boundary to dispatch to a worker"
+  ],
+  "class": "blocking filesystem work inside an asynchronous orchestration function",
+  "prevention": "The existing Ruff ASYNC230 gate remains enabled. vendor_sources() now owns the complete synchronous copy, and vendor() awaits asyncio.to_thread(vendor_sources, repo).",
+  "workaround": "none",
+  "fix": "Moved the complete read/copy/write phase to a worker without changing the preserved ABI prefix or vendored files. uv run --frozen ruff check passes.",
+  "state": "fixed in the V2 sync follow-up; remote CI pending"
+}

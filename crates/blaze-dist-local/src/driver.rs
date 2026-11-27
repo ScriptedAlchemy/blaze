@@ -1,0 +1,642 @@
+//! The IO driver of one executor's [`Holder`]: it carries the holder's calls over a
+//! [`Client`], hands its compile plans to the caller's batch compiler, and ticks it
+//! with the caller's clock until the holder leaves the execution.
+//!
+//! The caller thread owns compilation and release (including thread-local compiler state),
+//! while a scoped driver thread services holder events and heartbeats. A cancelled batch
+//! still finishes; its unpublished findings are released before the driver returns.
+//!
+//! Nothing here compiles by itself and nothing falls back: a transport failure is
+//! returned to the caller, whose `LocalPolicy` decides what happens next.
+
+use core::alloc::AllocatorClone;
+use core::mem;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
+
+use blaze_dist::holder::{
+    BatchCompiler, Call, Compiled, Effect, Event, Holder, Plan, Reply, StopWhy,
+};
+use blaze_own::{BTreeSet, Vec, format_in};
+use blaze_wire::{JobContent, WireAlloc, WireString, WireVec, WorkName, WorkersEventsRequest};
+
+use crate::Error;
+use crate::client::Client;
+use crate::protocol::*;
+use crate::sys::{RecvTimeoutError, channel, scope};
+
+/// How the driver paces an idle holder and bounds its reconnects.
+#[derive(Clone, Debug)]
+pub struct DriverConfig {
+    /// Sleep between ticks when the holder asked for nothing.
+    pub poll: Duration,
+    /// Additional reconnects of one call after `Client::call`'s one automatic same-session
+    /// resume, before its IO error is the caller's.
+    pub max_reconnects: u32,
+    /// Explicit acceptance-only gate for one real result; no capture or IO when absent.
+    pub result_gate: Option<crate::result_gate::ResultGate>,
+}
+
+impl Default for DriverConfig {
+    fn default() -> Self {
+        Self { poll: Duration::from_millis(5), max_reconnects: 8, result_gate: None }
+    }
+}
+
+/// Run the holder to completion over a local carrier. Compilation remains on the
+/// caller's thread: a compiler may own thread-local or non-Sync semantic state.
+/// The scoped driver thread ticks and sends heartbeats while it compiles. Nothing
+/// falls back to another compiler. The clock must share the coordinator's origin.
+pub fn run_holder(
+    client: &mut Client,
+    socket: &str,
+    holder: &mut Holder<impl AllocatorClone + Send>,
+    content: JobContent,
+    executor: &str,
+    config: &DriverConfig,
+    now_ms: impl Fn() -> u64 + Send,
+    compiler: &mut (impl BatchCompiler + ?Sized),
+) -> Result<StopWhy, Error> {
+    let never = AtomicBool::new(false);
+    run_holder_until(client, socket, holder, content, executor, config, now_ms, compiler, &never)
+}
+
+/// [`run_holder`] for an executor that also watches the execution: once `leave` is set and no
+/// compile is running, the holder leaves as [`StopWhy::Ended`], with nothing retained. The
+/// watcher sets it when the compile phase is done, the only state in which leaving loses
+/// nothing: every result it reported is committed or was refused.
+#[allow(clippy::too_many_arguments)]
+pub fn run_holder_until(
+    client: &mut Client,
+    socket: &str,
+    holder: &mut Holder<impl AllocatorClone + Send>,
+    content: JobContent,
+    executor: &str,
+    config: &DriverConfig,
+    now_ms: impl Fn() -> u64 + Send,
+    compiler: &mut (impl BatchCompiler + ?Sized),
+    leave: &AtomicBool,
+) -> Result<StopWhy, Error> {
+    let alloc = client.alloc();
+    let mut pending: Option<u64> = None;
+    drive(holder, config, now_ms, compiler, leave, alloc, |call, id| {
+        send(client, socket, content, executor, call, id, &mut pending, config)
+    })
+}
+
+enum CompilerTask {
+    Compile(Plan),
+    Release(WireVec<WorkName>),
+}
+
+/// The same event loop as the socket driver, with the transport boundary injected
+/// so cancellation, late results and transport loss can be tested deterministically.
+fn drive(
+    holder: &mut Holder<impl AllocatorClone + Send>,
+    config: &DriverConfig,
+    now_ms: impl Fn() -> u64 + Send,
+    compiler: &mut (impl BatchCompiler + ?Sized),
+    leave: &AtomicBool,
+    alloc: WireAlloc,
+    mut transmit: impl FnMut(&Call, u64) -> Result<Reply, Error> + Send,
+) -> Result<StopWhy, Error> {
+    scope(alloc, |s| {
+        let (tasks, receiver) = channel::<CompilerTask>(alloc);
+        let (finished, completions) = channel::<Result<Compiled, WireString>>(alloc);
+        let driver = s.spawn(move || {
+            let mut working = false;
+            // The compiler retains new findings until the result is acknowledged.
+            // Transport failure before acknowledgment must release them as well as
+            // findings already retained from earlier successful batches.
+            let mut unconfirmed = BTreeSet::new_in(alloc);
+            let result = (|| -> Result<StopWhy, Error> {
+                let mut effects = Vec::new_in(alloc);
+                let mut stopped: Option<StopWhy> = None;
+                holder.start(now_ms(), &mut effects);
+                holder.step(now_ms(), Event::Loaded, &mut effects);
+                loop {
+                    if effects.is_empty() {
+                        if let Some(why) = stopped.take() {
+                            if !working {
+                                return Ok(why);
+                            }
+                            stopped = Some(why);
+                        }
+                        match completions.recv_timeout(config.poll) {
+                            Ok(Ok(batch)) => {
+                                working = false;
+                                if !holder.is_stopped() {
+                                    unconfirmed.extend(
+                                        batch.roots.iter().chain(&batch.names).flat_map(|item| {
+                                            item.found.iter().map(|found| found.name)
+                                        }),
+                                    );
+                                }
+                                // The stopped holder releases even findings from a
+                                // compile that finished after cancellation.
+                                holder.step(now_ms(), Event::Compiled(batch), &mut effects);
+                            }
+                            Ok(Err(error)) => {
+                                working = false;
+                                if stopped.is_none() {
+                                    return Err(Error::Protocol(error));
+                                }
+                            }
+                            Err(RecvTimeoutError::Timeout) => {
+                                if !working && leave.load(Ordering::Acquire) {
+                                    return Ok(StopWhy::Ended);
+                                }
+                                if stopped.is_none() {
+                                    holder.step(now_ms(), Event::Tick, &mut effects);
+                                }
+                            }
+                            Err(RecvTimeoutError::Disconnected) => {
+                                return Err(Error::Protocol(WireString::from_str_in(
+                                    "compiler worker exited without a result",
+                                    alloc,
+                                )));
+                            }
+                        }
+                        continue;
+                    }
+                    for effect in mem::replace(&mut effects, Vec::new_in(alloc)) {
+                        match effect {
+                            Effect::Stop(why) => stopped = Some(why),
+                            Effect::Release(names) => {
+                                for name in &names {
+                                    unconfirmed.remove(name);
+                                }
+                                tasks.send(CompilerTask::Release(names)).map_err(|_| {
+                                    Error::Protocol(WireString::from_str_in(
+                                        "compiler worker is unavailable",
+                                        alloc,
+                                    ))
+                                })?;
+                            }
+                            Effect::Compile(plan) => {
+                                if working {
+                                    return Err(Error::Protocol(WireString::from_str_in(
+                                        "holder granted overlapping compiler batches",
+                                        alloc,
+                                    )));
+                                }
+                                tasks.send(CompilerTask::Compile(plan)).map_err(|_| {
+                                    Error::Protocol(WireString::from_str_in(
+                                        "compiler worker is unavailable",
+                                        alloc,
+                                    ))
+                                })?;
+                                working = true;
+                            }
+                            Effect::Send { id, call } if stopped.is_none() => {
+                                let is_result = matches!(call, Call::Result(_));
+                                let reply = transmit(&call, id)?;
+                                holder.step(now_ms(), Event::Reply { id, reply }, &mut effects);
+                                if is_result {
+                                    // The holder has either retained or released every
+                                    // discovery from this acknowledged result.
+                                    unconfirmed.clear();
+                                }
+                            }
+                            Effect::Send { .. } => {}
+                        }
+                    }
+                }
+            })();
+
+            if result.is_err() {
+                if working {
+                    // The socket failed while compilation was running. Do not leave
+                    // unreported findings in the caller's compiler after joining it.
+                    if let Ok(Ok(batch)) = completions.recv() {
+                        unconfirmed.extend(
+                            batch
+                                .roots
+                                .iter()
+                                .chain(&batch.names)
+                                .flat_map(|item| item.found.iter().map(|found| found.name)),
+                        );
+                    }
+                }
+                unconfirmed.extend(holder.findings().map(|(name, _)| *name));
+                if !unconfirmed.is_empty() {
+                    let mut release = Vec::with_capacity_in(unconfirmed.len(), alloc);
+                    release.extend(unconfirmed);
+                    let _ = tasks.send(CompilerTask::Release(release));
+                }
+            }
+            drop(tasks);
+            result
+        })?;
+
+        // The actual exporter owns non-Send data: always execute and release on
+        // its originating thread, never move its database or resolver into a worker.
+        while let Ok(task) = receiver.recv() {
+            match task {
+                CompilerTask::Compile(plan) => {
+                    let outcome =
+                        compiler.compile(&plan).map_err(|error| format_in!(alloc, "{error}"));
+                    if finished.send(outcome).is_err() {
+                        break;
+                    }
+                }
+                CompilerTask::Release(names) => compiler.release(&names),
+            }
+        }
+        match driver.join() {
+            Ok(result) => result,
+            Err(_) => Err(Error::Protocol(WireString::from_str_in("holder driver panicked", alloc))),
+        }
+    })
+}
+
+/// One holder call over the carrier. A repeated `Send` of the call still pending in
+/// the client (the holder's own resend after `retry_ms`) retries those exact bytes;
+/// an IO failure reconnects the same lifetime and retries, bounded by the config.
+fn send(
+    client: &mut Client,
+    socket: &str,
+    content: JobContent,
+    executor: &str,
+    call: &Call,
+    id: u64,
+    pending: &mut Option<u64>,
+    config: &DriverConfig,
+) -> Result<Reply, Error> {
+    let alloc = client.alloc();
+    // Capture only after Holder produced its actual Call::Result. An opt-in fault gate
+    // sends ordinary heartbeats here until release or until its process stops.
+    let mut outgoing = None;
+    let captured = if *pending != Some(id)
+        && let Some(gate) = &config.result_gate
+        && let Call::Result(result) = call
+    {
+        let request = command(content, executor, call, alloc);
+        let captured = gate.hold(&request, || {
+            let heartbeat = Command::WorkerEvents(WorkerEvents {
+                content,
+                executor: WireString::from_str_in(executor, alloc),
+                request: WorkersEventsRequest {
+                    execution: result.lease.execution,
+                    attempt: result.lease.attempt,
+                    events: Vec::new_in(alloc),
+                },
+            });
+            match client.call(heartbeat)? {
+                Answer::WorkerEvents(answer) if answer.verdict == 0 => Ok(()),
+                answer => Err(Error::Protocol(format_in!(alloc, "the held result's heartbeat answered {answer:?}"))),
+            }
+        })?;
+        outgoing = Some(request);
+        captured
+    } else {
+        None
+    };
+    let sent = (|| {
+        if captured.is_some() {
+            // The held command has not entered Client's pending state. Give this intentional
+            // delay a fresh transport lifetime, so an idle socket or expired local session
+            // cannot hide the coordinator's actual lease refusal. No worker heartbeat is sent
+            // and no lease or result field changes; transport sessions grant no work authority.
+            *client = Client::connect(socket, crate::server::random_id()?, alloc)?;
+        }
+        let mut reconnects = 0u32;
+        loop {
+            let answer = if *pending == Some(id) {
+                client.retry()
+            } else {
+                *pending = Some(id);
+                client.call(match outgoing.take() {
+                    Some(request) => request,
+                    None => command(content, executor, call, alloc),
+                })
+            };
+            match answer {
+                Ok(answer) => {
+                    *pending = None;
+                    if let Some(capture) = &captured {
+                        capture.answer(&answer)?;
+                    }
+                    return reply(call, answer, alloc);
+                }
+                Err(Error::Io(error)) => {
+                    reconnects = reconnects.saturating_add(1);
+                    if reconnects > config.max_reconnects {
+                        return Err(Error::Io(error));
+                    }
+                    client.reconnect(socket)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })();
+    if let (Some(capture), Err(why)) = (&captured, &sent) {
+        capture.error(why)?;
+    }
+    sent
+}
+
+fn command(content: JobContent, executor: &str, call: &Call, alloc: WireAlloc) -> Command {
+    let executor = WireString::from_str_in(executor, alloc);
+    match call {
+        Call::Join(request) => Command::Join(Join { content, executor, request: request.clone() }),
+        Call::Lease(request) => {
+            Command::Lease(Lease { content, executor, request: request.clone() })
+        }
+        Call::Result(request) => {
+            Command::Result(BatchSubmission { content, executor, request: request.clone() })
+        }
+        Call::Events(request) => {
+            Command::WorkerEvents(WorkerEvents { content, executor, request: request.clone() })
+        }
+    }
+}
+
+/// The holder's typed reply for one answer: a carrier `Error` answer is the call's
+/// `Err`, never a driver failure, so refusals reach the holder's own rules.
+fn reply(call: &Call, answer: Answer, alloc: WireAlloc) -> Result<Reply, Error> {
+    Ok(match (call, answer) {
+        (_, Answer::Error(error)) => match call {
+            Call::Join(_) => Reply::Join(Err(error)),
+            Call::Lease(_) => Reply::Lease(Err(error)),
+            Call::Result(_) => Reply::Result(Err(error)),
+            Call::Events(_) => Reply::Events(Err(error)),
+        },
+        (Call::Join(_), Answer::Join(answer)) => Reply::Join(Ok(answer)),
+        (Call::Lease(_), Answer::Lease(answer)) => Reply::Lease(Ok(answer)),
+        (Call::Result(_), Answer::Result(answer)) => Reply::Result(Ok(answer)),
+        (Call::Events(_), Answer::WorkerEvents(answer)) => Reply::Events(Ok(answer)),
+        (call, answer) => {
+            return Err(Error::Protocol(format_in!(
+                alloc,
+                "answer {answer:?} to holder call {call:?}"
+            )));
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use core::cell::Cell;
+    use core::convert::Infallible;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use core::time::Duration;
+
+    use blaze_dist::Ranges;
+    use blaze_dist::holder::{Compiled, HolderConfig};
+    use blaze_own::{Arc, BTreeSet, Rc, Vec};
+    use blaze_wire::{
+        Attempt, EntryKey, EntryRef, ExecutionId, Found, Grant, ItemOutcome, ItemResult, Lease,
+        RootSet, Set, WireAlloc, WireString, WorkJoinAnswer, WorkLeaseAnswer, WorkersEventsAnswer,
+    };
+
+    use super::*;
+    use crate::sys::{Receiver, SystemClock, current_thread_id};
+
+    const FOUND: WorkName = WorkName([7; 32]);
+
+    fn test_alloc() -> WireAlloc {
+        blaze_own::testing::heap().shared()
+    }
+
+    // The real exporter also holds non-Send semantic state. These tests prove
+    // its compile and release methods stay on the thread where it was created.
+    struct TestCompiler {
+        active: Arc<AtomicBool, WireAlloc>,
+        // Set for cases that must keep a compile in flight until a particular reply.
+        finish: Option<Receiver<()>>,
+        released: WireVec<WorkName>,
+        caller: u64,
+        calls: Rc<Cell<usize>, WireAlloc>,
+        alloc: WireAlloc,
+    }
+
+    impl BatchCompiler for TestCompiler {
+        type Error = Infallible;
+
+        fn compile(&mut self, plan: &Plan) -> Result<Compiled, Self::Error> {
+            let alloc = self.alloc;
+            assert_eq!(current_thread_id(), self.caller);
+            self.calls.set(self.calls.get() + 1);
+            self.active.store(true, Ordering::SeqCst);
+            if let Some(finish) = self.finish.take() {
+                finish
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("the driver observes a heartbeat during compilation");
+            }
+            self.active.store(false, Ordering::SeqCst);
+            let mut found = Vec::new_in(alloc);
+            found.push(Found { name: FOUND, tuple: [10; 32] });
+            let mut roots = Vec::new_in(alloc);
+            roots.push(ItemResult {
+                name: WorkName([8; 32]),
+                outcome: ItemOutcome::Exported(EntryRef { entry: EntryKey([9; 32]) }),
+                found: Set::new(found),
+                unnamed: Set::new(Vec::new_in(alloc)),
+            });
+            Ok(Compiled {
+                generation: plan.grant.lease.generation,
+                roots,
+                names: Vec::new_in(alloc),
+                packs: Vec::new_in(alloc),
+                returned_roots: Ranges::new(alloc),
+                returned_names: Vec::new_in(alloc),
+            })
+        }
+
+        fn release(&mut self, names: &[WorkName]) {
+            assert_eq!(current_thread_id(), self.caller);
+            self.released.extend_from_slice(names);
+        }
+    }
+
+    fn test_holder(alloc: WireAlloc) -> (Holder<WireAlloc>, RootSet, Grant) {
+        let roots =
+            RootSet { spec: [1; 32], roots: [2; 32], count: 1, index: [3; 32], inputs: [4; 32] };
+        let mut grant_roots = Vec::new_in(alloc);
+        grant_roots.push((0, 1));
+        let grant = Grant {
+            lease: Lease {
+                execution: ExecutionId(1),
+                attempt: Attempt(1),
+                holder: WireString::from_str_in("helper", alloc),
+                generation: 1,
+            },
+            roots: Set::new(grant_roots),
+            names: Set::new(Vec::new_in(alloc)),
+        };
+        let holder = Holder::new(
+            "helper",
+            ExecutionId(1),
+            Attempt(1),
+            roots.clone(),
+            Set::new(Vec::new_in(alloc)),
+            BTreeSet::new_in(alloc),
+            HolderConfig { heartbeat_ms: 10, retry_ms: 100, idle_ms: 5 },
+            alloc,
+        );
+        (holder, roots, grant)
+    }
+
+    #[test]
+    fn heartbeats_during_compile_fence_a_cancelled_batch_and_release_its_findings() {
+        let alloc = test_alloc();
+        let (mut holder, roots, grant) = test_holder(alloc);
+        let active = Arc::new_in(AtomicBool::new(false), alloc);
+        let during = Arc::new_in(AtomicUsize::new(0), alloc);
+        let (release_compile, finish) = channel(alloc);
+        let mut compiler = TestCompiler {
+            active: active.clone(),
+            finish: Some(finish),
+            released: Vec::new_in(alloc),
+            caller: current_thread_id(),
+            calls: Rc::new_in(Cell::new(0), alloc),
+            alloc,
+        };
+        let mut leased = false;
+        let clock = SystemClock;
+        let start_ns = clock.monotonic_nanos().unwrap();
+        let why = drive(
+            &mut holder,
+            &DriverConfig {
+                poll: Duration::from_millis(1),
+                max_reconnects: 0,
+                ..Default::default()
+            },
+            || clock.monotonic_nanos().unwrap().saturating_sub(start_ns) / 1_000_000,
+            &mut compiler as &mut dyn BatchCompiler<Error = Infallible>,
+            &AtomicBool::new(false),
+            alloc,
+            |call, _| {
+                Ok(match call {
+                    Call::Events(_) => {
+                        if active.load(Ordering::SeqCst)
+                            && during.fetch_add(1, Ordering::SeqCst) >= 1
+                        {
+                            release_compile.send(()).expect("the cancelled compile can finish");
+                            Reply::Events(Ok(WorkersEventsAnswer::CANCEL))
+                        } else {
+                            Reply::Events(Ok(WorkersEventsAnswer::CONTINUE))
+                        }
+                    }
+                    Call::Join(_) => {
+                        Reply::Join(Ok(WorkJoinAnswer { roots: roots.clone(), fixed: true }))
+                    }
+                    Call::Lease(_) => {
+                        let next = (!leased).then_some(grant.clone());
+                        leased = true;
+                        Reply::Lease(Ok(WorkLeaseAnswer { grant: next }))
+                    }
+                    Call::Result(_) => panic!("cancelled work must not be published"),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(why, StopWhy::Cancelled);
+        assert!(during.load(Ordering::SeqCst) >= 2, "no heartbeat while compiling");
+        assert_eq!(compiler.released.as_slice(), &[FOUND]);
+        assert_eq!(compiler.calls.get(), 1);
+        assert!(holder.is_stopped());
+    }
+
+    #[test]
+    fn transport_failure_during_compile_releases_its_unreported_findings() {
+        let alloc = test_alloc();
+        let (mut holder, roots, grant) = test_holder(alloc);
+        let active = Arc::new_in(AtomicBool::new(false), alloc);
+        let (release_compile, finish) = channel(alloc);
+        let mut compiler = TestCompiler {
+            active: active.clone(),
+            finish: Some(finish),
+            released: Vec::new_in(alloc),
+            caller: current_thread_id(),
+            calls: Rc::new_in(Cell::new(0), alloc),
+            alloc,
+        };
+        let clock = SystemClock;
+        let start_ns = clock.monotonic_nanos().unwrap();
+        let mut leased = false;
+        let result = drive(
+            &mut holder,
+            &DriverConfig {
+                poll: Duration::from_millis(1),
+                max_reconnects: 0,
+                ..Default::default()
+            },
+            || clock.monotonic_nanos().unwrap().saturating_sub(start_ns) / 1_000_000,
+            &mut compiler,
+            &AtomicBool::new(false),
+            alloc,
+            |call, _| match call {
+                Call::Events(_) if active.load(Ordering::SeqCst) => {
+                    release_compile.send(()).expect("the interrupted compile can finish");
+                    Err(Error::Protocol(WireString::from_str_in(
+                        "carrier disconnected while compiling",
+                        alloc,
+                    )))
+                }
+                Call::Events(_) => Ok(Reply::Events(Ok(WorkersEventsAnswer::CONTINUE))),
+                Call::Join(_) => {
+                    Ok(Reply::Join(Ok(WorkJoinAnswer { roots: roots.clone(), fixed: true })))
+                }
+                Call::Lease(_) => {
+                    let next = (!leased).then_some(grant.clone());
+                    leased = true;
+                    Ok(Reply::Lease(Ok(WorkLeaseAnswer { grant: next })))
+                }
+                Call::Result(_) => panic!("a disconnected carrier cannot commit the batch"),
+            },
+        );
+        assert!(matches!(result, Err(Error::Protocol(_))));
+        assert_eq!(compiler.released.as_slice(), &[FOUND]);
+        assert_eq!(compiler.calls.get(), 1);
+    }
+
+    #[test]
+    fn failed_result_acknowledgement_releases_new_findings() {
+        let alloc = test_alloc();
+        let (mut holder, roots, grant) = test_holder(alloc);
+        let active = Arc::new_in(AtomicBool::new(false), alloc);
+        let mut compiler = TestCompiler {
+            active,
+            finish: None,
+            released: Vec::new_in(alloc),
+            caller: current_thread_id(),
+            calls: Rc::new_in(Cell::new(0), alloc),
+            alloc,
+        };
+        let clock = SystemClock;
+        let start_ns = clock.monotonic_nanos().unwrap();
+        let mut leased = false;
+        let result = drive(
+            &mut holder,
+            &DriverConfig {
+                poll: Duration::from_millis(1),
+                max_reconnects: 0,
+                ..Default::default()
+            },
+            || clock.monotonic_nanos().unwrap().saturating_sub(start_ns) / 1_000_000,
+            &mut compiler,
+            &AtomicBool::new(false),
+            alloc,
+            |call, _| match call {
+                Call::Events(_) => Ok(Reply::Events(Ok(WorkersEventsAnswer::CONTINUE))),
+                Call::Join(_) => {
+                    Ok(Reply::Join(Ok(WorkJoinAnswer { roots: roots.clone(), fixed: true })))
+                }
+                Call::Lease(_) => {
+                    let next = (!leased).then_some(grant.clone());
+                    leased = true;
+                    Ok(Reply::Lease(Ok(WorkLeaseAnswer { grant: next })))
+                }
+                Call::Result(_) => Err(Error::Protocol(WireString::from_str_in(
+                    "result acknowledgement lost",
+                    alloc,
+                ))),
+            },
+        );
+        assert!(matches!(result, Err(Error::Protocol(_))));
+        assert_eq!(compiler.released.as_slice(), &[FOUND]);
+        assert_eq!(compiler.calls.get(), 1);
+    }
+}

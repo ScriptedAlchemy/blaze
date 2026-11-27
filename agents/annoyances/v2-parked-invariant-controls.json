@@ -1,0 +1,14 @@
+{
+  "id": "v2-parked-invariant-controls",
+  "date": "2026-11-22",
+  "who": "GPT-6 Astra Pro, repair_catalogs lane",
+  "where": "18 stated invariants in 11 files of blaze-thin, blaze-testsel, blaze-usercode and blaze-units",
+  "what": "The strict invariant inventory found statements without named causal controls. Some useful counterexamples were inline; others described a control that no test actually ran.",
+  "cost": "The inventory failed, and positive examples alone could not show that an omitted input, policy decision or cleanup guard would be observed.",
+  "cause": "The documented properties, existing test scenarios and named-control discovery convention had drifted apart in parked crates.",
+  "class": "undiscoverable or incomplete negative controls for stated test properties",
+  "prevention": "Run the same observer against the real path and a concrete planted omission, and name the control with the established the_oracle_catches_ prefix in the statement's file. Preserve the statement and the strict scanner.",
+  "workaround": "none; no scanner, allowance, ignored-test setting or production behavior changed",
+  "fix": "Added or separated 18 controls using actual codecs, parsers, temporary files, selection machines, table lookups, cache-key functions and the deterministic test-runner driver. Plants drop spans or a provider, skip publication, duplicate timing, reuse a stale head, erase record identity or moved-read marks, lose deletions or exemptions, ignore sandbox mode or host policy, keep unread environment, forget a live server, or lose the program identity used to filter startup reads.",
+  "state": "implemented; whitespace and statement-preservation checks passed. These crates are parked, and their native tests have not been compiled or executed by this repair lane; static inventory discovery is not execution coverage."
+}

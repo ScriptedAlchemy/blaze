@@ -1,0 +1,2349 @@
+//! The frame allocator: a bump pointer over a chain of blocks, one frame per task, reset when
+//! the task that used it ends (docs/v2/plan/design/memory.md, "a task").
+//!
+//! [`task`] gives the closure a frame of its own, empty, and frees it when the closure returns
+//! (or unwinds); a task inside a task gets another frame, so an inner end never frees what the
+//! outer task holds, at any depth. Within a task, [`Frame::scope`] and [`Marker`]s roll back to
+//! a point. A frame implements [`Allocator`], so `Vec<T, &Frame>`, `Box<T, &Frame>` and the
+//! rest allocate from it.
+//!
+//! A frame's memory is a chain of blocks, each with a header at its start: 2 MB chunks from
+//! the process's cache ([`chunks`]), and for an allocation over half a chunk a span, a region
+//! of its own reserved far past it, so the top allocation grows in place there however big it
+//! gets. A task's frame is a header on [`task`]'s stack. An inner task's starts in the rest of
+//! its enclosing task's chunk, which the enclosing frame leaves alone until the inner task
+//! ends (it takes another block if it allocates meanwhile), so deep nesting of small tasks
+//! shares one chunk. Past that its chunks come from the thread's shelf ([`SHELF`] chunks, no
+//! atomic), then the process's cache (one compare-and-swap), and go back the same way; its
+//! spans come from and go back to the thread's shelf of spans, each with its first chunk's
+//! worth of pages committed and the rest given back to the kernel ([`WARM`]). So nested
+//! tasks to any depth make no global allocation once warm, and no system call while each
+//! span stays within what the shelf kept of it. A frame made with
+//! [`Frame::new`] keeps its blocks across [`Frame::reset`].
+//!
+//! Resetting is a few stores: nothing is freed piecemeal, no destructor of a value placed with
+//! [`Frame::alloc`] runs (collections in a frame drop their elements as usual); [`Frame::trim`]
+//! and [`trim_spare`] give pages back after a burst.
+//!
+//! Nothing limits a frame but its reserve ([`FRAME_RESERVE`]) and the kernel: a chunk or a
+//! span's pages the kernel refuses are a typed [`MemError`], never a wait, a cancel or a retry.
+//!
+//! Chunks are placed on the calling thread's NUMA node ([`chunks::set_thread_node`]), and so
+//! are spans.
+//!
+//! [`measure`] says the most the calling thread's frames held at once while a closure ran, a
+//! nested task's on top of its enclosing task's, counted at task and measure boundaries only.
+//!
+//! Cost: an allocation is an align, an add, a compare against the block's end and one store
+//! of the cursor (no atomic, no shared line, and no peak: that is folded in where the cursor
+//! moves back); about 2 ns. Freeing or growing the most recent
+//! allocation happens in place, so a `Vec<T, &Frame>` pushed in a loop never copies while
+//! nothing else is allocated after it and it stays in its block (in a span, always).
+
+use core::{
+    alloc::{AllocError, Allocator, Layout},
+    cell::Cell,
+    mem::{self, ManuallyDrop, MaybeUninit},
+    num::NonZeroUsize,
+    panic::Location,
+    ptr::{self, NonNull},
+    slice, str,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+};
+
+use crate::{
+    MemError, Region, Tag,
+    align::align_up,
+    chunks::{self, CHUNK, Chunk},
+    error::fail,
+    tag,
+};
+
+pub mod grow;
+pub mod table;
+
+#[cfg(test)]
+mod shelf_tests;
+
+pub use grow::{Abandoned, abandoned_on_thread};
+pub use table::{FrameTable, TableRefused};
+
+/// The most one frame holds unless made with [`Frame::with_reserve`]: what one task may take.
+#[cfg(target_pointer_width = "64")]
+pub const FRAME_RESERVE: usize = 4 << 30;
+
+/// The most one frame holds on a 32-bit target: 16 MB. There (wasm32) a reservation is memory
+/// taken whole, and the whole address space is 4 GB.
+#[cfg(not(target_pointer_width = "64"))]
+pub const FRAME_RESERVE: usize = 16 << 20;
+
+/// Chunks a thread keeps warm for its next tasks: 16 MB.
+pub const SHELF: usize = 8;
+
+/// Spans a thread keeps warm, each with its first [`SPAN_WARM`] bytes committed.
+const SPANS: usize = SHELF;
+
+/// What a span keeps committed on a thread's shelf: a chunk's worth, so the next task whose
+/// first big allocation fits it takes no page from the kernel. The pages past it go back as the
+/// task that grew the span ends: a span grows in place however big its task's top allocation
+/// gets, and a shelf that kept every page of it held a task's whole peak, on each thread, for
+/// as long as the thread lived, charged to no task (an hour after a build the daemon still held
+/// 5.8 GiB of frames, #1726).
+const SPAN_WARM: usize = CHUNK;
+
+/// The most frame memory a thread keeps warm between tasks ([`spare_bytes`]): [`SHELF`] chunks
+/// and [`SPANS`] spans of [`SPAN_WARM`] bytes each. What a task's frame leaves behind is never
+/// more.
+pub const WARM: usize = SHELF * CHUNK + SPANS * SPAN_WARM;
+
+/// The frame memory all of a machine's threads keep warm between tasks, at most: eight shelves
+/// at their most, 256 MiB, what a typical Mac's eight workers keep. A machine of more threads
+/// shares it ([`ShelfSize::for_threads`]): before, every thread kept [`WARM`], 32 MiB, so 128
+/// workers kept 4 GiB idle and charged to no task (the outside review, thoughts2.md 4.2).
+pub const WARM_ALL: usize = 8 * WARM;
+
+/// Warm spans the process keeps behind its threads' shelves, for a thread whose shelf has none
+/// (or non-task [`Frame::with_reserve`] spans): 80 of [`SPAN_WARM`], 160 MiB total across
+/// [`SPAN_POOL_SHARDS`] cache-padded shards (up to 64 warm spans = 128 MiB + 512 cold spans =
+/// 32 MiB max at 64 KiB granules) so 128 workers never serialize on one global mutex or trigger
+/// `munmap`/`mmap_lock` storms. Chunks have the process's cache behind them already
+/// ([`chunks::WARM_KEEP`]); a span past this goes to the kernel.
+pub const SPAN_POOL: usize = 80;
+
+/// How many blocks one thread's shelf keeps warm, from the machine it is on (rule 75: the pool
+/// that starts the thread hands it in, [`size_shelf`]; one code path, sized by the machine).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShelfSize {
+    /// Chunks, at most [`SHELF`].
+    pub chunks: usize,
+    /// Spans of [`SPAN_WARM`] committed, at most [`SPANS`].
+    pub spans: usize,
+}
+
+impl ShelfSize {
+    /// Today's on every thread that is handed no size: [`WARM`].
+    pub const MOST: ShelfSize = ShelfSize { chunks: SHELF, spans: SPANS };
+
+    /// A thread's part of [`WARM_ALL`] on a machine of `threads` workers, as chunks and spans
+    /// half each: [`ShelfSize::MOST`] up to eight threads, one of each (4 MiB) from 64 threads
+    /// on, so 128 threads keep at most 512 MiB (and the process's pools behind them).
+    pub const fn for_threads(threads: usize) -> ShelfSize {
+        let threads = if threads == 0 { 1 } else { threads };
+        let blocks = WARM_ALL / threads / CHUNK;
+        let half = blocks / 2;
+        let half = if half == 0 {
+            1
+        } else if half > SHELF {
+            SHELF
+        } else {
+            half
+        };
+        ShelfSize { chunks: half, spans: half }
+    }
+
+    /// The most a shelf of this size keeps committed.
+    pub const fn bytes(self) -> usize {
+        self.chunks * CHUNK + self.spans * SPAN_WARM
+    }
+}
+
+/// An allocation bigger than this goes in a span rather than a chunk.
+const SPAN_AT: usize = CHUNK / 2;
+
+/// The largest alignment a frame gives.
+const MAX_ALIGN: usize = 1 << 30;
+
+/// Where an empty frame's cursor and end sit: not null, in no block.
+const EMPTY: usize = 4096;
+
+/// The least rest of a chunk an enclosing task's frame lends an inner task's.
+const LEND_AT: usize = 4096;
+
+static IDS: AtomicU32 = AtomicU32::new(0);
+
+/// A block's header, at its first byte; its data follows.
+#[repr(C, align(64))]
+struct Block {
+    prev: *mut Block,
+    next: *mut Block,
+    /// The bytes the frame used in the blocks before this one, when it became current.
+    before: usize,
+    /// One past the last byte it can hold: the chunk's end, or its span's reservation's.
+    end: usize,
+    /// The chunk it is, or `stack::NONE` for a span.
+    chunk: u32,
+    /// The span's region, which this header is in; none for a chunk.
+    span: Option<ManuallyDrop<Region>>,
+}
+
+const HEADER: usize = mem::size_of::<Block>();
+
+const _: () = assert!(HEADER.is_multiple_of(64) && HEADER <= 256);
+
+// Every `*mut Block` a frame or a shelf holds points at a header written when the block was
+// taken, at the start of memory committed for it and owned by that holder alone, until the
+// holder gives the block up (`release`, `Shelf::give_span`'s drop). The helpers below rely on
+// that.
+
+/// The header of a held block.
+fn header<'a>(block: *mut Block) -> &'a Block {
+    // SAFETY: by the invariant above `block` is a live header of the caller's; the reference
+    // ends within the caller, before the block is given up.
+    unsafe { &*block }
+}
+
+/// The header of a held block, to change.
+#[allow(clippy::mut_from_ref, reason = "a header is reached only through its one holder")]
+fn header_mut<'a>(block: *mut Block) -> &'a mut Block {
+    // SAFETY: as for `header`; the holder makes no other reference to it meanwhile.
+    unsafe { &mut *block }
+}
+
+/// The block's first byte of data, with the block's provenance.
+fn data(block: *mut Block) -> *mut u8 {
+    block.cast::<u8>().wrapping_add(HEADER)
+}
+
+/// A bump allocator over a chain of blocks. Not `Sync`: a frame is its task's.
+pub struct Frame {
+    /// The next free byte, in the current block (or `EMPTY`).
+    cursor: Cell<*mut u8>,
+    /// The bump's end in the current block: its end, a span's committed end, or the limit's.
+    end: Cell<usize>,
+    /// The current block's first byte of data; `usize::MAX` with none.
+    floor: Cell<usize>,
+    /// `used() == cursor + bias`, wrapping.
+    bias: Cell<usize>,
+    /// The most `used()` was since the last reset.
+    peak: Cell<usize>,
+    /// Blocks `grow` moved since the last reset, and the bytes it copied moving them.
+    copies: Cell<u64>,
+    copied: Cell<u64>,
+    /// Blocks `grow` or `shrink` moved since the last reset, and the bytes they left behind
+    /// in the bump ([`grow::Abandoned`]).
+    abandons: Cell<u64>,
+    abandoned: Cell<u64>,
+    first: Cell<*mut Block>,
+    current: Cell<*mut Block>,
+    /// Bytes of the blocks it holds: whole chunks, spans' committed pages.
+    held: Cell<usize>,
+    /// The most bytes it hands out.
+    limit: usize,
+    /// The subsystem of the task using it, for [`tag::task_ended`].
+    tag: Cell<Tag>,
+    id: u32,
+    /// A task's frame: its blocks come from and go back to its thread's shelves.
+    task: bool,
+    /// The rest of the current block is lent to an inner task's frame: `end` stops at the
+    /// cursor of the lend until that task ends or this frame moves to another block.
+    lent: Cell<bool>,
+    /// The bytes an outer task's frame lent this one, `start..end`; empty when none.
+    window: (usize, usize),
+    /// The use before the last allocation the frame refused, until the caller takes it or reset.
+    exhaustion: Cell<Option<usize>>,
+    /// [`sealed`] of `id` while the frame is alive, [`UNSEALED`] once dropped: what [`task`]
+    /// checks of the frame a thread says encloses it before using it.
+    seal: Cell<u64>,
+    /// Where the frame was made: for a task's, the call of [`task`]. Named when a later task
+    /// finds this frame dropped where its thread says its enclosing task's is.
+    opened_at: &'static Location<'static>,
+    /// The thread whose task stack the task's end put back (its [`STACK`]'s address), 0 until it
+    /// ends: whether a dropped frame a thread still names was ended on that thread or another.
+    ended_on: Cell<usize>,
+}
+
+/// The high half of a live frame's seal, its id the low half.
+const SEAL: u64 = 0x5ea1_f4a3 << 32;
+/// A dropped frame's seal.
+const UNSEALED: u64 = 0xdead_f4a3_dead_f4a3;
+
+fn sealed(id: u32) -> u64 {
+    SEAL | u64::from(id)
+}
+
+// SAFETY: a frame owns its blocks, and every value in them is borrowed from it. A frame handed
+// out by value (`Frame::new`) takes and gives its blocks through the process's chunk cache and
+// its own regions, which any thread may; a task's frame, the only kind that uses a thread's
+// shelves, is never moved: `task` keeps it on its own stack and lends only `&Frame`, which is
+// not `Send` since `Frame` is not `Sync`.
+unsafe impl Send for Frame {}
+
+/// A point in a frame to roll back to with [`Frame::reset_to`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Marker {
+    frame: u32,
+    at: usize,
+}
+
+impl Frame {
+    /// A frame for tasks of `tag`, of at most [`FRAME_RESERVE`]: no memory until it is used.
+    #[track_caller]
+    pub fn new(tag: Tag) -> Result<Frame, MemError> {
+        Frame::with_reserve(FRAME_RESERVE, tag)
+    }
+
+    /// A frame of at most `bytes`, which takes blocks as it is used.
+    #[track_caller]
+    pub fn with_reserve(bytes: usize, tag: Tag) -> Result<Frame, MemError> {
+        Ok(Frame::empty(bytes, tag, IDS.fetch_add(1, Ordering::Relaxed), false))
+    }
+
+    #[track_caller]
+    fn empty(limit: usize, tag: Tag, id: u32, task: bool) -> Frame {
+        Frame {
+            cursor: Cell::new(ptr::without_provenance_mut(EMPTY)),
+            end: Cell::new(EMPTY),
+            floor: Cell::new(usize::MAX),
+            bias: Cell::new(0usize.wrapping_sub(EMPTY)),
+            peak: Cell::new(0),
+            copies: Cell::new(0),
+            copied: Cell::new(0),
+            abandons: Cell::new(0),
+            abandoned: Cell::new(0),
+            first: Cell::new(ptr::null_mut()),
+            current: Cell::new(ptr::null_mut()),
+            held: Cell::new(0),
+            limit,
+            tag: Cell::new(tag),
+            id,
+            task,
+            lent: Cell::new(false),
+            window: (0, 0),
+            exhaustion: Cell::new(None),
+            seal: Cell::new(sealed(id)),
+            opened_at: Location::caller(),
+            ended_on: Cell::new(0),
+        }
+    }
+
+    /// A task's frame that starts in the rest of the current chunk of `outer`, the enclosing
+    /// task's, when enough is left; else empty. `outer` stops short of the rest until
+    /// [`Frame::take_back`].
+    #[track_caller]
+    fn inner(outer: &Frame, tag: Tag, id: u32) -> (Frame, Option<usize>) {
+        let mut frame = Frame::empty(FRAME_RESERVE, tag, id, true);
+        let current = outer.current.get();
+        let in_span = !current.is_null() && header(current).span.is_some();
+        if outer.lent.get() || outer.floor.get() == usize::MAX || in_span {
+            return (frame, None);
+        }
+        let cursor = outer.cursor.get();
+        let start = align_up(cursor.addr(), 64);
+        let end = outer.end.get();
+        if end.saturating_sub(start) < LEND_AT {
+            return (frame, None);
+        }
+        outer.end.set(cursor.addr());
+        outer.lent.set(true);
+        frame.cursor.set(cursor.with_addr(start));
+        frame.end.set(end);
+        frame.floor.set(start);
+        frame.bias.set(0usize.wrapping_sub(start));
+        frame.window = (start, end);
+        (frame, Some(end))
+    }
+
+    /// The rest of the current block back from the inner task's frame [`Frame::inner`] lent it
+    /// to, `end` being where the bump stopped before; nothing when the frame moved on since.
+    fn take_back(&self, end: usize) {
+        if self.lent.replace(false) {
+            self.end.set(end);
+        }
+    }
+
+    pub fn tag(&self) -> Tag {
+        self.tag.get()
+    }
+
+    /// Bytes in use since the last reset (alignment padding included).
+    #[inline]
+    pub fn used(&self) -> usize {
+        self.cursor.get().addr().wrapping_add(self.bias.get())
+    }
+
+    /// The most bytes in use at once since the last reset.
+    pub fn peak(&self) -> usize {
+        self.peak.get().max(self.used())
+    }
+
+    /// What growing blocks that were not the last copied since the last reset.
+    pub fn copied(&self) -> tag::Copied {
+        tag::Copied { copies: self.copies.get(), bytes: self.copied.get() }
+    }
+
+    /// Folds the bytes in use into `peak`, before the cursor moves back. An allocation never
+    /// writes `peak`: `used()` only rises between the points that lower it (freeing or
+    /// shrinking the top allocation, a rollback, a reset), each of which folds first, so the
+    /// most it reached since the last fold is what it is when the next one runs.
+    #[inline]
+    fn fold_peak(&self) {
+        let used = self.used();
+        if used > self.peak.get() {
+            self.peak.set(used);
+        }
+    }
+
+    /// Bytes of the blocks it holds (whole chunks, spans' committed pages), in use or not.
+    pub fn committed(&self) -> usize {
+        self.held.get()
+    }
+
+    /// The most it hands out: [`FRAME_RESERVE`] or what [`Frame::with_reserve`] was given.
+    pub fn reserved(&self) -> usize {
+        self.limit
+    }
+
+    /// Whether `ptr` points into one of this frame's blocks.
+    pub fn contains(&self, ptr: *const u8) -> bool {
+        let at = ptr.addr();
+        if (self.window.0..self.window.1).contains(&at) {
+            return true;
+        }
+        let mut block = self.first.get();
+        while !block.is_null() {
+            let head = header(block);
+            if (data(block).addr()..head.end).contains(&at) {
+                return true;
+            }
+            block = head.next;
+        }
+        false
+    }
+
+    /// Takes `layout`'s bytes, aligned; `MemError` when the frame's limit is reached or the
+    /// kernel refuses the memory.
+    #[inline]
+    pub fn try_alloc_layout(&self, layout: Layout) -> Result<NonNull<u8>, MemError> {
+        let cursor = self.cursor.get();
+        let at = align_up(cursor.addr(), layout.align());
+        match at.checked_add(layout.size()) {
+            Some(end) if end <= self.end.get() => {
+                self.cursor.set(cursor.with_addr(end));
+                // SAFETY: `at` is in `[cursor, end]`, within the current block's committed bytes,
+                // or `EMPTY` (not null) for a zero-sized value in a frame with no block.
+                Ok(unsafe { NonNull::new_unchecked(cursor.with_addr(at)) })
+            }
+            _ => self.alloc_cold(layout),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_cold(&self, layout: Layout) -> Result<NonNull<u8>, MemError> {
+        self.make_room(layout)?;
+        let cursor = self.cursor.get();
+        let at = align_up(cursor.addr(), layout.align());
+        let end = at + layout.size();
+        if end > self.end.get() {
+            return Err(self.exhausted(end - cursor.addr()));
+        }
+        self.cursor.set(cursor.with_addr(end));
+        self.peak.set(self.peak.get().max(end.wrapping_add(self.bias.get())));
+        // SAFETY: as in `try_alloc_layout`: `at` is within the block `make_room` made current.
+        Ok(unsafe { NonNull::new_unchecked(cursor.with_addr(at)) })
+    }
+
+    fn exhausted(&self, more: usize) -> MemError {
+        self.exhaustion.set(Some(self.used()));
+        MemError::Exhausted {
+            tag: self.tag.get(),
+            reserved: self.limit,
+            wanted: self.used().saturating_add(more),
+        }
+    }
+
+    /// Takes the use remembered when the frame last refused an allocation.
+    pub fn take_exhaustion(&self) -> Option<usize> {
+        self.exhaustion.take()
+    }
+
+    /// Makes the current block one `layout` fits in at the cursor: the current span grown, a
+    /// block ahead (kept from before a rollback or reset), or a new one.
+    fn make_room(&self, layout: Layout) -> Result<(), MemError> {
+        let (size, align) = (layout.size(), layout.align());
+        if align > MAX_ALIGN {
+            return Err(MemError::TooLarge {
+                tag: self.tag.get(),
+                what: "a frame allocation's alignment",
+                wanted: align,
+            });
+        }
+        if self.used().saturating_add(size) > self.limit {
+            return Err(self.exhausted(size));
+        }
+        let current = self.current.get();
+        if !current.is_null() {
+            let at = align_up(self.cursor.get().addr(), align);
+            if header(current).span.is_some() && at.saturating_add(size) <= header(current).end {
+                return self.commit_span(current, at + size);
+            }
+            let mut ahead = header(current).next;
+            while !ahead.is_null() {
+                if fits(ahead, layout) {
+                    self.enter(ahead);
+                    return self.reach(ahead, layout);
+                }
+                ahead = header(ahead).next;
+            }
+        }
+        let block = if size > SPAN_AT || !chunk_fits(layout) {
+            self.new_span(layout)?
+        } else {
+            self.new_chunk()?
+        };
+        self.link_after_current(block);
+        self.enter(block);
+        self.reach(block, layout)
+    }
+
+    /// Commits what `layout` needs at the cursor of the span `block`, just made current.
+    fn reach(&self, block: *mut Block, layout: Layout) -> Result<(), MemError> {
+        if header(block).span.is_some() {
+            let at = align_up(self.cursor.get().addr(), layout.align());
+            return self.commit_span(block, at + layout.size());
+        }
+        Ok(())
+    }
+
+    /// Commits the current span `block` up to address `end` and moves the bump's end there.
+    fn commit_span(&self, block: *mut Block, end: usize) -> Result<(), MemError> {
+        let Some(region) = header(block).span.as_deref() else {
+            unreachable!("a chunk has no pages to commit")
+        };
+        let len = end - region.base().addr().get();
+        let before = region.committed();
+        region.ensure(len)?;
+        self.held.set(self.held.get() + region.committed() - before);
+        self.end.set(self.usable_end(block, header(block).before));
+        Ok(())
+    }
+
+    /// Where the bump of `block` must stop: its end (a span's committed end), or the limit's.
+    fn usable_end(&self, block: *mut Block, before: usize) -> usize {
+        let head = header(block);
+        let end = match head.span.as_deref() {
+            Some(region) => region.base().addr().get() + region.committed(),
+            None => head.end,
+        };
+        end.min(data(block).addr().saturating_add(self.limit.saturating_sub(before)))
+    }
+
+    /// Makes `block` current at its start, after what the frame used so far.
+    fn enter(&self, block: *mut Block) {
+        self.place(block, self.used(), data(block));
+    }
+
+    /// Makes `block` current with its cursor at `at`, `before` bytes used before it.
+    fn place(&self, block: *mut Block, before: usize, at: *mut u8) {
+        header_mut(block).before = before;
+        let start = data(block).addr();
+        self.current.set(block);
+        self.cursor.set(at);
+        self.floor.set(start);
+        self.bias.set(before.wrapping_sub(start));
+        self.end.set(self.usable_end(block, before));
+        self.lent.set(false);
+    }
+
+    fn link_after_current(&self, block: *mut Block) {
+        let current = self.current.get();
+        let head = header_mut(block);
+        if current.is_null() {
+            head.prev = ptr::null_mut();
+            head.next = self.first.get();
+            if !head.next.is_null() {
+                header_mut(head.next).prev = block;
+            }
+            self.first.set(block);
+            return;
+        }
+        let next = header(current).next;
+        head.prev = current;
+        head.next = next;
+        if !next.is_null() {
+            header_mut(next).prev = block;
+        }
+        header_mut(current).next = block;
+    }
+
+    fn new_chunk(&self) -> Result<*mut Block, MemError> {
+        let chunk = match self.task {
+            true => match SHELF_OF.try_with(Shelf::take_chunk) {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) | Err(_) => chunks::take(Tag::Frames)?,
+            },
+            false => chunks::take(Tag::Frames)?,
+        };
+        let base = chunk.ptr();
+        let block = base.cast::<Block>().as_ptr();
+        // SAFETY: the chunk is ours alone, committed, `CHUNK` bytes and aligned to `CHUNK`, so
+        // its start holds a header; what it held before is dead.
+        unsafe {
+            block.write(Block {
+                prev: ptr::null_mut(),
+                next: ptr::null_mut(),
+                before: 0,
+                end: base.addr().get() + CHUNK,
+                chunk: chunk.index(),
+                span: None,
+            })
+        };
+        self.held.set(self.held.get() + CHUNK);
+        Ok(block)
+    }
+
+    /// A span for `layout`: a warm one of the thread's (or the process's span pool) that is big
+    /// enough, or a new region reserved far past it, on the thread's node; its pages for `layout`
+    /// committed.
+    fn new_span(&self, layout: Layout) -> Result<*mut Block, MemError> {
+        let tag = self.tag.get();
+        let need = HEADER
+            .checked_add(layout.align())
+            .and_then(|it| it.checked_add(layout.size()))
+            .ok_or(MemError::TooLarge { tag, what: "a frame allocation", wanted: layout.size() })?;
+        let pooled = if self.task {
+            SHELF_OF.try_with(|shelf| shelf.take_span(need)).ok().flatten()
+        } else {
+            take_pooled_span(need)
+        };
+        if let Some(block) = pooled {
+            let head = header_mut(block);
+            let committed = head.span.as_deref().map_or(0, Region::committed);
+            head.prev = ptr::null_mut();
+            head.next = ptr::null_mut();
+            self.held.set(self.held.get() + committed);
+            return Ok(block);
+        }
+        let reserve = span_reserve(need);
+        let region = match chunks::thread_node() {
+            Some(node) => Region::reserve_huge_on(reserve, node, Tag::Frames)?,
+            None => Region::reserve_huge(reserve, Tag::Frames)?,
+        };
+        region.ensure(need)?;
+        let base = region.base();
+        let end = base.addr().get() + region.reserved();
+        let committed = region.committed();
+        let block = base.cast::<Block>().as_ptr();
+        // SAFETY: the region is fresh, committed for `need >= HEADER` bytes and aligned to a
+        // page, so its start holds a header; nothing else knows of it.
+        unsafe {
+            block.write(Block {
+                prev: ptr::null_mut(),
+                next: ptr::null_mut(),
+                before: 0,
+                end,
+                chunk: crate::stack::NONE,
+                span: Some(ManuallyDrop::new(region)),
+            })
+        };
+        self.held.set(self.held.get() + committed);
+        Ok(block)
+    }
+
+    /// Gives up `block`, which is out of the chain: a chunk back to the thread's shelf or the
+    /// cache, a span back to the thread's shelf of spans or to the kernel. With `cold`, its pages
+    /// go to the kernel.
+    fn release(&self, block: *mut Block, cold: bool) {
+        let head = header_mut(block);
+        if head.span.is_none() {
+            self.held.set(self.held.get() - CHUNK);
+            let index = head.chunk;
+            let given = self.task
+                && SHELF_OF
+                    .try_with(|shelf| shelf.give_chunk(Chunk::from_index(index), cold))
+                    .is_ok();
+            if !given {
+                match cold {
+                    true => chunks::give_cold(Chunk::from_index(index), Tag::Frames),
+                    false => chunks::give(Chunk::from_index(index), Tag::Frames),
+                }
+            }
+            return;
+        }
+        let committed = head.span.as_deref().map_or(0, Region::committed);
+        self.held.set(self.held.get() - committed);
+        if cold {
+            pool_cold_or_drop_span(block);
+            return;
+        }
+        if self.task && SHELF_OF.try_with(|shelf| shelf.give_span(block)).is_ok() {
+            return;
+        }
+        pool_or_drop_span(block);
+    }
+
+    /// Stops with the error when memory cannot be had.
+    #[inline]
+    #[track_caller]
+    pub fn alloc_layout(&self, layout: Layout) -> NonNull<u8> {
+        match self.try_alloc_layout(layout) {
+            Ok(ptr) => ptr,
+            Err(error) => fail(&error),
+        }
+    }
+
+    /// Places `value` in the frame. Its destructor never runs: the frame forgets it at reset.
+    #[inline]
+    #[track_caller]
+    #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
+    pub fn alloc<T>(&self, value: T) -> &mut T {
+        let ptr = self.alloc_layout(Layout::new::<T>()).cast::<T>();
+        // SAFETY: `ptr` is fresh memory of this frame, sized and aligned for `T`, handed out
+        // once; it stays valid until a reset, which takes `&mut self` and so outlives this
+        // borrow.
+        unsafe { ptr.write(value) };
+        // SAFETY: just initialized, and no other reference to it exists.
+        unsafe { &mut *ptr.as_ptr() }
+    }
+
+    /// Copies `values` into the frame.
+    #[inline]
+    #[track_caller]
+    #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
+    pub fn alloc_slice_copy<T: Copy>(&self, values: &[T]) -> &mut [T] {
+        let slots = self.alloc_uninit_slice::<T>(values.len());
+        for (slot, value) in slots.iter_mut().zip(values) {
+            slot.write(*value);
+        }
+        // SAFETY: every element was just written.
+        unsafe { slots.assume_init_mut() }
+    }
+
+    /// `len` values made by `f(0)`, `f(1)`, ... in the frame. If `f` panics, the values made
+    /// so far are forgotten with the frame, as every frame value is.
+    #[inline]
+    #[track_caller]
+    #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
+    pub fn alloc_slice_fill_with<T>(&self, len: usize, mut f: impl FnMut(usize) -> T) -> &mut [T] {
+        let slots = self.alloc_uninit_slice::<T>(len);
+        for (i, slot) in slots.iter_mut().enumerate() {
+            slot.write(f(i));
+        }
+        // SAFETY: every element was just written.
+        unsafe { slots.assume_init_mut() }
+    }
+
+    /// The items of `iter`, which says its length, in the frame.
+    #[inline]
+    #[track_caller]
+    #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
+    pub fn alloc_slice_from_iter<T, I>(&self, iter: I) -> &mut [T]
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let mut iter = iter.into_iter();
+        let len = iter.len();
+        let slots = self.alloc_uninit_slice::<T>(len);
+        let mut filled = 0;
+        for slot in slots.iter_mut() {
+            match iter.next() {
+                Some(value) => {
+                    slot.write(value);
+                    filled += 1;
+                }
+                None => break,
+            }
+        }
+        // SAFETY: the first `filled` elements were written; an iterator that said more than it
+        // gave leaves the rest out of the slice.
+        unsafe { slots[..filled].assume_init_mut() }
+    }
+
+    /// Room for `len` values of `T`, uninitialized.
+    #[inline]
+    #[track_caller]
+    #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
+    pub fn alloc_uninit_slice<T>(&self, len: usize) -> &mut [MaybeUninit<T>] {
+        let layout = match Layout::array::<T>(len) {
+            Ok(layout) => layout,
+            Err(_) => {
+                fail(&MemError::TooLarge { tag: self.tag(), what: "a frame slice", wanted: len })
+            }
+        };
+        let ptr = self.alloc_layout(layout).cast::<MaybeUninit<T>>();
+        // SAFETY: fresh memory of this frame for `len` elements, aligned, handed out once and
+        // valid until a reset (which takes `&mut self`); `MaybeUninit` needs no initialization.
+        unsafe { slice::from_raw_parts_mut(ptr.as_ptr(), len) }
+    }
+
+    /// Copies `text` into the frame.
+    #[inline]
+    #[track_caller]
+    #[allow(clippy::mut_from_ref, reason = "each call hands out fresh, disjoint memory")]
+    pub fn alloc_str(&self, text: &str) -> &mut str {
+        let bytes = self.alloc_slice_copy(text.as_bytes());
+        // SAFETY: the bytes are a copy of a `str`'s, so UTF-8.
+        unsafe { str::from_utf8_unchecked_mut(bytes) }
+    }
+
+    /// The point to roll back to.
+    pub fn mark(&self) -> Marker {
+        Marker { frame: self.id, at: self.cursor.get().addr() }
+    }
+
+    /// Frees everything allocated since `marker` was taken; the blocks taken since stay the
+    /// frame's, for what comes next. Stops when the marker is another frame's or from after a
+    /// rollback past it.
+    #[track_caller]
+    pub fn reset_to(&mut self, marker: Marker) {
+        assert_eq!(marker.frame, self.id, "a marker of another frame");
+        assert!(
+            self.roll_back(marker.at),
+            "a marker taken after a point the frame was already rolled back past"
+        );
+    }
+
+    /// Moves the cursor back to address `at`, in the current block or one before it. Whether
+    /// `at` was such a point.
+    fn roll_back(&self, at: usize) -> bool {
+        self.fold_peak();
+        let cursor = self.cursor.get();
+        if (self.floor.get()..=cursor.addr()).contains(&at) {
+            self.cursor.set(cursor.with_addr(at));
+            return true;
+        }
+        if at == EMPTY {
+            self.rewind();
+            return true;
+        }
+        let current = self.current.get();
+        if current.is_null() {
+            return false;
+        }
+        let mut block = header(current).prev;
+        while !block.is_null() {
+            let head = header(block);
+            if (data(block).addr()..=head.end).contains(&at) {
+                self.place(block, head.before, data(block).with_addr(at));
+                return true;
+            }
+            block = head.prev;
+        }
+        false
+    }
+
+    /// The cursor back at the first block's start (or the empty frame's), the blocks kept.
+    fn rewind(&self) {
+        let first = self.first.get();
+        if first.is_null() {
+            self.cursor.set(ptr::without_provenance_mut(EMPTY));
+            self.end.set(EMPTY);
+            self.floor.set(usize::MAX);
+            self.bias.set(0usize.wrapping_sub(EMPTY));
+            return;
+        }
+        self.place(first, 0, data(first));
+    }
+
+    /// Frees everything, keeping its blocks for the next task. Counts the task's peak to its
+    /// tag ([`tag::task_ended`]).
+    pub fn reset(&mut self) {
+        tag::task_ended(self.tag.get(), self.peak(), self.copied());
+        grow::report(self.abandoned());
+        self.rewind();
+        self.peak.set(0);
+        self.copies.set(0);
+        self.copied.set(0);
+        self.abandons.set(0);
+        self.abandoned.set(0);
+        self.exhaustion.set(None);
+    }
+
+    /// Runs `f` with this frame and frees what it allocated once it returns. What `f` returns
+    /// cannot borrow the frame, so nothing it allocated outlives the rollback.
+    pub fn scope<R>(&mut self, f: impl FnOnce(&Frame) -> R) -> R {
+        struct Back<'f> {
+            frame: &'f Frame,
+            at: usize,
+        }
+        impl Drop for Back<'_> {
+            fn drop(&mut self) {
+                let back = self.frame.roll_back(self.at);
+                debug_assert!(back, "a scope's own mark is a point of its frame");
+            }
+        }
+        let back = Back { frame: self, at: self.cursor.get().addr() };
+        f(back.frame)
+    }
+
+    /// Gives back to the kernel the blocks ahead of the cursor and the current span's pages
+    /// past it, until it holds at most `keep` bytes (or what is in use, if more).
+    pub fn trim(&mut self, keep: usize) {
+        let current = self.current.get();
+        let mut last = if current.is_null() { self.first.get() } else { header(current).next };
+        while !last.is_null() && !header(last).next.is_null() {
+            last = header(last).next;
+        }
+        while !last.is_null() && last != current && self.held.get() > keep {
+            let prev = header(last).prev;
+            match prev.is_null() {
+                true => self.first.set(ptr::null_mut()),
+                false => header_mut(prev).next = ptr::null_mut(),
+            }
+            self.release(last, true);
+            last = prev;
+        }
+        if current.is_null() || self.held.get() <= keep {
+            return;
+        }
+        let head = header_mut(current);
+        if let Some(region) = head.span.as_deref_mut() {
+            let before = region.committed();
+            let in_use = self.cursor.get().addr() - region.base().addr().get();
+            // A refused decommit leaves the pages committed: memory held, nothing broken.
+            _ = region.decommit_after(in_use.max(HEADER));
+            let freed = before - region.committed();
+            self.held.set(self.held.get() - freed);
+            self.end.set(self.usable_end(current, head.before));
+        }
+    }
+
+    /// Whether `[ptr, ptr + size)` ends at the cursor, in the current block: the most recent
+    /// allocation.
+    #[inline]
+    fn is_top(&self, ptr: NonNull<u8>, size: usize) -> bool {
+        ptr.addr().get() + size == self.cursor.get().addr() && ptr.addr().get() >= self.floor.get()
+    }
+
+    /// Grows the top allocation, ending at the cursor, to end at `end`, in place: within the
+    /// bump's end, or in the current span by committing more. Whether it could.
+    fn grow_top(&self, end: usize) -> Result<bool, MemError> {
+        // The block's end is exact: past the bump's end (a chunk's end, a span's committed end,
+        // the limit's) the block grows only by committing its span further, else it moves.
+        // `grow::ignores_end` is a test's planted bug, false in every other build.
+        if end > self.end.get() && !grow::ignores_end() {
+            let current = self.current.get();
+            if current.is_null() || header(current).span.is_none() || end > header(current).end {
+                return Ok(false);
+            }
+            if self.used().saturating_add(end - self.cursor.get().addr()) > self.limit {
+                return Ok(false);
+            }
+            self.commit_span(current, end)?;
+            if end > self.end.get() {
+                return Ok(false);
+            }
+        }
+        self.cursor.set(self.cursor.get().with_addr(end));
+        self.peak.set(self.peak.get().max(end.wrapping_add(self.bias.get())));
+        Ok(true)
+    }
+}
+
+/// Whether a fresh chunk holds `layout` after its header.
+fn chunk_fits(layout: Layout) -> bool {
+    layout.align() <= CHUNK
+        && align_up(HEADER, layout.align()).saturating_add(layout.size()) <= CHUNK
+}
+
+/// Whether the block `block` holds `layout` at its start.
+fn fits(block: *mut Block, layout: Layout) -> bool {
+    let at = align_up(data(block).addr(), layout.align());
+    at.checked_add(layout.size()).is_some_and(|end| end <= header(block).end)
+}
+
+/// The address space a span for `need` bytes reserves: room to grow in place to four times
+/// the next power of two, at least 64 MB.
+#[cfg(target_pointer_width = "64")]
+fn span_reserve(need: usize) -> usize {
+    need.checked_next_power_of_two().map_or(need, |it| it.saturating_mul(4)).max(64 << 20)
+}
+
+/// On a 32-bit target a reservation is memory taken whole: a span is what it holds.
+#[cfg(not(target_pointer_width = "64"))]
+fn span_reserve(need: usize) -> usize {
+    need
+}
+
+/// Gives a span's region back to the kernel, its header with it.
+fn drop_span(block: *mut Block) {
+    let head = header_mut(block);
+    let Some(region) = head.span.take() else { unreachable!("a span holds its region") };
+    // The header is inside the region: nothing reads it once the region goes.
+    drop(ManuallyDrop::into_inner(region));
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        let mut block = self.first.get();
+        self.first.set(ptr::null_mut());
+        self.current.set(ptr::null_mut());
+        while !block.is_null() {
+            let next = header(block).next;
+            self.release(block, false);
+            block = next;
+        }
+        // SAFETY: `seal` is this frame's own field, alive until `drop` returns. Volatile, as a
+        // store to an object about to die is otherwise one the compiler may drop, and a stale
+        // pointer to this frame must find it unsealed.
+        unsafe { self.seal.as_ptr().write_volatile(UNSEALED) };
+    }
+}
+
+// SAFETY: blocks are disjoint ranges of the frame's chunks and spans, handed out once each and
+// committed before they are returned. A block stays valid until it is deallocated or the frame
+// is reset, rolled back or dropped, each of which takes `&mut Frame` (or ownership), which no
+// live `&Frame` an allocation borrows allows; growing commits a span further, never moving it.
+// `deallocate` and `shrink` only move the cursor back over the top block, never touching
+// another.
+// SAFETY: `Frame` is a bump arena whose allocations stay live until the frame resets or drops,
+// reclaiming all storage in bulk; forgetting a container handle never leaks memory past the frame.
+unsafe impl blaze_own::BumpAlloc for Frame {}
+
+unsafe impl Allocator for Frame {
+    #[inline]
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let ptr = self.try_alloc_layout(layout).map_err(|_| AllocError)?;
+        Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
+    }
+
+    #[inline]
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        if self.is_top(ptr, layout.size()) {
+            self.fold_peak();
+            self.cursor.set(self.cursor.get().with_addr(ptr.addr().get()));
+        }
+    }
+
+    #[inline]
+    unsafe fn grow(
+        &self,
+        ptr: NonNull<u8>,
+        old: Layout,
+        new: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        if self.is_top(ptr, old.size())
+            && ptr.as_ptr().align_offset(new.align()) == 0
+            && let Some(end) = ptr.addr().get().checked_add(new.size())
+            && self.grow_top(end).map_err(|_| AllocError)?
+        {
+            return Ok(NonNull::slice_from_raw_parts(ptr, new.size()));
+        }
+        let to = self.try_alloc_layout(new).map_err(|_| AllocError)?;
+        // SAFETY: the caller says `ptr` is a live block of `old.size()` bytes; `to` is a fresh
+        // block of at least as many, so the two do not overlap.
+        unsafe { ptr::copy_nonoverlapping(ptr.as_ptr(), to.as_ptr(), old.size()) };
+        self.copies.set(self.copies.get() + 1);
+        self.copied.set(self.copied.get() + old.size() as u64);
+        // The old block stays taken until a reset: counted, so a profile shows it.
+        self.left_behind(old.size());
+        Ok(NonNull::slice_from_raw_parts(to, new.size()))
+    }
+
+    #[inline]
+    unsafe fn grow_zeroed(
+        &self,
+        ptr: NonNull<u8>,
+        old: Layout,
+        new: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: the caller's guarantees for `grow_zeroed` are those of `grow`.
+        let block = unsafe { self.grow(ptr, old, new) }?;
+        let tail = block.cast::<u8>().as_ptr().wrapping_add(old.size());
+        // SAFETY: the block holds `new.size()` bytes, so `[old.size(), new.size())` is inside
+        // it; memory reused after a reset may hold old bytes, hence the explicit zeroing.
+        unsafe { ptr::write_bytes(tail, 0, new.size() - old.size()) };
+        Ok(block)
+    }
+
+    #[inline]
+    unsafe fn shrink(
+        &self,
+        ptr: NonNull<u8>,
+        old: Layout,
+        new: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        if ptr.as_ptr().align_offset(new.align()) != 0 {
+            let to = self.try_alloc_layout(new).map_err(|_| AllocError)?;
+            // SAFETY: `ptr` is a live block of at least `new.size()` bytes and `to` a fresh one.
+            unsafe { ptr::copy_nonoverlapping(ptr.as_ptr(), to.as_ptr(), new.size()) };
+            self.left_behind(old.size());
+            return Ok(NonNull::slice_from_raw_parts(to, new.size()));
+        }
+        if self.is_top(ptr, old.size()) {
+            self.fold_peak();
+            self.cursor.set(self.cursor.get().with_addr(ptr.addr().get() + new.size()));
+        }
+        Ok(NonNull::slice_from_raw_parts(ptr, new.size()))
+    }
+}
+
+impl core::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Frame")
+            .field("tag", &self.tag.get())
+            .field("used", &self.used())
+            .field("peak", &self.peak())
+            .field("committed", &self.committed())
+            .field("reserved", &self.limit)
+            .finish()
+    }
+}
+
+/// A thread's memory for its tasks' frames between tasks: chunks, and spans with their pages
+/// committed. Given back to the process when the thread ends.
+struct Shelf {
+    chunks: [Cell<u32>; SHELF],
+    len: Cell<usize>,
+    /// Spans, linked through their headers' `next`.
+    spans: Cell<*mut Block>,
+    span_count: Cell<usize>,
+    /// What it keeps at most ([`size_shelf`]): [`ShelfSize::MOST`] until its thread is sized.
+    most_chunks: Cell<usize>,
+    most_spans: Cell<usize>,
+}
+
+/// Number of cache-line-padded shards backing [`SPANS_POOLED`] (power of two): 32 shards give at
+/// most 4 threads per shard on 128-core Linux servers, eliminating global mutex and `mmap_lock`
+/// contention on concurrent non-task `Frame::with_reserve` releases.
+const SPAN_POOL_SHARDS: usize = 32;
+/// Warm slots per shard: 2 x 32 = 64 warm spans (128 MiB max at [`SPAN_WARM`] = 2 MiB each).
+const SPAN_POOL_WARM_PER_SHARD: usize = 2;
+/// Cold slots per shard: 16 x 32 = 512 cold spans (decommitted down to one granule, 32 MiB max
+/// even on 64 KiB granules), reusing virtual reservations without `mmap`/`munmap` churn.
+const SPAN_POOL_COLD_PER_SHARD: usize = 16;
+/// Total warm slots across all shards.
+const SPAN_POOL_WARM: usize = SPAN_POOL_SHARDS * SPAN_POOL_WARM_PER_SHARD;
+/// Total cold slots across all shards.
+const SPAN_POOL_COLD: usize = SPAN_POOL_SHARDS * SPAN_POOL_COLD_PER_SHARD;
+/// Total committed-byte budget across all shards (`SPAN_POOL * SPAN_WARM` = 160 MiB).
+const SPAN_POOL_BUDGET: usize = SPAN_POOL * SPAN_WARM;
+/// Committed-byte budget per shard (5 MiB = 4 MiB warm + 1 MiB cold headroom).
+const SPAN_POOL_SHARD_BUDGET: usize = SPAN_POOL_BUDGET / SPAN_POOL_SHARDS;
+
+const _: () = assert!(SPAN_POOL_SHARDS.is_power_of_two());
+const _: () = assert!(SPAN_POOL_WARM == 64 && SPAN_POOL_COLD == 512);
+const _: () = assert!(SPAN_POOL_SHARD_BUDGET * SPAN_POOL_SHARDS <= SPAN_POOL_BUDGET);
+
+/// Pooled spans in one shard of [`SPANS_POOLED`]: up to [`SPAN_POOL_WARM_PER_SHARD`] warm spans
+/// (each down to [`SPAN_WARM`]) plus up to [`SPAN_POOL_COLD_PER_SHARD`] cold spans (each down to
+/// [`HEADER`], one granule), keeping committed bytes within [`SPAN_POOL_SHARD_BUDGET`].
+struct SpanPool {
+    warm: [*mut Block; SPAN_POOL_WARM_PER_SHARD],
+    warm_len: usize,
+    cold: [*mut Block; SPAN_POOL_COLD_PER_SHARD],
+    cold_len: usize,
+}
+
+// SAFETY: a pooled span is the pool's alone: by the invariant above `header`, its header and
+// committed pages are owned by their one holder, here the pool, and no thread keeps a pointer
+// into it; handing it to another thread moves that ownership whole.
+unsafe impl Send for SpanPool {}
+
+impl SpanPool {
+    const fn empty() -> SpanPool {
+        SpanPool {
+            warm: [ptr::null_mut(); SPAN_POOL_WARM_PER_SHARD],
+            warm_len: 0,
+            cold: [ptr::null_mut(); SPAN_POOL_COLD_PER_SHARD],
+            cold_len: 0,
+        }
+    }
+
+    fn committed_bytes(&self) -> usize {
+        let warm: usize = self
+            .warm
+            .iter()
+            .take(self.warm_len)
+            .map(|&span| header(span).span.as_deref().map_or(0, Region::committed))
+            .sum();
+        let cold: usize = self
+            .cold
+            .iter()
+            .take(self.cold_len)
+            .map(|&span| header(span).span.as_deref().map_or(0, Region::committed))
+            .sum();
+        warm + cold
+    }
+
+    /// Best-fit index in `slots` (first `len` elements) whose reservation holds `need` bytes.
+    fn best_fit(slots: &[*mut Block], len: usize, need: usize) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None;
+        for (i, &span) in slots.iter().take(len).enumerate() {
+            let cap = header(span).end - data(span).addr();
+            if cap >= need && best.is_none_or(|(_, best_cap)| cap < best_cap) {
+                best = Some((i, cap));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Removes and returns the element at `at` from `slots[..*len]` via swap-remove.
+    fn take_at(slots: &mut [*mut Block], len: &mut usize, at: usize) -> Option<*mut Block> {
+        let last = len.checked_sub(1)?;
+        let span = *slots.get(at)?;
+        let tail = *slots.get(last)?;
+        if let Some(slot) = slots.get_mut(at) {
+            *slot = tail;
+        }
+        if let Some(slot) = slots.get_mut(last) {
+            *slot = ptr::null_mut();
+        }
+        *len = last;
+        Some(span)
+    }
+
+    fn take_matching(&mut self, need: usize) -> Option<*mut Block> {
+        if let Some(at) = SpanPool::best_fit(&self.warm, self.warm_len, need) {
+            let mut len = self.warm_len;
+            let span = SpanPool::take_at(&mut self.warm, &mut len, at);
+            self.warm_len = len;
+            return span;
+        }
+        if let Some(at) = SpanPool::best_fit(&self.cold, self.cold_len, need) {
+            let mut len = self.cold_len;
+            let span = SpanPool::take_at(&mut self.cold, &mut len, at);
+            self.cold_len = len;
+            return span;
+        }
+        None
+    }
+}
+
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// 128-byte cache-line padded span pool shard (rule 86: prevents cross-core false sharing).
+#[repr(C, align(128))]
+struct SpanPoolShard(Mutex<SpanPool>);
+
+const _: () = assert!(mem::align_of::<SpanPoolShard>() == 128);
+
+impl SpanPoolShard {
+    const fn new() -> SpanPoolShard {
+        SpanPoolShard(Mutex::new(SpanPool::empty()))
+    }
+}
+
+type SpanPoolShards = [SpanPoolShard; SPAN_POOL_SHARDS];
+const EMPTY_SPAN_POOL: SpanPoolShards = [const { SpanPoolShard::new() }; SPAN_POOL_SHARDS];
+
+/// The process's sharded [`SpanPool`]. `std` mutexes (as os.rs's and region.rs's): blaze-mem is
+/// below blaze-core's named locks, and each shard is 128-byte padded and indexed by thread id.
+static SPANS_POOLED: SpanPoolShards = EMPTY_SPAN_POOL;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SPAN_POOL: Cell<Option<&'static SpanPoolShards>> = const { Cell::new(None) };
+}
+
+/// Tests making assertions across several pool operations select their own shards on each
+/// participating thread. Other tests can continue taking, returning and trimming process spans.
+#[cfg(test)]
+fn with_span_pool<R>(shards: &'static SpanPoolShards, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<&'static SpanPoolShards>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_SPAN_POOL.set(self.0);
+        }
+    }
+
+    let _restore = Restore(TEST_SPAN_POOL.replace(Some(shards)));
+    run()
+}
+
+#[inline]
+fn span_pool_shards() -> &'static SpanPoolShards {
+    #[cfg(test)]
+    if let Ok(Some(shards)) = TEST_SPAN_POOL.try_with(Cell::get) {
+        return shards;
+    }
+    &SPANS_POOLED
+}
+
+/// Monotonic counter assigning threads round-robin to [`SPANS_POOLED`] shards so 128 workers
+/// distribute evenly (4 workers/shard) without hash collisions.
+static SPAN_SHARD_NEXT: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    /// This thread's home shard in [`SPANS_POOLED`] (`usize::MAX` until first use; no destructor).
+    static SPAN_SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+#[inline]
+fn thread_span_shard() -> usize {
+    SPAN_SHARD
+        .try_with(|cell| {
+            let cur = cell.get();
+            if cur < SPAN_POOL_SHARDS {
+                return cur;
+            }
+            let assigned =
+                usize::try_from(SPAN_SHARD_NEXT.fetch_add(1, Ordering::Relaxed)).unwrap_or(0)
+                    & (SPAN_POOL_SHARDS - 1);
+            cell.set(assigned);
+            assigned
+        })
+        .unwrap_or_else(|_| {
+            // During thread teardown: deterministic stack-address hash, zero allocation.
+            #[cfg(target_pointer_width = "64")]
+            const MUL: usize = 0x9e37_79b9_7f4a_7c15;
+            #[cfg(not(target_pointer_width = "64"))]
+            const MUL: usize = 0x9e37_79b9;
+            let anchor = 0u8;
+            let mixed = ptr::from_ref(&anchor).addr().wrapping_mul(MUL);
+            (mixed >> 16) & (SPAN_POOL_SHARDS - 1)
+        })
+}
+
+fn span_pool_shard(idx: usize) -> MutexGuard<'static, SpanPool> {
+    let shards = span_pool_shards();
+    let shard = shards.get(idx & (SPAN_POOL_SHARDS - 1)).unwrap_or(&shards[0]);
+    // A panic while it was held left a consistent pool: each push and pop is one store each.
+    shard.0.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `span`, which no shelf kept, to the calling thread's shard of the process's pool with its pages
+/// past [`SPAN_WARM`] given back (or cooled to [`HEADER`] in the cold tier when warm is full), or
+/// to the kernel when both tiers or the shard byte budget are full.
+fn pool_or_drop_span(span: *mut Block) {
+    // Decommit past `SPAN_WARM` outside the pool lock so threads never serialize on syscalls.
+    if let Some(region) = header_mut(span).span.as_deref_mut()
+        && region.committed() > SPAN_WARM
+    {
+        // A refused decommit leaves the pages committed: memory held, nothing broken.
+        _ = region.decommit_after(SPAN_WARM);
+    }
+    let committed = header(span).span.as_deref().map_or(0, Region::committed);
+    let home = thread_span_shard();
+    {
+        let mut pool = span_pool_shard(home);
+        let len = pool.warm_len;
+        if len < SPAN_POOL_WARM_PER_SHARD
+            && pool.committed_bytes() + committed <= SPAN_POOL_SHARD_BUDGET
+        {
+            if let Some(slot) = pool.warm.get_mut(len) {
+                *slot = span;
+                pool.warm_len = len + 1;
+                return;
+            }
+        }
+    }
+    pool_cold_or_drop_span_in(home, span);
+}
+
+/// Decommits `span` down to its header granule (`HEADER`) and keeps its virtual reservation in
+/// the cold tier of the calling thread's shard in [`SPANS_POOLED`], or releases it to the kernel
+/// if the cold tier or shard budget is full.
+fn pool_cold_or_drop_span(span: *mut Block) {
+    pool_cold_or_drop_span_in(thread_span_shard(), span);
+}
+
+fn pool_cold_or_drop_span_in(shard: usize, span: *mut Block) {
+    if let Some(region) = header_mut(span).span.as_deref_mut() {
+        _ = region.decommit_after(HEADER);
+    }
+    let committed = header(span).span.as_deref().map_or(0, Region::committed);
+    let mut pool = span_pool_shard(shard);
+    let len = pool.cold_len;
+    if len < SPAN_POOL_COLD_PER_SHARD
+        && pool.committed_bytes() + committed <= SPAN_POOL_SHARD_BUDGET
+    {
+        if let Some(slot) = pool.cold.get_mut(len) {
+            *slot = span;
+            pool.cold_len = len + 1;
+            return;
+        }
+    }
+    drop(pool);
+    drop_span(span);
+}
+
+/// A pooled span whose reservation holds `need` bytes, out of the calling thread's shard first
+/// (preferring warm, then cold, best-fit by reservation capacity), then non-blocking steal across
+/// sibling shards via `try_lock` so asymmetric producer/consumer threads still reuse reservations
+/// without cross-core lock contention.
+fn take_pooled_span(need: usize) -> Option<*mut Block> {
+    let home = thread_span_shard();
+    if let Some(span) = span_pool_shard(home).take_matching(need) {
+        return Some(span);
+    }
+    let shards = span_pool_shards();
+    for step in 1..SPAN_POOL_SHARDS {
+        let idx = (home + step) & (SPAN_POOL_SHARDS - 1);
+        let Some(shard) = shards.get(idx) else { continue };
+        let Ok(mut pool) = shard.0.try_lock() else { continue };
+        if let Some(span) = pool.take_matching(need) {
+            return Some(span);
+        }
+    }
+    None
+}
+
+/// The bytes the process's sharded pool of spans keeps committed.
+pub fn pooled_span_bytes() -> usize {
+    let mut total = 0usize;
+    for i in 0..SPAN_POOL_SHARDS {
+        total = total.saturating_add(span_pool_shard(i).committed_bytes());
+    }
+    total
+}
+
+/// Moves every warm pooled span across all shards to the cold tier (decommitted down to one
+/// granule) without unmapping its virtual reservation: sheds resident RAM between phases without
+/// `munmap` churn.
+pub fn cool_span_pool() {
+    for i in 0..SPAN_POOL_SHARDS {
+        let (warm, warm_len) = {
+            let mut pool = span_pool_shard(i);
+            let len = pool.warm_len;
+            pool.warm_len = 0;
+            let spans = pool.warm;
+            for slot in pool.warm.iter_mut().take(len) {
+                *slot = ptr::null_mut();
+            }
+            (spans, len)
+        };
+        for &span in warm.iter().take(warm_len) {
+            pool_cold_or_drop_span_in(i, span);
+        }
+    }
+}
+
+/// Gives every pooled span across all shards to the kernel: with [`trim_spare`], after a burst.
+pub fn trim_span_pool() {
+    for i in 0..SPAN_POOL_SHARDS {
+        let (warm, warm_len, cold, cold_len) = {
+            let mut pool = span_pool_shard(i);
+            let wlen = pool.warm_len;
+            let clen = pool.cold_len;
+            pool.warm_len = 0;
+            pool.cold_len = 0;
+            let warm = pool.warm;
+            let cold = pool.cold;
+            for slot in pool.warm.iter_mut().take(wlen) {
+                *slot = ptr::null_mut();
+            }
+            for slot in pool.cold.iter_mut().take(clen) {
+                *slot = ptr::null_mut();
+            }
+            (warm, wlen, cold, clen)
+        };
+        for &span in warm.iter().take(warm_len) {
+            drop_span(span);
+        }
+        for &span in cold.iter().take(cold_len) {
+            drop_span(span);
+        }
+    }
+}
+
+/// Sizes the calling thread's shelf for the machine: what a pool's worker does as it starts,
+/// with the size its pool was handed ([`ShelfSize::for_threads`] of the pool's workers). What
+/// the shelf keeps past the size goes to the process's pools now.
+pub fn size_shelf(size: ShelfSize) {
+    _ = SHELF_OF.try_with(|shelf| shelf.resize(size));
+}
+
+impl Shelf {
+    /// Keeps at most `size` from now on; what it keeps past it goes to the process's pools.
+    fn resize(&self, size: ShelfSize) {
+        self.most_chunks.set(size.chunks.min(SHELF));
+        self.most_spans.set(size.spans.min(SPANS));
+        while self.len.get() > self.most_chunks.get() {
+            let len = self.len.get() - 1;
+            self.len.set(len);
+            // Past the new most, so to the process's cache warm (`give_chunk`'s other arm).
+            self.give_chunk(Chunk::from_index(self.chunks[len].get()), false);
+        }
+        while self.span_count.get() > self.most_spans.get() {
+            let span = self.spans.get();
+            self.spans.set(header(span).next);
+            self.span_count.set(self.span_count.get() - 1);
+            pool_or_drop_span(span);
+        }
+    }
+
+    /// The shelf's top chunk, if it keeps any.
+    fn take_chunk(&self) -> Option<Chunk> {
+        let len = self.len.get();
+        if len == 0 {
+            return None;
+        }
+        self.len.set(len - 1);
+        Some(Chunk::from_index(self.chunks[len - 1].get()))
+    }
+
+    /// Keeps a chunk a task's frame gave up, or gives it to the cache when the shelf is full
+    /// (to the kernel's pages with `cold`).
+    fn give_chunk(&self, chunk: Chunk, cold: bool) {
+        let len = self.len.get();
+        if len < self.most_chunks.get() && !cold {
+            self.chunks[len].set(chunk.index());
+            self.len.set(len + 1);
+            return;
+        }
+        match cold {
+            true => chunks::give_cold(chunk, Tag::Frames),
+            false => chunks::give(chunk, Tag::Frames),
+        }
+    }
+
+    /// A warm span whose reservation holds `need` bytes, out of the shelf, else out of the
+    /// process's pool.
+    fn take_span(&self, need: usize) -> Option<*mut Block> {
+        let mut prev: *mut Block = ptr::null_mut();
+        let mut span = self.spans.get();
+        while !span.is_null() {
+            let head = header(span);
+            if head.end - data(span).addr() >= need {
+                match prev.is_null() {
+                    true => self.spans.set(head.next),
+                    false => header_mut(prev).next = head.next,
+                }
+                self.span_count.set(self.span_count.get() - 1);
+                return Some(span);
+            }
+            prev = span;
+            span = head.next;
+        }
+        take_pooled_span(need)
+    }
+
+    /// Keeps a span a task's frame gave up, its pages past [`SPAN_WARM`] given to the kernel,
+    /// or gives it to the process's pool when the shelf is full (whole to the kernel when that
+    /// is full too).
+    fn give_span(&self, span: *mut Block) {
+        if self.span_count.get() >= self.most_spans.get() {
+            pool_or_drop_span(span);
+            return;
+        }
+        let head = header_mut(span);
+        if let Some(region) = head.span.as_deref_mut() {
+            // A refused decommit leaves the pages committed: memory held, nothing broken.
+            _ = region.decommit_after(SPAN_WARM);
+        }
+        head.prev = ptr::null_mut();
+        head.next = self.spans.get();
+        self.spans.set(span);
+        self.span_count.set(self.span_count.get() + 1);
+    }
+
+    /// Keeps at most `keep` bytes: the chunks past it go to the cache with their pages given
+    /// to the kernel, the spans past it go to the kernel, and the last span kept is decommitted
+    /// down to what is left of `keep`.
+    fn trim(&self, keep: usize) {
+        let keep_chunks = (keep / CHUNK).min(SHELF);
+        while self.len.get() > keep_chunks {
+            let len = self.len.get() - 1;
+            self.len.set(len);
+            let chunk = Chunk::from_index(self.chunks[len].get());
+            self.give_chunk(chunk, true);
+        }
+        let mut left = keep - keep_chunks * CHUNK;
+        let mut prev: *mut Block = ptr::null_mut();
+        let mut span = self.spans.get();
+        while !span.is_null() {
+            let head = header_mut(span);
+            let next = head.next;
+            let committed = head.span.as_deref().map_or(0, Region::committed);
+            if left >= committed {
+                left -= committed;
+                prev = span;
+            } else if left >= HEADER {
+                if let Some(region) = head.span.as_deref_mut() {
+                    // A refused decommit leaves the pages committed: memory held, nothing broken.
+                    _ = region.decommit_after(left);
+                }
+                left = 0;
+                prev = span;
+            } else {
+                match prev.is_null() {
+                    true => self.spans.set(next),
+                    false => header_mut(prev).next = next,
+                }
+                self.span_count.set(self.span_count.get() - 1);
+                drop_span(span);
+            }
+            span = next;
+        }
+    }
+
+    /// Gives all chunks on this shelf to the chunk cache cold and moves all spans to the
+    /// process's cold span pool (decommitted down to one granule) without `munmap`.
+    fn cool(&self) {
+        while let Some(len) = self.len.get().checked_sub(1) {
+            self.len.set(len);
+            if let Some(slot) = self.chunks.get(len) {
+                self.give_chunk(Chunk::from_index(slot.get()), true);
+            }
+        }
+        let mut span = self.spans.get();
+        self.spans.set(ptr::null_mut());
+        self.span_count.set(0);
+        while !span.is_null() {
+            let next = header(span).next;
+            pool_cold_or_drop_span(span);
+            span = next;
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.len.get() + self.span_count.get()
+    }
+
+    /// The bytes its blocks keep committed: its chunks whole, and each span's committed part.
+    fn bytes(&self) -> usize {
+        let mut bytes = self.len.get() * CHUNK;
+        let mut span = self.spans.get();
+        while !span.is_null() {
+            let head = header(span);
+            bytes += head.span.as_deref().map_or(0, Region::committed);
+            span = head.next;
+        }
+        bytes
+    }
+}
+
+impl Drop for Shelf {
+    fn drop(&mut self) {
+        for at in 0..self.len.get() {
+            chunks::give(Chunk::from_index(self.chunks[at].get()), Tag::Frames);
+        }
+        self.len.set(0);
+        let mut span = self.spans.get();
+        self.spans.set(ptr::null_mut());
+        while !span.is_null() {
+            let next = header(span).next;
+            drop_span(span);
+            span = next;
+        }
+    }
+}
+
+/// The thread's tasks: the innermost one's frame, what the frames enclosing it used when it
+/// began, and the most the thread's frames held at once since the innermost [`measure`] began.
+struct Stack {
+    current: Cell<*const Frame>,
+    below: Cell<usize>,
+    peak: Cell<usize>,
+    /// Frame ids handed out to this thread's tasks, `next..end`.
+    ids: Cell<(u32, u32)>,
+    /// What the thread's global allocations outside any task count to, while [`heap_of`] runs.
+    heap: Cell<Option<Tag>>,
+}
+
+// D171: this shelf is per-worker state held by the thread, the form the workers' cells
+// (bstd's `workers`) replace. It moves when its callers can reach a worker cell: the shelf
+// becomes a `Shelf` value in the worker's own fields, `task` and `heap_of` take `&Shelf`
+// handed by their driver (`cx.on_worker(|w| frame::task_on(w.shelf(), tag, ..))`), and this
+// `thread_local!` is deleted with the last caller. The global allocator's hook (`heap_of`'s
+// tag, read inside `GlobalAlloc`) is the one exception: an allocator has no context, so its
+// named thread-local stays (C3).
+thread_local! {
+    static SHELF_OF: Shelf = const {
+        Shelf {
+            chunks: [const { Cell::new(0) }; SHELF],
+            len: Cell::new(0),
+            spans: Cell::new(ptr::null_mut()),
+            span_count: Cell::new(0),
+            most_chunks: Cell::new(SHELF),
+            most_spans: Cell::new(SPANS),
+        }
+    };
+    static STACK: Stack = const {
+        Stack {
+            current: Cell::new(ptr::null()),
+            below: Cell::new(0),
+            peak: Cell::new(0),
+            ids: Cell::new((0, 0)),
+            heap: Cell::new(None),
+        }
+    };
+}
+
+/// An id for a task's frame: from a block of 1024 the thread takes at once, so a task does not
+/// write a shared line for one.
+fn task_id(stack: &Stack) -> u32 {
+    let (next, end) = stack.ids.get();
+    if next != end {
+        stack.ids.set((next.wrapping_add(1), end));
+        return next;
+    }
+    let start = IDS.fetch_add(1024, Ordering::Relaxed);
+    stack.ids.set((start.wrapping_add(1), start.wrapping_add(1024)));
+    start
+}
+
+/// The innermost task's frame of the calling thread, if it is in one.
+///
+/// # Safety
+///
+/// The reference is used only while the task that made it current is running, on this
+/// thread: within a call made from inside its closure.
+#[inline(never)]
+unsafe fn innermost<'a>() -> Option<&'a Frame> {
+    let frame = STACK.try_with(|stack| stack.current.get()).unwrap_or(ptr::null());
+    // SAFETY: `task` points `current` at the frame its `Back` holds on `task`'s own stack (never
+    // moved while its closure runs) and points it back at the outer task's before that frame
+    // is dropped. The caller uses it only within that closure, deeper on the same thread's
+    // stack, so the frame is alive meanwhile, and no reset happens: a reset takes `&mut Frame`,
+    // which nothing has while `task` lends `&Frame`.
+    unsafe { frame.as_ref() }
+}
+
+/// Panics, naming the frame, its owner and task `starting`, when `outer`, the frame the thread
+/// says encloses `starting`, is not a live task's frame: one dropped, or memory that never was a
+/// frame. That is a thread-local carried wrong across a job's switch (a job resumed or started
+/// on a thread whose current frame is another job's), which used as is corrupts both.
+#[cold]
+#[inline(never)]
+fn refuse_unmapped(outer: *const Frame, starting: u32) -> ! {
+    panic!(
+        "blaze-mem: task {starting} starts inside the frame at {outer:p}, which this thread's \
+         stack names as the enclosing task's, and no frame can be there: it is {}; a task frame \
+         was carried wrong across a job's switch, or a number was stored as a frame. Task \
+         {starting} starts at:\n{}",
+        if outer.addr() < LOWEST {
+            "below the lowest address mapped"
+        } else {
+            "not aligned as a frame is"
+        },
+        std::backtrace::Backtrace::force_capture()
+    )
+}
+
+/// No address below this is mapped: Linux's default `vm.mmap_min_addr`, and far below macOS's
+/// zero page.
+const LOWEST: usize = 1 << 16;
+
+#[cold]
+#[inline(never)]
+fn refuse_outer(outer: *const Frame, seal: u64, owner: u32, starting: u32) -> ! {
+    let why = if seal == UNSEALED { "dropped" } else { "not a frame, or overwritten" };
+    // A frame's drop writes only its seal, so a frame sealed as dropped still has its other
+    // bytes as they were; any other seal says the bytes are not a frame's, and nothing more is
+    // read of them.
+    let owned = if seal == UNSEALED {
+        let opened_at = outer
+            .wrapping_byte_add(mem::offset_of!(Frame, opened_at))
+            .cast::<&'static Location<'static>>();
+        let ended_on = outer.wrapping_byte_add(mem::offset_of!(Frame, ended_on)).cast::<usize>();
+        // SAFETY: the `opened_at` field of the dropped frame's bytes, as they were when it was
+        // alive: a `&'static Location`, which a drop leaves as it was.
+        let opened_at = unsafe { opened_at.read_volatile() };
+        // SAFETY: the `ended_on` field of the same bytes; a `Cell<usize>` is a `usize`.
+        let ended_on = unsafe { ended_on.read_volatile() };
+        let here = STACK.try_with(|stack| ptr::from_ref(stack).addr()).unwrap_or(0);
+        let ended = match ended_on {
+            0 => "ended by no task's end",
+            on if on == here => "ended on this thread",
+            _ => "ended on another thread",
+        };
+        // alloc: once, for the panic's message
+        format!(" Task {owner} was opened at {opened_at} and {ended}.")
+    } else {
+        String::new()
+    };
+    panic!(
+        "blaze-mem: task {starting} starts inside the frame at {outer:p}, which this thread's \
+         stack names as the enclosing task's, and it is {why}: its seal is {seal:#x}, where a \
+         live frame of its owner, task {owner}, has {:#x}; a task frame was carried wrong \
+         across a job's switch.{owned} The frame's address is {}. Task {starting} starts at:\n{}",
+        sealed(owner),
+        whereabouts(outer),
+        std::backtrace::Backtrace::force_capture()
+    )
+}
+
+/// Where `at` lies against the calling thread's stack pointer: the frame of a call still under
+/// way on this stack is above it, by less than the stack's size; one below it is of a call
+/// that returned, and one far either way is on another stack (another fiber's, a segment
+/// `stdx::ensure_sufficient_stack` grew) or not on a stack.
+#[inline(never)]
+fn whereabouts(at: *const Frame) -> String {
+    let here = 0u8;
+    let sp = ptr::from_ref(&here).addr();
+    let (by, side) = match at.addr().checked_sub(sp) {
+        Some(above) => (above, "above"),
+        None => (sp - at.addr(), "below"),
+    };
+    // alloc: once, for a panic's message
+    format!("{by:#x} bytes {side} this thread's stack pointer {sp:#x}")
+}
+
+/// The seal and the owner's id in the frame-sized, aligned bytes at `at`, as the memory holds
+/// them now: only the two fields are read, at their offsets, with no reference to a frame made.
+fn read_seal(at: *const Frame) -> (u64, u32) {
+    // `at` points at a live frame, or, when a thread-local was carried wrong, at the stack
+    // memory a dropped one was in: a fiber's stack, which the scheduler keeps mapped for its
+    // next job, so the reads are of mapped bytes (were they not, the read faults and the
+    // daemon's signal line names it). Volatile, so each read is of the memory now and not a
+    // value the compiler assumed of a frame it believes alive.
+    let seal_at = at.wrapping_byte_add(mem::offset_of!(Frame, seal)).cast::<u64>();
+    let id_at = at.wrapping_byte_add(mem::offset_of!(Frame, id)).cast::<u32>();
+    // SAFETY: `seal_at` is the `seal` field of the frame-sized, aligned bytes at `at`, as
+    // above; a `Cell<u64>` is a `u64`.
+    let seal = unsafe { seal_at.read_volatile() };
+    // SAFETY: `id_at` is the `id` field of the same bytes, as above.
+    let owner = unsafe { id_at.read_volatile() };
+    (seal, owner)
+}
+
+/// Panics, naming the switch, when the frame a job carries across it ([`take_current`],
+/// [`put_current`]) is not a live task's frame, so a frame carried wrong fails at the switch
+/// that carries it rather than at the next task that starts inside it.
+#[inline(never)]
+fn check_carried(frame: *const Frame, switch: &'static str) {
+    if frame.is_null() {
+        return;
+    }
+    let why = if frame.addr() < LOWEST {
+        "below the lowest address mapped"
+    } else if !frame.is_aligned() {
+        "not aligned as a frame is"
+    } else {
+        let (seal, owner) = read_seal(frame);
+        if seal == sealed(owner) {
+            return;
+        }
+        if seal == UNSEALED { "dropped" } else { "not a frame, or overwritten" }
+    };
+    panic!(
+        "blaze-mem: a job {switch} carrying the frame at {frame:p} as its innermost task's, and it \
+         is {why}; the frame's address is {}. The switch is at:\n{}",
+        whereabouts(frame),
+        std::backtrace::Backtrace::force_capture()
+    )
+}
+
+/// [`refuse_outer`] unless `outer` is null or a live frame.
+#[inline]
+fn check_outer(outer: *const Frame, starting: u32) {
+    if outer.is_null() {
+        return;
+    }
+    if outer.addr() < LOWEST || !outer.is_aligned() {
+        refuse_unmapped(outer, starting);
+    }
+    let (seal, owner) = read_seal(outer);
+    if seal != sealed(owner) {
+        refuse_outer(outer, seal, owner, starting);
+    }
+}
+
+/// Runs a task of `tag` with a frame of its own, empty, and frees it when `f` returns or
+/// unwinds. A task inside a task, at any depth, gets another frame, so the inner end frees only
+/// the inner task's memory. What `f` returns cannot borrow the frame.
+///
+/// Once the thread's shelves are warm a task makes no system call and no global allocation:
+/// its frame is a header here, and its blocks come from and go back to the shelves (or the
+/// process's chunk cache, one compare-and-swap each).
+#[track_caller]
+pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
+    struct Back {
+        frame: Frame,
+        outer: *const Frame,
+        /// What the enclosing frames used when this task began, and the outer one's part.
+        below: usize,
+        outer_below: usize,
+        outer_used: usize,
+        /// Where the outer frame's bump stopped before it lent this one the rest of its chunk.
+        lent: Option<usize>,
+    }
+    impl Drop for Back {
+        fn drop(&mut self) {
+            // SAFETY: `outer` is the enclosing task's frame, alive until that task ends, which
+            // is after this one; null outside any.
+            let outer = unsafe { self.outer.as_ref() };
+            let outer_now = outer.map_or(0, Frame::used);
+            // Nothing of this task's is used past here: what `f` returned cannot borrow its
+            // frame, so the lent bytes are the outer frame's again.
+            if let (Some(outer), Some(end)) = (outer, self.lent) {
+                outer.take_back(end);
+            }
+            // What the outer frame grew by while this task ran, counted on top of this one's
+            // peak: the two may not have been at once, so this errs high.
+            let grew = outer_now.saturating_sub(self.outer_used);
+            let held = self.below + self.frame.peak() + grew;
+            end_task(&self.frame, self.outer, self.outer_below, held);
+            tag::task_ended(self.frame.tag(), self.frame.peak(), self.frame.copied());
+            grow::report(self.frame.abandoned());
+            // Dropping the frame, after this, gives its blocks to the thread's shelves.
+        }
+    }
+    let (outer, outer_below, id) = begin_task();
+    check_outer(outer, id);
+    // SAFETY: `outer` is the enclosing task's frame, alive while this call, made from inside
+    // its closure, runs; null outside any. `check_outer` refused one that is not.
+    let outer_frame = unsafe { outer.as_ref() };
+    let outer_used = outer_frame.map_or(0, Frame::used);
+    let below = outer_below + outer_used;
+    let (frame, lent) = match outer_frame {
+        Some(outer) => Frame::inner(outer, tag, id),
+        None => (Frame::empty(FRAME_RESERVE, tag, id, true), None),
+    };
+    let back = Back { frame, outer, below, outer_below, outer_used, lent };
+    enter_task(&back.frame, below);
+    f(&back.frame)
+}
+
+// A job can resume on another thread after any wait inside a task, so every access to `STACK`
+// is a call of its own that ends before any wait: inlined into a task's caller, the
+// thread-local's address could be kept from before the wait.
+
+/// The thread's innermost frame, what the frames enclosing it use, and a new task's id.
+#[inline(never)]
+fn begin_task() -> (*const Frame, usize, u32) {
+    STACK
+        .try_with(|stack| (stack.current.get(), stack.below.get(), task_id(stack)))
+        .unwrap_or_else(|_| (ptr::null(), 0, IDS.fetch_add(1, Ordering::Relaxed)))
+}
+
+#[inline(never)]
+fn enter_task(frame: &Frame, below: usize) {
+    _ = STACK.try_with(|stack| {
+        stack.current.set(frame);
+        stack.below.set(below);
+    });
+}
+
+/// `frame`'s task ended on this thread: `outer` is innermost again, and the thread's peak is
+/// at least `held`.
+#[inline(never)]
+fn end_task(frame: &Frame, outer: *const Frame, outer_below: usize, held: usize) {
+    // A thread being torn down has no stack left to put back.
+    _ = STACK.try_with(|stack| {
+        frame.ended_on.set(ptr::from_ref(stack).addr());
+        stack.current.set(outer);
+        stack.below.set(outer_below);
+        if held > stack.peak.get() {
+            stack.peak.set(held);
+        }
+    });
+}
+
+/// Runs `f` with the frame of the innermost [`task`] the calling thread is in: for code a task
+/// reaches through calls that don't pass its frame (a query's body, run by the db's executor).
+/// Stops, naming the caller, when it is in none: code that allocates for a task runs in one
+/// (no-fallback). What `f` returns cannot borrow the frame.
+#[track_caller]
+pub fn current<R>(f: impl FnOnce(&Frame) -> R) -> R {
+    // SAFETY: the frame is used only within `f`, called here, inside the task's closure.
+    let frame = unsafe { innermost() };
+    let Some(frame) = frame else { panic!("frame::current outside any frame::task") };
+    f(frame)
+}
+
+/// The calling thread's innermost task frame, taken off it for a job that switches out (a
+/// fiber's, which may resume on another thread): the thread is in no task after, until
+/// [`put_current`] puts back what this took, on the thread the job resumes on. With
+/// [`take_below`] and [`take_peak`], the rest of the job's task state.
+#[inline(never)]
+pub fn take_current() -> Option<NonZeroUsize> {
+    let taken = STACK.try_with(|stack| stack.current.replace(ptr::null())).unwrap_or(ptr::null());
+    check_carried(taken, "switched out");
+    NonZeroUsize::new(taken.expose_provenance())
+}
+
+/// Puts back what [`take_current`] took, on a thread in no task.
+///
+/// # Panics
+///
+/// Where the thread is in a task: another job's frame would be lost.
+#[inline(never)]
+pub fn put_current(taken: NonZeroUsize) {
+    let frame: *const Frame = ptr::with_exposed_provenance(taken.get());
+    check_carried(frame, "switched in");
+    STACK.with(|stack| {
+        assert!(
+            stack.current.get().is_null(),
+            "a job's frame put back on a thread inside another task"
+        );
+        // Used only as `innermost` says: by the job that owns the frame, which runs on this
+        // thread from now on.
+        stack.current.set(frame);
+    });
+}
+
+/// What the frames enclosing the switching job's task used ([`take_current`]).
+#[inline(never)]
+pub fn take_below() -> Option<NonZeroUsize> {
+    NonZeroUsize::new(STACK.try_with(|stack| stack.below.replace(0)).unwrap_or(0))
+}
+
+#[inline(never)]
+pub fn put_below(taken: NonZeroUsize) {
+    STACK.with(|stack| stack.below.set(taken.get()));
+}
+
+/// The most the switching job's frames held since its innermost [`measure`] began
+/// ([`take_current`]): in the job's own terms (what its enclosing frames used and its frames'
+/// peaks), so it means the same on the thread that resumes it, where the thread's own is
+/// another job's.
+#[inline(never)]
+pub fn take_peak() -> Option<NonZeroUsize> {
+    NonZeroUsize::new(STACK.try_with(|stack| stack.peak.replace(0)).unwrap_or(0))
+}
+
+#[inline(never)]
+pub fn put_peak(taken: NonZeroUsize) {
+    STACK.with(|stack| stack.peak.set(taken.get()));
+}
+
+/// The tag of the [`task`] the calling thread runs; outside any, the tag [`heap_of`] names,
+/// else `None`: what the global allocator charges an allocation to
+/// (`blaze_graph::arena::Counting`). Allocates nothing, takes no lock and never panics, so an
+/// allocator may call it, on a thread being torn down too.
+#[inline(never)]
+pub fn running_tag() -> Option<Tag> {
+    // `innermost`'s read, inline: the allocator asks on every allocation, and a call more is a
+    // tenth of its cost. This function is the call that keeps the read from moving across a
+    // job's switch of threads.
+    STACK
+        .try_with(|stack| {
+            let frame = stack.current.get();
+            // SAFETY: as `innermost`'s: the frame is alive while the calling thread is in its
+            // task, and only its tag is read, here.
+            unsafe { frame.as_ref() }.map(Frame::tag).or(stack.heap.get())
+        })
+        .unwrap_or(None)
+}
+
+/// Runs `f` with the global heap the calling thread allocates outside any [`task`] counted to
+/// `tag` ([`running_tag`]): for a thread's own work that opens no frame (the daemon's loop), so
+/// its allocations are named, not counted outside any task. It opens no frame: [`in_task`] stays
+/// false, so what decides by the running task (a kept value's tag, `blocks::Kept::here`; a
+/// tree's budget) decides as outside one, and a task `f` runs counts to its own tag.
+pub fn heap_of<R>(tag: Tag, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Tag>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = STACK.try_with(|stack| stack.heap.set(self.0));
+        }
+    }
+    let _restore = Restore(STACK.try_with(|stack| stack.heap.replace(Some(tag))).unwrap_or(None));
+    f()
+}
+
+/// Whether the calling thread is in a [`task`], so [`current`] has a frame to give.
+#[inline(never)]
+pub fn in_task() -> bool {
+    STACK.try_with(|stack| !stack.current.get().is_null()).unwrap_or(false)
+}
+
+/// Runs `f` and says the most bytes the calling thread's task frames held at once while it ran,
+/// above what they held when it began: a nested task's on top of its enclosing tasks'. Measures
+/// nest, an inner one's peak part of the outer one's. Frames made with [`Frame::new`] are not
+/// counted.
+///
+/// It is counted when a task ends and when a measure ends, never per allocation, and allocates
+/// nothing. An enclosing frame that grows while an inner task runs counts its growth on top of
+/// the inner task's peak, so the measure errs high, never low.
+pub fn measure<R>(f: impl FnOnce() -> R) -> (R, usize) {
+    struct Restore<'f> {
+        frame: Option<&'f Frame>,
+        below: usize,
+        frame_peak: usize,
+        thread_peak: usize,
+    }
+    impl Restore<'_> {
+        /// The most held since the measure began, as the thread stands now.
+        fn top(&self) -> usize {
+            let inner = self.frame.map_or(0, |frame| self.below + frame.peak());
+            thread_peak().max(inner)
+        }
+    }
+    impl Drop for Restore<'_> {
+        // On a panic too: the outer measure and the frame's own peak still see what `f` held.
+        fn drop(&mut self) {
+            let top = self.top();
+            if let Some(frame) = self.frame {
+                frame.peak.set(frame.peak().max(self.frame_peak));
+            }
+            set_thread_peak(top.max(self.thread_peak));
+        }
+    }
+    // SAFETY: the frame is used only in this call, made inside its task's closure; the tasks `f`
+    // runs end before it returns, so it is the innermost again when `Restore` reads it.
+    let frame = unsafe { innermost() };
+    let below = STACK.try_with(|stack| stack.below.get()).unwrap_or(0);
+    let base = below + frame.map_or(0, Frame::used);
+    let frame_peak = frame.map_or(0, |frame| {
+        let peak = frame.peak();
+        frame.peak.set(frame.used());
+        peak
+    });
+    let thread_peak = STACK.try_with(|stack| stack.peak.replace(base)).unwrap_or(0);
+    let restore = Restore { frame, below, frame_peak, thread_peak };
+    let result = f();
+    let top = restore.top();
+    drop(restore);
+    (result, top.saturating_sub(base))
+}
+
+#[inline(never)]
+fn thread_peak() -> usize {
+    STACK.try_with(|stack| stack.peak.get()).unwrap_or(0)
+}
+
+#[inline(never)]
+fn set_thread_peak(peak: usize) {
+    _ = STACK.try_with(|stack| stack.peak.set(peak));
+}
+
+/// Blocks of frame memory (chunks and spans) the calling thread keeps warm for its next tasks.
+pub fn spare_frames() -> usize {
+    SHELF_OF.try_with(Shelf::count).unwrap_or(0)
+}
+
+/// Bytes of frame memory the calling thread keeps warm for its next tasks, committed and
+/// charged to no task: at most [`WARM`].
+pub fn spare_bytes() -> usize {
+    SHELF_OF.try_with(Shelf::bytes).unwrap_or(0)
+}
+
+/// Trims the frame memory the calling thread keeps warm to `keep` bytes, the rest given back
+/// to the kernel: what a worker does when it goes idle after a burst.
+pub fn trim_spare(keep: usize) {
+    _ = SHELF_OF.try_with(|shelf| shelf.trim(keep));
+}
+
+/// Gives back pages of the calling thread's warm frame memory without unmapping spans: chunks go
+/// cold to the chunk cache and spans move to the cold span pool (decommitted to one granule).
+pub fn cool_spare() {
+    _ = SHELF_OF.try_with(Shelf::cool);
+}
+
+/// Packed trim/cool generation counter: high 32 bits count hard trims ([`ask_spare_trim`]) and
+/// low 32 bits count non-unmapping cools ([`ask_spare_cool`]).
+static SPARE_TRIMS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The last packed trim/cool generation this thread answered ([`settle_spare`]). `const`,
+    /// with no destructor.
+    static SPARE_TRIMMED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Asks every thread to give its warm frame memory ([`WARM`] at most, a thread) back to the
+/// kernel: each does as it next goes idle ([`settle_spare`]). What a daemon with nothing to do
+/// asks, since the shelves are charged to no task and an idle daemon's next task can wait for
+/// the page faults. It wakes nobody and waits for nobody.
+pub fn ask_spare_trim() {
+    SPARE_TRIMS.fetch_add(1u64 << 32, Ordering::Release);
+}
+
+/// Asks every thread to shed resident pages of its warm frame memory between phases without
+/// unmapping span reservations ([`cool_spare`] + [`cool_span_pool`]).
+pub fn ask_spare_cool() {
+    // Wrapping increment of the low 32-bit cool counter without carrying into the high 32 bits.
+    let _ = SPARE_TRIMS.fetch_update(Ordering::Release, Ordering::Relaxed, |cur| {
+        let hi = cur & !0xFFFF_FFFFu64;
+        let lo = (cur & 0xFFFF_FFFFu64).wrapping_add(1) & 0xFFFF_FFFFu64;
+        Some(hi | lo)
+    });
+}
+
+/// Gives the calling thread's warm frame memory back if [`ask_spare_trim`] or [`ask_spare_cool`]
+/// was called since it last did; one load and a thread-local compare otherwise. What a pool
+/// worker does as it goes idle, outside any task. Whether it trimmed or cooled.
+pub fn settle_spare() -> bool {
+    let asked = SPARE_TRIMS.load(Ordering::Acquire);
+    let prev = match SPARE_TRIMMED.try_with(|done| done.replace(asked)) {
+        Ok(prev) => prev,
+        Err(_) => return false,
+    };
+    if prev == asked {
+        return false;
+    }
+    if (prev >> 32) != (asked >> 32) {
+        trim_spare(0);
+        trim_span_pool();
+    } else {
+        cool_spare();
+        cool_span_pool();
+    }
+    true
+}
+
+/// The items of `items` in a vector in `frame`, its room the iterator's lower bound to start:
+/// `bumpalo`'s `Vec::from_iter_in`.
+#[inline]
+pub fn collect<'f, T>(frame: &'f Frame, items: impl IntoIterator<Item = T>) -> Vec<T, &'f Frame> {
+    let items = items.into_iter();
+    let mut out = Vec::with_capacity_in(items.size_hint().0, frame);
+    out.extend(items);
+    out
+}
+
+/// A copy of `text` in `frame`, to grow: `bumpalo`'s `String::from_str_in`. For finished text
+/// that won't grow, [`Frame::alloc_str`]; for formatting, [`format_in!`](crate::format_in).
+#[inline]
+pub fn string<'f>(frame: &'f Frame, text: &str) -> crate::text::String<&'f Frame> {
+    crate::text::String::from_str_in(text, frame)
+}
+
+/// A copy of `path` in `frame`, to push onto or pop (unix only, [`crate::text`]).
+#[cfg(unix)]
+#[inline]
+pub fn path<'f>(
+    frame: &'f Frame,
+    path: impl AsRef<std::path::Path>,
+) -> crate::text::PathBuf<&'f Frame> {
+    crate::text::PathBuf::from_path_in(path, frame)
+}
+
+/// A copy of `text` in `frame`, to grow (unix only, [`crate::text`]).
+#[cfg(unix)]
+#[inline]
+pub fn os_string<'f>(
+    frame: &'f Frame,
+    text: impl AsRef<std::ffi::OsStr>,
+) -> crate::text::OsString<&'f Frame> {
+    crate::text::OsString::from_os_str_in(text, frame)
+}
+
+const _: () = assert!(mem::size_of::<Marker>() == 2 * mem::size_of::<usize>());
+
+#[cfg(test)]
+mod tests {
+    use std::{mem::MaybeUninit, panic};
+
+    use super::*;
+
+    /// What `task` panics with when this thread's stack names `stale` as the enclosing frame.
+    fn started_inside(stale: *const Frame) -> String {
+        let before = STACK.with(|stack| stack.current.replace(stale));
+        let got = panic::catch_unwind(|| task(Tag::Other, |_| ()));
+        STACK.with(|stack| stack.current.set(before));
+        let payload = got.expect_err("a task inside a frame that is not live panics");
+        payload.downcast_ref::<String>().cloned().expect("the panic's text is formatted")
+    }
+
+    #[test]
+    fn a_task_inside_a_dropped_frame_panics_naming_the_frame_its_owner_and_the_task() {
+        let mut slot = MaybeUninit::new(Frame::empty(FRAME_RESERVE, Tag::Other, 7, true));
+        let stale: *const Frame = slot.as_ptr();
+        // SAFETY: the frame was written just above and is dropped once; its bytes stay, as a
+        // fiber's stack's do after the task on it ends.
+        unsafe { slot.assume_init_drop() };
+        let text = started_inside(stale);
+        assert!(text.contains(&format!("inside the frame at {stale:p}")), "{text}");
+        assert!(text.contains("it is dropped: its seal is 0xdeadf4a3deadf4a3"), "{text}");
+        assert!(text.contains("its owner, task 7,"), "{text}");
+        assert!(text.contains("blaze-mem: task "), "{text}");
+        assert!(text.contains("Task 7 was opened at ") && text.contains("frame.rs:"), "{text}");
+        assert!(text.contains("and ended by no task's end."), "{text}");
+    }
+
+    #[test]
+    fn a_task_inside_memory_that_never_was_a_frame_panics_naming_it() {
+        let junk = [0u64; 64];
+        assert!(mem::size_of::<Frame>() <= mem::size_of_val(&junk));
+        let stale = junk.as_ptr().cast::<Frame>();
+        let text = started_inside(stale);
+        assert!(text.contains("it is not a frame, or overwritten: its seal is 0x0"), "{text}");
+    }
+
+    #[test]
+    fn a_task_inside_a_small_number_taken_for_a_frame_panics_before_reading_it() {
+        for at in [0x8usize, 0x40, LOWEST - 1] {
+            let text = started_inside(ptr::without_provenance(at));
+            assert!(text.contains("is below the lowest address mapped"), "{text}");
+        }
+        let junk = [0u64; 64];
+        let skewed = junk.as_ptr().cast::<u8>().wrapping_add(1).cast::<Frame>();
+        assert!(started_inside(skewed).contains("is not aligned as a frame is"));
+    }
+
+    #[test]
+    fn a_dropped_frame_carried_across_a_switch_fails_at_the_switch() {
+        let mut slot = MaybeUninit::new(Frame::empty(FRAME_RESERVE, Tag::Other, 9, true));
+        let stale: *const Frame = slot.as_ptr();
+        // SAFETY: as in the test of a task inside a dropped frame.
+        unsafe { slot.assume_init_drop() };
+        let taken = NonZeroUsize::new(stale.expose_provenance()).expect("a frame's address");
+        let got = panic::catch_unwind(|| put_current(taken));
+        let payload = got.expect_err("a dropped frame put back on a thread panics");
+        let text =
+            payload.downcast_ref::<String>().cloned().expect("the panic's text is formatted");
+        assert!(
+            text.contains(&format!("a job switched in carrying the frame at {stale:p}")),
+            "{text}"
+        );
+        assert!(text.contains("it is dropped; the frame's address is "), "{text}");
+        assert!(!in_task(), "the refused frame is not made current");
+    }
+
+    #[test]
+    fn a_live_frame_carried_across_a_switch_is_current_again() {
+        task(Tag::Other, |frame| {
+            let at: *const Frame = frame;
+            let taken = take_current().expect("a task's frame is taken");
+            assert!(!in_task());
+            put_current(taken);
+            assert_eq!(STACK.with(|stack| stack.current.get()), at);
+        });
+    }
+
+    #[test]
+    fn a_task_inside_a_live_task_starts_in_its_frame() {
+        let inner = task(Tag::Other, |outer| {
+            let at: *const Frame = outer;
+            task(Tag::Other, |_| STACK.with(|stack| stack.current.get()) != at)
+        });
+        assert!(inner, "the inner task's frame is current inside it");
+    }
+
+    #[test]
+    fn an_exhaustion_is_taken_once_and_reset_clears_it() {
+        let mut frame = Frame::with_reserve(64, Tag::Other).expect("a small frame");
+        let fitting = Layout::from_size_align(32, 1).expect("a layout");
+        let too_large = Layout::from_size_align(40, 1).expect("a layout");
+        assert!(frame.try_alloc_layout(fitting).is_ok());
+        assert_eq!(frame.take_exhaustion(), None, "a fitting allocation leaves no exhaustion");
+
+        let used = frame.used();
+        assert!(frame.try_alloc_layout(too_large).is_err(), "the frame refuses past its reserve");
+        assert_eq!(frame.used(), used, "a refused allocation does not advance the frame");
+        assert_eq!(frame.take_exhaustion(), Some(used), "the refused allocation records its use");
+        assert_eq!(frame.take_exhaustion(), None, "taking exhaustion clears it");
+
+        assert!(frame.try_alloc_layout(too_large).is_err(), "a second allocation is refused");
+        frame.reset();
+        assert_eq!(frame.take_exhaustion(), None, "reset clears an unconsumed exhaustion");
+        assert!(frame.try_alloc_layout(fitting).is_ok());
+        assert_eq!(frame.take_exhaustion(), None, "a fitting allocation after reset leaves none");
+    }
+
+    #[test]
+    fn sharded_span_pool_handles_concurrent_non_task_frames_within_budget() {
+        static SHARDS: SpanPoolShards = EMPTY_SPAN_POOL;
+        with_span_pool(&SHARDS, || {
+            trim_span_pool();
+            let handles: Vec<_> = (0..16)
+                .map(|tid| {
+                    std::thread::spawn(move || {
+                        with_span_pool(&SHARDS, || {
+                            for round in 0..4u8 {
+                                let frame =
+                                    Frame::with_reserve(16 << 20, Tag::Other).expect("non-task frame");
+                                let slice = frame.alloc_slice_fill_with(3 << 20, |i| {
+                                    u8::try_from((i.wrapping_add(tid).wrapping_add(usize::from(round))) & 0xff)
+                                        .unwrap_or(0)
+                                });
+                                assert_eq!(slice.len(), 3 << 20);
+                            }
+                        });
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("worker joined");
+            }
+            let pooled = pooled_span_bytes();
+            assert!(pooled > 0, "concurrent non-task frames populate sharded span pool");
+            assert!(
+                pooled <= SPAN_POOL * SPAN_WARM,
+                "sharded span pool committed {pooled} bytes, past budget {}",
+                SPAN_POOL * SPAN_WARM
+            );
+            cool_span_pool();
+            let cooled = pooled_span_bytes();
+            assert!(cooled > 0 && cooled < pooled, "cool_span_pool reduced {pooled} -> {cooled}");
+            trim_span_pool();
+            assert_eq!(pooled_span_bytes(), 0, "trim_span_pool emptied all shards");
+        });
+    }
+}

@@ -1,0 +1,9 @@
+[workspace]
+members = ["pm", "shapes", "mathy", "app"]
+resolver = "2"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+debug = 1

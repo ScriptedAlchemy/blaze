@@ -1,0 +1,37 @@
+[package]
+name = "blaze-audit"
+description = "blaze audit, sans-IO: every dependency source pinned by a strong digest (a git source by the BLAKE3 of its tree, recorded in blaze.lock; an unpinned path refused), every locked package checked against a RustSec advisory database and the registry's yanked versions, acceptances with a reason and an expiry, and one report in text and versioned JSON"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The one tree listing (`blaze tree 2`) a git source's digest is over, and `Digest`'s one
+# spelling (`blake3:<hex>`) and refusal of weak algorithms by name.
+blaze-fetch.workspace = true
+# The advisories' version ranges and the lock's exact versions.
+blaze-semver.workspace = true
+# `Cargo.lock`, read by the one lock reader (rule 30; the audit's own reader is gone).
+blaze-manifest = { workspace = true, default-features = false }
+# The advisories' front matter, blaze.lock's tables and the workspace's settings.
+blaze-toml.workspace = true
+# `--json`, and the sparse index's lines the yanked check reads.
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-own.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+# `Alloc::global()`: the tests' locks are read in the global allocator.
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+# The Rust tests that may fail: the one exemption from the gate (docs/harness.md#ci).
+#
+# harness/failures.py holds a run to this list: a failing test that is not here fails the run,
+# and so does a test here that passes, is ignored or no longer exists (take it out: the list only
+# shrinks). harness/unittests.py, CI's test step, runs every test of the workspace and calls it
+# on the log; a lane runs it on the crates it touched:
+#
+#   uv run --frozen harness/failures.py '{"run": {"packages": ["hir-def"]}}'
+#
+# One table a crate, `[crates.<package>]`, its entries sorted. An entry is one of:
+#   "<binary>::<path>"  a test, by its full name as libtest names it under the binary the
+#                       `Running` line names (`-` as `_`);
+#   "<binary>::*"       the test binary does not finish (it crashes or aborts);
+#   "*"                 no test binary of the package runs (its test build fails).
+# Each has:
+#   cause  one line: what fails and why, as far as it is known. `unittests.py` with
+#          `{"record": true}` writes the first line of the failure where the entry is new, and
+#          keeps the cause of an entry that was here;
+#   only   optional, { profile = "dev"|"release", os = "linux"|"macos"|"windows" or a list of them }:
+#          the entry holds only for such a run, and is unchecked by others.
+# `[recorded]` is the last run this list was written from: python3 harness/unittests.py '{"record": true}'
+
+[crates.blaze-manifest]
+"config_get::config_fixtures_read_as_cargo_reads_them" = { cause = "`config get --show-origin` for a runner list differs from cargo's" }

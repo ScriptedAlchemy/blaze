@@ -4,13 +4,15 @@
 
 use std::fmt;
 
-use anyhow::{Result, bail};
 use url::Url;
 
+use crate::error::ResolveError;
 use crate::names::validate_package_name;
 use crate::package_id::PackageId;
 use crate::source_id::{GitReference, SourceKind};
-use crate::version::PartialVersion;
+use crate::version::{PartialVersion, Version};
+
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
 
 /// A name with an optional partial version, source URL and source kind.
 #[derive(Clone, PartialEq, Eq, Debug, Hash, Ord, PartialOrd)]
@@ -51,11 +53,8 @@ impl PackageIdSpec {
         } else if spec.contains('/') || spec.contains('\\') {
             let abs = std::env::current_dir().unwrap_or_default().join(spec);
             if abs.exists() {
-                let maybe_url = Url::from_file_path(abs)
-                    .map_or_else(|_| "a file:// URL".to_owned(), |url| url.to_string());
-                bail!(
-                    "package ID specification `{spec}` looks like a file path, maybe try {maybe_url}"
-                );
+                let url = blaze_source::file_url(abs).ok();
+                return Err(ResolveError::SpecLooksLikePath { spec: spec.to_owned(), url });
             }
         }
         let (name, version) = parse_spec(spec)?.unwrap_or_else(|| (spec.to_owned(), None));
@@ -75,7 +74,7 @@ impl PackageIdSpec {
                 }
                 "registry" => {
                     if url.query().is_some() {
-                        bail!("cannot have a query string in a pkgid: {url}");
+                        return Err(ResolveError::SpecQueryString { url: url.clone() });
                     }
                     kind = Some(SourceKind::Registry);
                     url = strip_url_protocol(&url);
@@ -83,26 +82,24 @@ impl PackageIdSpec {
                 // `sparse+` stays part of the URL, as in a `SourceId`.
                 "sparse" => {
                     if url.query().is_some() {
-                        bail!("cannot have a query string in a pkgid: {url}");
+                        return Err(ResolveError::SpecQueryString { url: url.clone() });
                     }
                     kind = Some(SourceKind::SparseRegistry);
                 }
                 "path" => {
                     if url.query().is_some() {
-                        bail!("cannot have a query string in a pkgid: {url}");
+                        return Err(ResolveError::SpecQueryString { url: url.clone() });
                     }
                     if scheme != "file" {
-                        bail!(
-                            "`path+{scheme}` is unsupported; `path+file` and `file` schemes are supported"
-                        );
+                        return Err(ResolveError::SpecPathScheme { scheme: scheme.to_owned() });
                     }
                     kind = Some(SourceKind::Path);
                     url = strip_url_protocol(&url);
                 }
-                kind => bail!("unsupported source protocol: {kind}"),
+                kind => return Err(ResolveError::SpecProtocol { kind: kind.to_owned() }),
             }
         } else if url.query().is_some() {
-            bail!("cannot have a query string in a pkgid: {url}");
+            return Err(ResolveError::SpecQueryString { url: url.clone() });
         }
 
         let frag = url.fragment().map(|s| s.to_owned());
@@ -110,14 +107,14 @@ impl PackageIdSpec {
 
         let (name, version) = {
             let Some(path_name) = url.path_segments().and_then(|mut p| p.next_back()) else {
-                bail!("pkgid urls must have at least one path component: {url}");
+                return Err(ResolveError::SpecNoPath { url: url.clone() });
             };
             match frag {
                 Some(fragment) => match parse_spec(&fragment)? {
                     Some((name, ver)) => (name, ver),
                     None => {
                         let Some(f) = fragment.chars().next() else {
-                            bail!("pkgid url cannot have an empty fragment");
+                            return Err(ResolveError::SpecEmptyFragment);
                         };
                         if f.is_alphabetic() {
                             (fragment, None)
@@ -137,7 +134,7 @@ impl PackageIdSpec {
         &self.name
     }
 
-    pub fn version(&self) -> Option<semver::Version> {
+    pub fn version(&self) -> Option<Version> {
         self.version.as_ref().and_then(|v| v.to_version())
     }
 
@@ -173,6 +170,85 @@ impl PackageIdSpec {
             return false;
         }
         true
+    }
+
+    /// The package of `all_ids` given by `spec`, a spec yet to be parsed: cargo's
+    /// `PackageIdSpecQuery::query_str`.
+    pub fn query_str(spec: &str, all_ids: &[PackageId]) -> Result<PackageId> {
+        let parsed = PackageIdSpec::parse(spec).map_err(|cause| {
+            let suggestion =
+                crate::closest_msg(spec, all_ids.iter(), |id| id.name().as_str(), "package");
+            ResolveError::InvalidSpec { spec: spec.to_owned(), suggestion, cause: Box::new(cause) }
+        })?;
+        parsed.query(all_ids)
+    }
+
+    /// The one of `all_ids` this spec matches, or why there is not one: cargo's
+    /// `PackageIdSpecQuery::query`.
+    pub fn query(&self, all_ids: &[PackageId]) -> Result<PackageId> {
+        let spec = self;
+        let mut ids = all_ids.iter().copied().filter(|&id| spec.matches(id));
+        let Some(ret) = ids.next() else {
+            let mut suggestion = String::new();
+            let try_spec = |tried: PackageIdSpec, suggestion: &mut String| {
+                let try_matches: Vec<PackageId> =
+                    all_ids.iter().copied().filter(|&id| tried.matches(id)).collect();
+                if !try_matches.is_empty() {
+                    suggestion.push_str("\nhelp: there are similar package ID specifications:\n");
+                    minimize(suggestion, &try_matches, spec);
+                }
+            };
+            if spec.url().is_some() {
+                let tried = PackageIdSpec::new(spec.name().to_owned());
+                let tried = match spec.partial_version().cloned() {
+                    Some(version) => tried.with_version(version),
+                    None => tried,
+                };
+                try_spec(tried, &mut suggestion);
+            }
+            if suggestion.is_empty() && spec.version().is_some() {
+                try_spec(PackageIdSpec::new(spec.name().to_owned()), &mut suggestion);
+            }
+            if suggestion.is_empty() {
+                suggestion.push_str(&crate::closest_msg(
+                    spec.name(),
+                    all_ids.iter(),
+                    |id| id.name().as_str(),
+                    "package",
+                ));
+            }
+            return Err(ResolveError::SpecNoMatch { spec: spec.clone(), suggestion });
+        };
+        match ids.next() {
+            Some(other) => {
+                let mut options = String::new();
+                let mut all = vec![ret, other];
+                all.extend(ids);
+                minimize(&mut options, &all, spec);
+                Err(ResolveError::SpecAmbiguous { spec: spec.clone(), options })
+            }
+            None => Ok(ret),
+        }
+    }
+}
+
+/// Of the ids `spec` matches, each by the least that tells it apart.
+fn minimize(msg: &mut String, ids: &[PackageId], spec: &PackageIdSpec) {
+    let mut version_cnt: blaze_hash::Map<&Version, usize, blaze_hash::FixedState, std::alloc::Global> =
+        blaze_hash::Map::new(blaze_hash::MapOpts {
+            hasher: blaze_hash::FixedState,
+            alloc: std::alloc::Global,
+            capacity: None,
+        });
+    for id in ids {
+        *version_cnt.entry(id.version()).or_insert(0) += 1;
+    }
+    for id in ids {
+        if version_cnt[id.version()] == 1 {
+            msg.push_str(&format!("\n  {}@{}", spec.name(), id.version()));
+        } else {
+            msg.push_str(&format!("\n  {}", id.to_spec()));
+        }
     }
 }
 

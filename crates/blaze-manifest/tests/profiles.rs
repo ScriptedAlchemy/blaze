@@ -1,48 +1,31 @@
 //! Each tree of `tests/profile-fixtures` with the unit graph cargo 1.99 printed for each run
-//! (`expected.json`, written by `harness/resolve.py --fixtures` with the runs of the case's
-//! `case.json` after its `PROFILE_RUNS`): the profile blaze-manifest computes for every unit,
+//! (`expected.json`, recorded once with the runs of the case's `case.json` after its
+//! `PROFILE_RUNS`, and kept as blaze's own expected output): the profile blaze-manifest computes for every unit,
 //! the warnings about profiles and the error when cargo refused the profiles, against cargo's.
 
-#![allow(dead_code, reason = "the example's module, of which the test uses `main`")]
+#![allow(dead_code, reason = "the walk module, of which the test uses `main`")]
+#![feature(allocator_api)]
 
-#[path = "../examples/profiles/walk.rs"]
+#[path = "support/profiles_walk.rs"]
 mod walk;
 
 #[path = "support/paths.rs"]
-#[allow(dead_code)]
 mod fixture_paths;
 
 use std::path::Path;
 
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let name = entry.file_name();
-        if name == "expected.json" || name == "case.json" {
-            continue;
-        }
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &to.join(&name));
-        } else {
-            std::fs::copy(entry.path(), to.join(&name)).unwrap();
-        }
-    }
-}
-
-/// The error of `stderr` as `harness/resolve.py`'s `error_text` takes it.
+/// The error of `stderr`, as `expected.json` records it.
 fn error_text(stderr: &str) -> String {
-    let lines: Vec<&str> = stderr.lines().collect();
-    let start = lines.iter().position(|l| l.starts_with("error")).unwrap_or(lines.len());
-    lines[start..]
-        .iter()
+    stderr
+        .lines()
+        .skip_while(|l| !l.starts_with("error"))
         .filter(|l| !l.trim().is_empty())
-        .map(|l| l.trim_end())
+        .map(str::trim_end)
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// A warning less the manifest it is about, as `harness/resolve.py`'s `profile_warnings` takes it.
+/// A warning less the manifest it is about, as `expected.json` records it.
 fn message(line: &str) -> &str {
     let rest = &line["warning: ".len()..];
     match rest.split_once(": ") {
@@ -59,8 +42,8 @@ fn strings(value: &serde_json::Value) -> Vec<String> {
 fn check(fixture: &Path, scratch: &Path) -> (usize, Vec<String>) {
     let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
     let root = scratch.join(&name);
-    copy_dir(fixture, &root);
-    let root = root.canonicalize().unwrap();
+    fixture_paths::copy_dir(fixture, &root, &["expected.json", "case.json"]);
+    let root = fixture_paths::canonicalize(&root);
     let home = scratch.join("cargo-home");
     std::fs::create_dir_all(&home).unwrap();
     let home = home.canonicalize().unwrap();
@@ -138,8 +121,7 @@ fn check(fixture: &Path, scratch: &Path) -> (usize, Vec<String>) {
 #[test]
 fn profiles_match_cargo() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/profile-fixtures");
-    let scratch =
-        std::env::temp_dir().join(format!("blaze-manifest-profiles-{}", std::process::id()));
+    let scratch = blaze_core::temp::TempDir::for_test("blaze-manifest-profiles-");
     let mut names: Vec<_> =
         std::fs::read_dir(&fixtures).unwrap().map(|e| e.unwrap().file_name()).collect();
     names.sort();
@@ -150,7 +132,6 @@ fn profiles_match_cargo() {
         runs += n;
         failed.extend(f);
     }
-    let _ = std::fs::remove_dir_all(&scratch);
     assert!(runs >= 40, "only {runs} runs in {}", fixtures.display());
     assert!(failed.is_empty(), "{} differences:\n{}", failed.len(), failed.join("\n\n"));
 }

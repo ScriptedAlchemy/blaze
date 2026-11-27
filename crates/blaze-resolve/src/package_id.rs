@@ -1,17 +1,18 @@
 //! A package at a version in a source: `src/workspace/package_id.rs` of cargo 1.99.0
 //! (5f94df4789).
 
-use rustc_hash::FxHashSet;
+use blaze_ids::{Domain, Interner, Shards, Sharded};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ptr;
-use std::sync::{Mutex, OnceLock};
 
-use anyhow::{Result, anyhow};
-
+use crate::error::ResolveError;
 use crate::interning::InternedString;
 use crate::package_id_spec::PackageIdSpec;
 use crate::source_id::SourceId;
+use crate::version::{Version, parse_version};
+
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
 
 /// Interned like [`SourceId`], so it copies for free. Equal when the name, the version
 /// (build metadata included) and the source (as [`SourceId`] compares, without its precise)
@@ -24,7 +25,7 @@ pub struct PackageId {
 #[derive(PartialOrd, Eq, Ord)]
 struct PackageIdInner {
     name: InternedString,
-    version: semver::Version,
+    version: Version,
     source_id: SourceId,
 }
 
@@ -46,7 +47,15 @@ impl Hash for PackageIdInner {
     }
 }
 
-static PACKAGE_ID_CACHE: OnceLock<Mutex<FxHashSet<&'static PackageIdInner>>> = OnceLock::new();
+/// Every package id, by the content ID of what [`PackageIdInner`]'s `Eq` compares (its `Hash`
+/// covers exactly that, the source by address): a hit is lock-free probes and no allocation.
+/// The ID is only compared within this process, so an address in it is sound.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the process's interner: a `PackageId` is a `&'static` into it, compared by address, so there is one per process"
+)]
+static PACKAGE_IDS: std::sync::OnceLock<Sharded<PackageIdInner>> = std::sync::OnceLock::new();
+static PACKAGE_ID: Domain = Domain::new("blaze-resolve package id 1");
 
 impl PartialEq for PackageId {
     fn eq(&self, other: &PackageId) -> bool {
@@ -73,29 +82,29 @@ impl PackageId {
         version: &str,
         sid: SourceId,
     ) -> Result<PackageId> {
-        let v = version.parse()?;
-        Ok(PackageId::new(name.into(), v, sid))
+        let name = name.into();
+        let v = parse_version(version).map_err(|error| ResolveError::Version {
+            what: format!("package `{name}`"),
+            text: version.to_owned(),
+            error,
+        })?;
+        Ok(PackageId::new(name, v, sid))
     }
 
-    pub fn new(name: InternedString, version: semver::Version, source_id: SourceId) -> PackageId {
+    pub fn new(name: InternedString, version: Version, source_id: SourceId) -> PackageId {
         let inner = PackageIdInner { name, version, source_id };
-        let mut cache = PACKAGE_ID_CACHE.get_or_init(Default::default).lock().unwrap();
-        let inner = match cache.get(&inner) {
-            Some(&inner) => inner,
-            None => {
-                let inner: &'static PackageIdInner = Box::leak(Box::new(inner));
-                cache.insert(inner);
-                inner
-            }
-        };
-        PackageId { inner }
+        let ids = PACKAGE_IDS.get_or_init(|| Sharded::new(Shards::for_this_machine()));
+        let mut hasher = blaze_ids::Hasher::of(&PACKAGE_ID);
+        hasher.std(&inner);
+        let at = ids.intern(hasher.finish(), || inner);
+        PackageId { inner: ids.get(at) }
     }
 
     pub fn name(self) -> InternedString {
         self.inner.name
     }
 
-    pub fn version(self) -> &'static semver::Version {
+    pub fn version(self) -> &'static Version {
         &self.inner.version
     }
 
@@ -129,10 +138,14 @@ impl PackageId {
     /// Reads `name version (source-url)`, the form of the old lock files' `[metadata]` keys
     /// and dependency lists, and of [`PackageId::serialized`].
     pub fn from_serialized(string: &str) -> Result<PackageId> {
-        let invalid = || anyhow!("invalid serialized PackageId");
+        let invalid = || ResolveError::SerializedPackageId { text: string.to_owned() };
         let (name, rest) = string.split_once(' ').ok_or_else(invalid)?;
         let (version, rest) = rest.split_once(' ').ok_or_else(invalid)?;
-        let version = version.parse()?;
+        let version = parse_version(version).map_err(|error| ResolveError::Version {
+            what: format!("package id `{string}`"),
+            text: version.to_owned(),
+            error,
+        })?;
         let url = rest.strip_prefix('(').and_then(|r| r.strip_suffix(')')).ok_or_else(invalid)?;
         let source_id = SourceId::from_url(url)?;
         Ok(PackageId::new(name.into(), version, source_id))

@@ -4,28 +4,31 @@
 
 #![allow(dead_code)]
 
+use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
-use std::sync::OnceLock;
 use std::time::Instant;
 
-use anyhow::Result as CargoResult;
 use blaze_resolve::resolver::{
     self, ResolveOpts, ResolveSettings, VersionOrdering, VersionPreferences,
 };
+use blaze_resolve::resolving::Asking;
 use blaze_resolve::{
-    DepKind, Dependency, GitReference, IndexSummary, InternedString, PackageId, QueryKind,
-    Registry, Resolve, ResolveVersion, SourceId, Summary,
+    DepKind, Dependency, Effect, Event, GitReference, IndexSummary, InternedString, Lookup,
+    PackageId, QueryKind, Registry, Resolve, ResolveError, ResolveVersion, Resolving, SourceId,
+    Summary,
 };
 use url::Url;
 
+type CargoResult<T> = Result<T, ResolveError>;
+
 trait IntoUrl {
-    fn into_url(self) -> CargoResult<Url>;
+    fn into_url(self) -> Result<Url, url::ParseError>;
 }
 
 impl IntoUrl for &str {
-    fn into_url(self) -> CargoResult<Url> {
-        Ok(Url::parse(self)?)
+    fn into_url(self) -> Result<Url, url::ParseError> {
+        Url::parse(self)
     }
 }
 
@@ -111,25 +114,21 @@ impl<T: AsRef<str>, U: AsRef<str>> ToPkgId for (T, U) {
 }
 
 fn registry_loc() -> SourceId {
-    static EXAMPLE_DOT_COM: OnceLock<SourceId> = OnceLock::new();
-    let example_dot = EXAMPLE_DOT_COM.get_or_init(|| {
-        SourceId::for_registry(&"https://example.com".into_url().unwrap()).unwrap()
-    });
-    *example_dot
+    SourceId::for_registry(&"https://example.com".into_url().unwrap()).unwrap()
 }
 
-pub(crate) fn pkg<T: ToPkgId>(name: T) -> Summary {
+pub(crate) fn pkg<T: ToPkgId>(name: &T) -> Summary {
     pkg_dep(name, Vec::new())
 }
 
-pub(crate) fn pkg_dep<T: ToPkgId>(name: T, dep: Vec<Dependency>) -> Summary {
+pub(crate) fn pkg_dep<T: ToPkgId>(name: &T, dep: Vec<Dependency>) -> Summary {
     let pkgid = name.to_pkgid();
     let link = if pkgid.name().ends_with("-sys") { Some(pkgid.name()) } else { None };
     Summary::new(name.to_pkgid(), dep, &BTreeMap::new(), link, None).unwrap()
 }
 
 pub(crate) fn pkg_dep_with<T: ToPkgId>(
-    name: T,
+    name: &T,
     dep: Vec<Dependency>,
     features: &[(&'static str, &[&'static str])],
 ) -> Summary {
@@ -142,7 +141,7 @@ pub(crate) fn pkg_dep_with<T: ToPkgId>(
     Summary::new(name.to_pkgid(), dep, &features, link, None).unwrap()
 }
 
-pub(crate) fn pkg_dep_link<T: ToPkgId>(name: T, link: &str, dep: Vec<Dependency>) -> Summary {
+pub(crate) fn pkg_dep_link<T: ToPkgId>(name: &T, link: &str, dep: Vec<Dependency>) -> Summary {
     Summary::new(name.to_pkgid(), dep, &BTreeMap::new(), Some(link), None).unwrap()
 }
 
@@ -309,55 +308,71 @@ pub(crate) fn resolve_raw(
     resolve
 }
 
-/// Resolves the workspace members `roots` against `registry`.
+/// What the fake index `list` answers to `dep` queried as `kind`.
+fn matching(list: &[Summary], dep: &Dependency, kind: QueryKind) -> Vec<IndexSummary, Global> {
+    let mut found = Vec::new_in(Global);
+    for summary in list.iter() {
+        let matched = match kind {
+            QueryKind::Exact => dep.matches(summary),
+            QueryKind::RejectedVersions => dep.matches(summary),
+            QueryKind::AlternativeNames => true,
+            QueryKind::Normalized => true,
+        };
+        if matched {
+            found.push(IndexSummary::Candidate(summary.clone()));
+        }
+    }
+    found
+}
+
+/// Sources that hold nothing: every query is an effect, answered from the fake's table.
+struct Unfetched;
+
+impl Registry for Unfetched {
+    fn query(
+        &self,
+        _dep: &Dependency,
+        _kind: QueryKind,
+        _f: &mut impl FnMut(IndexSummary),
+    ) -> CargoResult<Lookup> {
+        Ok(Lookup::Unknown)
+    }
+
+    fn describe_source(&self, _src: SourceId) -> String {
+        String::new()
+    }
+
+    fn is_replaced(&self, _src: SourceId) -> bool {
+        false
+    }
+}
+
+/// Resolves the workspace members `roots` against `registry`: the resolve machine stepped,
+/// each effect's asks answered from `registry`.
 pub(crate) fn resolve_summaries(
     roots: &[(Summary, ResolveOpts)],
     registry: &[Summary],
     ordering: VersionOrdering,
 ) -> CargoResult<Resolve> {
-    struct MyRegistry<'a> {
-        list: &'a [Summary],
-    }
-    impl Registry for MyRegistry<'_> {
-        async fn query(
-            &self,
-            dep: &Dependency,
-            kind: QueryKind,
-            f: &mut dyn FnMut(IndexSummary),
-        ) -> CargoResult<()> {
-            for summary in self.list.iter() {
-                let matched = match kind {
-                    QueryKind::Exact => dep.matches(summary),
-                    QueryKind::RejectedVersions => dep.matches(summary),
-                    QueryKind::AlternativeNames => true,
-                    QueryKind::Normalized => true,
-                };
-                if matched {
-                    f(IndexSummary::Candidate(summary.clone()));
-                }
-            }
-            Ok(())
-        }
-
-        fn describe_source(&self, _src: SourceId) -> String {
-            String::new()
-        }
-
-        fn is_replaced(&self, _src: SourceId) -> bool {
-            false
-        }
-    }
-    let registry = MyRegistry { list: registry };
-
     let mut version_prefs = VersionPreferences::default();
     version_prefs.version_ordering(ordering);
-
-    resolver::resolve(
-        roots,
-        &[],
-        &registry,
-        &version_prefs,
-        ResolveVersion::with_rust_version(None),
-        &ResolveSettings::default(),
-    )
+    let settings = ResolveSettings::default();
+    let run = |asking: &Asking<'_, Unfetched, Global>| {
+        let version = ResolveVersion::with_rust_version(None);
+        resolver::resolve(roots, &[], asking, &version_prefs, version, &settings)
+    };
+    let mut machine = Resolving::new(Unfetched, run, Global);
+    let mut out = Vec::new_in(Global);
+    machine.step(Event::Start, &mut out).expect("a new machine takes its start");
+    loop {
+        match out.pop().expect("a round's step pushes its effect") {
+            Effect::Done(result) => return result,
+            Effect::Query { asks } => {
+                for ask in asks {
+                    let answer = Ok(matching(registry, &ask.dep, ask.kind));
+                    machine.step(Event::Answered { ask, answer }, &mut out).expect("asked");
+                }
+            }
+        }
+    }
 }

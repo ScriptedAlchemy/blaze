@@ -1,0 +1,14 @@
+{
+  "id": "thirdparty-vendored-dev-lock-20261124",
+  "date": "2026-11-24",
+  "who": "GPT-6 Astra Pro, upstream repair lane",
+  "where": "scripts/src/bin/thirdparty.rs; main base 2177d456a3d790a1c2b5e4e574fcd97bdf3c835e",
+  "what": "The third-party gate stopped reading the historical base at proc-macro-test before reporting current count violations. The base's proc-macro-srv manifest lists that path only in dev-dependencies, but its Cargo.lock entry includes the edge without its dependency kind.",
+  "cost": "Native gate run 45315686765 reported a historical graph error instead of the current third-party count findings.",
+  "cause": "Graph::reach followed every lock edge for vendored third-party packages, although workspace_from correctly omitted nonmember dev manifests. Package ownership was incorrectly used to choose whether dependency kinds could be read from a local manifest.",
+  "class": "a dependency graph loses edge kinds when package provenance chooses the traversal",
+  "prevention": "Every path package uses its manifest's normal and build edges; vendored packages still count as third-party. The selftest plants the historical dev edge, moves the same edge to normal and build with a transitive registry package, refuses a missing reachable manifest, and keeps current and base ceiling checks active.",
+  "workaround": "None; neither historical census errors nor dependency counts are skipped.",
+  "fix": "Source and selftest prepared; exact-tree native execution remains required.",
+  "state": "open"
+}

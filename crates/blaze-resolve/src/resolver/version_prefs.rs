@@ -4,7 +4,8 @@
 
 use std::cmp::Ordering;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_hash::{FixedState, Map, Set};
+use std::alloc::Global;
 
 use crate::dependency::Dependency;
 use crate::interning::InternedString;
@@ -21,8 +22,8 @@ use crate::version::PartialVersion;
 /// introduce more granular preferences.
 #[derive(Default)]
 pub struct VersionPreferences {
-    try_to_use: FxHashSet<PackageId>,
-    prefer_patch_deps: FxHashMap<InternedString, FxHashSet<Dependency>>,
+    try_to_use: Set<PackageId, FixedState, Global>,
+    prefer_patch_deps: Map<InternedString, Set<Dependency, FixedState, Global>, FixedState, Global>,
     version_ordering: VersionOrdering,
     rust_versions: Vec<PartialVersion>,
 }

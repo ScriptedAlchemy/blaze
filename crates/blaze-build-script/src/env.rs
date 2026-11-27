@@ -1,447 +1,441 @@
-//! The environment cargo 1.99 runs a build script with: `Compilation::host_process` and
-//! `fill_env` (`src/compiler/compilation.rs`), then `build_work`
-//! (`src/compiler/custom_build.rs`) and the jobserver, in rust-lang/cargo at 5f94df478, the
-//! commit `cargo 1.99.0 -vV` names. The script inherits cargo's own environment with what
-//! these set and take away.
+//! The environment a script is given: exactly what the Cargo Book's "Environment variables
+//! Cargo sets for build scripts" documents, computed from the unit graph, and nothing of the
+//! machine. Paths are the sandbox's view (decision D96): a dependency's package at `/package`, a
+//! member at `/workspace/<dir>` with its workspace above it, and `OUT_DIR` an in-memory folder
+//! at `/target/debug/build/<name>-<config>/out`, the shape scripts parse (tempo-node takes the
+//! profile from its fourth part from the end).
 //!
-//! Left out, as unstable in 1.99 and so never set by a stable cargo: `CARGO_DEP_<name>_<key>`
-//! (`-Z any-build-script-metadata`), `CARGO_TRIM_PATHS_*` (`-Z trim-paths`), the artifact
-//! dependencies' variables (`-Z bindeps`) and the host runner (`-Z host-config`).
+//! What is set, for `check` (the dev profile):
+//!
+//! - `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_MANIFEST_LINKS` (with `links`);
+//! - `CARGO_FEATURE_<NAME>` = `1` for each feature, uppercased, `-` as `_`;
+//! - `CARGO_CFG_<NAME>` for each cfg of the target the crate is built for: a flag as an empty
+//!   value, a name with values as the values joined by `,` (in the target description's
+//!   sorted order); `test` and `proc_macro`, which no `--print cfg` gives, left out;
+//! - `OUT_DIR`, `TARGET`, `HOST`, `OPT_LEVEL` `0`, `DEBUG` `true`, `PROFILE` `debug`;
+//! - `RUSTC` `rustc` and `RUSTDOC` `rustdoc` (names the sandbox's process host answers, not
+//!   paths), `CARGO` `cargo`, `CARGO_ENCODED_RUSTFLAGS` empty;
+//! - `CARGO_PKG_*` from the manifest, absent values as `""`;
+//! - `DEP_<LINKS>_<KEY>` from each direct dependency's `links` metadata;
+//! - for an `-apple-darwin` target, `MACOSX_DEPLOYMENT_TARGET`
+//!   ([`crate::toolchain::MACOS_MIN`]): not cargo's, but what `cc` reads first, so it never asks
+//!   `xcrun --show-sdk-version` (a deferred tool) for the `-mmacosx-version-min` of its
+//!   compiles; a compiler probe's row (pins/answers/clang.json) is keyed with it.
+//!
+//! Not set: `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTC_LINKER`, `PATH`, `HOME`, and every
+//! variable of the user's: a switch such as `LIBC_CI` is unset.
+//!
+//! The parallelism a script's children get is NOT in [`Env`]: a job count is a hint about the
+//! machine, never an input of the run's result, so it is in no key and no record (rules 21, 25).
+//! A run is given [`Env::for_run`], a [`RunEnv`] (another type, so no key can take it): the keyed
+//! variables and its [`Jobs`]:
+//!
+//! - a wasm run ([`Jobs::One`], it has no threads): `NUM_JOBS` `1`, no jobserver;
+//! - a native run ([`Jobs::Shared`]): `NUM_JOBS` the command's worker count and
+//!   `CARGO_MAKEFLAGS` naming the command's jobserver fifo exactly as cargo writes it
+//!   ([`makeflags`]), which the `jobserver` crate (`cc`'s `parallel`), cmake and make read
+//!   (`CARGO_MAKEFLAGS`, then `MAKEFLAGS`, then `MFLAGS`; `NUM_JOBS` only when none is set).
 
-use std::{
-    collections::BTreeMap,
-    ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
-    process::Command,
-};
+#![blaze::sans_io]
 
-use crate::{Error, unit::Unit};
+use blaze_expand::seen::SeenRoot;
+use blaze_ids::{ContentId, Hasher};
+use blaze_own::{AString, AVec, Alloc, String, Vec};
+use blaze_unit_graph::{CfgAtom, PackageMetaVars, Text};
 
-/// A script's whole environment.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Env {
-    pub vars: BTreeMap<OsString, OsString>,
+/// The names authorized by one command, their optional values, and their home-private MAC.
+/// The rows are transient. A job key takes only the MAC.
+#[derive(Clone, Copy, Default)]
+pub struct CallerEnv<'a> {
+    rows: &'a [(&'a str, Option<&'a str>, ContentId)],
+    mac: Option<ContentId>,
 }
 
-impl Env {
-    pub fn get(&self, name: &str) -> Option<&OsStr> {
-        self.vars.get(OsStr::new(name)).map(OsString::as_os_str)
-    }
-
-    /// Gives `command` this environment and no other.
-    pub fn apply(&self, command: &mut Command) {
-        command.env_clear().envs(&self.vars);
-    }
-}
-
-/// What cargo sets on the command, in order, over what it inherits: a variable set, or taken
-/// away (`None`).
-#[derive(Default)]
-struct Explicit {
-    vars: BTreeMap<OsString, Option<OsString>>,
-}
-
-impl Explicit {
-    fn set(&mut self, name: impl Into<OsString>, value: impl Into<OsString>) {
-        self.vars.insert(name.into(), Some(value.into()));
-    }
-
-    fn remove(&mut self, name: &str) {
-        self.vars.insert(name.into(), None);
-    }
-
-    fn contains(&self, name: &str) -> bool {
-        self.vars.contains_key(OsStr::new(name))
-    }
-
-    fn get(&self, name: &str) -> Option<&OsStr> {
-        self.vars.get(OsStr::new(name)).and_then(|it| it.as_deref())
-    }
-}
-
-/// What the machine that runs the script is, as far as its environment goes: cargo decides
-/// these by what it was built for, which is the host.
-struct HostOs {
-    windows: bool,
-    macos: bool,
-    /// The variable programs find dynamic libraries by.
-    dylib_var: &'static str,
-}
-
-impl HostOs {
-    fn of(host: &str) -> HostOs {
-        let windows = host.contains("windows");
-        let macos = host.contains("apple");
-        let dylib_var = if windows {
-            "PATH"
-        } else if macos {
-            "DYLD_FALLBACK_LIBRARY_PATH"
-        } else if host.contains("aix") {
-            "LIBPATH"
-        } else if host.contains("haiku") {
-            "LIBRARY_PATH"
-        } else {
-            "LD_LIBRARY_PATH"
-        };
-        HostOs { windows, macos, dylib_var }
-    }
-
-    /// `std::env::split_paths` on the host.
-    fn split_paths(&self, value: &OsStr) -> Vec<PathBuf> {
-        let value = value.to_string_lossy();
-        if !self.windows {
-            return value.split(':').map(PathBuf::from).collect();
+impl<'a> CallerEnv<'a> {
+    /// A grant names an application setting. Runner, shell, loader and tool configuration
+    /// are owned by the command and cannot be supplied by this channel.
+    pub fn allows(name: &str) -> bool {
+        let mut bytes = name.bytes();
+        if name.len() > 128 || !bytes.next().is_some_and(|b| b.is_ascii_alphabetic()) || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return false;
         }
-        let mut paths = Vec::new();
-        let mut path = String::new();
-        let mut quoted = false;
-        let mut after_separator = false;
-        for c in value.chars() {
-            after_separator = false;
-            match c {
-                '"' => quoted = !quoted,
-                ';' if !quoted => {
-                    paths.push(PathBuf::from(std::mem::take(&mut path)));
-                    after_separator = true;
+        let prefix = name.split('_').next().unwrap_or(name);
+        !matches!(name, "HOME" | "PATH" | "PWD" | "OLDPWD" | "USER" | "LOGNAME" | "TMP" | "TEMP" | "TMPDIR"
+            | "LANG" | "LANGUAGE" | "TZ" | "TZDIR" | "IFS" | "ENV" | "SHELL" | "SHELLOPTS" | "BASHOPTS" | "CDPATH"
+            | "OUT_DIR" | "OPT_LEVEL" | "NUM_JOBS" | "PROFILE" | "DEBUG" | "TARGET" | "HOST" | "SOURCE_DATE_EPOCH"
+            | "RUSTFLAGS" | "RUSTDOCFLAGS" | "SDKROOT" | "TOOLCHAINS" | "MAKEFLAGS" | "MFLAGS" | "MAKEFILES" | "RANLIB"
+            | "VERGEN_IDEMPOTENT" | "AWK" | "NM" | "AR" | "AS" | "STRIP" | "OBJCOPY" | "OBJDUMP" | "READELF" | "CPATH"
+            | "CFLAGS" | "CPPFLAGS" | "CXXFLAGS" | "LDFLAGS" | "BINDGEN_EXTRA_CLANG_ARGS" | "DEVELOPER_DIR" | "SSLKEYLOGFILE")
+            && !matches!(prefix, "BLAZE" | "CARGO" | "DEP" | "RUST" | "RUSTC" | "RUSTDOC" | "RUSTUP" | "CC" | "CPP" | "CXX"
+                | "LD" | "DYLD" | "GLIBC" | "GCONV" | "MALLOC" | "BASH" | "LC" | "LIBCLANG" | "LIBRARY" | "COMPILER" | "SDK"
+                | "GCC" | "CLANG" | "LLVM" | "MACOSX" | "IPHONEOS" | "CMAKE" | "PKG" | "OPENSSL" | "SSL" | "GIT" | "XDG")
+            && !name.starts_with("PERL") && !name.starts_with("PYTHON") && !name.starts_with("RUBY")
+    }
+
+    /// Construct from already projected rows. Invalid or duplicate names never reach a runner.
+    pub fn new(rows: &'a [(&'a str, Option<&'a str>, ContentId)], mac: ContentId) -> Option<Self> {
+        if rows.len() > 64 || !rows.iter().all(|(name, v, fact)| Self::allows(name) && (v.is_some() || *fact == ContentId::default())) || !rows.windows(2).all(|p| p[0].0 < p[1].0) {
+            return None;
+        }
+        Some(Self { rows, mac: (!rows.is_empty()).then_some(mac) })
+    }
+
+    /// The named grant's value, when set.
+    pub fn get(self, name: &str) -> Option<&'a str> {
+        self.rows.binary_search_by_key(&name, |row| row.0).ok().and_then(|at| self.rows[at].1)
+    }
+
+    /// All granted names in ascending order, including explicit absences.
+    pub fn iter(self) -> impl ExactSizeIterator<Item = (&'a str, Option<&'a str>)> {
+        self.rows.iter().map(|&(name, value, _)| (name, value))
+    }
+
+    /// Authentication tag for an authorized read. Absent and present-empty are distinct.
+    pub fn fact(self, name: &str) -> Option<ContentId> {
+        self.rows.binary_search_by_key(&name, |row| row.0).ok().map(|at| self.rows[at].2)
+    }
+
+    /// An ungranted or absent name answers the same absent cell.
+    pub fn answer(self, name: &str) -> ContentId {
+        self.fact(name).unwrap_or_default()
+    }
+
+    /// Verified rows, for transferring a projection into a worker's memory.
+    pub fn rows(self) -> &'a [(&'a str, Option<&'a str>, ContentId)] {
+        self.rows
+    }
+
+    /// Digest of the named grants and their individual facts. An empty grant has no identity.
+    pub fn identity(self) -> Option<ContentId> {
+        self.mac
+    }
+
+    /// Workspace membership limits which user code receives the caller's projection.
+    pub fn for_root(self, seen: SeenRoot<'_>) -> Self {
+        match seen {
+            SeenRoot::Member { .. } => self,
+            SeenRoot::Package => Self::default(),
+        }
+    }
+
+    /// Construct the guest environment only after computing the private run key.
+    pub fn serve<'r>(self, mut env: Env<'r>, alloc: Alloc<'r>) -> Env<'r> {
+        for (name, value) in self.iter() {
+            if let Some(value) = value {
+                env.vars.push((String::from_str_in(name, alloc), String::from_str_in(value, alloc)));
+            }
+        }
+        if self.mac.is_some() {
+            env.vars.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        }
+        env
+    }
+
+    /// Fold the complete projection into the key for a build script that may enumerate it.
+    pub fn with_source(self, source: ContentId) -> ContentId {
+        match self.mac {
+            None => source,
+            Some(mac) => {
+                let mut h = Hasher::new("blaze workspace caller environment 1");
+                h.id(&source).id(&mac);
+                h.finish()
+            }
+        }
+    }
+}
+
+impl core::fmt::Debug for CallerEnv<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.rows.iter().map(|row| row.0)).finish()
+    }
+}
+
+/// The manifest's package facts a script is told (`CARGO_PKG_*`); an absent value is `""`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PackageFacts<'s> {
+    pub name: &'s str,
+    /// The full version: `2.1.2+zstd.1.5.7`.
+    pub version: &'s str,
+    /// The `[package]` metadata (`CARGO_PKG_AUTHORS`, ..), from the one table (blaze-manifest
+    /// layout meta.rs, carried as `UnitGraph::meta`): an unstated key `""` as cargo sets it.
+    /// `None`: the graph does not carry it, and the script is told none of those names.
+    pub meta: Option<PackageMetaVars<'s>>,
+    pub links: Option<&'s str>,
+}
+
+/// One `links` metadata pair of a direct dependency: `DEP_<LINKS>_<KEY>=value`.
+#[derive(Clone, Copy, Debug)]
+pub struct DepMetadata<'s> {
+    pub links: &'s str,
+    pub key: &'s str,
+    pub value: &'s str,
+}
+
+/// What the environment is computed from.
+#[derive(Clone, Copy, Debug)]
+pub struct Given<'s, 'u> {
+    pub package: PackageFacts<'s>,
+    /// What the script sees as its package's root (D96): `SeenRoot::Package` for a dependency
+    /// (`/package`), `SeenRoot::member(dir)` for a workspace member (`/workspace/<dir>`).
+    pub seen: SeenRoot<'s>,
+    /// The unit's features, sorted.
+    pub features: &'s [Text<'u>],
+    /// The cfgs of the target the crate is built for, sorted (the library unit's).
+    pub target_cfg: &'s [CfgAtom<'u>],
+    pub target: &'s str,
+    pub host: &'s str,
+    pub deps: &'s [DepMetadata<'s>],
+}
+
+/// The variables, sorted by name, each once.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Env<'a> {
+    pub vars: AVec<'a, (AString<'a>, AString<'a>)>,
+}
+
+impl core::fmt::Debug for Env<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.vars.iter().map(|(name, _)| name)).finish()
+    }
+}
+
+impl Env<'_> {
+    pub fn get(&self, name: &str) -> Option<&str> {
+        let at = self.vars.binary_search_by(|(n, _)| n.as_str().cmp(name)).ok()?;
+        Some(self.vars[at].1.as_str())
+    }
+
+    /// Appends the bytes the key hashes: a count, then each name and value length-prefixed.
+    pub fn encode(&self, out: &mut AVec<'_, u8>) {
+        out.extend_from_slice(&(self.vars.len() as u64).to_le_bytes());
+        for (name, value) in self.vars.iter() {
+            out.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+    }
+
+    /// The environment a run is given: these variables and the job variables of `jobs`
+    /// ([`job_vars`]), sorted by name, each once. Never keyed: [`crate::key::KeyInputs`] takes an
+    /// [`Env`], and this is a [`RunEnv`].
+    pub fn for_run<'a>(&self, jobs: Jobs<'_>, alloc: Alloc<'a>) -> RunEnv<'a> {
+        let mut vars: AVec<'a, (AString<'a>, AString<'a>)> = Vec::with_capacity_in(self.vars.len() + 2, alloc);
+        for (name, value) in self.vars.iter() {
+            vars.push((String::from_str_in(name, alloc), String::from_str_in(value, alloc)));
+        }
+        for (name, value) in job_vars(jobs, alloc) {
+            match vars.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
+                // The keyed environment never holds a job variable (`env` sets none); a caller's
+                // own `Env` that did is overridden, as the last `export` would.
+                Ok(at) => vars[at].1 = value,
+                Err(at) => vars.insert(at, (String::from_str_in(name, alloc), value)),
+            }
+        }
+        RunEnv { vars }
+    }
+}
+
+/// The environment a run is given ([`Env::for_run`]): the keyed variables and the job
+/// variables, sorted by name, each once. A separate type so no key can hold it (rule 25).
+#[derive(Clone, PartialEq, Eq)]
+pub struct RunEnv<'a> {
+    pub vars: AVec<'a, (AString<'a>, AString<'a>)>,
+}
+
+impl core::fmt::Debug for RunEnv<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.vars.iter().map(|(name, _)| name)).finish()
+    }
+}
+
+impl RunEnv<'_> {
+    pub fn get(&self, name: &str) -> Option<&str> {
+        let at = self.vars.binary_search_by(|(n, _)| n.as_str().cmp(name)).ok()?;
+        Some(self.vars[at].1.as_str())
+    }
+}
+
+/// How many jobs a run's children may run at once: a hint about the machine, never an input of
+/// the run's result (no key or record holds it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Jobs<'s> {
+    /// One: a wasm run (it has no threads), or a native run given no jobserver (an example's).
+    One,
+    /// A native run: the command's `workers` and its jobserver's fifo (an absolute path), which
+    /// holds the tokens the command lends its scripts' children.
+    Shared { workers: core::num::NonZeroU32, fifo: &'s str },
+}
+
+/// `CARGO_MAKEFLAGS`' value for the jobserver fifo `fifo`, as cargo writes it (the `jobserver`
+/// crate's `Client::configure`: both spellings, for old and new make):
+/// `-j --jobserver-fds=fifo:<fifo> --jobserver-auth=fifo:<fifo>`.
+pub fn makeflags<'a>(fifo: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = String::with_capacity_in(2 * fifo.len() + 48, alloc);
+    out.push_str("-j --jobserver-fds=fifo:");
+    out.push_str(fifo);
+    out.push_str(" --jobserver-auth=fifo:");
+    out.push_str(fifo);
+    out
+}
+
+/// The job variables of `jobs`, sorted by name: `NUM_JOBS` (`1`, or the worker count) and, for a
+/// shared jobserver, `CARGO_MAKEFLAGS` ([`makeflags`]).
+pub fn job_vars<'a>(jobs: Jobs<'_>, alloc: Alloc<'a>) -> AVec<'a, (&'static str, AString<'a>)> {
+    let mut out: AVec<'a, (&'static str, AString<'a>)> = Vec::with_capacity_in(2, alloc);
+    match jobs {
+        Jobs::One => out.push(("NUM_JOBS", String::from_str_in("1", alloc))),
+        Jobs::Shared { workers, fifo } => {
+            out.push(("CARGO_MAKEFLAGS", makeflags(fifo, alloc)));
+            let mut count = String::with_capacity_in(10, alloc);
+            // Writing into a string cannot fail (`String`'s `fmt::Write` never errs).
+            _ = core::fmt::Write::write_fmt(&mut count, format_args!("{workers}"));
+            out.push(("NUM_JOBS", count));
+        }
+    }
+    out
+}
+
+/// `-` as `_`, uppercased: how Cargo spells a feature or cfg name in a variable's name.
+fn shout<'a>(prefix: &str, name: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = String::with_capacity_in(prefix.len() + name.len(), alloc);
+    out.push_str(prefix);
+    for ch in name.chars() {
+        out.push(if ch == '-' { '_' } else { ch.to_ascii_uppercase() });
+    }
+    out
+}
+
+/// The 16 hex digits naming a configuration in `OUT_DIR`'s path: of the package's name and
+/// version, the features and the target and its cfgs.
+fn config(given: &Given<'_, '_>) -> [u8; 16] {
+    let mut hasher = Hasher::new("blaze v2 build-script out-dir 1");
+    hasher.part(given.package.name.as_bytes()).part(given.package.version.as_bytes()).part(given.target.as_bytes());
+    for feature in given.features {
+        hasher.part(feature.as_bytes());
+    }
+    for atom in given.target_cfg {
+        hasher.part(atom.name.as_bytes()).opt_part(atom.value.as_ref().map(|v| v.as_bytes()));
+    }
+    let id = hasher.finish();
+    let mut out = [0; 16];
+    for (at, byte) in id.0[..8].iter().enumerate() {
+        out[at * 2] = b"0123456789abcdef"[usize::from(byte >> 4)];
+        out[at * 2 + 1] = b"0123456789abcdef"[usize::from(byte & 15)];
+    }
+    out
+}
+
+/// `major.minor.patch[-pre][+build]` split as Cargo's `CARGO_PKG_VERSION_*` give it.
+fn version_parts(version: &str) -> (&str, &str, &str, &str) {
+    let core_pre = version.split_once('+').map_or(version, |(v, _)| v);
+    let (core, pre) = core_pre.split_once('-').unwrap_or((core_pre, ""));
+    let mut parts = core.splitn(3, '.');
+    (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""), pre)
+}
+
+/// The script's environment.
+pub fn env<'a>(given: &Given<'_, '_>, alloc: Alloc<'a>) -> Env<'a> {
+    let mut vars: AVec<'a, (AString<'a>, AString<'a>)> = Vec::new_in(alloc);
+    let mut set = |name: AString<'a>, value: &str| vars.push((name, String::from_str_in(value, alloc)));
+    let named = |name: &str| String::from_str_in(name, alloc);
+
+    // D96: the mount and the folder in it come from `SeenRoot`, their one home.
+    let mut dir = String::from_str_in(given.seen.mount(), alloc);
+    if !given.seen.folder().is_empty() {
+        dir.push('/');
+        dir.push_str(given.seen.folder());
+    }
+    let mut manifest = dir.clone_in(alloc);
+    manifest.push_str("/Cargo.toml");
+    set(named("CARGO_MANIFEST_DIR"), dir.as_str());
+    set(named("CARGO_MANIFEST_PATH"), manifest.as_str());
+    if let Some(links) = given.package.links {
+        set(named("CARGO_MANIFEST_LINKS"), links);
+    }
+
+    for feature in given.features {
+        set(shout("CARGO_FEATURE_", feature, alloc), "1");
+    }
+
+    // `CARGO_CFG_*`: atoms of one name joined; the atoms are sorted, so a name's are adjacent.
+    let mut at = 0;
+    let cfg = given.target_cfg;
+    while at < cfg.len() {
+        let name = cfg[at].name.as_str();
+        let mut end = at;
+        let mut joined = String::new_in(alloc);
+        while end < cfg.len() && cfg[end].name.as_str() == name {
+            if let Some(value) = &cfg[end].value {
+                if !joined.is_empty() {
+                    joined.push(',');
                 }
-                c => path.push(c),
+                joined.push_str(value);
             }
+            end += 1;
         }
-        if after_separator || !path.is_empty() {
-            paths.push(PathBuf::from(path));
+        if name != "test" && name != "proc_macro" {
+            set(shout("CARGO_CFG_", name, alloc), joined.as_str());
         }
-        paths
+        at = end;
     }
 
-    /// `std::env::join_paths` on the host, which cargo fails on as here.
-    fn join_paths(&self, paths: &[PathBuf], var: &str) -> Result<OsString, Error> {
-        let mut joined = OsString::new();
-        for (i, path) in paths.iter().enumerate() {
-            let text = path.as_os_str();
-            let lossy = text.to_string_lossy();
-            if i > 0 {
-                joined.push(if self.windows { ";" } else { ":" });
-            }
-            if self.windows && lossy.contains('"') || !self.windows && lossy.contains(':') {
-                let mut message = format!(
-                    "failed to join paths from `${var}` together\n\n\
-                     Check if any of path segments listed below contain an \
-                     unterminated quote character or path separator:"
-                );
-                for path in paths {
-                    message.push_str(&format!("\n    {path:?}"));
-                }
-                return Err(Error(message));
-            }
-            if self.windows && lossy.contains(';') {
-                joined.push("\"");
-                joined.push(text);
-                joined.push("\"");
-            } else {
-                joined.push(text);
-            }
-        }
-        Ok(joined)
+    let config = config(given);
+    let mut out_dir = String::from_str_in("/target/debug/build/", alloc);
+    out_dir.push_str(given.package.name);
+    out_dir.push('-');
+    out_dir.push_str(core::str::from_utf8(&config).unwrap_or(""));
+    out_dir.push_str("/out");
+    set(named("OUT_DIR"), out_dir.as_str());
+    set(named("TARGET"), given.target);
+    set(named("HOST"), given.host);
+    // No `NUM_JOBS` here: a job count is the machine's, never keyed (`Env::for_run` adds it).
+    set(named("OPT_LEVEL"), "0");
+    set(named("DEBUG"), "true");
+    set(named("PROFILE"), "debug");
+    set(named("RUSTC"), "rustc");
+    set(named("RUSTDOC"), "rustdoc");
+    set(named("CARGO"), "cargo");
+    set(named("CARGO_ENCODED_RUSTFLAGS"), "");
+    if given.target.ends_with("-apple-darwin") {
+        set(named("MACOSX_DEPLOYMENT_TARGET"), crate::toolchain::MACOS_MIN);
     }
+
+    let p = &given.package;
+    let (major, minor, patch, pre) = version_parts(p.version);
+    for (name, value) in [
+        ("CARGO_PKG_NAME", p.name),
+        ("CARGO_PKG_VERSION", p.version),
+        ("CARGO_PKG_VERSION_MAJOR", major),
+        ("CARGO_PKG_VERSION_MINOR", minor),
+        ("CARGO_PKG_VERSION_PATCH", patch),
+        ("CARGO_PKG_VERSION_PRE", pre),
+    ] {
+        set(named(name), value);
+    }
+    if let Some(meta) = p.meta {
+        for (name, value) in meta.pairs() {
+            set(named(name), value);
+        }
+    }
+
+    for dep in given.deps {
+        let mut name = shout("DEP_", dep.links, alloc);
+        name.push('_');
+        let key = shout("", dep.key, alloc);
+        name.push_str(&key);
+        set(name, dep.value);
+    }
+
+    // Sorted by name; a later value of one name (a `DEP_` pair printed twice) wins, as the
+    // last `export` would.
+    vars.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    let mut kept: AVec<'a, (AString<'a>, AString<'a>)> = Vec::with_capacity_in(vars.len(), alloc);
+    for pair in vars {
+        match kept.last_mut() {
+            Some(last) if last.0 == pair.0 => *last = pair,
+            _ => kept.push(pair),
+        }
+    }
+    Env { vars: kept }
 }
-
-/// A name as cargo makes it part of a variable's: upper case, `-` as `_`.
-pub fn envify(name: &str) -> String {
-    name.chars().flat_map(char::to_uppercase).map(|c| if c == '-' { '_' } else { c }).collect()
-}
-
-/// A cfg as `rustc --print cfg` prints it: a name, or a name and a quoted value.
-fn cfg_of(line: &str) -> (&str, Option<&str>) {
-    match line.split_once('=') {
-        Some((name, value)) => {
-            let value = value.trim();
-            let value =
-                value.strip_prefix('"').and_then(|it| it.strip_suffix('"')).unwrap_or(value);
-            (name.trim(), Some(value))
-        }
-        None => (line.trim(), None),
-    }
-}
-
-/// The search path of `paths` for dynamic libraries: of those with a kind (`native=`,
-/// `crate=`, `dependency=`, `framework=`, `all=`), the directory.
-fn dynamic_search_path(path: &Path) -> &Path {
-    match path.to_str().and_then(|it| it.split_once('=')) {
-        Some(("native" | "crate" | "dependency" | "framework" | "all", path)) => Path::new(path),
-        _ => path,
-    }
-}
-
-/// Of `paths`, the directories below `root`: one outside is likely the system's, whose
-/// libraries would be found in place of the system's own (cargo's issue 3366).
-fn below(paths: &[PathBuf], root: &Path) -> Vec<PathBuf> {
-    paths
-        .iter()
-        .map(|it| dynamic_search_path(it))
-        .filter(|it| it.starts_with(root))
-        .map(Path::to_owned)
-        .collect()
-}
-
-/// Where openssl-probe 0.1.6 looks for certificates, in order, on `host`.
-fn certificate_dirs(host: &str) -> Vec<&'static Path> {
-    let mut dirs = vec![
-        "/var/ssl",
-        "/usr/share/ssl",
-        "/usr/local/ssl",
-        "/usr/local/openssl",
-        "/usr/local/etc/openssl",
-        "/usr/local/share",
-        "/usr/lib/ssl",
-        "/usr/ssl",
-        "/etc/openssl",
-        "/etc/pki/ca-trust/extracted/pem",
-        "/etc/pki/tls",
-        "/etc/ssl",
-        "/etc/certs",
-        "/opt/etc/ssl",
-    ];
-    if host.contains("android") {
-        dirs.push("/data/data/com.termux/files/usr/etc/tls");
-    }
-    if host.contains("haiku") {
-        dirs.push("/boot/system/data/ssl");
-    }
-    dirs.into_iter().map(Path::new).collect()
-}
-
-const CERTIFICATE_FILES: [&str; 10] = [
-    "cert.pem",
-    "certs.pem",
-    "ca-bundle.pem",
-    "cacert.pem",
-    "ca-certificates.crt",
-    "certs/ca-certificates.crt",
-    "certs/ca-root-nss.crt",
-    "certs/ca-bundle.crt",
-    "CARootCertificates.pem",
-    "tls-ca-bundle.pem",
-];
-
-/// cargo's environment once it has started, from the one it was started with: what its
-/// scripts inherit. Before any command, cargo starts libgit2, whose `openssl_env_init` (git2
-/// 0.21.0, on hosts other than Windows, macOS and iOS) sets `SSL_CERT_FILE` and `SSL_CERT_DIR`
-/// to the certificates openssl-probe 0.1.6 finds on this machine, unless they name a file and
-/// a directory that exist.
-pub fn cargo_started(
-    started_with: &[(OsString, OsString)],
-    host: &str,
-) -> Vec<(OsString, OsString)> {
-    cargo_started_in(started_with, host, &certificate_dirs(host))
-}
-
-fn cargo_started_in(
-    started_with: &[(OsString, OsString)],
-    host: &str,
-    certificate_dirs: &[&Path],
-) -> Vec<(OsString, OsString)> {
-    let os = HostOs::of(host);
-    let mut env = started_with.to_vec();
-    if os.windows || os.macos {
-        return env;
-    }
-    let existing = |name: &str| {
-        started_with
-            .iter()
-            .find(|(it, _)| it == OsStr::new(name))
-            .map(|(_, value)| PathBuf::from(value))
-            .filter(|it| it.exists())
-    };
-    let mut cert_file = existing("SSL_CERT_FILE");
-    let mut cert_dir = existing("SSL_CERT_DIR");
-    for dir in certificate_dirs.iter().filter(|it| it.exists()) {
-        if cert_file.is_none() {
-            cert_file = CERTIFICATE_FILES.iter().map(|it| dir.join(it)).find(|it| it.exists());
-        }
-        if cert_dir.is_none() && dir.join("certs").exists() {
-            cert_dir = Some(dir.join("certs"));
-        }
-        if cert_file.is_some() && cert_dir.is_some() {
-            break;
-        }
-    }
-    for (name, value) in [("SSL_CERT_FILE", cert_file), ("SSL_CERT_DIR", cert_dir)] {
-        let Some(value) = value else { continue };
-        match env.iter_mut().find(|(it, _)| it == OsStr::new(name)) {
-            Some((_, it)) => *it = value.into_os_string(),
-            None => env.push((name.into(), value.into_os_string())),
-        }
-    }
-    env
-}
-
-/// The environment cargo runs `unit`'s script with, when cargo's own is `inherited` (see
-/// [`cargo_started`]).
-pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error> {
-    let host = HostOs::of(&unit.host);
-    let inherited_var = |name: &str| {
-        inherited.iter().find(|(it, _)| it == OsStr::new(name)).map(|(_, value)| value.as_os_str())
-    };
-    let mut cmd = Explicit::default();
-    let package = &unit.package;
-
-    // `fill_env`, for a process on the host.
-    let search = &unit.dylib_search;
-    let mut search_path = Vec::new();
-    if let Some(host_root) = &search.host_root {
-        search_path.extend(below(&[], host_root));
-        search_path.push(host_root.clone());
-    }
-    search_path.extend(search.host_deps.iter().cloned());
-    search_path.push(search.sysroot_libdir.clone());
-    let dylib_path =
-        inherited_var(host.dylib_var).map(|it| host.split_paths(it)).unwrap_or_default();
-    let dylib_path_is_empty = dylib_path.is_empty();
-    if dylib_path.starts_with(&search_path) {
-        search_path = dylib_path;
-    } else {
-        search_path.extend(dylib_path);
-    }
-    if host.macos && dylib_path_is_empty {
-        if let Some(home) = inherited_var("HOME") {
-            let mut lib = home.to_os_string();
-            lib.push("/lib");
-            search_path.push(lib.into());
-        }
-        search_path.push(PathBuf::from("/usr/local/lib"));
-        search_path.push(PathBuf::from("/usr/lib"));
-    }
-    cmd.set(host.dylib_var, host.join_paths(&search_path, host.dylib_var)?);
-    cmd.set("CARGO", &unit.tools.cargo);
-    let version = Version::of(&package.version);
-    cmd.set("CARGO_MANIFEST_DIR", &package.manifest_dir);
-    cmd.set("CARGO_MANIFEST_PATH", &package.manifest_path);
-    cmd.set("CARGO_PKG_VERSION_MAJOR", version.major);
-    cmd.set("CARGO_PKG_VERSION_MINOR", version.minor);
-    cmd.set("CARGO_PKG_VERSION_PATCH", version.patch);
-    cmd.set("CARGO_PKG_VERSION_PRE", version.pre);
-    cmd.set("CARGO_PKG_VERSION", &package.version);
-    cmd.set("CARGO_PKG_NAME", &package.name);
-    let field = |it: &Option<String>| it.clone().unwrap_or_default();
-    cmd.set("CARGO_PKG_DESCRIPTION", field(&package.description));
-    cmd.set("CARGO_PKG_HOMEPAGE", field(&package.homepage));
-    cmd.set("CARGO_PKG_REPOSITORY", field(&package.repository));
-    cmd.set("CARGO_PKG_LICENSE", field(&package.license));
-    cmd.set("CARGO_PKG_LICENSE_FILE", field(&package.license_file));
-    cmd.set("CARGO_PKG_AUTHORS", package.authors.join(":"));
-    cmd.set("CARGO_PKG_RUST_VERSION", field(&package.rust_version));
-    cmd.set("CARGO_PKG_README", field(&package.readme));
-    // `[env]` takes nothing cargo has set, and only what cargo's environment lacks unless forced.
-    for it in &unit.config_env {
-        if (it.force || inherited_var(&it.name).is_none()) && !cmd.contains(&it.name) {
-            cmd.set(&it.name, &it.value);
-        }
-    }
-
-    // `build_work`.
-    cmd.set("OUT_DIR", &unit.out_dir);
-    cmd.set("CARGO_MANIFEST_DIR", &package.manifest_dir);
-    cmd.set("CARGO_MANIFEST_PATH", &package.manifest_path);
-    cmd.set("NUM_JOBS", unit.jobs.to_string());
-    cmd.set("TARGET", &unit.target);
-    cmd.set("DEBUG", unit.profile.debuginfo.to_string());
-    cmd.set("OPT_LEVEL", &unit.profile.opt_level);
-    cmd.set("PROFILE", if unit.profile.release { "release" } else { "debug" });
-    cmd.set("HOST", &unit.host);
-    cmd.set("RUSTC", &unit.tools.rustc);
-    cmd.set("RUSTDOC", &unit.tools.rustdoc);
-    if let Some(linker) = &unit.tools.linker {
-        cmd.set("RUSTC_LINKER", linker);
-    }
-    if let Some(links) = &package.links {
-        cmd.set("CARGO_MANIFEST_LINKS", links);
-    }
-    for feature in &unit.features {
-        cmd.set(format!("CARGO_FEATURE_{}", envify(feature)), "1");
-    }
-    // The cfgs as cargo's map has them: `feature` first, `debug_assertions` from the profile
-    // and not from rustc, which asks without the profile's flags; a name again empties it.
-    let mut cfgs: Vec<(&str, Vec<&str>)> = Vec::new();
-    fn insert<'a>(cfgs: &mut Vec<(&'a str, Vec<&'a str>)>, name: &'a str, values: Vec<&'a str>) {
-        match cfgs.iter_mut().find(|(it, _)| *it == name) {
-            Some((_, it)) => *it = values,
-            None => cfgs.push((name, values)),
-        }
-    }
-    insert(&mut cfgs, "feature", unit.features.iter().map(String::as_str).collect());
-    if unit.profile.debug_assertions {
-        insert(&mut cfgs, "debug_assertions", Vec::new());
-    }
-    for line in &unit.target_cfgs {
-        match cfg_of(line) {
-            ("debug_assertions", None) => {}
-            (name, None) => insert(&mut cfgs, name, Vec::new()),
-            (name, Some(value)) => match cfgs.iter_mut().find(|(it, _)| *it == name) {
-                Some((_, values)) => values.push(value),
-                None => cfgs.push((name, vec![value])),
-            },
-        }
-    }
-    for (name, values) in cfgs {
-        cmd.set(format!("CARGO_CFG_{}", envify(name)), values.join(","));
-    }
-    match &unit.tools.rustc_wrapper {
-        Some(wrapper) => cmd.set("RUSTC_WRAPPER", wrapper),
-        None => cmd.remove("RUSTC_WRAPPER"),
-    }
-    cmd.remove("RUSTC_WORKSPACE_WRAPPER");
-    if unit.workspace_member
-        && let Some(wrapper) = &unit.tools.rustc_workspace_wrapper
-    {
-        cmd.set("RUSTC_WORKSPACE_WRAPPER", wrapper);
-    }
-    cmd.set("CARGO_ENCODED_RUSTFLAGS", unit.rustflags.join("\x1f"));
-    cmd.remove("RUSTFLAGS");
-    for dependency in &unit.dependencies {
-        let Some(links) = &dependency.links else { continue };
-        for (key, value) in &dependency.metadata {
-            cmd.set(format!("DEP_{}_{}", envify(links), envify(key)), value);
-        }
-    }
-    // `add_plugin_deps`.
-    if let Some(host_root) = &search.host_root {
-        let mut search_path =
-            cmd.get(host.dylib_var).map(|it| host.split_paths(it)).unwrap_or_default();
-        search_path.extend(below(&search.plugin_search, host_root));
-        cmd.set(host.dylib_var, host.join_paths(&search_path, host.dylib_var)?);
-    }
-    // The jobserver's `Client::configure`.
-    if let Some(auth) = &unit.jobserver {
-        cmd.set("CARGO_MAKEFLAGS", format!("-j --jobserver-fds={auth} --jobserver-auth={auth}"));
-    }
-
-    let mut vars: BTreeMap<OsString, OsString> = inherited.iter().cloned().collect();
-    for (name, value) in cmd.vars {
-        match value {
-            Some(value) => _ = vars.insert(name, value),
-            None => _ = vars.remove(&name),
-        }
-    }
-    Ok(Env { vars })
-}
-
-/// The parts of a version cargo names apart.
-struct Version<'a> {
-    major: &'a str,
-    minor: &'a str,
-    patch: &'a str,
-    pre: &'a str,
-}
-
-impl Version<'_> {
-    fn of(version: &str) -> Version<'_> {
-        let version = version.split_once('+').map_or(version, |(it, _)| it);
-        let (numbers, pre) = version.split_once('-').unwrap_or((version, ""));
-        let mut numbers = numbers.splitn(3, '.');
-        let mut next = || numbers.next().unwrap_or("0");
-        Version { major: next(), minor: next(), patch: next(), pre }
-    }
-}
-
-#[cfg(test)]
-mod tests;

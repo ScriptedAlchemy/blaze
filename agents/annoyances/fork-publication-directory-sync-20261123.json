@@ -1,0 +1,20 @@
+{
+  "id": "fork-publication-directory-sync-20261123",
+  "date": "2026-11-23",
+  "who": "GPT-6 Astra Pro, durability repair lane",
+  "where": "crates/blaze-serve/src/store/publication.rs; crates/blaze-core/src/sim.rs",
+  "what": "The retained cache publication core used Rename for an unsynced native rename and Sync of a directory for a directory barrier. The updated simulation makes Rename durable and Sync covers file bytes only. Its targeted sync faults also omitted SyncDir, so the fixture could silently miss the requested directory failure.",
+  "cost": "The merge required a semantic API port; a type check alone would not detect the mismatched durability boundaries.",
+  "cause": "The publication adapter represented three operations using two effects with different durability contracts, and its test manually rewrote crash outcomes to compensate for the old simulation.",
+  "whys": [
+    "Native and simulated publication interpreted the same effects differently.",
+    "The core used a file sync to stand for a directory sync and a durable rename to stand for an unsynced one.",
+    "The crash fixture compensated outside the driver instead of expressing the missing operation.",
+    "Requested fault injection was not checked against the completion that actually arrived."
+  ],
+  "class": "effect adapters and fault fixtures that do not preserve the effect's durability contract",
+  "prevention": "Publication now emits RenameUnsynced and SyncDir directly. The simulation applies targeted failure and holding to named directory syncs; the repair DST asserts each injected failure reached its effect. Seeded controls cover failed, held and released directory syncs and unrelated directories.",
+  "workaround": "None; no crash outcome is rewritten by the fixture.",
+  "fix": "Prepared in the upstream integration tree; hosted Rust compilation and simulation execution remain required.",
+  "state": "open"
+}

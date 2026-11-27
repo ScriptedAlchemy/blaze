@@ -1,0 +1,132 @@
+{
+ "t": 35.5,
+ "client_mb": 20770,
+ "client_procs": {
+  "56464": [
+   2430,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56470": [
+   1079,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56726": [
+   1072,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56492": [
+   1069,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56622": [
+   1069,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56480": [
+   1067,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56601": [
+   1066,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56594": [
+   1066,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56507": [
+   1066,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56512": [
+   1064,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56703": [
+   1064,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56462": [
+   1064,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56595": [
+   1063,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56525": [
+   1062,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56481": [
+   1061,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56504": [
+   1055,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56475": [
+   1053,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ],
+  "56735": [
+   1051,
+   [
+    "ra-jit",
+    "rust-project.json"
+   ]
+  ]
+ }
+}

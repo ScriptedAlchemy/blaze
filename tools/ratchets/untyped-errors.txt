@@ -1,0 +1,53 @@
+# The function signatures whose error is untyped, outside test code, by crate (its directory
+# under crates/): a `Result` whose error is `String`, `&str`, `Box<dyn Error>` or `anyhow`
+# in a signature's return or parameter types (`blaze::untyped_error`'s rule, read from the
+# text), and the type aliases of such a `Result`, counted where they are defined. Only
+# shrinks; a crate with no row is held to 0 (AGENTS.md errors-name-the-thing). Written by
+# scripts/src/bin/untyped.rs (`{"command": "write"}`), checked in CI.
+# crate	string	str	boxed	anyhow	aliases
+blaze-audit	4	0	0	0	0
+blaze-bench	0	0	0	0	1
+blaze-build-script	0	1	0	0	0
+blaze-cas	1	2	0	0	0
+blaze-cbor	0	1	0	0	0
+blaze-check	19	0	0	0	0
+blaze-cli	4	61	0	0	5
+blaze-core	8	1	0	0	0
+blaze-emit	0	8	0	0	0
+blaze-fmt	1	7	0	0	0
+blaze-graph	1	0	0	0	0
+blaze-http	15	6	0	0	0
+blaze-ids	0	1	0	0	0
+blaze-ladder	1	14	0	0	0
+blaze-launch	1	0	0	0	0
+blaze-launch-rt	11	2	0	0	1
+blaze-lint-defs	3	0	0	0	0
+blaze-lir	0	15	0	0	1
+blaze-lower	0	1	0	0	0
+blaze-manifest	1	1	0	0	0
+blaze-pack	5	0	0	0	0
+blaze-proc-macro	6	1	0	0	0
+blaze-profile	62	2	0	0	1
+blaze-protocol	1	0	0	0	0
+blaze-remote	25	3	0	0	0
+blaze-scope	0	1	0	0	0
+blaze-script	8	0	0	0	0
+blaze-shell	16	0	0	0	0
+blaze-std	30	1	0	0	0
+blaze-store-check	1	0	0	0	0
+blaze-tokens	0	1	0	0	0
+blaze-v2-proof	2	0	0	0	0
+harness/harness	6	0	0	25	1
+harness/harness-browser	35	0	0	0	0
+harness/harness-chat-library	36	0	0	0	0
+harness/harness-mach	3	0	0	0	0
+harness/harness-native	67	0	0	0	1
+harness/harness-native-flecs	6	0	0	0	0
+harness/harness-native-flecs-derive	1	0	0	0	0
+harness/harness-native-kip	2	0	0	0	0
+harness/harness-native-render	39	2	0	0	1
+harness/harness-native-ui-inline	4	0	0	0	0
+harness/harness-native-ui-timeline	2	0	0	0	0
+harness/harness-video	13	0	0	0	1
+ix-prof	45	0	0	0	0
+rustc_abi	1	0	0	0	0

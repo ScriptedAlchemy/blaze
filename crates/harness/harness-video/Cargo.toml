@@ -1,0 +1,55 @@
+[package]
+name = "harness-video"
+description = "Renders a video from a flecs scene: the native stack's UI (prims, layout, motion, draw) on a fixed frame clock, a timeline of Cues as data, Metal offscreen, encoded by VideoToolbox (HEVC Main 10, HDR10) into an mp4 by AVAssetWriter"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "harness-video"
+path = "src/main.rs"
+
+[dependencies]
+# The app, as a library: its scene world (tokens, prims, hn.* widgets) is what a video's scene loads into.
+harness-native = { path = "../harness-native" }
+harness-native-flecs = { path = "../harness-native-flecs", features = ["json"] }
+harness-native-ecs = { path = "../harness-native-ecs" }
+harness-native-api = { path = "../harness-native-api" }
+harness-native-render = { path = "../harness-native-render" }
+harness-native-blaze = { path = "../harness-native-blaze" }
+harness-native-ui-text-api = { path = "../harness-native-ui-text-api" }
+harness-native-ui-node-api = { path = "../harness-native-ui-node-api" }
+harness-native-ui-layout-api = { path = "../harness-native-ui-layout-api" }
+harness-native-ui-layout = { path = "../harness-native-ui-layout" }
+harness-native-ui-input-api = { path = "../harness-native-ui-input-api" }
+harness-native-ui-input = { path = "../harness-native-ui-input" }
+harness-native-ui-motion = { path = "../harness-native-ui-motion" }
+harness-native-ui-draw-api = { path = "../harness-native-ui-draw-api" }
+harness-native-ui-draw = { path = "../harness-native-ui-draw" }
+harness-native-ui-timeline-api = { path = "../harness-native-ui-timeline-api" }
+harness-native-ui-timeline = { path = "../harness-native-ui-timeline" }
+hyperion-ecs = { path = "../vendor/hyperion-ecs", features = ["pipeline", "meta"] }
+hyperion-flecs-c = { path = "../vendor/hyperion-flecs-c", features = ["prefab", "constraint_traits", "pipeline", "script", "script_input"] }
+png = "0.17"
+
+[dev-dependencies]
+harness-native-ui-motion-api = { path = "../harness-native-ui-motion-api" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+objc2-core-foundation = "0.3"
+block2 = "0.6"
+# The mp4 (src/encode.rs): VideoToolbox's hardware HEVC session, CoreVideo's pool buffers mapped into Metal, AVAssetWriter.
+# Default features off: their defaults pull in frameworks the encoder never uses.
+objc2-video-toolbox = { version = "0.3.2", default-features = false, features = ["std", "objc2", "VTBase", "VTErrors", "VTSession", "VTCompressionSession", "VTCompressionProperties", "objc2-core-media", "objc2-core-video"] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = ["std", "objc2", "objc2-metal", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferPool", "CVMetalTexture", "CVMetalTextureCache", "CVReturn"] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CMBase", "CMTime", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "objc2-core-audio-types"] }
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVAssetWriter", "AVAssetWriterInput", "AVMediaFormat", "block2", "objc2-core-media"] }
+objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "AVAudioSettings"] }
+
+[lints.rust]
+unsafe_code = "allow"

@@ -1,0 +1,37 @@
+[package]
+name = "blaze-lir"
+description = "LIR, blaze's low-level IR: one monomorphized function after layout, the ABI and drop elaboration, as flat columns with Rust's facts as flags and attribute rows; its builder, verifier, text form and blaze-format record (docs/v2/plan/design/lir.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The record a kept LIR is (`persist`), and `SpanRef`, the position-free span its locations name.
+blaze-format.workspace = true
+# The interning tables of the builder, in the builder's allocator.
+blaze-hash.workspace = true
+# `ContentId`: a variable's type and a span's anchor, by content.
+blaze-ids.workspace = true
+# `Vec<T, A>` for the simplify passes' scratch: blaze's own, never std's (std-alloc ratchet).
+blaze-own.workspace = true
+
+[features]
+# `blaze_lir::eval`, the reference evaluator, for a backend's tests (its dev-dependency turns
+# it on); this crate's own tests have it always. Never on in a build.
+eval = []
+
+[dev-dependencies]
+blaze-sim.workspace = true
+# `Alloc::global()`, which legalize's tests name (blaze-own's `std` feature).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true

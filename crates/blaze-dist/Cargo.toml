@@ -1,0 +1,24 @@
+[package]
+name = "blaze-dist"
+description = "blaze's distributed compile and jobs as sans-IO state machines: the work set of claimed discovery, an executor's side of it, executions and admission, and the deterministic simulation that checks them"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-own.workspace = true
+blaze-wire.workspace = true
+
+[dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

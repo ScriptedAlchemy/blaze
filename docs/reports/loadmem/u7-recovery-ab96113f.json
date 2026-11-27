@@ -1,0 +1,53 @@
+{
+  "runtime_source_sha": "ab96113f253e92db5f27d9b3432fc9ac23cf095f",
+  "platform": "macOS AArch64",
+  "toolchain": "Rust 1.99.0",
+  "backend": "Cranelift",
+  "binary_sha256": "94125db4e131d94ba7760e99bcb9491e4a21c0fbb750c913b7b3ca628c078659",
+  "n": 1,
+  "provider": "explicit controlled production provider",
+  "soft_target_bytes": 67108864,
+  "grace_seconds": 2,
+  "runtime_result": {
+    "steps": [
+      {
+        "version": 1,
+        "persistent_failure": false,
+        "same_daemon": true,
+        "running_job_drained": true,
+        "no_new_entry_critical": true,
+        "no_partial_publication": true,
+        "recovered_patch": true
+      },
+      {
+        "version": 2,
+        "persistent_failure": true,
+        "same_daemon": true,
+        "running_job_drained": true,
+        "no_new_entry_critical": true,
+        "no_partial_publication": true,
+        "recovered_patch": true
+      }
+    ],
+    "same_source_retry": true,
+    "compiler_pid": 65832,
+    "matches_expected_and_initial_reference": true
+  },
+  "focused_tests": {
+    "budget": 10,
+    "pressure": 8,
+    "patch": 2
+  },
+  "watchdog": {
+    "runtime_exit": 0,
+    "runtime_peak_summed_footprint_mb": 780,
+    "runtime_guard_wall_seconds": 9.8,
+    "trip": null
+  },
+  "limits": [
+    "No speedup claim, baseline or spread",
+    "No deliberate host memory exhaustion",
+    "Production daemon/controller component tests are not a fleet aggregate-pressure run",
+    "LLVM and arbitrary coroutine/semantic-debug differentials were not run"
+  ]
+}

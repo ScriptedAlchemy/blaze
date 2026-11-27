@@ -1,0 +1,2375 @@
+//! One script of effects on every driver: they must end the same.
+
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
+
+use crate::{
+    Completion, Done, Driver, Effect, FileName, Tag, run_until_idle,
+    sim::{Faults, Sim},
+    temp::TempDir,
+    threads::Threads,
+    wait::Deadline,
+};
+
+fn name(it: &str) -> FileName {
+    FileName::new(it).unwrap()
+}
+
+/// A new empty directory for the test `what`, removed when the guard drops: hold it for as long
+/// as a driver works in it.
+fn dir(what: &str) -> TempDir {
+    TempDir::for_test(&format!("blaze-core-{what}-"))
+}
+
+/// As [`dir`], under `/tmp`: a Unix socket's whole path must fit in its address (about 104
+/// bytes), which a long temporary directory (a Nix shell's) leaves no room for.
+#[cfg(unix)]
+fn socket_dir(what: &str) -> TempDir {
+    TempDir::for_test_socket(&format!("blaze-core-{what}-"))
+}
+
+/// What became of each step, by its tag. A clone is either done or refused for the file
+/// system, which the drivers on disk may differ in; it reads back the same either way.
+fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
+    let mut seen = BTreeMap::new();
+    let mut effects = vec![Effect::Write {
+        file: name("store/a/value"),
+        bytes: b"compiled".to_vec(),
+        tag: Tag(1),
+    }];
+    run_until_idle(driver, &mut effects, |done, effects| {
+        let shown = match &done.done {
+            Done::Failed(why) if done.tag == Tag(3) && why.0.contains("does not copy") => {
+                "refused".to_owned()
+            }
+            Done::Cloned if done.tag == Tag(3) => "refused".to_owned(),
+            Done::Stat(Some(meta)) if meta.dir => "stat a directory".to_owned(),
+            Done::Stat(Some(meta)) => format!("stat {} bytes", meta.len),
+            // A directory's own length is the file system's.
+            Done::Listed(found) => found
+                .iter()
+                .map(|(file, meta)| match meta.dir {
+                    true => format!("{file}/"),
+                    false => format!("{file} {}", meta.len),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            Done::Failed(_) => "failed".to_owned(),
+            other => format!("{other:?}"),
+        };
+        seen.insert(done.tag.0, shown);
+        let next = match done.tag.0 {
+            1 => {
+                Effect::Write { file: name("store/a/value"), bytes: b"again".to_vec(), tag: Tag(2) }
+            }
+            2 => Effect::Clone { from: name("store/a/value"), to: name("out/c"), tag: Tag(3) },
+            3 => Effect::Link { from: name("store/a/value"), to: name("out/l"), tag: Tag(4) },
+            4 => Effect::ReadAll { file: name("out/l"), tag: Tag(5) },
+            5 => Effect::Stat { file: name("store/a/value"), tag: Tag(6) },
+            6 => Effect::Stat { file: name("store/a"), tag: Tag(7) },
+            7 => Effect::Stat { file: name("missing"), tag: Tag(8) },
+            8 => Effect::Remove { file: name("out/l"), tag: Tag(9) },
+            9 => Effect::Remove { file: name("out/l"), tag: Tag(10) },
+            10 => Effect::ReadAll { file: name("out/l"), tag: Tag(11) },
+            11 => {
+                Effect::Append { file: name("store/a/value"), bytes: b"+".to_vec(), tag: Tag(12) }
+            }
+            12 => Effect::ReadAll { file: name("store/a/value"), tag: Tag(13) },
+            13 => Effect::Link { from: name("missing"), to: name("out/m"), tag: Tag(14) },
+            14 => Effect::Unwatch { tag: Tag(99) },
+            99 => Effect::WriteAt {
+                file: name("store/a/value"),
+                at: 4,
+                bytes: b"XYZ".to_vec(),
+                tag: Tag(16),
+            },
+            16 => Effect::ReadAll { file: name("store/a/value"), tag: Tag(17) },
+            17 => Effect::Mode { file: name("store/a/value"), mode: 0o755, tag: Tag(18) },
+            18 => Effect::Rename {
+                from: name("store/a/value"),
+                to: name("store/a/moved"),
+                tag: Tag(19),
+            },
+            19 => Effect::Stat { file: name("store/a/value"), tag: Tag(20) },
+            20 => Effect::List { dir: name("store").into(), tag: Tag(21) },
+            21 => Effect::WriteAt { file: name("missing"), at: 0, bytes: vec![1], tag: Tag(22) },
+            22 => Effect::Rename { from: name("missing"), to: name("out/m"), tag: Tag(23) },
+            23 => Effect::List { dir: name("missing").into(), tag: Tag(24) },
+            // The effects whose calls are blaze-sys's on Linux (`fs/linux.rs`): a cut, a read
+            // of a range that runs past the end, a sync, and an append after them. (A ranged
+            // read of a file that is not there is not in the script: the simulation reads it
+            // as empty and the native drivers fail it, a difference this lane found and left.)
+            24 => Effect::Truncate { file: name("store/a/moved"), len: 3, tag: Tag(25) },
+            25 => Effect::Read { file: name("store/a/moved"), at: 1, len: 10, tag: Tag(26) },
+            26 => Effect::Sync { file: name("store/a/moved"), tag: Tag(27) },
+            27 => Effect::Append { file: name("store/a/moved"), bytes: b"!".to_vec(), tag: Tag(28) },
+            28 => Effect::ReadAll { file: name("store/a/moved"), tag: Tag(29) },
+            // A write-back of a file that is there and of one that is not, and a directory's
+            // names synced.
+            29 => Effect::WriteBack { file: name("store/a/moved"), tag: Tag(30) },
+            30 => Effect::WriteBack { file: name("missing"), tag: Tag(31) },
+            31 => Effect::SyncDir { dir: name("store/a").into(), tag: Tag(32) },
+            // A barrier of a file that is there, and of one it makes (as a sync makes it).
+            32 => Effect::Barrier { file: name("store/a/moved"), tag: Tag(33) },
+            33 => Effect::Barrier { file: name("store/a/ordered"), tag: Tag(34) },
+            34 => Effect::Stat { file: name("store/a/ordered"), tag: Tag(35) },
+            _ => return,
+        };
+        effects.push(next);
+    }).expect("the effects end");
+    seen
+}
+
+#[test]
+fn every_driver_ends_the_script_the_same() {
+    let mut sim = Sim::new(1, Faults::default());
+    let simulated = script(&mut sim);
+    let root = dir("threads");
+    let root = root.path();
+    let threads = script(&mut Threads::new(&root, 2));
+    assert_eq!(simulated, threads);
+    #[cfg(target_os = "macos")]
+    {
+        let root = dir("kqueue");
+        let root = root.path();
+        let kqueue = script(&mut crate::kqueue::Kqueue::new(&root, 2).unwrap());
+        assert_eq!(simulated, kqueue);
+    }
+    #[cfg(windows)]
+    {
+        let root = dir("iocp");
+        let root = root.path();
+        let iocp = script(&mut crate::iocp::Iocp::new(&root, 2).unwrap());
+        assert_eq!(simulated, iocp);
+    }
+    assert_eq!(simulated[&5], format!("{:?}", Done::Read(b"again".to_vec())));
+    assert_eq!(simulated[&13], format!("{:?}", Done::Read(b"again+".to_vec())));
+    assert_eq!(simulated[&8], format!("{:?}", Done::Stat(None)));
+    assert_eq!(simulated[&7], "stat a directory");
+    assert_eq!(simulated[&14], "failed");
+    assert_eq!(simulated[&17], format!("{:?}", Done::Read(b"agaiXYZ".to_vec())));
+    assert_eq!(simulated[&20], format!("{:?}", Done::Stat(None)));
+    assert_eq!(simulated[&21], "store/a/, store/a/moved 7");
+    assert_eq!(
+        (&simulated[&22][..], &simulated[&23][..], &simulated[&24][..]),
+        ("failed", "failed", "failed")
+    );
+    assert_eq!(simulated[&25], format!("{:?}", Done::Truncated));
+    assert_eq!(simulated[&26], format!("{:?}", Done::Read(b"ga".to_vec())));
+    assert_eq!(simulated[&27], format!("{:?}", Done::Synced));
+    assert_eq!(simulated[&29], format!("{:?}", Done::Read(b"aga!".to_vec())));
+    assert_eq!(simulated[&30], format!("{:?}", Done::WrittenBack));
+    assert_eq!(simulated[&31], "failed");
+    assert_eq!(simulated[&32], format!("{:?}", Done::Synced));
+    assert_eq!(simulated[&33], format!("{:?}", Done::Ordered));
+    assert_eq!(simulated[&34], format!("{:?}", Done::Ordered));
+    assert_eq!(simulated[&35], "stat 0 bytes", "a barrier makes the file it orders");
+    #[cfg(target_os = "linux")]
+    {
+        let root = dir("uring");
+        let root = root.path();
+        let ring = script(&mut crate::uring::Uring::new(&root).unwrap());
+        assert_eq!(simulated, ring);
+    }
+}
+
+/// A whole-file write and a rename that wait for no sync, with what a reader sees of each:
+/// what became of each step, by its tag.
+fn unsynced_script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
+    let mut seen = BTreeMap::new();
+    // Into a directory not yet there, then over itself, then renamed over another file and
+    // into another directory not yet there; a rename of what is not there fails.
+    let mut effects = vec![Effect::WriteUnsynced {
+        file: name("placed/deep/value"),
+        bytes: b"first".to_vec(),
+        tag: Tag(1),
+    }];
+    run_until_idle(driver, &mut effects, |done, effects| {
+        let shown = match &done.done {
+            Done::Failed(_) => "failed".to_owned(),
+            // A file's time is the file system's.
+            Done::Stat(Some(meta)) => format!("stat {} bytes", meta.len),
+            other => format!("{other:?}"),
+        };
+        seen.insert(done.tag.0, shown);
+        let value = || name("placed/deep/value");
+        let next = match done.tag.0 {
+            1 => Effect::WriteUnsynced { file: value(), bytes: vec![7; 70_000], tag: Tag(2) },
+            2 => Effect::ReadAll { file: value(), tag: Tag(3) },
+            3 => Effect::Write { file: name("out/a"), bytes: b"old".to_vec(), tag: Tag(4) },
+            4 => Effect::RenameUnsynced { from: value(), to: name("out/a"), tag: Tag(5) },
+            5 => Effect::ReadAll { file: name("out/a"), tag: Tag(6) },
+            6 => Effect::Stat { file: value(), tag: Tag(7) },
+            7 => Effect::RenameUnsynced { from: name("out/a"), to: name("new/dir/b"), tag: Tag(8) },
+            8 => Effect::Stat { file: name("new/dir/b"), tag: Tag(9) },
+            9 => Effect::RenameUnsynced { from: value(), to: name("out/c"), tag: Tag(10) },
+            10 => Effect::WriteUnsynced { file: name("out/empty"), bytes: Vec::new(), tag: Tag(11) },
+            11 => Effect::Stat { file: name("out/empty"), tag: Tag(12) },
+            _ => return,
+        };
+        effects.push(next);
+    })
+    .expect("the effects end");
+    seen
+}
+
+/// [`Effect::WriteUnsynced`] and [`Effect::RenameUnsynced`] end on every driver as on the
+/// simulation: the bytes are all there to a reader once each completes, a rename replaces its
+/// target and makes its directories, and one of a file not there fails.
+#[test]
+fn every_driver_writes_and_renames_without_a_sync_the_same() {
+    let mut sim = Sim::new(1, Faults::default());
+    let simulated = unsynced_script(&mut sim);
+    let root = dir("unsynced-threads");
+    let root = root.path();
+    assert_eq!(simulated, unsynced_script(&mut Threads::new(&root, 2)));
+    #[cfg(target_os = "macos")]
+    {
+        let root = dir("unsynced-kqueue");
+        let root = root.path();
+        let kqueue = unsynced_script(&mut crate::kqueue::Kqueue::new(&root, 2).unwrap());
+        assert_eq!(simulated, kqueue);
+    }
+    #[cfg(windows)]
+    {
+        let root = dir("unsynced-iocp");
+        let root = root.path();
+        let iocp = unsynced_script(&mut crate::iocp::Iocp::new(&root, 2).unwrap());
+        assert_eq!(simulated, iocp);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let root = dir("unsynced-uring");
+        let root = root.path();
+        let ring = unsynced_script(&mut crate::uring::Uring::new(&root).unwrap());
+        assert_eq!(simulated, ring);
+    }
+    assert_eq!(simulated[&3], format!("{:?}", Done::Read(vec![7; 70_000])));
+    assert_eq!(simulated[&6], format!("{:?}", Done::Read(vec![7; 70_000])));
+    assert_eq!(simulated[&7], format!("{:?}", Done::Stat(None)));
+    assert_eq!(simulated[&9], "stat 70000 bytes");
+    assert_eq!(simulated[&10], "failed");
+    assert_eq!(simulated[&12], "stat 0 bytes");
+    assert_eq!(simulated.len(), 12);
+}
+
+/// The reads above the root, from the driver's answer of its ancestors: the depth it answered
+/// (cut to `most`), a stat, a read and a listing two folders up, and a file not there.
+fn above_script(driver: &mut impl Driver, most: u8) -> Vec<String> {
+    let mut seen = Vec::new();
+    let mut ancestors = None;
+    let mut effects = vec![Effect::Ancestors { most, tag: Tag(1) }];
+    run_until_idle(driver, &mut effects, |done, effects| {
+        let shown = match done.done {
+            Done::Ancestors(answered) => {
+                let shown = format!("depth {}", answered.depth());
+                ancestors = Some(answered);
+                shown
+            }
+            Done::Stat(Some(meta)) => format!("stat {} bytes dir {}", meta.len, meta.dir),
+            Done::Listed(names) => {
+                format!("{:?}", names.iter().map(|(name, meta)| (name.as_str().to_owned(), meta.dir)).collect::<Vec<_>>())
+            }
+            Done::Failed(_) => "failed".to_owned(),
+            other => format!("{other:?}"),
+        };
+        seen.push(shown);
+        let Some(ancestors) = &ancestors else { return };
+        let above = |up, rest: Option<&str>| ancestors.above(up, rest.map(name)).expect("a name above, granted");
+        let next = match done.tag.0 {
+            1 if ancestors.depth() >= 2 => Effect::Above { op: crate::AboveOp::Stat, name: above(2, Some("Cargo.toml")), tag: Tag(2) },
+            2 => Effect::Above { op: crate::AboveOp::Read, name: above(2, Some("Cargo.toml")), tag: Tag(3) },
+            3 => Effect::Above { op: crate::AboveOp::List, name: above(2, None), tag: Tag(4) },
+            4 => Effect::Above { op: crate::AboveOp::Read, name: above(1, Some("absent")), tag: Tag(5) },
+            _ => return,
+        };
+        effects.push(next);
+    })
+    .expect("the effects end");
+    seen
+}
+
+/// The folders above the root read the same on the simulation and on disk; past the granted
+/// top and back down into the root no name can be made.
+#[test]
+fn every_driver_reads_above_its_root_the_same() {
+    let top = dir("above");
+    let start = top.path().join("ws/crate");
+    std::fs::create_dir_all(&start).unwrap();
+    std::fs::write(top.path().join("Cargo.toml"), b"[workspace]").unwrap();
+    std::fs::create_dir(top.path().join("docs")).unwrap();
+    let mut sim = Sim::new(1, Faults::default());
+    sim.set_above(vec![
+        crate::sim::SimAbove { toward: "crate".into(), files: Vec::new() },
+        crate::sim::SimAbove {
+            toward: "ws".into(),
+            files: vec![(name("Cargo.toml"), b"[workspace]".to_vec()), (name("docs/a"), Vec::new())],
+        },
+    ]);
+    let simulated = above_script(&mut sim, 2);
+    let on_disk = above_script(&mut Threads::new(&start, 2), 2);
+    assert_eq!(simulated, on_disk);
+    assert_eq!(
+        simulated,
+        [
+            "depth 2",
+            "stat 11 bytes dir false",
+            "Read([91, 119, 111, 114, 107, 115, 112, 97, 99, 101, 93])",
+            r#"[("Cargo.toml", false), ("docs", true), ("ws", true)]"#,
+            "failed",
+        ]
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(above_script(&mut crate::kqueue::Kqueue::new(&start, 2).unwrap(), 2), simulated);
+    // Granted one folder: the answer is cut there, and two up is past the top.
+    let one = above_script(&mut sim, 1);
+    assert_eq!(one, ["depth 1"]);
+    let mut effects = vec![Effect::Ancestors { most: 1, tag: Tag(1) }];
+    let mut answered = None;
+    run_until_idle(&mut sim, &mut effects, |done, _| {
+        if let Done::Ancestors(it) = done.done {
+            answered = Some(it);
+        }
+    })
+    .unwrap();
+    let answered = answered.unwrap();
+    assert_eq!(answered.above(2, None), Err(crate::AboveRefused::PastTop { up: 2, depth: 1 }));
+    assert_eq!(answered.above(0, None), Err(crate::AboveRefused::Root));
+    assert_eq!(
+        answered.above(1, Some(name("crate/src/lib.rs"))),
+        Err(crate::AboveRefused::IntoStart { up: 1, toward: "crate".into() })
+    );
+    assert!(answered.above(1, Some(name("crates2/x"))).is_ok(), "a sibling whose name only starts the same");
+}
+
+/// One level of a tree written through `driver`, listed: each entry's own name, kind and (for
+/// a file) length, the listing's order kept. Names that sort differently by bytes than by any
+/// other rule (case, punctuation, a multi-byte letter, a digit) and a directory among files.
+fn entries_script(driver: &mut impl Driver) -> Vec<String> {
+    // No two names differ by case alone: APFS, as macOS formats it, holds them as one.
+    let files = ["src/b.rs", "src/C.rs", "src/a-b", "src/a.b", "src/a/inner.rs", "src/é", "src/z", "src/_x", "src/0"];
+    let mut effects: Vec<Effect> = files
+        .iter()
+        .enumerate()
+        .map(|(at, it)| Effect::Write { file: name(it), bytes: vec![b'x'; at], tag: Tag(at as u64) })
+        .collect();
+    run_until_idle(&mut *driver, &mut effects, |_, _| {}).unwrap();
+    let mut seen = Vec::new();
+    let mut effects = vec![
+        // The root itself, which holds `src` alone.
+        Effect::Entries { dir: crate::DirName::Root, tag: Tag(99) },
+        Effect::Entries { dir: name("src").into(), tag: Tag(100) },
+        Effect::Entries { dir: name("src/missing").into(), tag: Tag(101) },
+        Effect::Entries { dir: name("src/z").into(), tag: Tag(102) },
+    ];
+    let mut done = BTreeMap::new();
+    run_until_idle(&mut *driver, &mut effects, |it, _| _ = done.insert(it.tag, it.done)).unwrap();
+    for (tag, done) in done {
+        match done {
+            Done::Entries(listing) => {
+                let want = match tag {
+                    Tag(99) => crate::DirName::Root,
+                    _ => name("src").into(),
+                };
+                assert_eq!(listing.dir(), &want);
+                if tag == Tag(99) {
+                    assert_eq!((listing.find_file("src"), listing.file(0)), (Some(0), name("src")));
+                }
+                for (at, (leaf, stamp)) in listing.iter().enumerate() {
+                    let kind = listing.kind(at);
+                    assert_eq!(listing.find(leaf.as_str()), Some(at), "found by name");
+                    let len = match kind {
+                        crate::Kind::File => stamp.size.to_string(),
+                        _ => "-".into(),
+                    };
+                    seen.push(format!("{leaf} {kind:?} {len}"));
+                }
+            }
+            Done::Failed(_) => seen.push("failed".into()),
+            other => panic!("{other:?}"),
+        }
+    }
+    seen
+}
+
+/// Every driver lists one level of a directory as the simulation does: the same names, in the
+/// order of their bytes, with the same kinds and lengths; a directory that is not there, or a
+/// file, fails.
+#[test]
+fn every_driver_lists_one_level_the_same() {
+    let simulated = entries_script(&mut Sim::new(1, Faults::default()));
+    assert_eq!(
+        simulated,
+        [
+            "src Dir -", "0 File 8", "C.rs File 1", "_x File 7", "a Dir -", "a-b File 2", "a.b File 3", "b.rs File 0",
+            "z File 6", "é File 5", "failed", "failed",
+        ]
+    );
+    let root = dir("entries-threads");
+    assert_eq!(entries_script(&mut Threads::new(root.path(), 2)), simulated);
+    #[cfg(target_os = "macos")]
+    {
+        let root = dir("entries-kqueue");
+        assert_eq!(entries_script(&mut crate::kqueue::Kqueue::new(root.path(), 2).unwrap()), simulated);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    {
+        let root = dir("entries-native");
+        assert_eq!(entries_script(&mut crate::native(root.path(), 2).unwrap()), simulated);
+    }
+}
+
+/// What a driver tells of one column of names stamped as one [`Effect::Stamp`] (the batched
+/// stat: one submission, one completion): each row a kind and a file's length, or `gone` for a
+/// name not there or under a file; an empty column; and a column past [`crate::STAMP_MOST`],
+/// refused as a whole.
+fn stamps_script(driver: &mut impl Driver) -> Vec<String> {
+    let mut effects = vec![
+        Effect::Write { file: name("s/a.rs"), bytes: vec![b'x'; 3], tag: Tag(1) },
+        Effect::Write { file: name("s/sub/b.rs"), bytes: vec![b'y'; 5], tag: Tag(2) },
+    ];
+    run_until_idle(&mut *driver, &mut effects, |_, _| {}).unwrap();
+    let rows = ["s/a.rs", "s/sub/b.rs", "s/sub", "s/missing", "s/a.rs/under", "s/a.rs"];
+    let mut column = crate::Names::with_capacity(rows.len(), 64);
+    for it in rows {
+        column.push(&name(it));
+    }
+    let mut over = crate::Names::with_capacity(crate::STAMP_MOST + 1, 2 * (crate::STAMP_MOST + 1));
+    for _ in 0..=crate::STAMP_MOST {
+        over.push(&name("a"));
+    }
+    let mut effects = vec![
+        Effect::Stamp { files: std::sync::Arc::new(column), tag: Tag(10) },
+        Effect::Stamp { files: std::sync::Arc::new(crate::Names::default()), tag: Tag(11) },
+        Effect::Stamp { files: std::sync::Arc::new(over), tag: Tag(12) },
+    ];
+    let mut done = BTreeMap::new();
+    run_until_idle(&mut *driver, &mut effects, |it, _| _ = done.insert(it.tag, it.done)).unwrap();
+    let mut seen = Vec::new();
+    for (tag, done) in done {
+        match done {
+            Done::Stamped(stamps) => {
+                seen.push(format!("{tag:?}: {} rows", stamps.len()));
+                for stamp in stamps {
+                    seen.push(match stamp.mode & crate::S_IFMT {
+                        _ if stamp == crate::Stamp::GONE => "gone".into(),
+                        crate::S_IFDIR => "dir".into(),
+                        crate::S_IFREG => format!("file {}", stamp.size),
+                        other => format!("mode {other:o}"),
+                    });
+                }
+            }
+            Done::Failed(crate::IoError(why)) if why.contains("STAMP_MOST") => seen.push(format!("{tag:?}: refused")),
+            other => panic!("{tag:?}: {other:?}"),
+        }
+    }
+    seen
+}
+
+/// Every driver stamps a column as the simulation does, refuses one past the cap as a whole,
+/// and the same file twice in one column stamps the same.
+#[test]
+fn every_driver_stamps_a_column_the_same() {
+    let simulated = stamps_script(&mut Sim::new(1, Faults::default()));
+    assert_eq!(
+        simulated,
+        [
+            "Tag(10): 6 rows", "file 3", "file 5", "dir", "gone", "gone", "file 3", "Tag(11): 0 rows",
+            "Tag(12): refused",
+        ]
+    );
+    let root = dir("stamps-threads");
+    assert_eq!(stamps_script(&mut Threads::new(root.path(), 2)), simulated);
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    {
+        let root = dir("stamps-native");
+        assert_eq!(stamps_script(&mut crate::native(root.path(), 2).unwrap()), simulated);
+    }
+}
+
+/// One [`Effect::Roots`] on `driver`, as what it ended with: its roots' count, or the places
+/// looked and why each gave none.
+fn roots_asked(driver: &mut impl Driver) -> Result<usize, Vec<String>> {
+    let mut effects = vec![Effect::Roots { cert_file: None, cert_dir: None, tag: Tag(1) }];
+    let mut told = None;
+    run_until_idle(driver, &mut effects, |it, _| told = Some(it.done)).unwrap();
+    match told.expect("the roots' completion") {
+        Done::Roots(roots) => Ok(roots.len()),
+        Done::Untrusted(error) => Err(error.looked.iter().map(|it| format!("{:?}: {:?}", it.place, it.why)).collect()),
+        other => panic!("Effect::Roots ended {other:?}"),
+    }
+}
+
+/// The simulation's store answers what the test gave it, and counts each ask (so a client's
+/// "read once" is testable); a world never given roots answers by name that it has none. On
+/// macOS and Linux the native driver and the threads driver read the machine's store, on a
+/// thread of the host's, and find roots there.
+#[test]
+fn roots_are_the_worlds_and_each_ask_is_counted() {
+    let mut sim = Sim::new(1, Faults::default());
+    let none = roots_asked(&mut sim).unwrap_err();
+    assert!(none.len() == 1 && none[0].contains("Sim::roots never called"), "{none:?}");
+    let mut roots = crate::trust::Roots::new_in(std::alloc::Global);
+    roots.add(b"one root's DER").unwrap();
+    roots.add(b"another").unwrap();
+    sim.roots(roots);
+    assert_eq!(roots_asked(&mut sim), Ok(2));
+    assert_eq!(sim.roots_read(), 2);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let root = dir("roots-native");
+        let native = roots_asked(&mut crate::native(root.path(), 2).unwrap()).unwrap();
+        let threads = roots_asked(&mut Threads::new(root.path(), 2)).unwrap();
+        assert!(native > 0 && native == threads, "the machine's roots: native {native}, threads {threads}");
+    }
+}
+
+/// On Linux, where a name may be any bytes: a directory holding one that is not UTF-8 fails its
+/// listing on every driver, naming the directory and the name escaped (the listing's rule).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_name_that_is_not_utf8_fails_its_listing_naming_it() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let root = dir("entries-not-utf8");
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src").join(std::ffi::OsStr::from_bytes(b"caf\xe9")), b"").unwrap();
+    let list = |driver: &mut dyn FnMut(&mut Vec<Effect>, &mut Vec<Done>)| {
+        let mut done = Vec::new();
+        driver(&mut vec![Effect::Entries { dir: name("src").into(), tag: Tag(1) }], &mut done);
+        done
+    };
+    for done in [
+        list(&mut |effects, done| {
+            run_until_idle(&mut Threads::new(root.path(), 2), effects, |it, _| done.push(it.done)).unwrap()
+        }),
+        list(&mut |effects, done| {
+            run_until_idle(&mut crate::native(root.path(), 2).unwrap(), effects, |it, _| done.push(it.done)).unwrap()
+        }),
+    ] {
+        assert!(
+            matches!(&done[..], [Done::Failed(crate::IoError(why))] if why.contains("src/caf\\xe9: a name that is not UTF-8")),
+            "{done:?}"
+        );
+    }
+}
+
+/// This target's [`crate::Native`] driver, as the build path makes it, ends the script as the
+/// threads driver does.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn the_native_driver_runs_the_shared_script_as_threads_does() {
+    let root = dir("native-script");
+    let root = root.path();
+    let threads = script(&mut Threads::new(&root, 2));
+    let root = dir("native-script-native");
+    let root = root.path();
+    assert_eq!(script(&mut crate::native(&root, 2).unwrap()), threads);
+}
+
+/// What a pack of the store's pool holds in the script below: three whole blocks, then a tail
+/// past the last whole one.
+fn pack_bytes() -> Vec<u8> {
+    let block = crate::DIRECT_ALIGN as usize;
+    let mut bytes = Vec::new();
+    for fill in [b'a', b'b', b'c'] {
+        bytes.extend(std::iter::repeat_n(fill, block));
+    }
+    bytes.extend(std::iter::repeat_n(b'd', 100));
+    bytes
+}
+
+/// Memory for the script below, 8 blocks, registered for reads into and writes from it.
+#[allow(unsafe_code, reason = "test memory: the script reads it only between effects, once each completed")]
+fn script_memory() -> crate::Memory {
+    // SAFETY: `memory_script` reads and writes the memory only while no effect on it is in
+    // flight: each step runs to its completion before the next.
+    unsafe { crate::Memory::new("the drivers' memory script", 8 * crate::DIRECT_ALIGN as usize) }
+        .expect("a free region")
+}
+
+/// Reads into memory of the asker's and writes from it, each step run to its end before the
+/// next, what each ended with and what the memory and the file held then: a read of whole
+/// blocks, one cut at the file's end, one at an odd offset, a write from memory into the middle
+/// and one past the end (the file kept by the reads before them), the refusals every driver
+/// makes alike (a missing file, a span past its region, a misaligned read around the cache),
+/// and a read of a file sealed read-only (mode 0444) that nothing read before, which no
+/// driver opens for writing to read. What a read leaves of its span past what it read, or of
+/// all of it where it failed, is anything (the simulation scribbles it, a read around the
+/// cache writes whole blocks), so the script zeroes it, as the store's pool does.
+fn memory_script(driver: &mut impl Driver) -> Vec<String> {
+    use crate::{Cache, Priority};
+    let block = crate::DIRECT_ALIGN;
+    let mut memory = script_memory();
+    let pack = name("pool/pack-1");
+    let missing = name("pool/missing");
+    let placed = name("placed/sealed");
+    let read = |file: &FileName, at, into, cache| Effect::ReadInto {
+        file: file.clone(),
+        at,
+        into,
+        cache,
+        priority: Priority::Demand,
+        tag: Tag(1),
+    };
+    let write = |file: &FileName, at, from| Effect::WriteFrom {
+        file: file.clone(),
+        at,
+        from,
+        cache: Cache::Kept,
+        tag: Tag(2),
+    };
+    let steps = [
+        Effect::Write { file: pack.clone(), bytes: pack_bytes(), tag: Tag(0) },
+        read(&pack, 0, memory.span(0, 2 * block as u32), Cache::Kept),
+        read(&pack, 2 * block, memory.span(2 * block, 2 * block as u32), Cache::Kept),
+        read(&pack, 1, memory.span(5 * block + 3, 10), Cache::Kept),
+        // Memory written with `w` first, below.
+        write(&pack, block, memory.span(4 * block, block as u32)),
+        Effect::Sync { file: pack.clone(), tag: Tag(3) },
+        write(&pack, pack_bytes().len() as u64, memory.span(4 * block, 100)),
+        Effect::ReadAll { file: pack.clone(), tag: Tag(4) },
+        read(&missing, 0, memory.span(0, 16), Cache::Kept),
+        write(&missing, 0, memory.span(0, 16)),
+        read(&pack, 0, memory.span(8 * block - 10, 100), Cache::Kept),
+        read(&pack, 1, memory.span(0, block as u32), Cache::Bypassed),
+        read(&pack, 0, memory.span(1, block as u32), Cache::Bypassed),
+        // A file sealed read-only before anything read it, as a store opened after the place
+        // reads a placed file: read, made writable again so the directory can go.
+        Effect::Write { file: placed.clone(), bytes: pack_bytes(), tag: Tag(5) },
+        Effect::Seal { file: placed.clone(), mode: 0o444, tag: Tag(6) },
+        read(&placed, block, memory.span(0, block as u32), Cache::Kept),
+        Effect::Mode { file: placed.clone(), mode: 0o644, tag: Tag(7) },
+    ];
+    let mut seen = Vec::new();
+    for (n, effect) in steps.into_iter().enumerate() {
+        if n == 4 {
+            memory.write(4 * block as usize, &vec![b'w'; block as usize]);
+        }
+        let into = match &effect {
+            Effect::ReadInto { into, .. } => Some(*into),
+            _ => None,
+        };
+        let mut ended = None;
+        run_until_idle(driver, &mut vec![effect], |done, _| ended = Some(done.done))
+            .expect("the effects end");
+        let ended = ended.expect("the step ended");
+        if let Some(into) = into {
+            let read = match ended {
+                Done::ReadInto { len } => u64::from(len),
+                _ => 0,
+            };
+            let left = (u64::from(into.len) - read) as usize;
+            if (into.end() as usize) <= memory.len() {
+                memory.fill((into.offset + read) as usize, left, 0);
+            }
+        }
+        let shown = match ended {
+            Done::Failed(why) if why.0.contains("DIRECT_ALIGN") => "refused: alignment".into(),
+            Done::Failed(why) if why.0.contains("past the region's end") => {
+                "refused: past the region".into()
+            }
+            Done::Failed(_) => "failed".to_owned(),
+            Done::Read(bytes) => format!("read {:?}", digest(&bytes)),
+            other => format!("{other:?}"),
+        };
+        let mut held = vec![0; memory.len()];
+        memory.read(0, &mut held);
+        seen.push(format!("{shown}; memory {:?}", digest(&held)));
+    }
+    seen
+}
+
+/// A short stand-in for bytes, so a mismatch is readable: their length and a hash.
+fn digest(bytes: &[u8]) -> (usize, u32) {
+    (bytes.len(), blaze_ids::crc32c::crc32c(bytes))
+}
+
+/// A read into memory and a write from it end the same on every driver, the simulation's
+/// scribble included: each read here completes before its span is looked at. The sealed
+/// file's read is the control of the ring's positional keep: opened `O_RDWR` for a read, as
+/// before 2026-11-15, it fails with permission denied where the simulation reads (unless the
+/// test runs as root, whom the kernel lets open any file for writing); its writes after reads
+/// are the control of the keep opened read-only and never reopened to write (`EBADF`).
+#[test]
+fn every_driver_reads_into_and_writes_from_memory_the_same() {
+    let simulated = memory_script(&mut Sim::new(5, Faults::default()));
+    let threads = memory_script(&mut Threads::new(dir("memory-threads").path(), 2));
+    assert_eq!(simulated, threads);
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    {
+        let native = memory_script(&mut crate::native(dir("memory-native").path(), 2).unwrap());
+        assert_eq!(simulated, native);
+    }
+    // The read cut at the end of the file says how far it read.
+    let tail = format!("{:?}", Done::ReadInto { len: crate::DIRECT_ALIGN as u32 + 100 });
+    assert!(simulated[2].starts_with(&tail), "{simulated:?}");
+    assert!(simulated[8].starts_with("failed") && simulated[9].starts_with("failed"));
+    assert!(simulated[10].starts_with("refused: past the region"), "{simulated:?}");
+    assert!(simulated[11].starts_with("refused: alignment"), "{simulated:?}");
+    assert!(simulated[12].starts_with("refused: alignment"), "{simulated:?}");
+    let sealed = format!("{:?}", Done::ReadInto { len: crate::DIRECT_ALIGN as u32 });
+    assert!(simulated[15].starts_with(&sealed), "{simulated:?}");
+}
+
+/// Around the page cache, an aligned read into memory reads what the file holds, and one cut
+/// at the file's end stops there, on the driver the build path makes. Where the file system
+/// cannot bypass its cache (tmpfs before Linux 6.6), the read fails naming the file instead,
+/// and nothing reads through the cache in its place.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_read_around_the_page_cache_reads_the_file() {
+    use crate::{Cache, Priority};
+    let block = crate::DIRECT_ALIGN;
+    let root = dir("memory-bypassed");
+    let mut driver = crate::native(root.path(), 2).unwrap();
+    let mut memory = script_memory();
+    memory.fill(0, memory.len(), 0xEE);
+    let pack = name("pool/pack-2");
+    run_until_idle(
+        &mut driver,
+        &mut vec![Effect::Write { file: pack.clone(), bytes: pack_bytes(), tag: Tag(0) }],
+        |_, _| {},
+    )
+    .expect("the effects end");
+    let mut ended = None;
+    let mut effects = vec![Effect::ReadInto {
+        file: pack.clone(),
+        at: 0,
+        into: memory.span(0, 4 * block as u32),
+        cache: Cache::Bypassed,
+        priority: Priority::Demand,
+        tag: Tag(1),
+    }];
+    run_until_idle(&mut driver, &mut effects, |done, _| ended = Some(done.done))
+        .expect("the effects end");
+    match ended.expect("the read ended") {
+        Done::ReadInto { len } => {
+            // Three whole blocks, and the tail of 100 bytes, which ends short of a block.
+            assert_eq!(u64::from(len), 3 * block + 100);
+            let mut held = vec![0; len as usize];
+            memory.read(0, &mut held);
+            assert_eq!(held, pack_bytes());
+        }
+        Done::Failed(why) => {
+            assert!(cfg!(target_os = "linux") && why.0.contains("pool/pack-2"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Each step's end, one at a time: two exclusive locks of one file (the second contends, as
+/// another holder's does), the first let go of, the second asked again.
+fn locks(driver: &mut impl Driver) -> Vec<Done> {
+    let lock = name("history/lock");
+    let take =
+        |tag| Effect::Lock { file: lock.clone(), mode: crate::LockMode::Exclusive, tag: Tag(tag) };
+    let steps = [
+        take(1),
+        take(2),
+        Effect::Unlock { lock: Tag(1), tag: Tag(3) },
+        take(4),
+        Effect::Unlock { lock: Tag(4), tag: Tag(5) },
+    ];
+    let mut seen = Vec::new();
+    for step in steps {
+        run_until_idle(driver, &mut vec![step], |done, _| seen.push(done.done))
+        .expect("the effects end");
+    }
+    seen
+}
+
+/// A lock of a file excludes another of it, on the driver the build path makes as on threads,
+/// until it is let go of.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_lock_excludes_another_until_it_is_let_go_of() {
+    let want = vec![Done::Locked, Done::Contended, Done::Unlocked, Done::Locked, Done::Unlocked];
+    assert_eq!(locks(&mut Sim::new(1, Faults::default())), want, "simulated");
+    assert_eq!(locks(&mut Threads::new(dir("locks-threads").path(), 1)), want, "threads");
+    assert_eq!(locks(&mut crate::native(dir("locks-native").path(), 1).unwrap()), want, "native");
+}
+
+/// A lock let go of is free at once though another descriptor of its open file is still open,
+/// as a child's is between this process's fork and the child's exec: the unlock lets the lock
+/// go, not the close. (Closing alone left the lock standing until the child's exec, so a test
+/// that spawned beside `a_lock_excludes_another_until_it_is_let_go_of` made its second take
+/// contend.)
+#[cfg(unix)]
+#[test]
+fn a_lock_let_go_of_is_free_though_a_copy_of_its_descriptor_is_open() {
+    let root = dir("locks-copied");
+    let root = root.path();
+    let file = name("history/lock");
+    let mut locks = crate::locks::Locks::new();
+    let taken = locks.lock(&root, &file, crate::LockMode::Exclusive, Tag(1)).unwrap();
+    assert_eq!(taken, Done::Locked);
+    // What a fork gives the child: a second descriptor of the same open file.
+    let copy = locks.copy_of(Tag(1)).expect("the lock's file is copied");
+    assert_eq!(locks.unlock(Tag(1)).unwrap(), Done::Unlocked);
+    let again = locks.lock(&root, &file, crate::LockMode::Exclusive, Tag(2)).unwrap();
+    assert_eq!(again, Done::Locked, "the lock is free while the copy is open");
+    drop(copy);
+    assert_eq!(locks.unlock(Tag(2)).unwrap(), Done::Unlocked);
+}
+
+/// A time with nanoseconds below the second, and a whole number of NTFS's 100 ns, so every
+/// file system the tests run on keeps it exactly.
+const TIME: u64 = 1_700_000_000_123_456_700;
+
+/// A file written and its times set to `TIME`, then a directory's set to an earlier time, read
+/// back by a stat and a listing; then a name never written and one renamed away are each set,
+/// and fail naming it. What came of each step, by its tag.
+fn times(driver: &mut impl Driver) -> BTreeMap<u64, String> {
+    let earlier = TIME - 86_400 * 1_000_000_000;
+    let mut seen = BTreeMap::new();
+    let mut effects = vec![Effect::Write {
+        file: name("target/build/output"),
+        bytes: b"cargo::rerun-if-changed=build.rs\n".to_vec(),
+        tag: Tag(1),
+    }];
+    run_until_idle(driver, &mut effects, |done, effects| {
+        let shown = match &done.done {
+            // A directory's own length is the file system's.
+            Done::Stat(Some(meta)) if meta.dir => format!("stat a directory {}", meta.modified_ns),
+            Done::Stat(Some(meta)) => format!("stat {} bytes {}", meta.len, meta.modified_ns),
+            Done::Listed(found) => found
+                .iter()
+                .filter(|(_, meta)| !meta.dir)
+                .map(|(file, meta)| format!("{file} {}", meta.modified_ns))
+                .collect::<Vec<_>>()
+                .join(", "),
+            Done::Failed(why) if why.0.contains("never-written") || why.0.contains("output") => {
+                "failed, named".to_owned()
+            }
+            other => format!("{other:?}"),
+        };
+        seen.insert(done.tag.0, shown);
+        let next = match done.tag.0 {
+            1 => {
+                Effect::Times { file: name("target/build/output"), modified_ns: TIME, tag: Tag(2) }
+            }
+            2 => Effect::Stat { file: name("target/build/output"), tag: Tag(3) },
+            3 => Effect::Times { file: name("target/build"), modified_ns: earlier, tag: Tag(4) },
+            4 => Effect::Stat { file: name("target/build"), tag: Tag(5) },
+            5 => Effect::List { dir: name("target").into(), tag: Tag(6) },
+            6 => {
+                Effect::Times { file: name("target/never-written"), modified_ns: TIME, tag: Tag(7) }
+            }
+            7 => Effect::Rename {
+                from: name("target/build/output"),
+                to: name("target/moved"),
+                tag: Tag(8),
+            },
+            8 => {
+                Effect::Times { file: name("target/build/output"), modified_ns: TIME, tag: Tag(9) }
+            }
+            9 => Effect::Stat { file: name("target/moved"), tag: Tag(10) },
+            _ => return,
+        };
+        effects.push(next);
+    }).expect("the effects end");
+    seen
+}
+
+/// A file's times read back as they were set, on every driver that runs here; a name not
+/// there, never written or renamed away, fails and is named.
+#[test]
+fn every_driver_sets_a_files_times_as_asked() {
+    let earlier = TIME - 86_400 * 1_000_000_000;
+    let simulated = times(&mut Sim::new(5, Faults::default()));
+    assert_eq!(simulated[&2], format!("{:?}", Done::Timed));
+    assert_eq!(simulated[&3], format!("stat 33 bytes {TIME}"));
+    assert_eq!(simulated[&4], format!("{:?}", Done::Timed));
+    assert_eq!(simulated[&5], format!("stat a directory {earlier}"));
+    assert_eq!(simulated[&6], format!("target/build/output {TIME}"));
+    assert_eq!((&simulated[&7][..], &simulated[&9][..]), ("failed, named", "failed, named"));
+    // A rename keeps the inode, and with it the time.
+    assert_eq!(simulated[&10], format!("stat 33 bytes {TIME}"));
+    let root = dir("times-threads");
+    let root = root.path();
+    assert_eq!(times(&mut Threads::new(&root, 2)), simulated, "threads");
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        times(&mut crate::uring::Uring::new(dir("times-uring").path()).unwrap()),
+        simulated,
+        "io_uring"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        times(&mut crate::kqueue::Kqueue::new(dir("times-kqueue").path(), 2).unwrap()),
+        simulated,
+        "kqueue"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        times(&mut crate::iocp::Iocp::new(dir("times-iocp").path(), 2).unwrap()),
+        simulated,
+        "IOCP"
+    );
+}
+
+/// `rounds` of the file `f`'s times set: what they allocated on the polling thread.
+fn times_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
+    let file = name("f");
+    let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(4));
+    let mut used = 0;
+    for round in 0..rounds {
+        // The caller's: made before the cycle.
+        effects.push(Effect::Times {
+            file: file.clone(),
+            modified_ns: TIME + 100 * round,
+            tag: Tag(round),
+        });
+        let ((), cycle) = blaze_alloc_count::measure(|| {
+            driver.submit(&mut effects);
+            poll_for(driver, &mut out, 1);
+        });
+        used += cycle.allocations;
+        assert_eq!(out.as_slice(), [Completion { tag: Tag(round), done: Done::Timed }]);
+        out.clear();
+    }
+    assert_eq!(driver.in_flight(), 0);
+    used
+}
+
+/// A file's times set, once the driver has grown to it: nothing allocated by the drivers on
+/// disk, on the polling thread or a file thread. The simulation's disk keeps a journal of
+/// every change, which a set of times is: one entry each (its name), and the journal's growth.
+#[test]
+fn a_warm_times_set_allocates_nothing() {
+    fn write(driver: &mut impl Driver) {
+        let mut effects =
+            vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
+        run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written))
+        .expect("the effects end");
+    }
+    let mut sim = Sim::new(15, Faults::default());
+    write(&mut sim);
+    times_rounds(&mut sim, WARM);
+    let used = times_rounds(&mut sim, ROUNDS);
+    let journal = ROUNDS + u64::from(ROUNDS.ilog2());
+    assert!(
+        used <= journal,
+        "the simulation: {used} allocations over {ROUNDS} warm sets of times; its journal's entries and growth are {journal}"
+    );
+    let root = dir("budget-times");
+    let root = root.path();
+    let mut threads = Threads::new(&root, 1);
+    write(&mut threads);
+    times_rounds(&mut threads, WARM);
+    threads.off_thread();
+    assert_eq!(
+        times_rounds(&mut threads, ROUNDS),
+        0,
+        "threads: {ROUNDS} warm sets of times, on the polling thread"
+    );
+    // On Windows the file thread makes its path with `sys::path`, which allocates; `Iocp`, the
+    // native driver there, sets times on its polling thread and is held to zero below.
+    #[cfg(unix)]
+    assert_eq!(threads.off_thread(), (0, 0), "threads: the file thread's utimensat");
+    drop(threads);
+    std::fs::remove_dir_all(root).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        let root = dir("budget-times-uring");
+        let root = root.path();
+        let mut ring = crate::uring::Uring::new(&root).unwrap();
+        write(&mut ring);
+        times_rounds(&mut ring, WARM);
+        assert_eq!(
+            times_rounds(&mut ring, ROUNDS),
+            0,
+            "io_uring: {ROUNDS} warm sets of times, its utimensat inline"
+        );
+        drop(ring);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let root = dir("budget-times-iocp");
+        let root = root.path();
+        let mut iocp = crate::iocp::Iocp::new(&root, 1).unwrap();
+        write(&mut iocp);
+        times_rounds(&mut iocp, WARM);
+        assert_eq!(
+            times_rounds(&mut iocp, ROUNDS),
+            0,
+            "IOCP: {ROUNDS} warm sets of times, SetFileTime inline"
+        );
+        drop(iocp);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Timers asked for out of order, some due at once and one never in the test's time, fire in
+/// the order they are due on every driver, each counted out of what is in flight.
+#[test]
+fn every_driver_fires_timers_in_their_order() {
+    fn run(driver: &mut impl Driver) -> Vec<u64> {
+        let mut effects: Vec<Effect> = [9u64, 0, 4, 0, 13, 2, 7]
+            .into_iter()
+            .enumerate()
+            .map(|(n, it)| Effect::Timer {
+                after: Duration::from_millis(3 * it),
+                tag: Tag(n as u64),
+            })
+            .collect();
+        effects.push(Effect::Timer { after: Duration::from_secs(1 << 40), tag: Tag(99) });
+        driver.submit(&mut effects);
+        let mut fired = Vec::new();
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while driver.in_flight() > 1 && std::time::Instant::now() < deadline {
+            driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(100)));
+            for it in out.drain(..) {
+                assert_eq!(it.done, Done::Fired);
+                fired.push(it.tag.0);
+            }
+        }
+        assert_eq!(driver.in_flight(), 1, "the far timer is still in flight");
+        // The two due at once may fire together, in either order on a real clock.
+        fired[..2].sort_unstable();
+        fired
+    }
+    let want = vec![1, 3, 5, 2, 6, 0, 4];
+    assert_eq!(run(&mut Sim::new(3, Faults::default())), want);
+    assert_eq!(run(&mut Threads::new(dir("timers-threads").path(), 1)), want);
+    #[cfg(target_os = "macos")]
+    assert_eq!(run(&mut crate::kqueue::Kqueue::new(dir("timers-kqueue").path(), 1).unwrap()), want);
+    #[cfg(windows)]
+    assert_eq!(run(&mut crate::iocp::Iocp::new(dir("timers-iocp").path(), 1).unwrap()), want);
+    #[cfg(target_os = "linux")]
+    assert_eq!(run(&mut crate::uring::Uring::new(dir("timers-uring").path()).unwrap()), want);
+}
+
+/// Polls until a flush of `watch` asked now is answered, handing every other completion to
+/// `other`. A watch is in place once a flush of it (or a look under it) asked after it is
+/// answered; before that, a change may go unheard, as the ring driver's inotify start walks the
+/// tree off its loop.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn in_place(driver: &mut impl Driver, watch: Tag, tag: Tag, mut other: impl FnMut(Completion)) {
+    driver.submit(&mut vec![Effect::Flush { watch, tag }]);
+    let mut done = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(Instant::now() < deadline, "the watch {watch:?} was never in place");
+        driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
+        let mut flushed = false;
+        for it in done.drain(..) {
+            match it.done {
+                Done::Flushed if it.tag == tag => flushed = true,
+                Done::Failed(why) if it.tag == tag => panic!("confirming {watch:?}: {why}"),
+                _ => other(it),
+            }
+        }
+        if flushed {
+            return;
+        }
+    }
+}
+
+/// The invariant (`Threads::holds`): the threads driver's submit of a watch returns at once,
+/// its start (a walk of the tree under inotify) on the watch's errand, and a stat of the
+/// watched directory asked right after it is answered only once the watch is in place. The
+/// errand waits at a gate the test holds, so the stat is asked while the watch is provably not
+/// in place (were the submit to wait for the start, it would never return): the driver holds
+/// it until the test lets the walk through, and the control, nothing held, answers it before.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_threads_driver_holds_a_look_under_a_starting_watch() {
+    fn in_place_at_stat(holds_nothing: bool) -> bool {
+        let root = dir(&format!("threads-starting-{holds_nothing}"));
+        let root = root.path();
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        let mut driver = Threads::new(root, 2);
+        let (open, gate) = crate::chan::unbounded();
+        driver.gate_walks(gate);
+        crate::watch::HOLDS_NOTHING.set(holds_nothing);
+        driver.submit(&mut vec![
+            Effect::Watch { dir: name("src"), tag: Tag(1) },
+            Effect::Stat { file: name("src"), tag: Tag(2) },
+        ]);
+        assert!(driver.is_starting(Tag(1)), "the submit waited for the start");
+        // A held stat is answered only after the start, which waits at the gate: let it
+        // through. A stat not held is answered with the gate shut, so before the start.
+        let held = driver.is_held(Tag(2));
+        if held {
+            open.send(()).unwrap();
+        }
+        let (mut out, mut at_stat) = (Vec::new(), None);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while at_stat.is_none() {
+            assert!(Instant::now() < deadline, "the stat never came (held: {held})");
+            driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
+            for it in out.drain(..) {
+                match (it.tag.0, it.done) {
+                    (2, Done::Stat(Some(_))) => at_stat = Some(!driver.is_starting(Tag(1))),
+                    (1, Done::Changed { .. }) => {}
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        drop(open);
+        crate::watch::HOLDS_NOTHING.set(false);
+        let mut ended = false;
+        run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(1) }], |it, _| {
+            match (it.tag.0, it.done) {
+                (1, Done::Unwatched) => ended = true,
+                (1, Done::Changed { .. }) => {}
+                other => panic!("{other:?}"),
+            }
+        })
+        .expect("the effects end");
+        assert!(ended && driver.in_flight() == 0);
+        at_stat.expect("polled until the stat came")
+    }
+    assert!(in_place_at_stat(false), "the stat was answered before the watch was in place");
+    assert!(!in_place_at_stat(true), "the control was not caught");
+}
+
+/// A file written under a watched directory is heard of, on the drivers that watch.
+#[cfg(target_os = "linux")]
+#[test]
+fn watches_hear_a_file_written_under_them() {
+    fn run(driver: &mut impl Driver, root: Option<&std::path::Path>) -> Vec<FileName> {
+        let mut effects =
+            vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
+        run_until_idle(driver, &mut effects, |_, _| {}).expect("the effects end");
+        driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
+        let mut heard = Vec::new();
+        let mut ended = false;
+        in_place(driver, Tag(7), Tag(6), |it| match it.done {
+            Done::Changed { files, .. } => heard.extend(files),
+            other => panic!("before the watch was in place: {other:?}"),
+        });
+        let mut effects = vec![Effect::Write {
+            file: name("src/deep/lib.rs"),
+            bytes: b"fn f() {}".to_vec(),
+            tag: Tag(2),
+        }];
+        let mut asked_end = false;
+        // A write by someone else, as an editor's.
+        if let Some(root) = root {
+            std::fs::write(root.join("src/keep"), b"edited").unwrap();
+        }
+        let mut done = Vec::new();
+        // The write's own completion too: a watch may hear the file, and end, before the
+        // driver reaps it (the uring driver does), and then it is still in flight.
+        let mut written = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !(ended && written) && std::time::Instant::now() < deadline {
+            driver.submit(&mut effects);
+            driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
+            for it in done.drain(..) {
+                match it.done {
+                    Done::Changed { files, .. } => heard.extend(files),
+                    Done::Unwatched => ended = true,
+                    Done::Written if it.tag == Tag(2) => written = true,
+                    Done::Failed(why) => panic!("{why}"),
+                    _ => {}
+                }
+            }
+            if !asked_end && heard.contains(&name("src/deep/lib.rs")) {
+                asked_end = true;
+                effects.push(Effect::Unwatch { tag: Tag(7) });
+            }
+        }
+        assert!(ended, "the watch never ended; heard {heard:?}");
+        assert!(written, "the write never completed; heard {heard:?}");
+        assert_eq!(driver.in_flight(), 0);
+        heard
+    }
+    let root = dir("watch-threads");
+    let root = root.path();
+    let heard = run(&mut Threads::new(root, 2), Some(root));
+    assert!(heard.contains(&name("src/keep")), "{heard:?}");
+    let root = dir("watch-uring");
+    let root = root.path();
+    let heard = run(&mut crate::uring::Uring::new(root).unwrap(), Some(root));
+    assert!(heard.contains(&name("src/keep")), "{heard:?}");
+}
+
+/// A file written by someone else before a flush is heard of before the flush completes, every
+/// round; a flush of a watch not in flight fails; nothing is left in flight once the watch ends.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn flushes_follow_the_changes_before_them(driver: &mut impl Driver, root: &std::path::Path) {
+    let mut effects =
+        vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }];
+    run_until_idle(driver, &mut effects, |_, _| {}).expect("the effects end");
+    driver.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(7) }]);
+    in_place(driver, Tag(7), Tag(6), |it| match it.done {
+        Done::Changed { .. } => {}
+        other => panic!("before the watch was in place: {other:?}"),
+    });
+    let mut done = Vec::new();
+    for round in 0..50u64 {
+        let file = format!("src/deep/edit-{round}");
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::write(root.join(&file), b"edited").unwrap();
+        // Two flushes at once: each comes after the change.
+        let (one, two) = (Tag(1000 + 2 * round), Tag(1001 + 2 * round));
+        driver.submit(&mut vec![
+            Effect::Flush { watch: Tag(7), tag: one },
+            Effect::Flush { watch: Tag(7), tag: two },
+        ]);
+        let mut heard = Vec::new();
+        let mut flushed = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while flushed < 2 && std::time::Instant::now() < deadline {
+            driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_millis(50)));
+            for it in done.drain(..) {
+                match it.done {
+                    Done::Changed { files, .. } => heard.extend(files),
+                    Done::Flushed if it.tag == one || it.tag == two => {
+                        assert!(
+                            heard.contains(&name(&file)),
+                            "round {round}: flushed first; {heard:?}"
+                        );
+                        flushed += 1;
+                    }
+                    other => panic!("round {round}: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(flushed, 2, "round {round}: the flushes never came");
+    }
+    let mut effects =
+        vec![Effect::Flush { watch: Tag(8), tag: Tag(9) }, Effect::Unwatch { tag: Tag(7) }];
+    let (mut refused, mut ended) = (false, false);
+    run_until_idle(driver, &mut effects, |it, _| match (it.tag.0, it.done) {
+        (9, Done::Failed(_)) => refused = true,
+        (7, Done::Changed { .. }) => {}
+        (7, Done::Unwatched) => ended = true,
+        other => panic!("{other:?}"),
+    }).expect("the effects end");
+    assert!(refused && ended);
+    assert_eq!(driver.in_flight(), 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn every_watching_driver_tells_a_flush_after_the_changes_before_it() {
+    let root = dir("flush-threads");
+    let root = root.path();
+    flushes_follow_the_changes_before_them(&mut Threads::new(&root, 2), &root);
+    #[cfg(target_os = "linux")]
+    {
+        let root = dir("flush-uring");
+        let root = root.path();
+        flushes_follow_the_changes_before_them(
+            &mut crate::uring::Uring::new(&root).unwrap(),
+            &root,
+        );
+    }
+}
+
+/// A file mapped, a process run with input, and a connection made, used and hung up: what
+/// came of each, by step.
+#[cfg(unix)]
+fn processes_and_sockets(driver: &mut impl Driver) -> Vec<String> {
+    use crate::{Address, Command, Sandbox};
+    let at = Address::Unix(name("run/daemon.sock"));
+    let sh = Box::new(Command {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "cat; echo err >&2; exit 3".into()],
+        env: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        dir: "/".into(),
+        stdin: b"in".to_vec(),
+        sandbox: Sandbox::Off,
+        memory: None,
+    });
+    let mut seen = Vec::new();
+    let mut effects = vec![
+        Effect::Write { file: name("store/pack"), bytes: b"packed".to_vec(), tag: Tag(1) },
+        Effect::Spawn { command: sh, tag: Tag(3) },
+        Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(4) },
+    ];
+    let (mut client, mut server, mut got) = (None, None, Vec::new());
+    let mut ended_after_hangup = false;
+    let mut next = 100;
+    run_until_idle(driver, &mut effects, |done, effects| {
+        next += 1;
+        match (done.tag.0, done.done) {
+            (1, Done::Written) => {
+                seen.push("written".to_owned());
+                effects.push(Effect::Map {
+                    file: name("store/pack"),
+                    extent: crate::Extent::Whole,
+                    tag: Tag(2),
+                });
+                effects.push(Effect::Connect { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(5) });
+            }
+            (2, Done::Mapped(it)) => seen.push(format!("mapped {:?}", it.bytes())),
+            (3, Done::Exited(exit)) => seen.push(format!(
+                "exited {:?} {:?} {:?} {:?}",
+                exit.code,
+                exit.signal,
+                String::from_utf8_lossy(&exit.stdout),
+                String::from_utf8_lossy(&exit.stderr)
+            )),
+            (4, Done::Accepted { conn }) => {
+                server = Some(conn);
+                effects.push(Effect::Recv { conn, most: 16, into: Vec::new(), tag: Tag(next) });
+            }
+            (5, Done::Connected { conn }) => {
+                client = Some(conn);
+                effects.push(Effect::Send { conn, bytes: b"ping".to_vec(), tag: Tag(6) });
+            }
+            (6, Done::Sent(bytes)) => seen.push(format!("sent, {} bytes back", bytes.len())),
+            (7, Done::HungUp) => seen.push("hung up".to_owned()),
+            (4, Done::Unlistened) => seen.push("unlistened".to_owned()),
+            (_, Done::Read(bytes)) if bytes.is_empty() => {
+                ended_after_hangup = got.len() == 4;
+                seen.push(format!("received {:?}, then the end", String::from_utf8_lossy(&got)));
+                effects.push(Effect::Unlisten { tag: Tag(4) });
+            }
+            (_, Done::Read(mut bytes)) => {
+                got.extend_from_slice(&bytes);
+                bytes.clear();
+                let conn = server.expect("accepted");
+                if got.len() == 4 {
+                    effects.push(Effect::Hangup { conn: client.expect("connected"), tag: Tag(7) });
+                }
+                effects.push(Effect::Recv { conn, most: 16, into: bytes, tag: Tag(next) });
+            }
+            (tag, other) => seen.push(format!("{tag}: {other:?}")),
+        }
+    }).expect("the effects end");
+    assert!(ended_after_hangup, "{seen:?}");
+    assert_eq!(driver.in_flight(), 0);
+    seen.sort();
+    seen
+}
+
+#[cfg(unix)]
+#[test]
+fn every_driver_runs_processes_and_sockets_the_same() {
+    let mut sim = Sim::new(3, Faults::default());
+    sim.program("/bin/sh", |command: &crate::Command, _: &mut crate::sim::Rng| crate::sim::Ran {
+        exit: crate::Exit {
+            code: Some(3),
+            signal: None,
+            stdout: command.stdin.clone(),
+            stderr: b"err\n".to_vec(),
+            traced: None,
+            peak_memory: 0,
+        },
+        takes: Duration::from_millis(1),
+    });
+    let simulated = processes_and_sockets(&mut sim);
+    assert_eq!(
+        simulated,
+        [
+            "exited Some(3) None \"in\" \"err\\n\"",
+            "hung up",
+            "mapped [112, 97, 99, 107, 101, 100]",
+            "received \"ping\", then the end",
+            "sent, 0 bytes back",
+            "unlistened",
+            "written",
+        ]
+    );
+    let root = socket_dir("threads-processes");
+    let root = root.path();
+    assert_eq!(simulated, processes_and_sockets(&mut Threads::new(&root, 2)));
+    #[cfg(target_os = "linux")]
+    {
+        let root = socket_dir("uring-processes");
+        let root = root.path();
+        let ring = processes_and_sockets(&mut crate::uring::Uring::new(&root).unwrap());
+        assert_eq!(simulated, ring);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let root = socket_dir("kqueue-processes");
+        let root = root.path();
+        let kqueue = processes_and_sockets(&mut crate::kqueue::Kqueue::new(&root, 2).unwrap());
+        assert_eq!(simulated, kqueue);
+    }
+}
+
+/// A sandbox asked for of a driver given nothing to make one is refused, and one given a
+/// `Confine` runs what it says and hands back its record.
+#[cfg(unix)]
+#[test]
+fn a_sandbox_is_made_by_the_confine_or_refused() {
+    use std::sync::Arc;
+
+    use crate::{Command, Confine, Confined, Sandbox, Traced};
+
+    struct Shell;
+    impl Confine for Shell {
+        fn confine(
+            &self,
+            command: &Command,
+            scratch: &std::path::Path,
+        ) -> Result<Confined, String> {
+            assert!(scratch.is_dir());
+            let mut args = vec!["-c".into(), "printf confined; \"$0\" \"$@\"".into()];
+            args.push(command.program.clone().into_os_string());
+            args.extend(command.args.iter().cloned());
+            Ok(Confined {
+                program: "/bin/sh".into(),
+                args,
+                env: command.env.clone(),
+                dir: command.dir.clone(),
+            })
+        }
+        fn traced(&self, _: &Command, scratch: &std::path::Path) -> Result<Traced, String> {
+            assert!(scratch.is_dir());
+            let env = vec![("HOME".into(), None)];
+            Ok(Traced { env, ..Traced::default() })
+        }
+    }
+    fn command() -> Box<Command> {
+        Box::new(Command {
+            program: "/bin/echo".into(),
+            args: vec![" ok".into()],
+            env: Vec::new(),
+            dir: "/".into(),
+            stdin: Vec::new(),
+            sandbox: Sandbox::On {
+                read: Vec::new(),
+                write: Vec::new(),
+                network: false,
+                trace: true,
+                services: Vec::new(),
+            },
+            memory: None,
+        })
+    }
+    fn run(driver: &mut impl Driver) -> Done {
+        let mut effects = vec![Effect::Spawn { command: command(), tag: Tag(1) }];
+        let mut done = None;
+        run_until_idle(driver, &mut effects, |it, _| done = Some(it.done))
+        .expect("the effects end");
+        done.expect("the spawn ended")
+    }
+    let check = |root: &std::path::Path, refused: Done, confined: Done| {
+        assert!(matches!(&refused, Done::Failed(why) if why.0.contains("Confine")), "{refused:?}");
+        let Done::Exited(exit) = confined else { panic!("{confined:?}") };
+        assert_eq!((exit.code, exit.stdout.as_slice()), (Some(0), &b"confined ok\n"[..]));
+        assert_eq!(
+            exit.traced.expect("traced").env,
+            vec![(std::ffi::OsString::from("HOME"), None)],
+        );
+        assert!(!root.join(".blaze-spawn").read_dir().is_ok_and(|mut it| it.next().is_some()));
+    };
+    let root = dir("unconfined");
+    let root = root.path();
+    check(
+        &root,
+        run(&mut Threads::new(&root, 1)),
+        run(&mut Threads::new(&root, 1).confined(Arc::new(Shell))),
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let root = dir("uring-unconfined");
+        let root = root.path();
+        check(
+            &root,
+            run(&mut crate::uring::Uring::new(&root).unwrap()),
+            run(&mut crate::uring::Uring::new(&root).unwrap().confined(Arc::new(Shell))),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let root = dir("kqueue-unconfined");
+        let root = root.path();
+        check(
+            &root,
+            run(&mut crate::kqueue::Kqueue::new(&root, 1).unwrap()),
+            run(&mut crate::kqueue::Kqueue::new(&root, 1).unwrap().confined(Arc::new(Shell))),
+        );
+    }
+}
+
+#[test]
+fn an_answer_is_its_bytes_and_a_confine_hands_nothing_unless_it_says() {
+    use crate::{Answer, Command, Confine, Confined, Handed, Sandbox, Traced};
+    let answers = [
+        Answer { run: 0, code: 0 },
+        Answer { run: u64::MAX, code: -1 },
+        Answer { run: 7, code: 125 },
+    ];
+    for answer in answers {
+        assert_eq!(Answer::from_bytes(answer.to_bytes()), answer);
+    }
+    assert_eq!(Answer { run: 1, code: 2 }.to_bytes(), [1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0]);
+    struct Cold;
+    impl Confine for Cold {
+        fn confine(&self, _: &Command, _: &std::path::Path) -> Result<Confined, String> {
+            Err("no".into())
+        }
+        fn traced(&self, _: &Command, _: &std::path::Path) -> Result<Traced, String> {
+            Ok(Traced::default())
+        }
+    }
+    let command = Command {
+        program: "x".into(),
+        args: Vec::new(),
+        env: Vec::new(),
+        dir: ".".into(),
+        stdin: Vec::new(),
+        sandbox: Sandbox::On {
+            read: Vec::new(),
+            write: Vec::new(),
+            network: false,
+            trace: false,
+            services: Vec::new(),
+        },
+        memory: None,
+    };
+    assert!(Cold.warm().is_none());
+    let handed = Handed { run: 1, stdin: 0, stdout: 0, stderr: 0, job: 0 };
+    assert!(Cold.hand(&command, std::path::Path::new("."), &handed).is_err());
+}
+
+#[test]
+fn a_mapping_is_the_file() {
+    let mut sim = Sim::new(7, Faults::default());
+    sim.change(&name("store/pack"), b"packed");
+    let mut effects = vec![
+        Effect::Map { file: name("store/pack"), extent: crate::Extent::Whole, tag: Tag(1) },
+        Effect::Map {
+            file: name("store/pack"),
+            extent: crate::Extent::Range { at: 2, len: 3 },
+            tag: Tag(2),
+        },
+        Effect::Map {
+            file: name("store/pack"),
+            extent: crate::Extent::Range { at: 4, len: 3 },
+            tag: Tag(3),
+        },
+    ];
+    let mut seen = std::collections::BTreeMap::new();
+    run_until_idle(&mut sim, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done))
+        .expect("the effects end");
+    match &seen[&1] {
+        Done::Mapped(it) => assert_eq!(it.bytes(), b"packed"),
+        other => panic!("{other:?}"),
+    }
+    // A range sees its bytes and nothing past its length.
+    match &seen[&2] {
+        Done::Mapped(it) => assert_eq!((it.bytes(), it.slack()), (&b"cke"[..], 0)),
+        other => panic!("{other:?}"),
+    }
+    // A range past the file's end fails, naming the file and the range.
+    match &seen[&3] {
+        Done::Failed(why) => assert!(why.0.contains("store/pack") && why.0.contains("3 bytes at 4"), "{why:?}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `n` reads into memory of `file`, each run to its end before the next, every one ending in
+/// a read of `want` bytes.
+fn read_often(driver: &mut impl Driver, memory: &crate::Memory, file: &FileName, n: usize, want: u32) {
+    use crate::{Cache, Priority};
+    for at in 0..n {
+        let mut effects = vec![Effect::ReadInto {
+            file: file.clone(),
+            at: (at % 4) as u64,
+            into: memory.span(0, 16),
+            cache: Cache::Kept,
+            priority: Priority::Demand,
+            tag: Tag(at as u64),
+        }];
+        let mut ended = None;
+        run_until_idle(driver, &mut effects, |done, _| ended = Some(done.done))
+            .expect("the effects end");
+        assert_eq!(ended, Some(Done::ReadInto { len: want }), "read {at} of {file}");
+    }
+}
+
+/// A thousand reads into memory of one file open it once, counted by the driver's table, and
+/// a write to it closes that descriptor. The control plants the bug the table removes (every
+/// read opens its file) and the count catches it.
+///
+/// The invariant: after its first read, a file a driver's table keeps costs no open.
+#[test]
+fn a_thousand_reads_open_a_file_once() {
+    let memory = script_memory();
+    let pack = name("pool/pack-often");
+    let write = || vec![Effect::Write { file: pack.clone(), bytes: pack_bytes(), tag: Tag(0) }];
+
+    let often_threads = dir("often-threads");
+    let mut threads = Threads::new(often_threads.path(), 1);
+    run_until_idle(&mut threads, &mut write(), |_, _| {}).expect("the effects end");
+    read_often(&mut threads, &memory, &pack, 1000, 16);
+    assert_eq!(threads.opens(), crate::Opens { opened: 1, closed: 0 });
+    // The driver's own write changes the file: its kept descriptor closes.
+    run_until_idle(&mut threads, &mut write(), |_, _| {}).expect("the effects end");
+    assert_eq!(threads.opens(), crate::Opens { opened: 1, closed: 1 });
+    read_often(&mut threads, &memory, &pack, 10, 16);
+    assert_eq!(threads.opens().opened, 2, "a read after the write opens the file anew");
+
+    // The control: a table bypassed opens the file a thousand times, and the count says so.
+    let often_bypassed = dir("often-bypassed");
+    let mut bypassed = Threads::new(often_bypassed.path(), 1);
+    bypassed.descriptors().bypass();
+    run_until_idle(&mut bypassed, &mut write(), |_, _| {}).expect("the effects end");
+    read_often(&mut bypassed, &memory, &pack, 1000, 16);
+    assert_eq!(bypassed.opens().opened, 1000, "the planted bug is caught");
+
+    // The simulation models the same table.
+    let mut sim = Sim::new(8, Faults::default());
+    sim.change(&pack, &pack_bytes());
+    read_often(&mut sim, &memory, &pack, 1000, 16);
+    assert_eq!(sim.opens(), crate::Opens { opened: 1, closed: 0 });
+
+    #[cfg(target_os = "macos")]
+    {
+        let often_kqueue = dir("often-kqueue");
+        let mut kqueue = crate::kqueue::Kqueue::new(often_kqueue.path(), 1).unwrap();
+        run_until_idle(&mut kqueue, &mut write(), |_, _| {}).expect("the effects end");
+        read_often(&mut kqueue, &memory, &pack, 1000, 16);
+        assert_eq!(kqueue.opens(), crate::Opens { opened: 1, closed: 0 });
+    }
+}
+
+/// One batch of reads into memory, what each part got and the bytes each read part landed:
+/// two adjacent parts of a pack into memory apart, a part of a missing file, a part at an odd
+/// offset, a span past its region and a part cut at the file's end.
+fn batch_script(driver: &mut impl Driver) -> Vec<String> {
+    use crate::{Cache, Got, Priority, ReadPart};
+    let block = crate::DIRECT_ALIGN;
+    let memory = script_memory();
+    let pack = name("pool/pack-3");
+    let missing = name("pool/missing");
+    run_until_idle(
+        driver,
+        &mut vec![Effect::Write { file: pack.clone(), bytes: pack_bytes(), tag: Tag(0) }],
+        |_, _| {},
+    )
+    .expect("the effects end");
+    let parts = vec![
+        ReadPart::asked(pack.clone(), 0, memory.span(0, block as u32)),
+        ReadPart::asked(pack.clone(), block, memory.span(3 * block, block as u32)),
+        ReadPart::asked(missing.clone(), 0, memory.span(5 * block, 16)),
+        ReadPart::asked(pack.clone(), 1, memory.span(6 * block + 3, 10)),
+        ReadPart::asked(pack.clone(), 2 * block, memory.span(8 * block - 10, 100)),
+        ReadPart::asked(pack.clone(), 3 * block, memory.span(7 * block, 200)),
+    ];
+    let mut effects =
+        vec![Effect::ReadMany { parts, cache: Cache::Kept, priority: Priority::Demand, tag: Tag(5) }];
+    let mut ended = Vec::new();
+    run_until_idle(driver, &mut effects, |done, _| ended.push(done)).expect("the effects end");
+    let [ended] = ended.as_slice() else { panic!("one completion for the batch: {ended:?}") };
+    assert_eq!(ended.tag, Tag(5));
+    let Done::ReadMany(parts) = &ended.done else { panic!("{:?}", ended.done) };
+    assert_eq!(parts.len(), 6, "every part comes back, in the order asked");
+    let file = pack_bytes();
+    parts
+        .iter()
+        .map(|part| match &part.got {
+            Got::Read(len) => {
+                // The bytes landed where the part asked, and are the file's at its offset.
+                let mut held = vec![0; *len as usize];
+                memory.read(part.into.offset as usize, &mut held);
+                let at = part.at as usize;
+                assert_eq!(held, file[at..at + *len as usize], "{} at {}", part.file, part.at);
+                format!("read {len}")
+            }
+            Got::Failed(why) => {
+                // A failed part names its file and offset.
+                assert!(why.0.contains(part.file.as_str()), "{why:?}");
+                assert!(why.0.contains(&format!("at {}", part.at)), "{why:?}");
+                if why.0.contains("past the region's end") {
+                    "refused: past the region".to_owned()
+                } else {
+                    "failed".to_owned()
+                }
+            }
+            Got::Asked => panic!("{} at {} came back unread", part.file, part.at),
+        })
+        .collect()
+}
+
+/// A batch's parts land where asked on every driver alike, and a failed part fails only
+/// itself: the parts around it, of the same file and of others, read.
+#[test]
+fn a_batchs_parts_land_where_asked_and_fail_alone() {
+    let block = crate::DIRECT_ALIGN;
+    let want = vec![
+        format!("read {block}"),
+        format!("read {block}"),
+        "failed".to_owned(),
+        "read 10".to_owned(),
+        "refused: past the region".to_owned(),
+        "read 100".to_owned(),
+    ];
+    assert_eq!(batch_script(&mut Sim::new(9, Faults::default())), want, "simulated");
+    assert_eq!(batch_script(&mut Threads::new(dir("batch-threads").path(), 2)), want, "threads");
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    assert_eq!(batch_script(&mut crate::native(dir("batch-native").path(), 2).unwrap()), want, "native");
+}
+
+/// The simulation's table at its bound closes the least recently read descriptor, never
+/// failing a read; a descriptor kept of a file another process unlinked reads the bytes the
+/// file held, and the driver's own Remove closes it, so a read after fails.
+#[test]
+fn the_simulated_table_closes_past_its_bound_and_never_fails_a_read() {
+    let memory = script_memory();
+    let mut sim = Sim::new(10, Faults::default());
+    sim.bound_descriptors(2);
+    let files: Vec<FileName> = (0..5).map(|n| name(&format!("pool/pack-{n}"))).collect();
+    for file in &files {
+        sim.change(file, &pack_bytes());
+    }
+    for _ in 0..3 {
+        for file in &files {
+            read_often(&mut sim, &memory, file, 1, 16);
+            assert!(sim.descriptors_kept() <= 2, "{} kept past the bound", sim.descriptors_kept());
+        }
+    }
+    // Round-robin over five files with room for two: every read opens, and all but the two
+    // kept closed.
+    assert_eq!(sim.opens(), crate::Opens { opened: 15, closed: 13 });
+
+    // Another process unlinks a file kept open: the descriptor still reads its old bytes.
+    read_often(&mut sim, &memory, &files[4], 1, 16);
+    sim.delete(&files[4]);
+    read_often(&mut sim, &memory, &files[4], 1, 16);
+    let mut held = vec![0; 16];
+    memory.read(0, &mut held);
+    assert_eq!(held, pack_bytes()[..16], "the unlinked file's bytes, through its descriptor");
+
+    // The driver's own Remove closes its descriptor: a read after finds no file.
+    let mut effects = vec![Effect::Remove { file: files[3].clone(), tag: Tag(1) }];
+    run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
+    let mut effects = vec![Effect::ReadInto {
+        file: files[3].clone(),
+        at: 0,
+        into: memory.span(0, 16),
+        cache: crate::Cache::Kept,
+        priority: crate::Priority::Demand,
+        tag: Tag(2),
+    }];
+    let mut ended = None;
+    run_until_idle(&mut sim, &mut effects, |done, _| ended = Some(done.done))
+        .expect("the effects end");
+    assert!(matches!(ended, Some(Done::Failed(_))), "{ended:?}");
+}
+
+/// Rounds that grow a driver's slabs, queues and buffers (and its threads') to a cycle's
+/// working set before the measured ones.
+const WARM: u64 = 8;
+/// Measured rounds of a warm cycle.
+const ROUNDS: u64 = 50;
+
+/// Polls until `out` holds `n` completions.
+fn poll_for(driver: &mut impl Driver, out: &mut Vec<Completion>, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while out.len() < n {
+        assert!(Instant::now() < deadline, "{} of {n} completions: {out:?}", out.len());
+        driver.poll(out, Deadline::after(driver.now(), Duration::from_millis(50)));
+    }
+}
+
+/// `rounds` of a Sync, a Stat and a Read of the file `f`: what they allocated on the polling
+/// thread.
+fn file_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
+    let file = name("f");
+    let (mut effects, mut out) = (Vec::with_capacity(3), Vec::with_capacity(16));
+    let mut used = 0;
+    for round in 0..rounds {
+        // The caller's: made before the cycle.
+        effects.extend([
+            Effect::Sync { file: file.clone(), tag: Tag(10) },
+            Effect::Stat { file: file.clone(), tag: Tag(11) },
+            Effect::Read { file: file.clone(), at: 1, len: 3, tag: Tag(12) },
+        ]);
+        let ((), cycle) = blaze_alloc_count::measure(|| {
+            driver.submit(&mut effects);
+            poll_for(driver, &mut out, 3);
+        });
+        used += cycle.allocations;
+        out.sort_by_key(|it| it.tag);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [
+                    Completion { done: Done::Synced, .. },
+                    Completion { done: Done::Stat(Some(_)), .. },
+                    Completion { done: Done::Read(bytes), .. },
+                ] if bytes == b"yte"
+            ),
+            "round {round}: {out:?}"
+        );
+        out.clear();
+    }
+    assert_eq!(driver.in_flight(), 0);
+    used
+}
+
+/// A Sync, a Stat and a Read, once the driver has grown to them: on `Sim` only the Read's
+/// `Vec<u8>`; on `Threads` nothing on the polling thread, and on its file thread only the
+/// Read's `Vec<u8>`.
+#[test]
+fn a_warm_file_cycle_allocates_only_the_reads_bytes() {
+    fn write(driver: &mut impl Driver) {
+        let mut effects =
+            vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
+        run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written))
+        .expect("the effects end");
+    }
+    let mut sim = Sim::new(11, Faults::default());
+    write(&mut sim);
+    file_rounds(&mut sim, WARM);
+    let used = file_rounds(&mut sim, ROUNDS);
+    assert!(
+        used <= ROUNDS,
+        "the simulation: {used} allocations over {ROUNDS} warm cycles; each may make the Read's Vec<u8> only"
+    );
+    let root = dir("budget-files");
+    let root = root.path();
+    let mut threads = Threads::new(&root, 1);
+    write(&mut threads);
+    file_rounds(&mut threads, WARM);
+    threads.off_thread();
+    let used = file_rounds(&mut threads, ROUNDS);
+    assert_eq!(used, 0, "threads: {ROUNDS} warm Sync, Stat and Read cycles, on the polling thread");
+    let (off, payload) = threads.off_thread();
+    assert!(
+        off - payload <= ROUNDS,
+        "threads: the file thread made {} allocations over {ROUNDS} warm cycles; each may make the Read's Vec<u8> only",
+        off - payload
+    );
+    drop(threads);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// `rounds` of a timer armed and fired: what they allocated on the polling thread.
+fn timer_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
+    let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(4));
+    let mut used = 0;
+    for round in 0..rounds {
+        let ((), cycle) = blaze_alloc_count::measure(|| {
+            effects.push(Effect::Timer { after: Duration::ZERO, tag: Tag(round) });
+            driver.submit(&mut effects);
+            poll_for(driver, &mut out, 1);
+        });
+        used += cycle.allocations;
+        assert_eq!(out.as_slice(), [Completion { tag: Tag(round), done: Done::Fired }]);
+        out.clear();
+    }
+    used
+}
+
+#[test]
+fn a_warm_timer_arm_and_fire_allocates_nothing() {
+    let mut sim = Sim::new(12, Faults::default());
+    timer_rounds(&mut sim, WARM);
+    assert_eq!(
+        timer_rounds(&mut sim, 10 * ROUNDS),
+        0,
+        "the simulation: warm timers armed and fired"
+    );
+    let root = dir("budget-timers");
+    let root = root.path();
+    let mut threads = Threads::new(&root, 1);
+    timer_rounds(&mut threads, WARM);
+    threads.off_thread();
+    assert_eq!(timer_rounds(&mut threads, 10 * ROUNDS), 0, "threads: warm timers armed and fired");
+    assert_eq!(threads.off_thread(), (0, 0), "threads: a timer is the polling thread's alone");
+    drop(threads);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// `rounds` of a watch of `src` added, a change under it (`edit`, the world's, not counted)
+/// heard, and the watch removed: what they allocated on the polling thread.
+fn watch_rounds<D: Driver>(driver: &mut D, rounds: u64, mut edit: impl FnMut(&mut D)) -> u64 {
+    let (src, edited) = (name("src"), name("src/edit"));
+    let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(64));
+    let mut used = 0;
+    for round in 0..rounds {
+        // The caller's: made before the cycle.
+        effects.push(Effect::Watch { dir: src.clone(), tag: Tag(7) });
+        let ((), added) = blaze_alloc_count::measure(|| driver.submit(&mut effects));
+        used += added.allocations;
+        let (mut heard, deadline) = (false, Instant::now() + Duration::from_secs(10));
+        while !heard {
+            assert!(Instant::now() < deadline, "round {round}: the change was never heard");
+            edit(driver);
+            let until = Deadline::after(driver.now(), Duration::from_millis(50));
+            let (_, polled) =
+                blaze_alloc_count::measure(|| driver.poll(&mut out, until));
+            used += polled.allocations;
+            for it in out.drain(..) {
+                match it.done {
+                    Done::Changed { files, .. } => heard |= files.contains(&edited),
+                    other => panic!("round {round}: {other:?}"),
+                }
+            }
+        }
+        effects.push(Effect::Unwatch { tag: Tag(7) });
+        let ((), removed) = blaze_alloc_count::measure(|| {
+            driver.submit(&mut effects);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !matches!(out.last(), Some(Completion { done: Done::Unwatched, .. })) {
+                assert!(Instant::now() < deadline, "round {round}: the watch never ended");
+                driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
+            }
+        });
+        used += removed.allocations;
+        for it in out.drain(..) {
+            assert!(
+                matches!(it.done, Done::Changed { .. } | Done::Unwatched),
+                "round {round}: {it:?}"
+            );
+        }
+        assert_eq!(driver.in_flight(), 0, "round {round}");
+    }
+    used
+}
+
+/// A watch added, a change heard and the watch removed, once the driver keeps a stopped watch
+/// for the next: nothing allocated by the driver beyond the names `Done::Changed` carries.
+#[test]
+fn a_warm_watch_add_change_and_remove_allocates_only_the_changes() {
+    let mut sim = Sim::new(13, Faults::default());
+    // The simulated world changed, which makes the change's payload.
+    let edit = |sim: &mut Sim| sim.change(&name("src/edit"), b"edited");
+    watch_rounds(&mut sim, WARM, edit);
+    assert_eq!(watch_rounds(&mut sim, ROUNDS, edit), 0, "the simulation: warm watch cycles");
+    assert_eq!(sim.stale(), 0, "no change raced an end");
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let root = dir("budget-watch");
+        let root = root.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let path = root.join("src/edit");
+        let edit = |_: &mut Threads| std::fs::write(&path, b"edited").unwrap();
+        let mut threads = Threads::new(&root, 1);
+        watch_rounds(&mut threads, 2, edit);
+        threads.off_thread();
+        assert_eq!(
+            watch_rounds(&mut threads, 4, edit),
+            0,
+            "threads: warm watch cycles, on the polling thread"
+        );
+        let (off, payload) = threads.off_thread();
+        assert_eq!(
+            off - payload,
+            0,
+            "threads: the watch's errand or callbacks made {off} allocations, {payload} of them the changes' names"
+        );
+        drop(threads);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// A listen at `at` as `Tag(1)` and a connect to it as `connect`: the accepted end and the
+/// connecting one.
+#[cfg(unix)]
+fn connected(
+    driver: &mut impl Driver,
+    at: &crate::Address,
+    connect: Tag,
+    listen: bool,
+) -> (crate::Conn, crate::Conn) {
+    let mut effects = Vec::with_capacity(2);
+    if listen {
+        effects.push(Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) });
+    }
+    effects.push(Effect::Connect { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: connect });
+    driver.submit(&mut effects);
+    let mut out = Vec::with_capacity(4);
+    poll_for(driver, &mut out, 2);
+    let (mut server, mut client) = (None, None);
+    for it in out {
+        match it.done {
+            Done::Accepted { conn } if it.tag == Tag(1) => server = Some(conn),
+            Done::Connected { conn } if it.tag == connect => client = Some(conn),
+            other => panic!("{other:?}"),
+        }
+    }
+    (server.expect("accepted"), client.expect("connected"))
+}
+
+#[cfg(unix)]
+enum SendRounds {
+    Warm(u64),
+    Measure,
+}
+
+/// Send "ping" on `client` and receive it on `server`, keeping both buffers for the next round.
+/// In measured rounds the polling thread must allocate nothing.
+#[cfg(unix)]
+fn send_rounds(
+    driver: &mut impl Driver,
+    (server, client): (crate::Conn, crate::Conn),
+    rounds: SendRounds,
+    buffers: &mut [Vec<u8>; 2],
+) {
+    let (mut effects, mut out) = (Vec::with_capacity(2), Vec::with_capacity(16));
+    let count = match rounds {
+        SendRounds::Warm(count) => count,
+        SendRounds::Measure => ROUNDS,
+    };
+    for round in 0..count {
+        let [sending, receiving] = buffers;
+        sending.extend_from_slice(b"ping");
+        receiving.clear();
+        let mut drive = || {
+            let send = Effect::Send {
+                conn: client,
+                bytes: std::mem::take(sending),
+                tag: Tag(10),
+            };
+            let recv = Effect::Recv {
+                conn: server,
+                most: 64,
+                into: std::mem::take(receiving),
+                tag: Tag(11),
+            };
+            effects.extend(match rounds {
+                // The socket is empty and the receive stays pending until the send.
+                // Threads must warm enough errand workers for both operations.
+                SendRounds::Warm(_) => [recv, send],
+                SendRounds::Measure => [send, recv],
+            });
+            driver.submit(&mut effects);
+            poll_for(driver, &mut out, 2);
+        };
+        match rounds {
+            SendRounds::Warm(_) => drive(),
+            SendRounds::Measure => {
+                blaze_alloc_count::assert_at_most(0, "a warm send and receive on the polling thread", drive)
+            }
+        }
+        out.sort_by_key(|it| it.tag);
+        match &mut out[..] {
+            [
+                Completion { done: Done::Sent(sent), .. },
+                Completion { done: Done::Read(read), .. },
+            ] if sent.is_empty() && read == b"ping" => {
+                *buffers = [std::mem::take(sent), std::mem::take(read)];
+            }
+            other => panic!("round {round}: {other:?}"),
+        }
+        out.clear();
+    }
+}
+
+/// Both ends of a connection hung up, and a new connection made in their slots: the old
+/// `Conn`s name nothing, a receive and a send on them fail with their buffers back, and the
+/// new one carries bytes.
+#[cfg(unix)]
+fn hung_up_conns_name_nothing(
+    driver: &mut impl Driver,
+    at: &crate::Address,
+    (server, client): (crate::Conn, crate::Conn),
+) {
+    let mut effects = vec![
+        Effect::Hangup { conn: client, tag: Tag(20) },
+        Effect::Hangup { conn: server, tag: Tag(21) },
+    ];
+    let mut out = Vec::new();
+    driver.submit(&mut effects);
+    poll_for(driver, &mut out, 2);
+    assert!(out.iter().all(|it| it.done == Done::HungUp), "{out:?}");
+    out.clear();
+    let again = connected(driver, at, Tag(3), false);
+    assert!(again.0 != server && again.0 != client && again.1 != server && again.1 != client);
+    effects.extend([
+        Effect::Recv { conn: client, most: 8, into: b"kept".to_vec(), tag: Tag(30) },
+        Effect::Send { conn: server, bytes: b"x".to_vec(), tag: Tag(31) },
+        Effect::Hangup { conn: client, tag: Tag(32) },
+    ]);
+    driver.submit(&mut effects);
+    poll_for(driver, &mut out, 3);
+    out.sort_by_key(|it| it.tag);
+    assert!(
+        matches!(
+            &out[..],
+            [
+                Completion { done: Done::Broken { buffer: kept, .. }, .. },
+                Completion { done: Done::Broken { buffer: sent, .. }, .. },
+                Completion { done: Done::Failed(_), .. },
+            ] if kept == b"kept" && sent.is_empty() && sent.capacity() >= 1
+        ),
+        "stale: {out:?}"
+    );
+    out.clear();
+    send_rounds(driver, again, SendRounds::Warm(1), &mut Default::default());
+    effects.extend([
+        Effect::Hangup { conn: again.0, tag: Tag(40) },
+        Effect::Hangup { conn: again.1, tag: Tag(41) },
+        Effect::Unlisten { tag: Tag(1) },
+    ]);
+    let mut done = BTreeMap::new();
+    run_until_idle(driver, &mut effects, |it, _| _ = done.insert(it.tag.0, it.done))
+    .expect("the effects end");
+    assert_eq!(
+        done,
+        BTreeMap::from([(1, Done::Unlistened), (40, Done::HungUp), (41, Done::HungUp)])
+    );
+}
+
+/// A send on one end and a receive on the other of a warm connection, each buffer handed back
+/// and given to the next: nothing allocated, on `Sim` by the poll and on `Threads` by the
+/// errands or on its polling thread. Then the connection's `Conn`s are stale once hung up.
+#[cfg(unix)]
+#[test]
+fn a_warm_send_and_receive_allocates_nothing() {
+    let at = crate::Address::Unix(name("s"));
+    let mut sim = Sim::new(14, Faults::default());
+    let conns = connected(&mut sim, &at, Tag(2), true);
+    let mut buffers = Default::default();
+    send_rounds(&mut sim, conns, SendRounds::Warm(WARM), &mut buffers);
+    send_rounds(&mut sim, conns, SendRounds::Measure, &mut buffers);
+    hung_up_conns_name_nothing(&mut sim, &at, conns);
+    let root = dir("budget-conn");
+    let root = root.path();
+    let mut threads = Threads::new(&root, 1);
+    let conns = connected(&mut threads, &at, Tag(2), true);
+    let mut buffers = Default::default();
+    send_rounds(&mut threads, conns, SendRounds::Warm(WARM), &mut buffers);
+    threads.off_thread();
+    send_rounds(&mut threads, conns, SendRounds::Measure, &mut buffers);
+    let (off, payload) = threads.off_thread();
+    assert_eq!(
+        (off, payload),
+        (0, 0),
+        "threads: the errands' allocations, and of them the receives' buffers"
+    );
+    hung_up_conns_name_nothing(&mut threads, &at, conns);
+    drop(threads);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A mapping copied reads as the file mapped with the same bytes, on a sixteen-byte boundary
+/// like the file's page, at every length around a block's; equal bytes are equal mappings, and
+/// only a clone is the same one.
+#[test]
+fn a_copied_mapping_reads_as_the_file_mapped() {
+    let root = dir("mapping");
+    let root = root.path();
+    for len in [0usize, 1, 15, 16, 17, 31, 4097] {
+        let bytes: Vec<u8> = (0..len).map(|at| (at * 7 + 3) as u8).collect();
+        let path = root.join(len.to_string());
+        std::fs::write(&path, &bytes).unwrap();
+        let file = crate::fs::map(&path).unwrap();
+        let copied = crate::Mapping::copy(&bytes);
+        assert_eq!((file.bytes(), copied.bytes()), (&bytes[..], &bytes[..]), "{len} bytes");
+        assert!((copied.bytes().as_ptr() as usize).is_multiple_of(16), "{len} bytes");
+        assert_eq!(file, copied, "{len} bytes");
+        assert!(!file.same(&copied) && file.same(&file.clone()) && copied.same(&copied.clone()));
+        assert!(!copied.same(&crate::Mapping::copy(&bytes)));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// An asker names a file in each effect it makes of it (a journal's appends and syncs, the
+/// store's reads): a name's clone is a count of the one made, so those effects allocate nothing
+/// for their names.
+#[test]
+fn a_file_name_cloned_into_effects_allocates_nothing() {
+    assert!(blaze_alloc_count::installed());
+    let file = name("state/journal");
+    let mut effects = Vec::with_capacity(64);
+    blaze_alloc_count::assert_at_most(0, "a name in each of 64 effects", || {
+        for round in 0..32 {
+            effects.push(Effect::Sync { file: file.clone(), tag: Tag(2 * round) });
+            effects.push(Effect::ReadAll { file: file.clone(), tag: Tag(2 * round + 1) });
+        }
+        effects.clear();
+    });
+    let copy = file.clone();
+    assert_eq!(copy, file);
+    assert_eq!(copy.as_str().as_ptr(), file.as_str().as_ptr(), "one name, shared");
+}
+
+/// The host's effects on `driver`, what became of each by its tag: two UDP sockets on
+/// loopback, one sending the other a datagram, both unbound; the wall clock (the system's
+/// where `real`, else a simulation's start after 2020); random bytes, and a draw too long;
+/// a directory made twice and removed twice, and one whose parent is not there; an empty write
+/// of the standard error and a read of none of the standard input, which end at once.
+fn host(driver: &mut impl Driver, real: bool) -> BTreeMap<u64, String> {
+    let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let made = || name("made");
+    let options = crate::dgram::Options::default();
+    let mut effects = vec![
+        Effect::Bind { at: loopback, options, tag: Tag(1) },
+        Effect::Bind { at: loopback, options, tag: Tag(2) },
+        Effect::Now { tag: Tag(7) },
+        Effect::Random { len: 32, tag: Tag(8) },
+        Effect::Random { len: crate::RANDOM_MOST + 1, tag: Tag(9) },
+        Effect::MakeDir { dir: made(), tag: Tag(10) },
+        Effect::WriteOut { stream: crate::Stream::Stderr, bytes: Vec::new(), tag: Tag(15) },
+        Effect::ReadStdin { most: 0, into: Vec::new(), tag: Tag(16) },
+    ];
+    let mut bound: [Option<(crate::Dgram, std::net::SocketAddr)>; 2] = [None, None];
+    let mut seen = BTreeMap::new();
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        driver.submit(&mut effects);
+        if driver.in_flight() == 0 || Instant::now() >= deadline {
+            break;
+        }
+        driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(100)));
+        for Completion { tag, done } in out.drain(..) {
+            let shown = match done {
+                Done::Bound { sock, local, .. } => {
+                    bound[tag.0 as usize - 1] = Some((sock, local));
+                    "bound".to_owned()
+                }
+                Done::Datagrams(batch) => match batch.each().next() {
+                    Some((head, bytes)) => format!(
+                        "{} from the first: {}",
+                        String::from_utf8_lossy(bytes),
+                        bound[0].is_some_and(|(_, at)| at == head.peer)
+                    ),
+                    None => "no datagram".to_owned(),
+                },
+                Done::SentDatagrams(batch) => format!("sent, {} left", batch.bytes.len()),
+                Done::DatagramsFailed { .. } => "broken".to_owned(),
+                Done::Wall(wall) => {
+                    let near = match real {
+                        true => {
+                            let system = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap();
+                            wall.abs_diff(system) < Duration::from_secs(60)
+                        }
+                        false => wall > Duration::from_secs(1_600_000_000),
+                    };
+                    format!("now: {near}")
+                }
+                Done::Random(bytes) => format!("random {}", bytes.len()),
+                Done::Sent(bytes) => format!("sent, {} left", bytes.len()),
+                Done::Read(bytes) => format!("read {}", bytes.len()),
+                Done::Unbound => "unbound".to_owned(),
+                Done::MadeDir => "made".to_owned(),
+                Done::RemovedDir => "removed".to_owned(),
+                Done::Failed(_) => "failed".to_owned(),
+                Done::Broken { .. } => "broken".to_owned(),
+                other => format!("{other:?}"),
+            };
+            seen.insert(tag.0, shown);
+            match tag.0 {
+                1 | 2 => {
+                    if let [Some((from, _)), Some((to, at))] = bound {
+                        effects.push(Effect::RecvFrom {
+                            sock: to,
+                            into: crate::dgram::Batch::new(),
+                            slots: crate::dgram::Slots::ONE,
+                            tag: Tag(4),
+                        });
+                        let mut batch = crate::dgram::Batch::new();
+                        batch.push(at, crate::dgram::Ecn::NotEct, b"ping");
+                        effects.push(Effect::SendTo { sock: from, batch, tag: Tag(3) });
+                    }
+                }
+                4 => {
+                    for (at, tag) in [(0, Tag(5)), (1, Tag(6))] {
+                        if let Some((sock, _)) = bound[at] {
+                            effects.push(Effect::Unbind { sock, tag });
+                        }
+                    }
+                }
+                10 => effects.push(Effect::MakeDir { dir: made(), tag: Tag(11) }),
+                11 => effects.push(Effect::RemoveDir { dir: made(), tag: Tag(12) }),
+                12 => effects.push(Effect::RemoveDir { dir: made(), tag: Tag(13) }),
+                13 => effects.push(Effect::MakeDir { dir: name("missing/made"), tag: Tag(14) }),
+                _ => {}
+            }
+        }
+    }
+    seen
+}
+
+/// What [`host`] ends with: with the sockets and the streams, or with each refused (the IOCP
+/// driver's and WASI's).
+fn host_wanted(sockets_and_streams: bool) -> BTreeMap<u64, String> {
+    let mut want: BTreeMap<u64, String> = [
+        (7, "now: true"),
+        (8, "random 32"),
+        (9, "failed"),
+        (10, "made"),
+        (11, "failed"),
+        (12, "removed"),
+        (13, "failed"),
+        (14, "failed"),
+    ]
+    .into_iter()
+    .map(|(tag, it)| (tag, it.to_owned()))
+    .collect();
+    let rest: &[(u64, &str)] = match sockets_and_streams {
+        true => &[
+            (1, "bound"),
+            (2, "bound"),
+            (3, "sent, 0 left"),
+            (4, "ping from the first: true"),
+            (5, "unbound"),
+            (6, "unbound"),
+            (15, "sent, 0 left"),
+            (16, "read 0"),
+        ],
+        false => &[(1, "failed"), (2, "failed"), (15, "broken"), (16, "broken")],
+    };
+    for &(tag, it) in rest {
+        want.insert(tag, it.to_owned());
+    }
+    want
+}
+
+#[test]
+fn every_driver_runs_the_host_s_effects_or_refuses_them_naming_why() {
+    assert_eq!(host(&mut Sim::new(5, Faults::default()), false), host_wanted(true), "sim");
+    assert_eq!(
+        host(&mut Threads::new(dir("host-threads").path(), 2), true),
+        host_wanted(cfg!(unix)),
+        "threads"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        host(&mut crate::kqueue::Kqueue::new(dir("host-kqueue").path(), 2).unwrap(), true),
+        host_wanted(true),
+        "kqueue"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        host(&mut crate::uring::Uring::new(dir("host-uring").path()).unwrap(), true),
+        host_wanted(true),
+        "io_uring"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        host(&mut crate::iocp::Iocp::new(dir("host-iocp").path(), 2).unwrap(), true),
+        host_wanted(false),
+        "iocp"
+    );
+}
+
+/// A bind at an address another socket has fails naming the address; where the native driver
+/// has no sockets (IOCP), the bind is refused naming the effect.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_host_effect_that_fails_names_what_it_is_about() {
+    let root = dir("host-errors");
+    let mut driver = crate::native(root.path(), 1).unwrap();
+    let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut answers = Vec::new();
+    let options = crate::dgram::Options::default();
+    let mut effects = vec![Effect::Bind { at: loopback, options, tag: Tag(1) }];
+    run_until_idle(&mut driver, &mut effects, |it, _| answers.push(it.done)).unwrap();
+    let local = match answers.pop() {
+        Some(Done::Bound { local, .. }) => local,
+        Some(Done::Failed(error)) if cfg!(windows) => {
+            assert!(error.0.contains("Effect::Bind is refused"), "{error:?}");
+            return;
+        }
+        other => panic!("a bind at {loopback} ended {other:?}"),
+    };
+    let mut effects = vec![Effect::Bind { at: local, options, tag: Tag(2) }];
+    run_until_idle(&mut driver, &mut effects, |it, _| answers.push(it.done)).unwrap();
+    match answers.pop() {
+        Some(Done::Failed(error)) => assert!(error.0.contains(&local.to_string()), "{error:?}"),
+        other => panic!("a second bind at {local} ended {other:?}"),
+    }
+}

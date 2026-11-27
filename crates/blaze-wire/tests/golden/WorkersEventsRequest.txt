@@ -1,0 +1,3 @@
+type: WorkersEventsRequest
+cbor: a3001b000001579f4d51c0011a30ccd82602818204a2008205f60180
+digest: 932b9e4a70a3fa64a0cecd108de5b38afcf1be1c451f7b8bdcedcc1af1314da3

@@ -1,0 +1,334 @@
+//! Interpret the production whole-write SQEs on Sim's disk. Small import limits reproduce
+//! Linux's MAX_RW_COUNT boundary without allocating or writing gigabytes.
+
+use crate::{
+    run_until_idle,
+    sim::{Faults, Rng, Sim},
+};
+use super::*;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    None,
+    Write,
+    Zero,
+    FileSync,
+    Rename,
+    DirSync,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Plant {
+    None,
+    EarlyPublication,
+    NoDirSync,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Case {
+    seed: u64,
+    len: usize,
+    import_limit: u32,
+    short: bool,
+    fault: Fault,
+    crash_after: usize,
+}
+
+fn name(s: &str) -> FileName {
+    FileName::new(s).unwrap()
+}
+
+fn io(sim: &mut Sim, effect: Effect) -> Done {
+    let mut answer = None;
+    run_until_idle(sim, &mut vec![effect], |it, _| answer = Some(it.done))
+        .expect("one simulated syscall ends");
+    answer.expect("one syscall completion")
+}
+
+/// The same transition and SQEs as Uring::wrote/path_sqes. Only kernel execution is replaced.
+fn simulate(case: Case, plant: Plant) -> Result<(), &'static str> {
+    let mut sim = Sim::new(case.seed, Faults::default());
+    let mut rng = Rng::new(case.seed ^ 0xc10e);
+    let (temp, target) = (name("placed/temporary"), name("placed/value"));
+    let old: &[u8] = b"the old output";
+    sim.change(&target, old);
+    let mut buf = [0u8; 128];
+    for (n, b) in buf[..case.len].iter_mut().enumerate() {
+        *b = n as u8 ^ 0xa5;
+    }
+    let bytes = &buf[..case.len];
+    let mut hot = Hot::new(Tag(1), Kind::Write, 0);
+    let mut cold = Cold { slots: [0, 1], ..Cold::EMPTY };
+    let (mut ops, mut synced, mut injected) = (0, false, false);
+    let names = [c"temporary".as_ptr().cast(), c"value".as_ptr().cast(), c"placed".as_ptr().cast()];
+    for _ in 0..1024 {
+        let mut sqes = [Sqe::default(); LINKS];
+        let mut n = whole::sqes(&hot, &cold, bytes, names, |n| n as u64, &mut sqes);
+        // Plant the old missing gate: publish in the write's chain, before its count is known.
+        // The suffix itself comes from the production commit SQE builder, not a second writer.
+        if matches!(plant, Plant::EarlyPublication) && matches!(hot.phase, OPENING | OPENED) {
+            sqes[n - 1].flags |= SQE_IO_LINK;
+            let mut commit = [Sqe::default(); LINKS];
+            let committing = Hot { phase: COMMITTING, ..hot };
+            let more = whole::sqes(&committing, &cold, bytes, names, |n| n as u64, &mut commit);
+            sqes[n..n + more].copy_from_slice(&commit[..more]);
+            n += more;
+        }
+        let mut completions = [(0usize, 0i32); LINKS];
+        let mut completed = 0;
+        let mut cancelled = false;
+        for sqe in &sqes[..n] {
+            let link = sqe.user_data as usize;
+            let wanted_fault = match sqe.opcode {
+                OP_WRITE => {
+                    case.fault == Fault::Write || (case.fault == Fault::Zero && sqe.len > 0)
+                }
+                OP_FSYNC if link == 3 => case.fault == Fault::FileSync,
+                OP_RENAMEAT => case.fault == Fault::Rename,
+                OP_FSYNC if link == 5 => case.fault == Fault::DirSync,
+                _ => false,
+            };
+            let res = if cancelled {
+                -libc::ECANCELED
+            } else if wanted_fault && !injected {
+                injected = true;
+                if case.fault == Fault::Zero { 0 } else { -libc::EIO }
+            } else {
+                match sqe.opcode {
+                    OP_OPENAT if link == 0 => 0,
+                    OP_OPENAT => {
+                        assert_eq!(
+                            io(
+                                &mut sim,
+                                Effect::Truncate {
+                                    file: temp.clone(),
+                                    len: 0,
+                                    tag: Tag(1),
+                                }
+                            ),
+                            Done::Truncated
+                        );
+                        0
+                    }
+                    OP_WRITE => {
+                        let at = sqe.off as usize;
+                        assert_eq!(sqe.addr, bytes[at..].as_ptr() as u64);
+                        let imported = sqe.len.min(case.import_limit);
+                        let put = if case.short && imported > 1 { imported / 2 } else { imported };
+                        let done = io(
+                            &mut sim,
+                            Effect::WriteAt {
+                                file: temp.clone(),
+                                at: sqe.off,
+                                bytes: bytes[at..at + put as usize].to_vec(),
+                                tag: Tag(1),
+                            },
+                        );
+                        assert_eq!(done, Done::Written);
+                        synced = false;
+                        put as i32
+                    }
+                    OP_FSYNC if link == 3 => {
+                        assert_eq!(
+                            io(&mut sim, Effect::Sync { file: temp.clone(), tag: Tag(1) }),
+                            Done::Synced
+                        );
+                        synced = true;
+                        0
+                    }
+                    OP_RENAMEAT => {
+                        // A canonical name may become visible only after every byte of
+                        // the output was written and synced. Namespace durability follows.
+                        if !synced || sim.contents(&temp) != bytes {
+                            return Err(
+                                "rename published before all bytes were written and synced",
+                            );
+                        }
+                        assert_eq!(
+                            io(
+                                &mut sim,
+                                Effect::RenameUnsynced {
+                                    from: temp.clone(),
+                                    to: target.clone(),
+                                    tag: Tag(1),
+                                }
+                            ),
+                            Done::Renamed
+                        );
+                        0
+                    }
+                    OP_FSYNC => {
+                        // The planted bug reports a completed syscall without committing
+                        // the rename. Only Sim's actual SyncDir makes that name durable.
+                        if !matches!(plant, Plant::NoDirSync) {
+                            assert_eq!(
+                                io(
+                                    &mut sim,
+                                    Effect::SyncDir { dir: name("placed").into(), tag: Tag(1) }
+                                ),
+                                Done::Synced
+                            );
+                        }
+                        0
+                    }
+                    OP_UNLINKAT => {
+                        assert_eq!(
+                            io(&mut sim, Effect::Remove { file: temp.clone(), tag: Tag(1) }),
+                            Done::Removed
+                        );
+                        0
+                    }
+                    other => panic!("unexpected opcode {other}"),
+                }
+            };
+            // An imported prefix can succeed as a linked write. An ordinary short write
+            // cancels the suffix, as Linux does, relative to the IMPORTED count.
+            cancelled |= sqe.flags & SQE_IO_LINK != 0
+                && (res < 0
+                    || (sqe.opcode == OP_WRITE && res < sqe.len.min(case.import_limit) as i32));
+            completions[completed] = (link, res);
+            completed += 1;
+            ops += 1;
+            let visible = sim.contents(&target);
+            if visible != old && visible != bytes {
+                return Err("the canonical name contains a partial output");
+            }
+            if ops == case.crash_after {
+                sim.crash();
+                let visible = sim.contents(&target);
+                return if visible == old || visible == bytes {
+                    Ok(())
+                } else {
+                    Err("a crash exposed partial canonical bytes")
+                };
+            }
+        }
+        rng.shuffle(&mut completions[..completed]);
+        let mut results = [0; LINKS];
+        for &(link, res) in &completions[..completed] {
+            results[link] = res;
+        }
+        match whole::advance(&mut hot, &mut cold, bytes.len(), results) {
+            Step::Again => {}
+            Step::Ends(Some(Done::Written)) => {
+                if injected {
+                    return Err("an injected error was reported as success");
+                }
+                sim.crash();
+                return if sim.contents(&target) == bytes && !sim.exists(&temp) {
+                    Ok(())
+                } else {
+                    Err("success did not leave exactly the durable output")
+                };
+            }
+            Step::Ends(Some(Done::Failed(_))) if injected => {
+                if sim.exists(&temp) {
+                    return Err("failure did not clean its live temporary name");
+                }
+                sim.crash();
+                let visible = sim.contents(&target);
+                // Cleanup has no directory sync after a refused commit. A crash may
+                // restore its temporary name; it must never tear the canonical output.
+                return if visible == old || visible == bytes {
+                    Ok(())
+                } else {
+                    Err("failure exposed partial canonical bytes after a crash")
+                };
+            }
+            _ => return Err("unexpected write outcome"),
+        }
+    }
+    Err("whole-file write exceeded its positive-progress bound")
+}
+
+#[test]
+fn whole_write_publication_survives_import_limits_faults_and_crashes() {
+    blaze_sim::check(blaze_sim::Config::cases(128), |tape| {
+        let case = Case {
+            seed: tape.next_u64("sim seed"),
+            len: tape.int_in(0..=128, "length"),
+            import_limit: tape.int_in(1..=32, "import limit"),
+            short: tape.coin("short write"),
+            fault: *tape
+                .pick(
+                    &[
+                        Fault::None,
+                        Fault::Write,
+                        Fault::Zero,
+                        Fault::FileSync,
+                        Fault::Rename,
+                        Fault::DirSync,
+                    ],
+                    "fault",
+                )
+                .unwrap(),
+            crash_after: tape.int_in(0..=64, "crash after"),
+        };
+        assert_eq!(simulate(case, Plant::None), Ok(()), "{case:?}");
+    });
+}
+
+#[test]
+fn whole_write_oracle_catches_publication_linked_to_a_clamped_write() {
+    let case = Case {
+        seed: 94,
+        len: 43,
+        import_limit: 32,
+        short: false,
+        fault: Fault::None,
+        crash_after: 0,
+    };
+    assert_eq!(simulate(case, Plant::None), Ok(()));
+    assert_eq!(
+        simulate(case, Plant::EarlyPublication),
+        Err("rename published before all bytes were written and synced")
+    );
+    for fault in
+        [Fault::None, Fault::Write, Fault::Zero, Fault::FileSync, Fault::Rename, Fault::DirSync]
+    {
+        assert_eq!(simulate(Case { fault, ..case }, Plant::None), Ok(()), "{fault:?}");
+    }
+    for crash_after in 1..=7 {
+        assert_eq!(simulate(Case { crash_after, ..case }, Plant::None), Ok(()), "crash {crash_after}");
+    }
+}
+
+#[test]
+fn whole_write_oracle_catches_a_missing_directory_sync() {
+    let mut caught = false;
+    for seed in 0..64 {
+        let case = Case {
+            seed,
+            len: 43,
+            import_limit: 32,
+            short: false,
+            fault: Fault::None,
+            crash_after: 0,
+        };
+        assert_eq!(simulate(case, Plant::None), Ok(()), "seed {seed}");
+        match simulate(case, Plant::NoDirSync) {
+            Ok(()) => {}
+            Err(why) if why == "success did not leave exactly the durable output" => caught = true,
+            other => panic!("seed {seed}: unexpected missing-sync outcome {other:?}"),
+        }
+    }
+    assert!(caught, "the crash oracle missed an acknowledged write without a directory sync");
+}
+
+#[test]
+fn whole_write_counts_past_linux_max_rw_count_before_committing() {
+    let len = 2_739_161_264;
+    let mut hot = Hot::new(Tag(1), Kind::Write, 0);
+    let mut cold = Cold::EMPTY;
+    let mut results = [0; LINKS];
+    results[2] = 0x7fff_f000; // Linux's 4 KiB-page MAX_RW_COUNT, a successful imported prefix.
+    assert!(matches!(whole::advance(&mut hot, &mut cold, len, results), Step::Again));
+    assert_eq!((hot.done, hot.phase), (0x7fff_f000, OPENED));
+    results[2] = (len as u64 - hot.done) as i32;
+    assert!(matches!(whole::advance(&mut hot, &mut cold, len, results), Step::Again));
+    assert_eq!((hot.done, hot.phase), (len as u64, COMMITTING));
+    assert!(matches!(
+        whole::advance(&mut hot, &mut cold, len, [0; LINKS]),
+        Step::Ends(Some(Done::Written))
+    ));
+}

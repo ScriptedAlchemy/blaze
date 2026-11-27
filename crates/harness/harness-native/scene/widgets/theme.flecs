@@ -1,0 +1,172 @@
+// The theme: tones, sizes and springs the host reads by role.
+
+@tree ChildOf
+hn {
+  // The theme: every tone, size and spring the host reads by role (src/look.rs `role`, `hn.Theme.<role>`), one child
+  // each, valued from the tokens (00-tokens.flecs). Its colour roles are the theme's, one child per `tone_<role>` token
+  // (each named without the prefix: a token named like the entity that reads it does not resolve, flecs#2389), and
+  // what each is for is said there. A widget in script names the token; Rust names the role here. Another look is
+  // another set of those tokens.
+  prefab Theme {
+    // Grounds.
+    ground { Fill: $tone_ground }
+    sidebar { Fill: $tone_sidebar }
+    card { Fill: $tone_card }
+    raised { Fill: $tone_raised }
+    well { Fill: $tone_well }
+    term_ground { Fill: $tone_term_ground }
+    // Lines.
+    line { Fill: $tone_line }
+    line_strong { Fill: $tone_line_strong }
+    // Inks.
+    ink_strong { Fill: $tone_ink_strong }
+    ink { Fill: $tone_ink }
+    ink_muted { Fill: $tone_ink_muted }
+    ink_faint { Fill: $tone_ink_faint }
+    // Washes.
+    hover { Fill: $tone_hover }
+    wash { Fill: $tone_wash }
+    selection { Fill: $tone_selection }
+    selection_focus { Fill: $tone_selection_focus }
+    press { Fill: $tone_press }
+    scrim { Fill: $tone_scrim }
+    clear { Fill: $tone_clear }
+    text_selection { Fill: $tone_text_selection }
+    copy_sheen { Fill: $tone_copy_sheen }
+    sheen { Fill: $tone_sheen }
+    // Accent, links, code.
+    accent { Fill: $tone_accent }
+    accent_wash { Fill: $tone_accent_wash }
+    on_accent { Fill: $tone_on_accent }
+    // An aside's tint: the composer's card while its draft is one, and its edge (src/app/chat.rs fill_chat_pane).
+    aside { Fill: $tone_aside }
+    aside_line { Fill: $tone_aside_line }
+    link { Fill: $tone_link }
+    code_ink { Fill: $tone_code_ink }
+    // States (a status dot's: running success, lost warning, failed or killed error, ended ink_faint; src/app.rs dot_tone).
+    success { Fill: $tone_success }
+    warning { Fill: $tone_warning }
+    error { Fill: $tone_error }
+    success_wash { Fill: $tone_success_wash }
+    warning_wash { Fill: $tone_warning_wash }
+    error_wash { Fill: $tone_error_wash }
+    // The cute touch, a palette: a small warm colour per kind on its icon; a shell's is the muted ink.
+    kind_claude { Fill: $tone_kind_claude }
+    kind_codex { Fill: $tone_kind_codex }
+    kind_cursor { Fill: $tone_kind_cursor }
+    kind_shell { Fill: $tone_ink_muted }
+    // How long after it ended a finished run with no session leaves the tree for the Archive (seconds, as a width).
+    archive_after {
+      Size: {w: {kind: Fixed, value: $archive_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // How far the context ring breathes down while the agent works (chat/pick.rs breathe; a share, as a width).
+    chat_working_breath_at {
+      Size: {w: {kind: Fixed, value: $chat_working_breath, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // The work bar's band: its share of the window (as a width) and its period (as a height).
+    work_bar {
+      Size: {w: {kind: Fixed, value: $work_bar_share, min: 0, max: 0}, h: {kind: Fixed, value: $work_bar_period, min: 0, max: 0}}
+    }
+    // The air under the composer's activity strip while it holds items (src/app/chat.rs fill_chat_activity).
+    chat_activity_air {
+      Size: {w: {kind: Fixed, value: $chat_activity_below, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // How long a finished child keeps its row (and its done mark) under a folded node (seconds, as a width).
+    tree_linger_for {
+      Size: {w: {kind: Fixed, value: $tree_linger_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // The same for a finished top-level session.
+    archive_done_after {
+      Size: {w: {kind: Fixed, value: $archive_done_after_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // A tree level's indent, and a failure badge's padding while it shows.
+    indent {
+      Size: {w: {kind: Fixed, value: $indent_step, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // A sidebar row's padding before its icon at depth 0, and the disclosure slot hanging left of the icon.
+    row_inset {
+      Size: {w: {kind: Fixed, value: $row_pad, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    disclose {
+      Size: {w: {kind: Fixed, value: $disclose_w, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    badge_on {
+      Padding: {l: $badge_pad, r: $badge_pad, t: 0, b: 0}
+    }
+    // Springs: a breath (how far it dims is each Breath's own `low`), a chevron's turn, the sidebar's fold (the selection
+    // pill's is on hn.Selection).
+    breath { Motion: {omega: $breath_omega, zeta: $breath_zeta} }
+    turn { Motion: {omega: $turn_omega, zeta: $turn_zeta} }
+    sidebar { Motion: {omega: $sidebar_omega, zeta: $sidebar_zeta} }
+    lights { Motion: {omega: $lights_omega, zeta: $lights_zeta} }
+    // How far a nested list item steps in a level (src/app/chat.rs fill_row; points, as a width).
+    chat_list_nest {
+      Size: {w: {kind: Fixed, value: $chat_list_nest_w, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // A pasted picture's thumbnail height and widest in the composer, and a sent message's pictures' height
+    // (src/app/chat.rs fill_pictures; points, as a width).
+    chat_attach_tall {
+      Size: {w: {kind: Fixed, value: $chat_attach_h, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    chat_attach_wide {
+      Size: {w: {kind: Fixed, value: $chat_attach_max_w, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    chat_sent_tall {
+      Size: {w: {kind: Fixed, value: $chat_sent_h, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // A chip's hover card (src/app/chat/peek.rs, scene/widgets/peek.flecs): how long the pointer rests on a chip before
+    // it opens (seconds), and how many of a file's lines a path's card shows (each as Size.w's value).
+    inline_peek_dwell {
+      Size: {w: {kind: Fixed, value: $inline_peek_dwell_s, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    inline_peek_lines {
+      Size: {w: {kind: Fixed, value: $inline_peek_lines_n, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // How many of a folder's entries its card lists.
+    inline_peek_entries {
+      Size: {w: {kind: Fixed, value: $inline_peek_entries_n, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+    // A reply streaming in (src/app/chat.rs): the follow to its end, each glyph's arrival, the pace bursts show at. The
+    // follow's far is Size.w's value (it lands at once past it from rest).
+    chat_stream {
+      Motion: {omega: $chat_follow_omega, zeta: $chat_follow_zeta}
+      Size: {w: {kind: Fixed, value: $chat_follow_far, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+      GlyphsArrive: {dur: $chat_glyph_dur, by: $chat_glyph_rise, ease: Out, born: 0}
+      Pace: {lag: $chat_pace_lag, min: $chat_pace_min, max: $chat_pace_max, most: $chat_pace_most}
+    }
+    // Dragging the sidebar's edge (src/resize.rs): its range, latch, stretch, pulse rearm, grab band and the main card's
+    // least; and the spring the window rides back on after an over-drag pulled it aside.
+    side_drag {
+      SideDrag: {min: $side_min, max: $side_max, latch: $side_latch, give: $side_give, soft: $side_soft, rearm: $side_rearm, grab: $side_grab, reach: $side_reach, keep: $side_keep}
+    }
+    // Dragging the browser pane's left edge (src/app/web_drag.rs): its range, grab band and the main card's least.
+    web_drag {
+      PaneDrag: {min: $web_pane_min, max: $web_pane_max, grab: $web_grab, keep: $web_keep}
+    }
+    window_back { Motion: {omega: $window_back_omega, zeta: $window_back_zeta} }
+    // The chat's effort under a sideways swipe over its control (src/app/chat/pick.rs): the travel a stop takes, when the
+    // effort is sent after the last step, and how long the control says it in words after.
+    chat_pick {
+      PickFeel: {step: $chat_pick_swipe_step, commit: $chat_pick_commit_secs, word: $chat_pick_word_secs}
+    }
+    // The `@` mention menu's preview (src/app/chat/mention.rs): how much of a place it reads, and the box a picture fits.
+    chat_mention {
+      MentionLook: {
+        cols: $chat_mention_cols_n, line: $line_chat_code, entry: $line_peek_entry + $inline_peek_entry_gap,
+        image_w: $chat_mention_preview_w - 2 * $chat_mention_preview_pad,
+        image_h: $chat_mention_preview_h - 2 * $chat_mention_preview_pad - $line_peek_meta - $inline_peek_gap
+      }
+    }
+    // A tree row folding in or away: its height on the spring, its words in once there is room (src/app/fold.rs).
+    tree_fold {
+      Motion: {omega: $tree_fold_omega, zeta: $tree_fold_zeta}
+      FoldIn: {lead: $tree_fold_lead, rise: $tree_fold_rise}
+    }
+    // The tree's scroll: the glide that keeps the selected row in view (and how far inside an edge it leaves it). Its knob
+    // is the ui.Scroll's overlay scroller (prims.flecs ui.Scroller); its edge fade is hn.Tree's ClipFade.
+    tree_scroll {
+      Motion: {omega: $tree_glide_omega, zeta: $tree_glide_zeta}
+      Size: {w: {kind: Fixed, value: $tree_reveal_margin, min: 0, max: 0}, h: {kind: Fixed, value: 1, min: 0, max: 0}}
+    }
+  }
+}

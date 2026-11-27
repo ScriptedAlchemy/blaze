@@ -1,0 +1,19 @@
+{
+  "id": "fork-publication-completion-diagnostic-20261123",
+  "date": "2026-11-23",
+  "who": "GPT-6 Astra Pro, runtime repair lane",
+  "where": "crates/blaze-serve/src/store.rs: publication completion to std::io::Error",
+  "what": "Current-head native CI failed to compile std::io::Error::other(RefusedCompletion): the refusal owns Done, whose writable mapping is Send but deliberately not Sync.",
+  "cost": "The retained native library suite stopped at compilation before its tests could run.",
+  "cause": "The native error adapter tried to store an owned IO completion in a diagnostic container that requires Send + Sync.",
+  "whys": [
+    "The publication core returns an unexpected completion to preserve its ownership.",
+    "The native adapter treated that ownership carrier as a shared diagnostic.",
+    "A new writable-mapping completion made Done non-Sync and exposed the incompatible boundary."
+  ],
+  "class": "resource-owning refusal carriers escaping through shared error containers",
+  "prevention": "The native boundary consumes the refusal, releases its owned completion on the caller thread, and stores a typed diagnostic with the original destination, barrier, tag and completion detail. A deterministic simulation observes writable-mapping release while the IO error remains alive; its retained-mapping control must fail the same oracle.",
+  "workaround": "None; mapping synchronization and the publication state machine are unchanged.",
+  "fix": "Prepared with independent source review; hosted Rust compilation and regression execution remain required.",
+  "state": "open"
+}

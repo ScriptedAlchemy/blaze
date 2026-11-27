@@ -1,13 +1,23 @@
 name: release
 
-# A pushed tag `vX.Y.Z` builds blaze for Linux (x86_64, aarch64) and macOS (aarch64) and makes
-# a GitHub release of that name: one tarball per target, a `.sha256` per tarball, SHA256SUMS,
-# and the tag's CHANGELOG.md section as the notes. The tag must match the workspace version.
-# A manual run builds and checks the same archives without releasing anything.
+# Builds and publishes `blaze` (`blaze-cli`) for macOS ARM64, Linux x86-64, and Linux ARM64.
+# Uploads all release assets + SHA256SUMS + B3SUMS + library archive to Cloudflare R2
+# (`blaze-releases`, served at https://blaze-releases.ix.dev) and GitHub Releases, and updates
+# the `canary` (and optionally `stable`) channel pointers.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v0.*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.20261122.0)"
+        required: true
+        type: string
+      promote_stable:
+        description: "Also promote this release to the stable channel and Latest"
+        required: false
+        default: true
+        type: boolean
 
 concurrency:
   group: release-${{ github.ref }}
@@ -17,31 +27,55 @@ permissions:
   contents: read
 
 env:
+  BLAZE_CORES: all
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 10
 
 jobs:
-  notes:
-    name: version and notes
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
+  prepare:
+    name: prepare release
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
     outputs:
-      version: ${{ steps.notes.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      promote_stable: ${{ steps.meta.outputs.promote_stable }}
     steps:
       - uses: actions/checkout@v7
-      # On a tag: the tag is the workspace version and CHANGELOG.md has its section.
-      # By hand: the workspace version needs a section.
-      - id: notes
-        run: python3 -I .github/scripts/release_notes.py --tag "${{ github.ref_type == 'tag' && github.ref_name || '' }}" --out "$RUNNER_TEMP/notes.md"
+      - id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_STABLE: ${{ inputs.promote_stable }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+            PROMOTE="true"
+          else
+            TAG="$INPUT_TAG"
+            PROMOTE="${INPUT_STABLE:-true}"
+          fi
+          VER="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "promote_stable=$PROMOTE" >> "$GITHUB_OUTPUT"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
+          enable-cache: false
+      - run: |
+          uv run --frozen python harness/library.py archive "{\"out\": \"$RUNNER_TEMP/library\"}"
       - uses: actions/upload-artifact@v7
         with:
-          name: notes
-          path: ${{ runner.temp }}/notes.md
+          name: library
+          path: ${{ runner.temp }}/library/library-*.tar.xz
           if-no-files-found: error
 
   build:
     name: ${{ matrix.target }}
-    needs: notes
+    needs: prepare
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -49,111 +83,126 @@ jobs:
       matrix:
         include:
           - { target: aarch64-apple-darwin, os: macos-15 }
-          # The oldest hosted Ubuntu, so that the binaries ask for an old glibc.
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
     env:
-      # `cargo binstall` and install.sh find the archive and its binaries by this name
-      # ([package.metadata.binstall] in crates/ra-jit/Cargo.toml).
-      NAME: blaze-v${{ needs.notes.outputs.version }}-${{ matrix.target }}
+      NAME: blaze-v${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+      BLAZE_RELEASE: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      # rust-src: blaze's proc-macro server and the standard library are compiled from it.
-      - run: rustup toolchain install 1.99.0 --profile minimal --component rust-src && rustup default 1.99.0
-      # `cargo blaze --version` names the commit, as the flake's build does.
-      - run: echo "RA_JIT_GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-      # A release's builds fetch the standard library from the release's assets (the step
-      # `Standard library` below; crates/ra-jit/src/shipped.rs).
-      - if: github.ref_type == 'tag'
-        run: echo "RA_JIT_RELEASE=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
-      # No build cache: release binaries come from a clean build. Without the `llvm` feature:
-      # that one links libLLVM dynamically, which a machine that downloads the binary lacks.
-      # The recipe the flake's build runs too, with the profile pgo/profiles.json pins; a
-      # release refuses a profile trained on other crates (Cargo.lock or the toolchain moved
-      # since the pgo workflow last ran). On Linux the ra-jit it built then builds blaze's
-      # proc-macro server (`--server`), which the archive has beside it: the server that
-      # expands with the proc-macro libraries ra-jit links, so no user's machine builds it.
-      - run: python3 .github/scripts/build_release.py --target ${{ matrix.target }} --out shipped --strict ${{ runner.os == 'Linux' && '--server' || '' }}
+      - name: Install pinned nightly toolchain
+        run: |
+          tc="$(cat pins/toolchain)"
+          rustup toolchain install "$tc" --profile minimal --no-self-update
+          rustup default "$tc"
+          rustc --version
+      - name: Build release blaze binary
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
-      - name: Archive
         run: |
-          mkdir "$NAME"
-          cp LICENSE-APACHE LICENSE-MIT README.md CHANGELOG.md "$NAME"
-          cp shipped/* "$NAME"
-          "$NAME/ra-jit" --version | tee /dev/stderr | grep -F "blaze ${{ needs.notes.outputs.version }} "
-          # `blaze`, what cargo runs for `cargo blaze`, and the name it had before, run the one beside them.
-          "$NAME/blaze" --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
-          "$NAME/cargo-blaze" blaze --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
-          "$NAME/cargo-ra-jit" ra-jit --version | grep -F "blaze ${{ needs.notes.outputs.version }} "
-          if [ "$RUNNER_OS" = Linux ]; then
-            RUST_ANALYZER_INTERNALS_DO_NOT_USE=1 "$NAME/blaze-proc-macro-srv" --version | grep -F "rust-analyzer-proc-macro-srv "
-          fi
-          tar czf "$NAME.tar.gz" "$NAME"
-          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          tc="$(cat pins/toolchain)"
+          cargo +"$tc" build --release --locked --bins -p blaze-cli -p blaze-launcher
+      - name: Archive and checksum
+        run: bash .github/scripts/package-release.sh
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.NAME }}
-          path: ${{ env.NAME }}.tar.gz*
+          path: |
+            ${{ env.NAME }}.tar.xz*
+            ${{ env.NAME }}.tar.gz*
           if-no-files-found: error
-      # The standard library a build with nothing of rustc's starts from, made by the binary
-      # just archived for the toolchain the README pins, so that no user's first build makes
-      # it. The release's assets are the remote its builds fetch it from: each file of the
-      # remote under its path with `.` for `/`. A release without them builds it on the
-      # user's machine, so this does not hold the release up.
-      - name: Standard library
-        continue-on-error: true
-        run: |
-          shipped/ra-jit std "$RUNNER_TEMP/std" "$(rustc +1.99.0 --print sysroot)"
-          mkdir std-assets
-          cd "$RUNNER_TEMP/std"
-          find manifests packs keys -type f ! -name '*.lock' | while read -r file; do
-            cp "$file" "$GITHUB_WORKSPACE/std-assets/${file//\//.}"
-          done
-      - uses: actions/upload-artifact@v7
-        with:
-          name: std-${{ matrix.target }}
-          path: std-assets/*
-          if-no-files-found: warn
-
-  # cargo-blaze and the forks it depends on (`ra-jit-hir`, `ra-jit-rustc_abi`, ...) on crates.io, as
-  # its own job so it can be rerun alone: versions already published are skipped. Each crate is
-  # built first; crates.io's limit on new crates is waited out (a first release takes hours).
-  crates:
-    name: crates.io
-    needs: [notes, build]
-    if: github.ref_type == 'tag'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 340
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.99.0 --profile minimal && rustup default 1.99.0
-      - run: python3 -I .github/scripts/publish_crates.py --publish --max-hours 5
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish:
-    name: GitHub release
-    needs: [notes, build]
-    if: github.ref_type == 'tag'
+    name: publish release and channels
+    needs: [prepare, build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PROMOTE_STABLE: ${{ needs.prepare.outputs.promote_stable }}
     steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.5'
+          enable-cache: false
       - uses: actions/download-artifact@v8
         with:
           path: out
           merge-multiple: true
-      - name: Checksums
-        working-directory: out
-        run: sha256sum blaze-*.tar.gz | tee SHA256SUMS
-      - name: Release
+      - name: Generate SHA256SUMS and B3SUMS
+        run: |
+          uv run --frozen python - <<'EOF'
+          import hashlib, pathlib, blake3
+          out = pathlib.Path("out")
+          archives = sorted(
+              p for p in out.iterdir()
+              if p.is_file() and p.name.startswith("blaze-") and (p.name.endswith(".tar.gz") or p.name.endswith(".tar.xz"))
+          )
+          sha_lines = []
+          b3_lines = []
+          for p in archives:
+              data = p.read_bytes()
+              sha_lines.append(f"{hashlib.sha256(data).hexdigest()}  {p.name}\n")
+              b3_lines.append(f"{blake3.blake3(data).hexdigest()}  {p.name}\n")
+          (out / "SHA256SUMS").write_text("".join(sha_lines))
+          (out / "B3SUMS").write_text("".join(b3_lines))
+          EOF
+          cat out/SHA256SUMS
+          cat out/B3SUMS
+      - name: Plan R2 release upload
+        id: r2
+        run: |
+          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py "{\"kind\": \"release\", \"tag\": \"$TAG\", \"dir\": \"out\"}"; echo R2; } >> "$GITHUB_OUTPUT"
+      - name: Upload release assets to R2
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            ${{ steps.r2.outputs.r2 }}
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           shopt -s nullglob
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "blaze $GITHUB_REF_NAME" --notes-file out/notes.md \
-            out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS \
-            out/manifests.* out/packs.* out/keys.*
+          ASSETS=(out/blaze-*.tar.xz out/blaze-*.tar.xz.sha256 out/blaze-*.tar.gz out/blaze-*.tar.gz.sha256 out/SHA256SUMS out/B3SUMS out/library-*.tar.xz)
+          NOTES="Blaze $TAG — native zero-Wasm proc-macro & hermetic build-script pipeline, Sota AArch64 backend (memory, spilling, scalar FP), ThinArc/ThinVec, Rust Lean 4 kernel checker, and blaze-lint jank rules."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${ASSETS[@]}"
+            if [ "$PROMOTE_STABLE" = "true" ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+            fi
+          else
+            FLAGS=(--title "blaze $TAG" --notes "$NOTES")
+            if [ "$PROMOTE_STABLE" = "true" ]; then
+              FLAGS+=(--latest)
+            else
+              FLAGS+=(--prerelease)
+            fi
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" "${FLAGS[@]}" "${ASSETS[@]}"
+          fi
+      - name: Update stable and canary channel pointers
+        id: channels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p channels
+          printf '%s\n' "$VERSION" > channels/canary
+          if [ "$PROMOTE_STABLE" = "true" ]; then
+            printf '%s\n' "$VERSION" > channels/stable
+          else
+            curl -fsSL https://blaze-releases.ix.dev/channels/stable > channels/stable
+          fi
+          gh release upload channels --repo "$GITHUB_REPOSITORY" --clobber channels/stable channels/canary
+          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py '{"kind": "channels", "dir": "channels"}'; echo R2; } >> "$GITHUB_OUTPUT"
+      - name: Upload channel pointers to R2
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: |
+            ${{ steps.channels.outputs.r2 }}

@@ -1,0 +1,25 @@
+name: source toolchain shelf
+description: cut the canonical shelf from this source tree and verify the committed pin
+runs:
+  using: composite
+  steps:
+    - name: generate and verify the canonical toolchain shelf
+      shell: bash
+      run: |
+        set -euo pipefail
+        shelf="$HOME/.blaze/v2/toolchain"
+        tc="$(cat pins/toolchain)"
+        mkdir -p "$RUNNER_TEMP/toolchain-cut"
+        cp crates/blaze-toolchain/PINNED "$RUNNER_TEMP/toolchain-cut/expected-pin"
+        timeout -k 30 600 cargo +"$tc" fetch --locked --quiet
+        shopt -s nullglob
+        registries=("${CARGO_HOME:-$HOME/.cargo}"/registry/cache/index.crates.io-*)
+        if [ "${#registries[@]}" != 1 ]; then
+          echo "::error::canonical shelf needs exactly one crates.io registry cache; found ${#registries[@]}"
+          exit 1
+        fi
+        reg="${registries[0]}"
+        # Always ask the canonical producer to check/write every content-addressed file.
+        # Neither a warm shelf nor a successful Cargo build can waive the source pin.
+        timeout -k 30 900 "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": false, \"macro_side\": true}" | tee "$RUNNER_TEMP/toolchain-cut/generated.log"
+        timeout -k 30 900 "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": true, \"macro_side\": true}" | tee "$RUNNER_TEMP/toolchain-cut/verified.log"

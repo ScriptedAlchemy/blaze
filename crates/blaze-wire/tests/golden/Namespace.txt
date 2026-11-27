@@ -1,0 +1,3 @@
+type: Namespace
+cbor: 8201a1001b00000005ce886c7f
+digest: ec334c210ef2fce7b84a227c847b8bb6da140142139ae6bad573561e438fcf42

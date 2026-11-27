@@ -1,0 +1,31 @@
+[package]
+name = "test-utils"
+version = "0.0.0"
+repository.workspace = true
+description = "Assorted testing utilities for rust-analyzer."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-hash.workspace = true
+# Avoid adding deps here, this crate is widely used in tests it should compile fast!
+dissimilar.workspace = true
+blaze-text-size.workspace = true
+# `blaze_core::lock::Lock` around the files `expect!` rewrites under `UPDATE_EXPECT`.
+blaze-core.workspace = true
+
+paths.workspace = true
+stdx.workspace = true
+
+[dev-dependencies]
+# The round trip of `expect!`'s literals, as a property with its planted-bug control.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

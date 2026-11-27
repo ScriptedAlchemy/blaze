@@ -1,4 +1,4 @@
-# The site's renderer in Rust (README.md). Its own workspace, not a member of ra-jit's: it builds for wasm32 and
+# The site's renderer in Rust (README.md). Its own workspace, not a member of blaze's: it builds for wasm32 and
 # depends on flecs-opinionated by path, neither of which the compiler's workspace should see.
 [workspace]
 resolver = "3"
@@ -20,7 +20,6 @@ flecs-snapshot = { git = "https://github.com/indexable-inc/flecs-opinionated", r
 ipld-core = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_ipld_dagcbor = "0.7"
-ciborium = "0.2"
 serde_json = { version = "1", features = ["preserve_order"] }
 regex-lite = "0.1"
 

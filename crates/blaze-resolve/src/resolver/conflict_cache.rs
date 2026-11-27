@@ -1,7 +1,9 @@
-use crate::resolver::{HashMap, HashSet};
+use crate::resolver::{FixedState, Map, MapOpts, Set};
+use std::alloc::Global;
 use std::collections::BTreeMap;
 
-use tracing::trace;
+use blaze_own::Share;
+use blaze_trace::trace;
 
 use super::context::ResolverContext;
 use super::types::ConflictMap;
@@ -14,6 +16,7 @@ enum ConflictStoreTrie {
     Leaf(ConflictMap),
     /// A map from an element to a subtrie where
     /// all the sets in the subtrie contains that element.
+    // BTreeMap: `find` takes range queries up to `must_contain`.
     Node(BTreeMap<PackageId, ConflictStoreTrie>),
 }
 
@@ -140,15 +143,18 @@ pub(super) struct ConflictCache {
     // as a global cache which we never delete from. Any entry in this map is
     // unconditionally true regardless of our resolution history of how we got
     // here.
-    con_from_dep: HashMap<Dependency, ConflictStoreTrie>,
+    con_from_dep: Map<Dependency, ConflictStoreTrie, FixedState, Global>,
     // `dep_from_pid` is an inverse-index of `con_from_dep`.
     // For every `PackageId` this lists the `Dependency`s that mention it in `dep_from_pid`.
-    dep_from_pid: HashMap<PackageId, HashSet<Dependency>>,
+    dep_from_pid: Map<PackageId, Set<Dependency, FixedState, Global>, FixedState, Global>,
 }
 
 impl ConflictCache {
     pub(super) fn new() -> ConflictCache {
-        ConflictCache { con_from_dep: HashMap::default(), dep_from_pid: HashMap::default() }
+        ConflictCache {
+            con_from_dep: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            dep_from_pid: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+        }
     }
     pub(super) fn find(
         &self,
@@ -193,21 +199,21 @@ impl ConflictCache {
     /// all the `PackageId` entries are activated.
     pub(super) fn insert(&mut self, dep: &Dependency, con: &ConflictMap) {
         self.con_from_dep
-            .entry(dep.clone())
+            .entry(dep.share())
             .or_insert_with(|| ConflictStoreTrie::Node(BTreeMap::new()))
             .insert(con.keys().cloned(), con.clone());
 
         trace!("{} = \"{}\" adding a skip {:?}", dep.package_name(), dep.version_req(), con);
 
         for c in con.keys() {
-            self.dep_from_pid.entry(*c).or_default().insert(dep.clone());
+            self.dep_from_pid.entry(*c).or_default().insert(dep.share());
         }
     }
 
     pub(super) fn dependencies_conflicting_with(
         &self,
         pid: PackageId,
-    ) -> Option<&HashSet<Dependency>> {
+    ) -> Option<&Set<Dependency, FixedState, Global>> {
         self.dep_from_pid.get(&pid)
     }
 }

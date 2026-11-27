@@ -1,0 +1,13 @@
+# `#[blaze_memo::tracked(.., owns)]` and `#[blaze_memo::interned(.., owns)]` sites and
+# `blaze_memo::keep_owned(..)` calls by crate (its directory under crates/; its library's source,
+# `src/` or the directory of its `[lib] path`): values that own memory, on their arena's drop
+# list. Debt against the end state (results as flat records read in place). Only shrinks; a
+# crate with no row is held to 0. Checked by crates/blaze-memo/tests/owns.rs. The port's first
+# green head writes the rows.
+# Rows of the old layer's crates (base-db, blaze-lints, hir-def, hir-expand, every hir-ty*) went
+# with those crates, deleted 2026-11-16: a row for a crate that is gone holds nothing.
+# Raised 0 -> 2, port 2026-11-14 (lane "kept values"): key.rs `crate_items` and
+# `crate_inner_items`, each a `KeyIndex` whose rows grow in place in a reserved region
+# (`RegionVec`) and are unmapped when the value drops. Flat, but kept slices would copy the
+# crate's largest session table into the arena once walked (twice its size at the peak).
+blaze-items	2

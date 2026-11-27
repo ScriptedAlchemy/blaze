@@ -1,0 +1,35 @@
+name: release corpus
+description: Make the selected release commit's smoke corpus available without changing the checkout
+inputs:
+  commit:
+    description: Full source commit of the release being tested
+    required: true
+  repository:
+    description: GitHub owner/repository that published the release
+    required: true
+outputs:
+  manifest:
+    description: The selected commit's smoke manifest
+    value: ${{ steps.corpus.outputs.manifest }}
+runs:
+  using: composite
+  steps:
+    - id: corpus
+      shell: bash
+      env:
+        CORPUS_COMMIT: ${{ inputs.commit }}
+        CORPUS_REPOSITORY: ${{ inputs.repository }}
+      run: |
+        [[ "$CORPUS_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+          || { echo "::error::release corpus needs a full source commit"; exit 1; }
+        [[ "$CORPUS_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+          || { echo "::error::release corpus needs an owner/repository"; exit 1; }
+        if ! git cat-file -e "$CORPUS_COMMIT^{commit}" 2>/dev/null; then
+          git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=60 fetch --no-tags --depth=1 \
+            "https://github.com/$CORPUS_REPOSITORY.git" "$CORPUS_COMMIT"
+        fi
+        test "$(git rev-parse "$CORPUS_COMMIT^{commit}")" = "$CORPUS_COMMIT" \
+          || { echo "::error::release corpus source is not the selected commit"; exit 1; }
+        manifest="$RUNNER_TEMP/release-corpus-$CORPUS_COMMIT.json"
+        git show "$CORPUS_COMMIT:harness/smoke/smoke.json" > "$manifest"
+        echo "manifest=$manifest" >> "$GITHUB_OUTPUT"

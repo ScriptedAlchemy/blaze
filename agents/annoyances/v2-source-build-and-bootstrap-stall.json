@@ -1,0 +1,20 @@
+{
+  "id": "v2-source-build-and-bootstrap-stall",
+  "date": "2026-11-21",
+  "who": "Codex, repair_compiler_path lane",
+  "where": "PR 81 at 6ddf00dfd37e9f92bb85742767b978d0ab119176; source-build job 137071715562 and preceding cold-bootstrap job 137067146761",
+  "what": "The source-build command cannot select blaze-engine because the compiler is parked. Independently, a cold build of the native validation tools with the pinned release 0.20261105.4 ended with exit 76 LOOP_STALLED. Another job on the same preceding head built all 21 tools, and the final run restored that valid cache; a cache hit does not prove the cold-build stall fixed.",
+  "cost": "Source-built compiler and end-to-end acceptance remain unavailable. The failed cold bootstrap consumed 541 seconds before its client reported the daemon exit.",
+  "cause": "The compiler blocker is structural: upstream 8e87a017ff removed 662788 lines across 2081 files, including the daemon, query database and item/name-resolution layer. The retained engine still routes through that deleted daemon. blaze-surface supplies schema and Items/Source traits, but their only implementation is the MemSurface test fixture; signature, fields, variants, predicates, impl-index, body-facts and expansion APIs are explicitly unfinished, and the planned blaze-scope/blaze-expand crates do not exist. The bootstrap stall's native cause is not measured: the log shows main in loop turn for 131.3 seconds, four workers idle for 120.8 seconds, no wait-graph jobs and no unreaped children, but no native blocking frame.",
+  "prevention": "Keep the source-built compiler and end-to-end gates strict. Complete the production item/source seam and the compiler/command bridge before reactivating their crates; selecting a released compiler or merely removing workspace exclusions cannot establish that proof. A future recurrence of the bootstrap stall needs the stalled native thread's stack before the daemon watchdog exits; the existing span-only log cannot identify the blocking instruction.",
+  "workaround": "None claimed. Upstream's releases API still lists 0.20261105.4 as the newest published release, so there is no observed newer bootstrap release to substitute.",
+  "state": "open; source boundaries and actual stall evidence audited, no compiler or runtime fix claimed",
+  "evidence": [
+    "https://github.com/ScriptedAlchemy/blaze/actions/runs/44977840046/job/137071715562",
+    "https://github.com/ScriptedAlchemy/blaze/actions/runs/44976385318/job/137067146761",
+    "https://github.com/ScriptedAlchemy/blaze/actions/runs/44976385318/job/137067146771",
+    "https://github.com/indexable-inc/blaze/releases/tag/v0.20261105.4",
+    "docs/v2/plan/parked.md",
+    "crates/blaze-surface/src/items.rs"
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "runtime_source_sha": "4602d911e43176f8232465ee0dae7a77bad305f4",
+  "platform": "macOS AArch64",
+  "toolchain": "Rust 1.99.0",
+  "backend": "Cranelift",
+  "binary_sha256": "f9a9b77895c6491fbee4829dfa8ff25f3438af06a8ab93faeda911dfe2dfb23e",
+  "n": 1,
+  "test": "second-build tier branch",
+  "emitted_llvm": false,
+  "provider": "controlled production provider",
+  "grace_seconds": 2,
+  "steps": [
+    {
+      "version": 1,
+      "second_branch_reached": true,
+      "persistent_failure": false,
+      "same_pid": true,
+      "typed_pressure_reply": false,
+      "no_partial_publication": true,
+      "recovered_patch": true
+    },
+    {
+      "version": 2,
+      "second_branch_reached": true,
+      "persistent_failure": true,
+      "same_pid": true,
+      "typed_pressure_reply": true,
+      "no_partial_publication": true,
+      "recovered_patch": true
+    }
+  ],
+  "same_source_noop_retry": true,
+  "worker_pid": 45445,
+  "focused_pressure_tests_passed": 9,
+  "watchdog": {
+    "runtime_exit": 0,
+    "runtime_peak_summed_footprint_mb": 779,
+    "runtime_guard_wall_seconds": 9.0,
+    "trip": null
+  },
+  "limits": [
+    "Controlled branch trigger, not emitted LLVM tier execution",
+    "Published-file retention is not full-build in-memory-base restoration",
+    "No fleet, coroutine, semantic-debug or no-rustc certification",
+    "No benchmark baseline or speedup claim"
+  ]
+}
