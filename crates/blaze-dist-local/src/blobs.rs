@@ -15,7 +15,7 @@ use blaze_wire::{Digest, Limits, WireAlloc, WireString};
 
 use crate::Error;
 use crate::pack::Pack;
-use crate::sys::{Errno, IoError, TcpStream};
+use crate::sys::{Errno, IoError, TcpDeadline, TcpStream};
 
 /// Extra room for HTTP framing (including chunked transfers), not for value bytes.
 const HTTP_FRAMING_ROOM: u64 = 16 << 20;
@@ -25,9 +25,9 @@ const HTTP_HEADER_LIMIT: usize = 64 << 10;
 /// Only a successful pack GET may carry a documented blob. A missing
 /// pack, an HTTP error, a manifest or a PUT reply has the smaller
 /// request-body budget: an error response is never a multi-GiB blob.
-fn response_body_limit(method: &str, path: &str, status: u16) -> u64 {
+fn response_body_limit(method: &str, path: &str, status: u16, pack_ceiling: Option<u64>) -> u64 {
     if method == "GET" && status == 200 && path.starts_with("/v1/blob/") {
-        Limits::DOCUMENTED.blob
+        Limits::DOCUMENTED.blob.min(pack_ceiling.unwrap_or(Limits::DOCUMENTED.blob))
     } else {
         u64::from(Limits::DOCUMENTED.request)
     }
@@ -41,6 +41,17 @@ trait ByteRead {
 impl ByteRead for TcpStream {
     fn read_bytes(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
         self.read(buf)
+    }
+}
+
+struct DeadlineRead {
+    stream: TcpStream,
+    deadline: TcpDeadline,
+}
+
+impl ByteRead for DeadlineRead {
+    fn read_bytes(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+        self.stream.read_until(buf, self.deadline)
     }
 }
 
@@ -89,6 +100,11 @@ pub struct Blobs {
     pub alloc: WireAlloc,
 }
 
+struct ReadBound {
+    deadline: TcpDeadline,
+    pack_ceiling: Option<u64>,
+}
+
 impl Blobs {
     fn request<A: Allocator>(
         &self,
@@ -112,19 +128,22 @@ impl Blobs {
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
         stream.set_nodelay(true)?;
+        let head = self.request_head(method, path, body.len(), previous);
+        stream.write_all(head.as_bytes())?;
+        stream.write_all(body)?;
+        read_response(&mut stream, method, path, None, alloc, self.alloc)
+    }
+
+    fn request_head(&self, method: &str, path: &str, length: usize, previous: Option<&Digest>) -> WireString {
         let condition = match previous {
             Some(digest) => format_in!(self.alloc, "If-Match: \"{}\"\r\n", hex(digest)),
             None => WireString::new_in(self.alloc),
         };
-        let head = format_in!(
+        format_in!(
             self.alloc,
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n{condition}\r\n",
-            self.address,
-            body.len()
-        );
-        stream.write_all(head.as_bytes())?;
-        stream.write_all(body)?;
-        read_response(&mut stream, method, path, alloc, self.alloc)
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {length}\r\n{condition}\r\n",
+            self.address
+        )
     }
 
     /// Puts `pack` under its name. The server hashes it before it is visible, so a pack that
@@ -148,17 +167,18 @@ impl Blobs {
 
     /// The bytes of the pack named `digest`; `None` if the server has none.
     pub fn pack<A: Allocator>(&self, digest: &Digest, alloc: A) -> Result<Option<Vec<u8, A>>, Error> {
+        self.read_pack(digest, None, alloc)
+    }
+
+    /// Reads a committed pack under one deadline. Its declared length must fit both `ceiling`
+    /// and the wire limit before any of the body is buffered.
+    pub fn pack_until<A: Allocator>(&self, digest: &Digest, ceiling: u64, deadline: TcpDeadline, alloc: A) -> Result<Option<Vec<u8, A>>, Error> {
+        self.read_pack(digest, Some(ReadBound { deadline, pack_ceiling: Some(ceiling) }), alloc)
+    }
+
+    fn read_pack<A: Allocator>(&self, digest: &Digest, bound: Option<ReadBound>, alloc: A) -> Result<Option<Vec<u8, A>>, Error> {
         let path = format_in!(self.alloc, "/v1/blob/packs/{}.pack", hex(digest));
-        let (status, body) = self.request("GET", path.as_str(), &[], alloc)?;
-        match status {
-            200 => Ok(Some(body)),
-            404 => Ok(None),
-            _ => Err(Error::Protocol(format_in!(
-                self.alloc,
-                "GET {path}: {status}: {}",
-                lossy_text(&body, self.alloc)
-            ))),
-        }
+        self.get(path.as_str(), bound, alloc)
     }
 
     /// The published list of the unit named `spec`; `None` if nobody published it.
@@ -167,8 +187,30 @@ impl Blobs {
         spec: &Digest,
         alloc: A,
     ) -> Result<Option<Vec<u8, A>>, Error> {
+        self.read_published(spec, None, alloc)
+    }
+
+    /// Reads the published list of `spec` under one deadline for connection, request, and reply.
+    pub fn published_until<A: Allocator>(&self, spec: &Digest, deadline: TcpDeadline, alloc: A) -> Result<Option<Vec<u8, A>>, Error> {
+        self.read_published(spec, Some(ReadBound { deadline, pack_ceiling: None }), alloc)
+    }
+
+    fn read_published<A: Allocator>(&self, spec: &Digest, bound: Option<ReadBound>, alloc: A) -> Result<Option<Vec<u8, A>>, Error> {
         let path = format_in!(self.alloc, "/v1/list/manifests/{}", hex(spec));
-        let (status, body) = self.request("GET", path.as_str(), &[], alloc)?;
+        self.get(path.as_str(), bound, alloc)
+    }
+
+    fn get<A: Allocator>(&self, path: &str, bound: Option<ReadBound>, alloc: A) -> Result<Option<Vec<u8, A>>, Error> {
+        let (status, body) = if let Some(ReadBound { deadline, pack_ceiling }) = bound {
+            let mut stream = TcpStream::connect_until(self.address, deadline)?;
+            stream.set_nodelay(true)?;
+            let head = self.request_head("GET", path, 0, None);
+            stream.write_all_until(head.as_bytes(), deadline)?;
+            let mut reader = DeadlineRead { stream, deadline };
+            read_response(&mut reader, "GET", path, pack_ceiling, alloc, self.alloc)?
+        } else {
+            self.request("GET", path, &[], alloc)?
+        };
         match status {
             200 => Ok(Some(body)),
             404 => Ok(None),
@@ -239,24 +281,26 @@ impl Blobs {
 /// A read error at that point must never turn into permission to rebuild locally
 /// under the immutable key. Earlier IO failures remain subject to local policy.
 fn committed_get_head(method: &str, reply: &[u8]) -> bool {
-    if method != "GET" {
-        return false;
+    method == "GET" && response_status(reply) == Some(200)
+}
+
+fn response_status(reply: &[u8]) -> Option<u16> {
+    let mut fields = reply.split(|&byte| byte == b'\n').next()?
+        .split(u8::is_ascii_whitespace).filter(|field| !field.is_empty());
+    if !fields.next()?.starts_with(b"HTTP/1.") {
+        return None;
     }
-    let remaining =
-        reply.strip_prefix(b"HTTP/1.1 200").or_else(|| reply.strip_prefix(b"HTTP/1.0 200"));
-    remaining.is_some_and(|after| {
-        after.first().is_none_or(|&b| matches!(b, b' ' | b'\r' | b'\n'))
-    })
+    core::str::from_utf8(fields.next()?).ok()?.parse().ok()
 }
 
 fn read_failure(
     method: &str,
     path: &str,
-    reply: &[u8],
+    committed: bool,
     error: IoError,
     err_alloc: WireAlloc,
 ) -> Error {
-    if committed_get_head(method, reply) {
+    if committed {
         Error::Committed(format_in!(
             err_alloc,
             "{method} {path}: interrupted committed HTTP 200 reply: {error}"
@@ -272,6 +316,7 @@ fn read_response<A: Allocator>(
     stream: &mut impl ByteRead,
     method: &str,
     path: &str,
+    pack_ceiling: Option<u64>,
     alloc: A,
     err_alloc: WireAlloc,
 ) -> Result<(u16, Vec<u8, A>), Error> {
@@ -297,9 +342,25 @@ fn read_response<A: Allocator>(
         };
         let read = stream
             .read_bytes(slice)
-            .map_err(|error| read_failure(method, path, &reply, error, err_alloc))?;
+            .map_err(|error| read_failure(method, path, committed_get_head(method, &reply), error, err_alloc))?;
         if read == 0 {
-            return decode_response(method, path, reply, err_alloc);
+            return decode_response(method, path, reply, pack_ceiling, err_alloc);
+        }
+        if pack_ceiling.is_some() && let Some(got) = buffer.get(..read) {
+            // One socket read can contain both the end of the head and part of the body.
+            // Keep that body in the stack buffer until the head proves the length fits.
+            if let Some(end) = header_end_in(&reply, got) {
+                let (header, body) = got.split_at(end);
+                reply.extend_from_slice(header);
+                let head = decode_head(method, path, &reply, pack_ceiling, err_alloc)?;
+                if head.status == 200 && head.length.is_some_and(|length| body.len() > length) {
+                    return Err(Error::Committed(format_in!(err_alloc, "{method} {path}: HTTP body exceeds Content-Length")));
+                }
+                reply.extend_from_slice(body);
+                break head;
+            }
+            reply.extend_from_slice(got);
+            continue;
         }
         // Only the last three old bytes can start a delimiter crossing reads.
         let from = reply.len().saturating_sub(3);
@@ -307,10 +368,10 @@ fn read_response<A: Allocator>(
             reply.extend_from_slice(got);
         }
         if reply.get(from..).is_some_and(|tail| tail.windows(4).any(|bytes| bytes == b"\r\n\r\n")) {
-            break decode_head(method, path, &reply, err_alloc)?;
+            break decode_head(method, path, &reply, pack_ceiling, err_alloc)?;
         }
     };
-    let most = response_body_limit(method, path, head.status).saturating_add(HTTP_FRAMING_ROOM);
+    let most = response_body_limit(method, path, head.status, pack_ceiling).saturating_add(HTTP_FRAMING_ROOM);
     // A fixed-length response has no chunk framing. Refuse its first excess
     // byte instead of spending the remaining blob allowance on an invalid body.
     let most = head.length.map_or(most, |length| {
@@ -327,11 +388,16 @@ fn read_response<A: Allocator>(
             Ok(0) => break,
             Ok(read) => {
                 if let Some(got) = buffer.get(..read) {
+                    if pack_ceiling.is_some() && head.status == 200
+                        && reply.len().widen_to::<u64>().saturating_add(read.widen_to::<u64>()) > most
+                    {
+                        return Err(Error::Committed(format_in!(err_alloc, "{method} {path}: HTTP body exceeds Content-Length")));
+                    }
                     reply.extend_from_slice(got);
                 }
             }
             Err(error) if error.is_interrupted() => continue,
-            Err(error) => return Err(read_failure(method, path, &reply, error, err_alloc)),
+            Err(error) => return Err(read_failure(method, path, method == "GET" && head.status == 200, error, err_alloc)),
         }
     }
     if reply.len().widen_to::<u64>() > most {
@@ -342,7 +408,19 @@ fn read_response<A: Allocator>(
             Error::Protocol(message)
         });
     }
-    decode_response(method, path, reply, err_alloc)
+    decode_response(method, path, reply, pack_ceiling, err_alloc)
+}
+
+/// Counts how many bytes in `next` finish the HTTP head, including its delimiter.
+fn header_end_in(previous: &[u8], next: &[u8]) -> Option<usize> {
+    let delimiter = b"\r\n\r\n";
+    for split in (1..delimiter.len()).rev() {
+        let (first, rest) = delimiter.split_at(split);
+        if previous.ends_with(first) && next.starts_with(rest) {
+            return Some(rest.len());
+        }
+    }
+    next.windows(delimiter.len()).position(|bytes| bytes == delimiter).map(|at| at + delimiter.len())
 }
 
 struct ResponseHead {
@@ -358,6 +436,7 @@ fn decode_head(
     method: &str,
     path: &str,
     reply: &[u8],
+    pack_ceiling: Option<u64>,
     err_alloc: WireAlloc,
 ) -> Result<ResponseHead, Error> {
     let invalid = |why: &str| Error::Protocol(format_in!(err_alloc, "{method} {path}: {why}"));
@@ -393,16 +472,7 @@ fn decode_head(
             invalid("the head is not text")
         }
     })?;
-    let status = head
-        .split("\r\n")
-        .next()
-        .and_then(|line| {
-            let mut fields = line.split_ascii_whitespace();
-            if !fields.next()?.starts_with("HTTP/1.") {
-                return None;
-            }
-            fields.next()?.parse::<u16>().ok()
-        })
+    let status = response_status(head.as_bytes())
         .ok_or_else(|| invalid("no HTTP/1 status"))?;
     // A successful GET names committed data. Bad framing must not permit
     // the caller to rebuild locally under that immutable cache key.
@@ -431,15 +501,22 @@ fn decode_head(
             chunked = true;
         }
     }
-    let limit = response_body_limit(method, path, status);
+    let limit = response_body_limit(method, path, status, pack_ceiling);
     if length.is_some_and(|expected| expected.widen_to::<u64>() > limit) {
-        return Err(invalid("Content-Length exceeds the documented response body limit"));
+        return Err(invalid(if status == 200 && pack_ceiling.is_some() {
+            "Content-Length exceeds the committed pack body ceiling"
+        } else {
+            "Content-Length exceeds the documented response body limit"
+        }));
     }
     if chunked && length.is_some() {
         return Err(invalid("ambiguous HTTP body framing"));
     }
     if method == "GET" && status == 200 && length.is_none() && !chunked {
         return Err(invalid("a successful GET has no explicit HTTP body length"));
+    }
+    if status == 200 && pack_ceiling.is_some() && length.is_none() {
+        return Err(invalid("a bounded committed pack requires Content-Length"));
     }
     Ok(ResponseHead { status, body: end.saturating_add(4), length, chunked })
 }
@@ -450,10 +527,11 @@ fn decode_response<A: Allocator>(
     method: &str,
     path: &str,
     mut reply: Vec<u8, A>,
+    pack_ceiling: Option<u64>,
     err_alloc: WireAlloc,
 ) -> Result<(u16, Vec<u8, A>), Error> {
     let ResponseHead { status, body, length, chunked } =
-        decode_head(method, path, &reply, err_alloc)?;
+        decode_head(method, path, &reply, pack_ceiling, err_alloc)?;
     let invalid = |why: &str| {
         let message = format_in!(err_alloc, "{method} {path}: {why}");
         if method == "GET" && status == 200 {
@@ -463,7 +541,7 @@ fn decode_response<A: Allocator>(
         }
     };
     let body_len = reply.len().saturating_sub(body);
-    let limit = response_body_limit(method, path, status);
+    let limit = response_body_limit(method, path, status, pack_ceiling);
     if chunked {
         reply.copy_within(body.., 0);
         reply.truncate(body_len);
@@ -669,7 +747,7 @@ mod tests {
             let pointer = bytes.as_ptr();
             let capacity = bytes.capacity();
             let before = counts.allocations.get();
-            let (status, body) = decode_response("GET", path, bytes, alloc).unwrap();
+            let (status, body) = decode_response("GET", path, bytes, None, alloc).unwrap();
             assert_eq!(status, 200);
             assert_eq!(body.as_slice(), b"abcde");
             assert_eq!(body.as_ptr(), pointer, "decoding must compact the received allocation");
@@ -684,11 +762,11 @@ mod tests {
             // A second allocation would expose a body copy after validating its framing.
             let counts = Counts::default();
             let (status, body) =
-                read_response(&mut &reply[..], "GET", path, Counted(&counts), alloc).unwrap();
+                read_response(&mut &reply[..], "GET", path, None, Counted(&counts), alloc).unwrap();
             assert_eq!(status, 200);
             assert_eq!(counts.allocations.get(), 1);
             assert!(core::ptr::eq(body.allocator().0, &counts));
-            let (_, control) = read_response(&mut &reply[..], "GET", path, alloc, alloc).unwrap();
+            let (_, control) = read_response(&mut &reply[..], "GET", path, None, alloc, alloc).unwrap();
             assert_eq!(body.as_slice(), control.as_slice());
             assert_eq!(counts.allocations.get(), 1);
             drop(body);
@@ -701,7 +779,7 @@ mod tests {
         ] {
             let counts = Counts::default();
             assert!(matches!(
-                read_response(&mut &reply[..], "GET", path, Counted(&counts), alloc),
+                read_response(&mut &reply[..], "GET", path, None, Counted(&counts), alloc),
                 Err(Error::Committed(_))
             ));
             assert_eq!(counts.allocations.get(), counts.deallocations.get());
@@ -716,7 +794,7 @@ mod tests {
         oversized.resize(2 * HTTP_HEADER_LIMIT, b'a');
         for fragment in [1, 3, 8192] {
             let mut stream = Budgeted::new(&oversized, fragment, HTTP_HEADER_LIMIT + 4);
-            let error = read_response(&mut stream, "GET", path, alloc, alloc).unwrap_err();
+            let error = read_response(&mut stream, "GET", path, None, alloc, alloc).unwrap_err();
             assert!(!stream.exceeded, "read past the early-refusal budget");
             assert!(matches!(&error, Error::Committed(why) if why.contains("headers exceed")));
             assert!(stream.consumed <= HTTP_HEADER_LIMIT + 4);
@@ -729,7 +807,7 @@ mod tests {
         // before it can spend the blob allowance on header bytes.
         {
             let mut stream = Budgeted::new(&oversized, 8192, HTTP_HEADER_LIMIT + 4);
-            let most = usize::try_from(response_body_limit("GET", path, 200) + HTTP_FRAMING_ROOM)
+            let most = usize::try_from(response_body_limit("GET", path, 200, None) + HTTP_FRAMING_ROOM)
                 .unwrap_or(usize::MAX);
             let mut buf = [0u8; 8192];
             let mut total = 0usize;
@@ -747,17 +825,17 @@ mod tests {
         boundary.resize(HTTP_HEADER_LIMIT, b'a');
         boundary.extend_from_slice(b"\r\n\r\n");
         let mut stream = boundary.as_slice();
-        let (status, body) = read_response(&mut stream, "GET", path, alloc, alloc).unwrap();
+        let (status, body) = read_response(&mut stream, "GET", path, None, alloc, alloc).unwrap();
         assert_eq!(status, 200);
         assert!(body.is_empty());
 
         for path in [path, "/v1/list/manifests/unit"] {
-            let length = response_body_limit("GET", path, 200) + 1;
+            let length = response_body_limit("GET", path, 200, None) + 1;
             let head = format_in!(alloc, "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n");
             let reply = format_in!(alloc, "{head}must not read this body");
             let mut stream = Budgeted::new(reply.as_bytes(), head.len(), head.len());
             assert!(matches!(
-                read_response(&mut stream, "GET", path, alloc, alloc),
+                read_response(&mut stream, "GET", path, None, alloc, alloc),
                 Err(Error::Committed(why)) if why.contains("documented response body limit")
             ));
             assert!(!stream.exceeded);
@@ -770,11 +848,87 @@ mod tests {
         reply.extend_from_slice(b"abcd");
         let mut stream = Budgeted::new(&reply, head.len(), head.len() + 2);
         assert!(matches!(
-            read_response(&mut stream, "GET", path, alloc, alloc),
+            read_response(&mut stream, "GET", path, None, alloc, alloc),
             Err(Error::Committed(_))
         ));
         assert!(!stream.exceeded);
         assert_eq!(stream.consumed, head.len() + 2);
+    }
+
+    #[test]
+    fn committed_pack_ceiling_bounds_the_read_before_decoding_the_body() {
+        let alloc = test_alloc();
+        let path = "/v1/blob/packs/test.pack";
+        let exact = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabcde";
+        for fragment in [1, 3, 8192] {
+            let mut stream = Budgeted::new(exact, fragment, exact.len());
+            let (status, body) = read_response(&mut stream, "GET", path, Some(5), alloc, alloc).unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(body.as_slice(), b"abcde");
+            assert!(!stream.exceeded);
+        }
+
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n";
+        let mut long = Vec::from_slice_in(head, alloc);
+        long.extend_from_slice(b"unread oversized body");
+        let mut stream = Budgeted::new(&long, 3, head.len());
+        assert!(matches!(
+            read_response(&mut stream, "GET", path, Some(5), alloc, alloc),
+            Err(Error::Committed(why)) if why.contains("pack body ceiling")
+        ));
+        assert_eq!(stream.consumed, head.len());
+        assert!(!stream.exceeded);
+
+        let mut extra = Vec::from_slice_in(exact, alloc);
+        extra.extend_from_slice(b"one excess byte suffices");
+        for fragment in [exact.len(), 8192] {
+            let mut stream = Budgeted::new(&extra, fragment, exact.len() + 1);
+            assert!(matches!(
+                read_response(&mut stream, "GET", path, Some(5), alloc, alloc),
+                Err(Error::Committed(why)) if why.contains("exceeds Content-Length")
+            ));
+            assert_eq!(stream.consumed, exact.len() + 1);
+            assert!(!stream.exceeded);
+        }
+    }
+
+    #[test]
+    fn a_timed_out_read_after_200_is_a_committed_refusal() {
+        struct ExpiresAfter<'a>(&'a [u8]);
+
+        impl ByteRead for ExpiresAfter<'_> {
+            fn read_bytes(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
+                if self.0.is_empty() {
+                    return Err(IoError::from_errno(Errno::TimedOut));
+                }
+                self.0.read_bytes(buf)
+            }
+        }
+
+        let alloc = test_alloc();
+        let path = "/v1/blob/packs/test.pack";
+        let prefix = b"HTTP/1.1  200 OK\r\nContent-Length: 5\r\n\r\nabc";
+        for (reader, committed) in [(&b""[..], false), (&prefix[..], true)] {
+            let error = read_response(&mut ExpiresAfter(reader), "GET", path, Some(5), alloc, alloc).unwrap_err();
+            if committed {
+                assert!(matches!(error, Error::Committed(why) if why.contains("interrupted committed HTTP 200")));
+            } else {
+                assert!(matches!(error, Error::Io(why) if why.is_timed_out()));
+            }
+        }
+        assert!(matches!(
+            read_response(&mut &prefix[..], "GET", path, Some(5), alloc, alloc),
+            Err(Error::Committed(why)) if why.contains("Content-Length does not match")
+        ));
+        let blobs = Blobs {
+            address: SocketAddr::from(([127, 0, 0, 1], 0)),
+            timeout: Duration::from_secs(60),
+            alloc,
+        };
+        assert!(matches!(
+            blobs.published_until(&[0; 32], TcpDeadline::at_monotonic_nanos(0), alloc),
+            Err(Error::Io(why)) if why.is_timed_out()
+        ));
     }
 
     #[test]
@@ -789,15 +943,15 @@ mod tests {
         ] {
             for fragment in [1, 2, 7, 8192] {
                 let mut stream = Budgeted::new(reply, fragment, reply.len());
-                match decode_response("GET", path, Vec::from_slice_in(reply, alloc), alloc) {
+                match decode_response("GET", path, Vec::from_slice_in(reply, alloc), None, alloc) {
                     Ok(expected) => {
                         assert_eq!(
-                            read_response(&mut stream, "GET", path, alloc, alloc).unwrap(),
+                            read_response(&mut stream, "GET", path, None, alloc, alloc).unwrap(),
                             expected
                         );
                     }
                     Err(Error::Committed(_)) => assert!(matches!(
-                        read_response(&mut stream, "GET", path, alloc, alloc),
+                        read_response(&mut stream, "GET", path, None, alloc, alloc),
                         Err(Error::Committed(_))
                     )),
                     Err(other) => panic!("unexpected fixture refusal: {other}"),
@@ -818,9 +972,9 @@ mod tests {
         let alloc = test_alloc();
         let path = "/v1/blob/packs/test.pack";
         let small = u64::from(Limits::DOCUMENTED.request);
-        assert_eq!(response_body_limit("GET", path, 200), Limits::DOCUMENTED.blob);
+        assert_eq!(response_body_limit("GET", path, 200, None), Limits::DOCUMENTED.blob);
         for status in [404, 500] {
-            assert_eq!(response_body_limit("GET", path, status), small);
+            assert_eq!(response_body_limit("GET", path, status, None), small);
             let claimed = small + 1;
             let head = format_in!(
                 alloc,
@@ -829,7 +983,7 @@ mod tests {
             // Even a peer sending its response one byte at a time must be
             // refused before any body bytes can be read.
             let mut stream = Budgeted::new(head.as_bytes(), 1, head.len());
-            let error = read_response(&mut stream, "GET", path, alloc, alloc).unwrap_err();
+            let error = read_response(&mut stream, "GET", path, None, alloc, alloc).unwrap_err();
             assert!(!stream.exceeded);
             assert!(matches!(
                 error,
@@ -844,7 +998,7 @@ mod tests {
                 "HTTP/1.1 {status} Error\r\nTransfer-Encoding: chunked\r\n\r\n{claimed:x}\r\n"
             );
             assert!(matches!(
-                decode_response("GET", path, Vec::from_slice_in(chunked.as_bytes(), alloc), alloc),
+                decode_response("GET", path, Vec::from_slice_in(chunked.as_bytes(), alloc), None, alloc),
                 Err(Error::Protocol(why)) if why.contains("oversized chunked body")
             ));
         }
@@ -853,7 +1007,7 @@ mod tests {
         let large = small + 1;
         let head = format_in!(alloc, "HTTP/1.1 200 OK\r\nContent-Length: {large}\r\n\r\n");
         assert_eq!(
-            decode_head("GET", path, head.as_bytes(), alloc).unwrap().length,
+            decode_head("GET", path, head.as_bytes(), None, alloc).unwrap().length,
             Some(usize::try_from(large).unwrap())
         );
     }
@@ -863,13 +1017,13 @@ mod tests {
         let alloc = test_alloc();
         let blob = "/v1/blob/packs/abc.pack";
         let manifest = "/v1/list/manifests/abc";
-        assert_eq!(response_body_limit("GET", blob, 200), Limits::DOCUMENTED.blob);
+        assert_eq!(response_body_limit("GET", blob, 200, None), Limits::DOCUMENTED.blob);
         assert_eq!(
-            response_body_limit("GET", manifest, 200),
+            response_body_limit("GET", manifest, 200, None),
             u64::from(Limits::DOCUMENTED.request)
         );
         assert_eq!(
-            response_body_limit("PUT", blob, 200),
+            response_body_limit("PUT", blob, 200, None),
             u64::from(Limits::DOCUMENTED.request)
         );
         // A successful GET with a forged oversize length is a committed-data
@@ -877,7 +1031,7 @@ mod tests {
         let claimed = u64::from(Limits::DOCUMENTED.request) + 1;
         let oversized = format_in!(alloc, "HTTP/1.1 200 OK\r\nContent-Length: {claimed}\r\n\r\n");
         let refused =
-            decode_response("GET", manifest, Vec::from_slice_in(oversized.as_bytes(), alloc), alloc)
+            decode_response("GET", manifest, Vec::from_slice_in(oversized.as_bytes(), alloc), None, alloc)
                 .unwrap_err();
         assert!(matches!(
             &refused,
@@ -891,7 +1045,7 @@ mod tests {
         excessive_headers.extend(core::iter::repeat_n(b'a', HTTP_HEADER_LIMIT));
         excessive_headers.extend_from_slice(b"\r\n\r\n");
         assert!(matches!(
-            decode_response("GET", manifest, excessive_headers, alloc),
+            decode_response("GET", manifest, excessive_headers, None, alloc),
             Err(Error::Committed(_))
         ));
     }
@@ -902,7 +1056,7 @@ mod tests {
         let path = "/v1/list/manifests/unit";
         let fixed = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\na b c\n";
         let (status, body) =
-            decode_response("GET", path, Vec::from_slice_in(fixed, alloc), alloc).unwrap();
+            decode_response("GET", path, Vec::from_slice_in(fixed, alloc), None, alloc).unwrap();
         assert_eq!(status, 200);
         assert_eq!(body.as_slice(), b"a b c\n");
         let broken = [
@@ -916,7 +1070,7 @@ mod tests {
         ];
         for bytes in broken {
             assert!(matches!(
-                decode_response("GET", path, Vec::from_slice_in(bytes, alloc), alloc),
+                decode_response("GET", path, Vec::from_slice_in(bytes, alloc), None, alloc),
                 Err(Error::Committed(_))
             ));
         }
@@ -924,7 +1078,7 @@ mod tests {
         let chunks =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
         let (status, body) =
-            decode_response("GET", path, Vec::from_slice_in(chunks, alloc), alloc).unwrap();
+            decode_response("GET", path, Vec::from_slice_in(chunks, alloc), None, alloc).unwrap();
         assert_eq!(status, 200);
         assert_eq!(body.as_slice(), b"abcde");
         for bytes in [
@@ -934,7 +1088,7 @@ mod tests {
                 .as_slice(),
         ] {
             assert!(matches!(
-                decode_response("GET", path, Vec::from_slice_in(bytes, alloc), alloc),
+                decode_response("GET", path, Vec::from_slice_in(bytes, alloc), None, alloc),
                 Err(Error::Committed(_))
             ));
         }
@@ -943,6 +1097,7 @@ mod tests {
             "GET",
             path,
             Vec::from_slice_in(b"HTTP/1.1 404 Not Found\r\n\r\nnot here", alloc),
+            None,
             alloc,
         )
         .unwrap();
@@ -959,8 +1114,9 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\npartial".as_slice(),
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\npart".as_slice(),
         ] {
-            let refused =
-                read_failure("GET", path, bytes, IoError::from_errno(Errno::TimedOut), alloc);
+            let refused = read_failure(
+                "GET", path, committed_get_head("GET", bytes), IoError::from_errno(Errno::TimedOut), alloc,
+            );
             assert!(
                 matches!(&refused, Error::Committed(why) if why.contains(path)),
                 "partial HTTP 200 must be a committed-state refusal: {refused}"
@@ -975,7 +1131,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nSome-Header: \xff\r\n\r\n".as_slice(),
         ] {
             assert!(matches!(
-                decode_response("GET", path, Vec::from_slice_in(bytes, alloc), alloc),
+                decode_response("GET", path, Vec::from_slice_in(bytes, alloc), None, alloc),
                 Err(Error::Committed(_))
             ));
         }
@@ -988,7 +1144,7 @@ mod tests {
             ("PUT", b"HTTP/1.1 200 OK".as_slice()),
         ] {
             assert!(matches!(
-                read_failure(method, path, partial, IoError::from_errno(Errno::TimedOut), alloc),
+                read_failure(method, path, committed_get_head(method, partial), IoError::from_errno(Errno::TimedOut), alloc),
                 Error::Io(_)
             ));
         }

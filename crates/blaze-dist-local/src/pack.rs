@@ -153,6 +153,9 @@ pub struct Pack<A: Allocator> {
     pub reference: PackRef,
 }
 
+/// Target size of an ordinary native pack before a single large record is considered.
+pub(crate) const BATCH_BYTES_TARGET: usize = 64 << 20;
+
 impl<A: Allocator> fmt::Debug for Pack<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Pack")
@@ -232,7 +235,7 @@ impl<A: Allocator> Pack<A> {
         A: Clone,
     {
         let max_items = usize::try_from(Limits::DOCUMENTED.batch_items).unwrap_or(usize::MAX);
-        Self::batches_with_limits(values, max_items, 64 << 20, alloc)
+        Self::batches_with_limits(values, max_items, BATCH_BYTES_TARGET, alloc)
     }
 
     // A small limit makes the real partitioning path testable without allocating
