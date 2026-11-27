@@ -12,6 +12,10 @@ on:
         description: Run one distributed build on three GitHub-hosted ARM64 machines
         type: boolean
         default: false
+      three_host_benchmark:
+        description: Compare unpaused solo and three-machine dev exports after a cold start and a private edit
+        type: boolean
+        default: false
 
 concurrency:
   # A pull request's newer push cancels its run before. Main runs one push at a time: a push
@@ -888,7 +892,7 @@ jobs:
           if-no-files-found: warn
 
   three-hosts:
-    if: github.event_name == 'workflow_dispatch' && inputs.three_hosts
+    if: github.event_name == 'workflow_dispatch' && (inputs.three_hosts || inputs.three_host_benchmark)
     needs: source-compiler
     permissions:
       contents: read
@@ -898,6 +902,8 @@ jobs:
     with:
       source: ${{ github.sha }}
       source_run: ${{ github.run_id }}
+      proof: ${{ inputs.three_hosts }}
+      benchmark: ${{ inputs.three_host_benchmark }}
 
   ci:
     name: ci

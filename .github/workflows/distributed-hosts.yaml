@@ -8,6 +8,12 @@ on:
       source_run:
         required: true
         type: string
+      proof:
+        type: boolean
+        default: true
+      benchmark:
+        type: boolean
+        default: false
 
 # Protect this environment so only trusted dispatch refs can request a tailnet identity.
 # Set BLAZE_TAILSCALE_CLIENT_ID on the environment.
@@ -377,18 +383,51 @@ jobs:
             test "$boot_id" = "$expected"
           done
 
-      - name: Prove two helpers performed useful unique work for the primary build
+      - name: Run the requested three-host build
         id: build
         if: matrix.role == 'primary'
         timeout-minutes: 40
+        env:
+          RUN_PROOF: ${{ inputs.proof }}
+          RUN_BENCHMARK: ${{ inputs.benchmark }}
         run: |
           out="$RUNNER_TEMP/host-evidence"
-          timeout -k 30s 2280s python3 harness/distv2.py "$out/host-input.json" \
-            2>&1 | tee "$out/build.log"
-          proof="$RUNNER_TEMP/blaze-fs/host-case/worker/three-host-proof.json"
-          timeout 10s jq -e '
-            (.hosts | length == 3) and (.proof.placed_helper_keys | length == 2 and all(length > 0))
-          ' "$proof"
+          if [[ "$RUN_PROOF" == true ]]; then
+            timeout -k 30s 2280s python3 harness/distv2.py "$out/host-input.json" 2>&1 | tee "$out/build.log"
+            proof="$RUNNER_TEMP/blaze-fs/host-case/worker/three-host-proof.json"
+            timeout 10s jq -e '
+              (.hosts | length == 3) and (.proof.placed_helper_keys | length == 2 and all(length > 0))
+            ' "$proof"
+          fi
+          if [[ "$RUN_BENCHMARK" == true ]]; then
+            for sample in 1 2 3; do
+              # jq variables are evaluated by jq.
+              # shellcheck disable=SC2016
+              timeout 10s jq --argjson sample "$sample" '
+                .benchmark = true | .solo_first = ($sample % 2 == 1) |
+                (.scratch, .helpers[].scratch) += ("-sample-" + ($sample|tostring))
+              ' "$out/host-input.json" > "$out/input-$sample.json"
+              timeout -k 30s 900s python3 harness/distv2.py "$out/input-$sample.json" 2>&1 | tee "$out/benchmark-$sample.log"
+            done
+            timeout 10s python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import os
+          from pathlib import Path
+          from statistics import median
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "blaze-fs/host-case"
+          reports = [json.loads((root / f"worker-sample-{i}/three-host-latency.json").read_text())
+                     for i in (1, 2, 3)]
+          print("Median dev export time across three repetitions, two compiler cores per runner.")
+          print("\n| Phase | Solo | Three-runner primary | Solo / primary |")
+          print("|---|---:|---:|---:|")
+          for phase in ("cold", "edit"):
+              rows = [report["phases"][phase] for report in reports]
+              solo = median(row["solo_export_ns"] for row in rows) / 1e9
+              primary = median(row["primary_export_ns"] for row in rows) / 1e9
+              print(f"| {phase} | {solo:.3f} s | {primary:.3f} s | {solo / primary:.3f}× |")
+          PY
+          fi
 
       - name: Verify the primary's source executables after the build
         id: primary_identity
@@ -454,6 +493,8 @@ jobs:
             ${{ runner.temp }}/blaze-fs/host-case/**/*.log
             ${{ runner.temp }}/blaze-fs/host-case/**/.blaze/v2/start.txt
             ${{ runner.temp }}/blaze-fs/host-case/**/.blaze/v2/profile.txt
+            ${{ runner.temp }}/blaze-fs/host-case/**/cold/*.txt
+            ${{ runner.temp }}/blaze-fs/host-case/**/edit/*.txt
             ${{ runner.temp }}/blaze-fs/host-case/**/*.parquet
           if-no-files-found: warn
           include-hidden-files: true

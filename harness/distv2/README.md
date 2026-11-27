@@ -76,6 +76,15 @@ In GitHub, restrict the `blaze-distributed-hosts` environment to that branch and
 gh workflow run blaze.yaml --repo ScriptedAlchemy/blaze --ref "<trusted-branch>" -f three_hosts=true
 ```
 
+For latency, dispatch with `-f three_host_benchmark=true`. Three paired repetitions
+compare a solo export with the primary's export on the same runner while two remote
+helpers participate. Each runner has two compiler cores. Each repetition starts with
+fresh project state and a staged toolchain, then edits one private function and exports
+again using the same home and output path. Solo and distributed order alternates.
+The timer runs from export launch to command exit. CI checks the resulting binary and
+stdout against solo after timing. The job summary gives medians and the primary evidence
+archive includes a `three-host-latency.json` for each repetition.
+
 The runners pin SSH keys for that attempt. The coordinator and cache are reached through
 SSH forwards and listen only locally. The harness holds each participant's first real grant
 before letting the workers publish. The proof checks distinct hosts, disjoint compiled function

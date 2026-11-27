@@ -866,6 +866,31 @@ def host_test_held(index: int) -> dict:
 
 
 class HostProof(unittest.TestCase):
+    def test_benchmark_keeps_primary_latency_and_rejects_a_stale_helper_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            node = dict(checkout=directory, scratch=directory, blaze="/blaze", python=sys.executable,
+                        runner="runner", socket="/coordinator", blobs="127.0.0.1:80")
+            request = h.load_host(dict(**node, role="controller", namespace="sample", cores=2, timeout=60,
+                                       benchmark=True, solo_first=False, dist_local="/coord", serve="/serve",
+                                       ssh_config="/config", helpers=[dict(alias=role, **node) for role in ("helper-1", "helper-2")]))
+            cold_source, cold_stdout = h.host_fixture(root / "project")
+            edit_source, edit_stdout = h.host_edit_fixture(root / "project")
+            solo = {phase: dict(source_sha256=source, artifact=dict(stdout=stdout, sha256=source),
+                                elapsed_ns=100, identity={"runner": "primary"})
+                    for phase, source, stdout in (("cold", cold_source, cold_stdout), ("edit", edit_source, edit_stdout))}
+            h.host_check_latency_edit(solo["cold"], solo["edit"])
+            distributed = {phase: [dict(row, elapsed_ns=elapsed) for elapsed in (75, 40, 95)]
+                           for phase, row in solo.items()}
+            h.host_latency_report(root, request, [{"runner": name} for name in ("primary", "helper-1", "helper-2")],
+                                  solo, distributed)
+            report = json.loads((root / "three-host-latency.json").read_text())
+            self.assertEqual(report["phases"]["edit"]["primary_export_ns"], 75)
+            self.assertEqual(report["order"], ["distributed", "solo"])
+            distributed["edit"][2]["artifact"] = solo["cold"]["artifact"]
+            with self.assertRaisesRegex(e.Failed, "must match the solo control"):
+                h.host_latency_report(root, request, list(report["hosts"].values()), solo, distributed)
+
     def test_host_helpers_enable_the_result_gate_for_all_holders(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
