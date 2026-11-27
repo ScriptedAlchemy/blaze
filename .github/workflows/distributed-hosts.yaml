@@ -146,10 +146,17 @@ jobs:
           audience: api.tailscale.com/${{ vars.BLAZE_TAILSCALE_CLIENT_ID }}
           tags: tag:blaze-ci
           hostname: ${{ env.SESSION }}-${{ matrix.role }}
-          args: --accept-dns=false --accept-routes=false --ssh=false
+          args: --accept-dns=false --ssh=false
           timeout: 1m
           retry: "1"
           log-mode: quiet
+
+      - name: Disable subnet routes before starting peer services
+        timeout-minutes: 1
+        run: |
+          # The pinned action supplies --accept-routes to tailscale up.
+          timeout 15s sudo tailscale set --accept-routes=false
+          timeout 10s sudo tailscale debug prefs | jq -e '.RouteAll == false and .CorpDNS == false and .RunSSH == false'
 
       - name: Generate SSH identities and publish only the public rendezvous
         timeout-minutes: 2
