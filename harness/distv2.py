@@ -59,6 +59,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -1645,7 +1646,108 @@ def host_checked_output(command: list[str], *, timeout: int, env: dict | None = 
     return subprocess.check_output(command, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
 
 
+def host_affinity() -> list[int]:
+    evidence.require(sys.platform.startswith("linux") and callable(getattr(os, "sched_getaffinity", None))
+                     and callable(getattr(os, "sched_setaffinity", None)),
+                     "three-host benchmark requires Linux CPU affinity")
+    try:
+        return sorted(os.sched_getaffinity(0))
+    except OSError as error:
+        raise evidence.Failed(f"cannot read benchmark CPU affinity: {error}") from error
+
+
+def host_pin_cores(cores: int) -> None:
+    # Called at session entry, before threads or services: fork and exec inherit this mask.
+    available = host_affinity()
+    evidence.require(len(available) >= cores,
+                     f"benchmark needs {cores} CPUs in the runner affinity; available {available}")
+    selected = available[:cores]
+    try:
+        os.sched_setaffinity(0, selected)
+    except OSError as error:
+        raise evidence.Failed(f"cannot pin benchmark CPU affinity to {selected}: {error}") from error
+    evidence.require(host_affinity() == selected, f"kernel did not retain benchmark CPU affinity {selected}")
+
+
+def host_cpu_list(raw: str) -> set[int]:
+    evidence.require(re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*", raw) is not None,
+                     f"invalid effective cgroup cpuset: {raw!r}")
+    cpus = set()
+    for part in raw.split(","):
+        first, _, last = part.partition("-")
+        start, end = int(first), int(last or first)
+        evidence.require(start <= end, f"reversed effective cgroup cpuset range: {part}")
+        cpus.update(range(start, end + 1))
+    return cpus
+
+
+def host_cgroup_budget(cores: int, cpus: list[int], *, proc: Path = Path("/proc/self")) -> dict:
+    """Read every visible ancestor limit; a leaf's unlimited cpu.max does not remove its parent's cap."""
+    try:
+        membership = (proc / "cgroup").read_text().strip()
+        groups = [line.removeprefix("0::") for line in membership.splitlines() if line.startswith("0::")]
+        evidence.require(len(groups) == 1 and groups[0].startswith("/") and ".." not in Path(groups[0]).parts,
+                         "benchmark requires a readable cgroup v2 membership")
+        mounts = [line.split(" - ", 1)[0].split() for line in (proc / "mountinfo").read_text().splitlines()
+                  if " - cgroup2 " in line]
+        evidence.require(len(mounts) == 1 and len(mounts[0]) >= 5 and mounts[0][3] == "/",
+                         "benchmark requires the full cgroup v2 hierarchy to check ancestor quotas")
+        mount = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), mounts[0][4])
+        root = Path(mount)
+        controllers = (root / "cgroup.controllers").read_text().split()
+        evidence.require({"cpu", "cpuset"}.issubset(controllers),
+                         "benchmark requires readable cgroup v2 CPU and cpuset controllers")
+        current = root / groups[0].removeprefix("/")
+        evidence.require(root.is_absolute() and current.is_dir(), "benchmark cgroup membership is not visible at its mount")
+        limits = []
+        effective_cpuset = None
+        effective_quota = None
+        while True:
+            row = {"path": str(current)}
+            for name in ("cpu.max", "cpuset.cpus.effective"):
+                try:
+                    row[name] = (current / name).read_text().strip()
+                except FileNotFoundError:
+                    # The root has no cpu.max; a controller not enabled below an ancestor
+                    # adds no child limit. Keep those absences in the retained evidence.
+                    row[name] = None
+            limits.append(row)
+            if row["cpu.max"] is not None:
+                quota, period = row["cpu.max"].split()
+                evidence.require(period.isdecimal() and int(period) > 0 and
+                                 (quota == "max" or (quota.isdecimal() and int(quota) > 0)),
+                                 f"{current}: invalid cpu.max {row['cpu.max']!r}")
+                if quota != "max":
+                    quota_us, period_us = int(quota), int(period)
+                    evidence.require(quota_us >= cores * period_us,
+                                     f"{current}: cpu.max {quota} {period} allows less than {cores} benchmark cores")
+                    if (effective_quota is None or
+                            quota_us * effective_quota["period_us"] < effective_quota["quota_us"] * period_us):
+                        effective_quota = {"path": str(current), "quota_us": quota_us, "period_us": period_us}
+            if row["cpuset.cpus.effective"] is not None:
+                allowed = host_cpu_list(row["cpuset.cpus.effective"])
+                evidence.require(set(cpus).issubset(allowed),
+                                 f"{current}: benchmark affinity {cpus} escapes effective cgroup cpuset {sorted(allowed)}")
+                if effective_cpuset is None:
+                    effective_cpuset = sorted(allowed)
+            if current == root:
+                break
+            current = current.parent
+        evidence.require(effective_cpuset is not None, "benchmark cgroup hierarchy has no effective cpuset evidence")
+        return {"membership": membership, "mount": mount, "controllers": controllers, "limits": limits,
+                "effective_cpuset": effective_cpuset, "effective_cpu_max": effective_quota}
+    except (OSError, ValueError) as error:
+        raise evidence.Failed(f"cannot establish benchmark cgroup CPU budget: {error}") from error
+
+
+def host_resources(cores: int) -> dict:
+    cpus = host_affinity()
+    evidence.require(len(cpus) == cores, f"benchmark requires exactly {cores} pinned CPUs; observed {cpus}")
+    return {"configured_workers": cores, "sched_affinity": cpus, "cgroup": host_cgroup_budget(cores, cpus)}
+
+
 def host_node_identity(given: HostWorker, env: dict, source: str) -> dict:
+    resources = {"resources": host_resources(given.cores)} if given.benchmark else {}
     boot_id = str(UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
     git = ["git", "-C", given.checkout, "rev-parse"]
     triple = json.loads(host_checked_output([given.blaze, "toolchain", "--json"], timeout=given.timeout, env=env))["host"]
@@ -1667,6 +1769,7 @@ def host_node_identity(given: HostWorker, env: dict, source: str) -> dict:
         "workload_sha256": source,
         "triple": triple,
         "cores": given.cores,
+        **resources,
     }
 
 
@@ -1689,6 +1792,8 @@ def host_wait_gate(gate: Path, events_path: Path, process: subprocess.Popen, dea
 
 
 def host_spawn_export(given: HostWorker, root: Path, project: Path, env: dict, log) -> subprocess.Popen:
+    if given.benchmark:
+        evidence.require(len(host_affinity()) == given.cores, "benchmark CPU affinity changed before export")
     return subprocess.Popen(
         [given.blaze, "export", "-p", HOST_PACKAGE, "-o", str(root / "artifact"), "--stats"],
         cwd=project, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
@@ -1730,6 +1835,15 @@ def host_latency_work(log_path: Path, report_path: Path | None) -> dict:
     return work
 
 
+def host_body_workers(profile: Path, cores: int) -> int:
+    rows = re.findall(r"^Bodies floor:.*; at ([0-9]+) workers the same sum would be ",
+                      profile.read_text(), re.MULTILINE)
+    evidence.require(len(rows) == 1, f"{profile}: expected one measured body-pool worker count")
+    observed = int(rows[0])
+    evidence.require(observed == cores, f"{profile}: requested {cores} workers but compiler reported {observed}")
+    return observed
+
+
 def host_latency_export(given: HostWorker, root: Path, project: Path, env: dict, phase: str,
                         source: str, expected: str) -> dict:
     phase_dir = root / phase
@@ -1759,6 +1873,7 @@ def host_latency_export(given: HostWorker, root: Path, project: Path, env: dict,
     for name in profiles:
         shutil.copyfile(state / name, phase_dir / name)
     work = host_latency_work(log_path, report_path)
+    work["body_pool_workers"] = host_body_workers(phase_dir / "profile.txt", given.cores)
     work_path = phase_dir / "work.json"
     host_write_json(work_path, work)
     evidence_paths = {"log": str(log_path), "work": str(work_path),
@@ -1788,9 +1903,10 @@ def host_latency_worker(given: HostWorker, root: Path, project: Path, env: dict,
     for phase in ("cold", "edit"):
         controls.receive(phase, time.monotonic() + given.timeout)
         result = host_latency_export(given, root, project, env, phase, source, expected)
-        result["identity"] = host_node_identity(given, env, source)
-        evidence.require(result["identity"] == {**identity, "workload_sha256": source},
+        measured = host_node_identity(given, env, source)
+        evidence.require(measured == {**identity, "workload_sha256": source},
                          f"{given.runner}: measured identity changed during {phase}")
+        result["identity"] = {**measured, "observed_body_workers": result["work"]["body_pool_workers"]}
         if previous is not None:
             host_check_latency_edit(previous, result)
         host_write_json(root / phase / "result.json", result)
@@ -1802,6 +1918,8 @@ def host_latency_worker(given: HostWorker, root: Path, project: Path, env: dict,
 
 
 def host_worker(given: HostWorker) -> None:
+    if given.benchmark:
+        host_pin_cores(given.cores)
     root = Path(given.scratch)
     root.mkdir(parents=True, exist_ok=False)
     project = root / "project"
@@ -1969,7 +2087,8 @@ def host_solo_latency(given: HostController, root: Path, project: Path, env: dic
     evidence.require(edited_identity == {**identity, "workload_sha256": source},
                      "solo compiler or host identity changed during timing")
     host_check_latency_edit(cold, edit)
-    return {"cold": {**cold, "identity": identity}, "edit": {**edit, "identity": edited_identity}}
+    return {"cold": {**cold, "identity": {**identity, "observed_body_workers": cold["work"]["body_pool_workers"]}},
+            "edit": {**edit, "identity": {**edited_identity, "observed_body_workers": edit["work"]["body_pool_workers"]}}}
 
 
 def host_distributed_latency(given: HostController, channels: list, identities: list[dict]) -> dict:
@@ -1992,8 +2111,9 @@ def host_distributed_latency(given: HostController, channels: list, identities: 
     for (_, _, child), identity, before, after in zip(channels, identities, cold, edit, strict=True):
         evidence.require(child.wait(timeout=max(0.001, deadline - time.monotonic())) == 0,
                          f"{identity['runner']}: worker session failed")
-        evidence.require(before["identity"] == identity and before["source_sha256"] == identity["workload_sha256"]
-                         and after["identity"] == {**identity, "workload_sha256": source}
+        expected = {**identity, "observed_body_workers": given.cores}
+        evidence.require(before["identity"] == expected and before["source_sha256"] == identity["workload_sha256"]
+                         and after["identity"] == {**expected, "workload_sha256": source}
                          and after["source_sha256"] == source and after["artifact"]["stdout"] == stdout,
                          f"{identity['runner']}: measured host or source differs from the prepared worker")
         host_check_latency_edit(before, after)
@@ -2009,7 +2129,12 @@ def host_latency_report(root: Path, given: HostController, identities: list[dict
         workers = dict(zip(roles, distributed[phase], strict=True))
         evidence.require(workers["primary"]["identity"] == reference["identity"],
                          f"{phase}: solo and distributed primary must use the same host and compiler")
-        for role, result in workers.items():
+        for role, result in (("solo", reference), *workers.items()):
+            identity = result["identity"]
+            evidence.require(identity["observed_body_workers"] == given.cores
+                             and identity["resources"]["configured_workers"] == given.cores
+                             and len(identity["resources"]["sched_affinity"]) == given.cores,
+                             f"{phase} {role}: configured, pinned and observed workers must match the core budget")
             evidence.require(result["source_sha256"] == reference["source_sha256"]
                              and result["artifact"] == reference["artifact"],
                              f"{phase} {role}: source, artifact bytes and stdout must match the solo control")
@@ -2017,13 +2142,15 @@ def host_latency_report(root: Path, given: HostController, identities: list[dict
                          "primary_export_ns": workers["primary"]["elapsed_ns"],
                          "solo": reference, "workers": workers}
     host_write_json(root / "three-host-latency.json", {
-        "schema": 1, "order": order, "hosts": dict(zip(roles, identities, strict=True)), "phases": phases,
+        "schema": 2, "order": order, "hosts": dict(zip(roles, identities, strict=True)), "phases": phases,
         "timing": "Per-process monotonic wall time on the launching host from export spawn through exit",
     })
     print("distv2: unpaused cold and private-body edit exports match solo on all three hosts", flush=True)
 
 
 def host_controller(given: HostController) -> None:
+    if given.benchmark:
+        host_pin_cores(given.cores)
     root = Path(given.scratch)
     root.mkdir(parents=True, exist_ok=False)
     solo_root = root / "solo"

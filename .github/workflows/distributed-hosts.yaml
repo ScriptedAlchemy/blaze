@@ -418,7 +418,8 @@ jobs:
           root = Path(os.environ["RUNNER_TEMP"]) / "blaze-fs/host-case"
           reports = [json.loads((root / f"worker-sample-{i}/three-host-latency.json").read_text())
                      for i in (1, 2, 3)]
-          print("Median dev export time across three repetitions, two compiler cores per runner.")
+          print("Median dev export time across three repetitions, two pinned CPUs per runner.")
+          print("Each sample verifies the inherited affinity, cgroup quota and reported two-worker body pool.")
           print("\n| Phase | Solo | Three-runner primary | Solo / primary |")
           print("|---|---:|---:|---:|")
           for phase in ("cold", "edit"):

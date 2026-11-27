@@ -1,0 +1,19 @@
+{
+  "id": "forkfixes-detached-home-20261127",
+  "date": "2026-11-27",
+  "who": "GPT-6 Astra Pro, distributed transport review lane",
+  "where": "harness/forkfixes.py",
+  "what": "Production acceptance run 46032696808 executed and passed a-test-sees-the-library-beside-its-bin, then failed removing its temporary HOME alias container with ENOTEMPTY. The run stopped after 17 of 23 fixtures passed, leaving the final five unexecuted.",
+  "cost": "A successful compiler test could not supply migration acceptance because the harness began namespace cleanup without proving every process using that namespace had exited.",
+  "cause": "run_command waited for its foreground PID only. Blaze may launch detached background GC with the same HOME; setsid moves that helper outside the process group used for timeout cleanup. The failure artifact has no leftover-directory listing, so it does not identify the specific remaining writer.",
+  "whys": [
+    "cleanup_logical_home unlinked the short HOME alias before removing its parent directory.",
+    "Foreground exit was treated as proof that no descendant could still use or recreate the alias.",
+    "The timeout helper signalled a process group, which does not contain descendants that create their own sessions.",
+    "No causal fixture had held a detached HOME user beyond foreground completion."
+  ],
+  "class": "temporary namespace cleanup precedes completion of the process tree that owns it",
+  "prevention": "On Linux, each serial command enters subreaper ownership after a non-reaping probe refuses pre-existing children. Detached descendants are reaped before HOME cleanup. Draining has an explicit deadline; forced cleanup verifies every PID remains an unreaped child before signalling it. Incomplete cleanup retains both subreaper ownership and the HOME aliases, records the failure, and stops acceptance. A missing or unreadable completion record after an exception also retains aliases without replacing the original failure. The existing non-Linux process-group path remains supported.",
+  "fix": "Added recorded descendant outcomes and completion evidence, deterministic ownership and timeout controls, and a Linux fork/setsid fixture whose pipe handshake holds the helper past foreground exit. A planted foreground-only completion rule fails the same oracle. Cleanup errors, fixture coverage, and provenance requirements remain mandatory.",
+  "state": "Implemented with local causal tests; the main lane coordinates hosted migration acceptance."
+}

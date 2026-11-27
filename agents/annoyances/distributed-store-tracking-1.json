@@ -1,0 +1,20 @@
+{
+  "id": "distributed-store-tracking-1",
+  "date": "2026-11-27",
+  "who": "GPT-6 Astra Pro, compiler_worker_bridge lane",
+  "where": "crates/blaze-cli/src/engine_dist.rs: DistStore",
+  "what": "Each local put copied code into the home, the overlay and the write log. Draining preinserted writes skipped pointer targets already cached before the batch, and imported pointers could remain shadowed by an older overlay value.",
+  "cost": "Two additional retained payload copies per generated record; a pointer-only batch could publish an incomplete result.",
+  "cause": "Tracking represented writes as captured payload values instead of keys resolved against the authoritative store.",
+  "whys": [
+    "The bridge kept a write log to publish locally emitted records.",
+    "The same records were also put in the overlay even though the home already owned them.",
+    "The drain prefilled its deduplication map from the log, so a written pointer appeared complete before its target was traversed.",
+    "Existing tests exercised importing pointer targets but not exporting pointers to previously cached targets."
+  ],
+  "class": "Replicated mutable store state and value-based write tracking bypass dependency traversal.",
+  "prevention": "Track successful writes and reads by key; resolve current values and follow targets through one export path. Keep peer bytes only until acceptance. Deterministic store tests cover pointer closure, replacement precedence, failed writes and backing allocation equality.",
+  "workaround": "none",
+  "fix": "DistStore key tracking and engine_dist/tests.rs regressions; validation pending.",
+  "state": "open"
+}
