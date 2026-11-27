@@ -6,6 +6,7 @@
 mod mapped;
 
 pub(crate) mod beneath;
+pub use beneath::{ConfinedEntries, ConfinedFiles};
 
 pub(crate) use mapped::{map, map_extent, map_write};
 pub use mapped::{Advice, MapOptions, Mapped, MappedWrite, granularity};
