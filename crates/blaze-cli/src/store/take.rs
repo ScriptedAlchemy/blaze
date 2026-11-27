@@ -760,13 +760,7 @@ fn take_counted<D: Driver, O: Origin + ?Sized>(
     // 3. The root last, then the floor, then the single atomic commit that makes everything durable.
     kept.sort_unstable();
     kept.dedup();
-    let scope_index = scope_directory::keep(&mut place, &mut scope_rows, &kept)?;
-    if let Some(index) = scope_index {
-        let index = CasKey(index.0);
-        if let Err(at) = kept.binary_search(&index) {
-            kept.insert(at, index);
-        }
-    }
+    let scope_index = scope_directory::keep(&mut place, &mut scope_rows, &mut kept)?;
     roots::keep_toolchain(lent, toolchain, &kept, &[]).map_err(TakeError::Root)?;
     let receipt = TakenHead { scope_index, ..receipt(&head, &checked) };
     published::keep_floor(&mut place, &set, Seen { generation: head.generation, taken: Some(receipt) }).map_err(TakeError::Published)?;

@@ -65,7 +65,7 @@ pub(super) fn wire<'m, D: Driver>(lent: &'m Lent<D, StoreAlloc>, entry: &Entry<'
 
 /// Verifies closure in the selected signed generation and reconstructs the local expansion
 /// reach index of each scope using the keys its payload actually names.
-fn keep_reach<D: Driver>(lent: &Lent<D, StoreAlloc>, entry: &Entry<'_>, signed: &[CasKey]) -> Result<(), TakeError> {
+fn keep_reach<D: Driver>(lent: &Lent<D, StoreAlloc>, entry: &Entry<'_>, signed: &[CasKey]) -> Result<Option<CasKey>, TakeError> {
     if signed.binary_search(&CasKey(entry.payload.0)).is_err() {
         return Err(refused(entry.payload, "the scope payload is outside the signed generation"));
     }
@@ -94,15 +94,15 @@ fn keep_reach<D: Driver>(lent: &Lent<D, StoreAlloc>, entry: &Entry<'_>, signed: 
         }
         keys.push(expansion);
     }
-    if !keys.is_empty() {
-        lent.index_beside(CasKey(entry.payload.0), &keys).map_err(place_error)?;
+    if keys.is_empty() {
+        return Ok(None);
     }
-    Ok(())
+    lent.index_beside(CasKey(entry.payload.0), &keys).map(Some).map_err(place_error)
 }
 
 /// The whole set has been checked. The directory and all its references join the same toolchain
 /// root and commit as the receipt.
-pub(super) fn keep<D: Driver>(place: &mut PlainPlace<'_, D>, rows: &mut [(Key, Key)], signed: &[CasKey]) -> Result<Option<Key>, TakeError> {
+pub(super) fn keep<D: Driver>(place: &mut PlainPlace<'_, D>, rows: &mut [(Key, Key)], kept: &mut blaze_own::Vec<CasKey, StoreAlloc>) -> Result<Option<Key>, TakeError> {
     if rows.is_empty() {
         return Ok(None);
     }
@@ -112,11 +112,14 @@ pub(super) fn keep<D: Driver>(place: &mut PlainPlace<'_, D>, rows: &mut [(Key, K
     }
     let lent = place.lent();
     let mut bytes = blaze_own::Vec::with_capacity_in(rows.len() * ROW_BYTES, *lent.alloc());
+    let mut reach = blaze_own::Vec::with_capacity_in(rows.len(), *lent.alloc());
     for &(task, candidate) in rows.iter() {
         let held = lent.get(&CasKey(candidate.0)).map_err(place_error)?
             .ok_or_else(|| refused(candidate, "the verified scope entry is missing"))?;
         let entry = Entry::open(held.bytes).map_err(|_| refused(candidate, "the verified scope entry is malformed"))?;
-        keep_reach(lent, &entry, signed)?;
+        if let Some(index) = keep_reach(lent, &entry, kept)? {
+            reach.push(index);
+        }
         bytes.extend_from_slice(&task.0.0);
         bytes.extend_from_slice(&candidate.0.0);
     }
@@ -125,6 +128,10 @@ pub(super) fn keep<D: Driver>(place: &mut PlainPlace<'_, D>, rows: &mut [(Key, K
     if put == blaze_keyed::store::Put::Other {
         return Err(TakeError::TwoValues { key: key.0 });
     }
+    kept.extend_from_slice(&reach);
+    kept.push(CasKey(key.0));
+    kept.sort_unstable();
+    kept.dedup();
     Ok(Some(key))
 }
 

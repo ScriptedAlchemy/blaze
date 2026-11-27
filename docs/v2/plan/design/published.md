@@ -101,8 +101,7 @@ the planned source and complete producer identity. Its content covers the toolch
 target, scope payload key and sorted `(cell, digest)` witnesses. The writer has these values where
 it saves the toolchain answer. It checks that the scope and every expansion it names are held in
 the public namespace and that each witness refers to a closed toolchain dependency. A scope with
-findings or checkout reads stays local. The public entry carries no checkout page, serial, cause
-or file position.
+findings or checkout reads stays local.
 
 The signed take builds a sorted directory from the verified entries and attaches its key to the
 completed receipt. It refuses conflicting entries for one task key and missing public payloads.
