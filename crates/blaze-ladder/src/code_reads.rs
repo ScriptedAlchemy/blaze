@@ -1130,10 +1130,15 @@ impl<'a> Answers<'a> {
         self.rows.binary_search_by(|row| row.0[..].cmp(question)).ok().map(|at| self.rows[at].1)
     }
 
+    /// This exact question and answer were proved in this run by an entry that held.
+    pub(crate) fn holds(&self, question: &[u8], answer: ContentId) -> bool {
+        self.get(question) == Some(answer)
+    }
+
     /// Every question in this entry already has its exact answer in this run.
     /// An incomplete or different answer still needs the ordinary verifier.
     pub(crate) fn covers(&self, entry: &EntryView<'_>) -> bool {
-        entry.reads().all(|row| row.is_ok_and(|(question, answer)| self.get(question) == Some(answer)))
+        entry.reads().all(|row| row.is_ok_and(|(question, answer)| self.holds(question, answer)))
     }
 
     fn keep(&mut self, question: &[u8], answer: ContentId) {
