@@ -50,8 +50,14 @@ jobs:
         timeout-minutes: 1
         env:
           SOURCE_RUN: ${{ inputs.source_run }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
           CLIENT: ${{ vars.BLAZE_TAILSCALE_CLIENT_ID }}
         run: |
+          if [[ "$GITHUB_REPOSITORY_ID" != 1433869082 || "$GITHUB_ACTOR_ID" != 25274700 \
+                || "$TRIGGERING_ACTOR" != "$GITHUB_REPOSITORY_OWNER" ]]; then
+            echo "::error::Only the ScriptedAlchemy/blaze owner may start or rerun the private-network jobs."
+            exit 1
+          fi
           if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$GITHUB_REF" != refs/heads/* \
                 || "$GITHUB_WORKFLOW_REF" != "$GITHUB_REPOSITORY/.github/workflows/blaze.yaml@$GITHUB_REF" \
                 || "$SOURCE" != "$GITHUB_SHA" || "$SOURCE_RUN" != "$GITHUB_RUN_ID" ]]; then

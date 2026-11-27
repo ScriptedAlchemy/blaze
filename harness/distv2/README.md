@@ -40,6 +40,13 @@ python3 -m py_compile harness/distv2.py harness/distv2/evidence.py harness/distv
 python3 harness/distv2/selfcheck.py
 ```
 
+## CI approval
+
+GitHub requires maintainer approval for fork PR workflow runs from all outside contributors.
+Regular workflow tokens default to read-only. PR workflow approval permits the regular CI checks.
+Private network enrollment requires a separate manual dispatch by the repository owner from the
+authorized branch. Only the owner can rerun those jobs.
+
 ## Three GitHub-hosted ARM64 machines
 
 The manual `three_hosts` option runs a primary and two helpers against the same sealed source
