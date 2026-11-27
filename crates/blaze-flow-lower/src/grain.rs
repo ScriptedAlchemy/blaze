@@ -15,6 +15,11 @@
 //!   `closure_value` lays the value. Related invariantly (rustc `relate_args_invariantly` for
 //!   closures and coroutines; blaze-borrow `rule_variance`'s default).
 //!
+//! This layout is not the set of a captured type's outlives components. A captured trait
+//! object's predicate slots represent its callable contract, while only its own object
+//! lifetime bounds the captured value. Closure object coercions walk the capture types
+//! (`closure.rs` `capture_outlives`) before emitting those obligations.
+//!
 //! Every layout walk derives from the grain's count (`npos`): a tuple's offsets, a reference's
 //! referent, an ADT field's row (`field_slot`, which refuses a row of another count by name).
 //! The walks that knew the position model by node are behind the grain too: the variances

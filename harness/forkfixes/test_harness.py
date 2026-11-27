@@ -1,4 +1,4 @@
-"""Lightweight harness checks: fake processes only; never starts Blaze or a compiler.
+"""Lightweight harness checks: synthetic processes only; never starts Blaze or a compiler.
 
     python3 -m unittest discover -s harness/forkfixes -p 'test_*.py'
 """
@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -326,6 +327,233 @@ class ForkfixHarness(unittest.TestCase):
             self.assertTrue(json.loads(evidence.read_text())["timed_out"])
             self.assertEqual(kill.call_args_list, [unittest.mock.call(123, signal.SIGTERM), unittest.mock.call(123, signal.SIGKILL)])
             self.assertTrue(all(call.kwargs["timeout"] <= 5 for call in process.wait.call_args_list))
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux subreaper ownership")
+    def test_subreaper_refuses_existing_children_without_consuming_their_status(self):
+        for outcome in (None, Mock(si_pid=41)):
+            owner = runner.LinuxChildren()
+            with self.subTest(existing=outcome), patch.object(runner.os, "waitid", return_value=outcome) as probe, \
+                    patch.object(runner.os, "waitpid") as reap, patch.object(owner, "prctl") as prctl:
+                with self.assertRaisesRegex(runner.Failed, "existing child"):
+                    owner.start()
+                self.assertTrue(probe.call_args.args[2] & os.WNOWAIT)
+                reap.assert_not_called()
+                prctl.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux subreaper ownership")
+    def test_descendant_timeout_keeps_ownership_until_every_child_is_reaped(self):
+        for drained in (False, True):
+            owner = runner.LinuxChildren()
+            owner.started = True
+            statuses = [(0, 0), (0, 0)]
+            times = [0, 30, 30, 35]
+            if drained:
+                statuses += [(41, signal.SIGKILL), ChildProcessError()]
+                times[-1] = 30
+            with self.subTest(drained=drained), patch.object(runner.os, "waitpid", side_effect=statuses), \
+                    patch.object(runner.time, "monotonic", side_effect=times), patch.object(runner.time, "sleep"), \
+                    patch.object(Path, "read_text", return_value="41"), patch.object(runner.os, "kill") as kill, \
+                    patch.object(runner.os, "waitid", return_value=None) as probe, \
+                    patch.object(owner, "prctl") as prctl:
+                failure = owner.finish(900)
+            self.assertIn("drain deadline", failure)
+            self.assertEqual(owner.report["complete"], drained)
+            self.assertEqual(owner.report["killed"], [41])
+            kill.assert_called_once_with(41, signal.SIGKILL)
+            probe.assert_called_once_with(os.P_PID, 41, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            if drained:
+                prctl.assert_called_once_with(36, 0)
+                self.assertEqual(owner.report["reaped"], [{"pid": 41, "returncode": -signal.SIGKILL}])
+            else:
+                prctl.assert_not_called()
+                self.assertIn("cleanup is incomplete", failure)
+
+    def test_incomplete_descendant_cleanup_keeps_aliases_and_original_command_failure(self):
+        containers = []
+        logical_home = runner.logical_home
+        def remember_home(target):
+            home, container = logical_home(target)
+            containers.append(container)
+            return home, container
+        record = {"returncode": 23, "timed_out": False,
+                  "descendants": {"complete": False}, "cleanup_error": "owned descendants still live"}
+        with tempfile.TemporaryDirectory() as directory:
+            given = runner.Input(**self.fixture_input(Path(directory)))
+            try:
+                with patch.object(runner, "logical_home", side_effect=remember_home), \
+                        patch.object(runner, "run_command", return_value=record), \
+                        patch.object(runner, "cleanup_logical_home") as cleanup:
+                    result = runner.run_case(runner.CASES[0], given, Path(given.scratch))
+                cleanup.assert_not_called()
+                self.assertFalse(result["ok"])
+                self.assertIn("exit=23 timed_out=False", result["why"])
+                self.assertIn("owned descendants still live", result["why"])
+                self.assertTrue(any("aliases retained" in error for error in result["errors"]))
+                self.assertTrue(all((container / "h").is_symlink() for container in containers))
+            finally:
+                for container in containers:
+                    runner.cleanup_logical_home(container)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux subreaper ownership")
+    def test_descendant_cleanup_refuses_unowned_procfs_pids(self):
+        owner = runner.LinuxChildren()
+        owner.started = True
+        with patch.object(runner.os, "waitpid", return_value=(0, 0)), \
+                patch.object(runner.time, "monotonic", side_effect=[0, 30, 30]), \
+                patch.object(Path, "read_text", return_value="41"), \
+                patch.object(runner.os, "waitid", side_effect=ChildProcessError()), \
+                patch.object(runner.os, "kill") as kill, patch.object(owner, "prctl") as prctl:
+            failure = owner.finish(900)
+        self.assertIn("PID 41 outside the owned command tree", failure)
+        self.assertFalse(owner.report["complete"])
+        kill.assert_not_called()
+        prctl.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux subreaper ownership")
+    def test_interrupted_descendant_drain_records_incomplete_cleanup(self):
+        owner = runner.LinuxChildren()
+        owner.started = True
+        process = Mock(returncode=0)
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner, "LinuxChildren", return_value=owner), \
+                patch.object(owner, "start"), patch.object(owner, "wait", side_effect=KeyboardInterrupt()), \
+                patch.object(owner, "prctl") as prctl, patch.object(runner.subprocess, "Popen", return_value=process):
+            root = Path(directory)
+            log = runner.CommandLog(root, "interrupted")
+            with self.assertRaises(KeyboardInterrupt):
+                log(["fixture"], root, {}, 10, "command")
+            saved = json.loads((log.directory / "001-command.json").read_text())
+            self.assertEqual(saved["returncode"], 0)
+            self.assertFalse(saved["descendants"]["complete"])
+            self.assertFalse(log.cleanup_complete)
+            prctl.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux subreaper ownership")
+    def test_command_exception_requires_readable_descendant_completion_proof(self):
+        complete = '{"descendants":{"scope":"linux-subreaper","complete":true}}'
+        cases = [
+            ("missing", None, True, False),
+            ("unreadable", complete, True, False),
+            ("truncated", '{"descendants":', True, False),
+            ("wrong-shape", '[]', True, False),
+            ("missing-descendants", '{}', True, False),
+            ("missing-scope", '{"descendants":{"complete":true}}', True, False),
+            ("integer-verdict", '{"descendants":{"scope":"linux-subreaper","complete":1}}', True, False),
+            ("complete", complete, True, True),
+            ("earlier-incomplete", complete, False, False),
+        ]
+        real_read = Path.read_text
+        for name, proof, previous, expected in cases:
+            original = OSError("original command failure")
+            def failed(_argv, _cwd, _env, _timeout, evidence, _label):
+                if proof is not None:
+                    evidence.write_text(proof)
+                raise original
+            def read(path, *args, **kwargs):
+                if name == "unreadable":
+                    raise OSError("completion evidence unreadable")
+                return real_read(path, *args, **kwargs)
+            with self.subTest(proof=name), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(runner, "run_command", side_effect=failed), patch.object(Path, "read_text", new=read):
+                root = Path(directory)
+                log = runner.CommandLog(root, name)
+                log.cleanup_complete = previous
+                with self.assertRaises(OSError) as raised:
+                    log(["fixture"], root, {}, 10, "command")
+                self.assertIs(raised.exception, original, "proof failure must not replace the command failure")
+                self.assertEqual(log.cleanup_complete, expected)
+
+    def detached_home_probe(self, plant_parent_only: bool) -> None:
+        """A pipe fixes the schedule: the detached helper cannot finish before foreground exit.
+
+        This kernel check is needed for setsid/reparenting; neither a mocked Popen nor a
+        process-group test proves Linux adopts a detached grandchild. No timing sleeps.
+        """
+        script = '''import os, select, sys
+from pathlib import Path
+release = int(sys.argv[1])
+ready_read, ready_write = os.pipe()
+child = os.fork()
+if child:
+    os.close(ready_write)
+    os.close(release)
+    assert os.read(ready_read, 1) == b"r"
+    os._exit(0)
+os.close(ready_read)
+os.setsid()
+os.write(ready_write, b"r")
+os.close(ready_write)
+if not select.select([release], [], [], 5)[0]:
+    os._exit(91)
+assert os.read(release, 1) == b"x"
+(Path(os.environ["HOME"]) / "late-helper-output").write_text("finished")
+os._exit(0)
+'''
+        release_read, release_write = os.pipe()
+        real_popen = runner.subprocess.Popen
+        real_wait = runner.LinuxChildren.wait
+        owners = []
+        released = False
+        def spawn(*args, **kwargs):
+            return real_popen(*args, **kwargs, pass_fds=(release_read,))
+        def wait(owner, deadline, *, kill=False):
+            nonlocal released
+            owners.append(owner)
+            if plant_parent_only:
+                return True  # the old proof: foreground exit alone permits cleanup
+            self.assertFalse(marker.exists())
+            os.write(release_write, b"x")
+            released = True
+            return real_wait(owner, deadline, kill=kill)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            physical = root / "home-files"
+            physical.mkdir()
+            home, container = runner.logical_home(physical)
+            marker = physical / "late-helper-output"
+            try:
+                with patch.object(runner.subprocess, "Popen", side_effect=spawn), \
+                        patch.object(runner.LinuxChildren, "wait", new=wait):
+                    record = runner.run_command([sys.executable, "-c", script, str(release_read)], root,
+                                                {"HOME": str(home)}, 10, root / "evidence.json", "detached-helper")
+                self.assertEqual(record["returncode"], 0)
+                self.assertTrue(marker.exists(), "foreground exit left a live HOME user")
+                self.assertTrue(record["descendants"]["complete"], "foreground exit left a live HOME user")
+                self.assertEqual(len(record["descendants"]["reaped"]), 1)
+                self.assertEqual(record["descendants"]["reaped"][0]["returncode"], 0)
+                self.assertEqual(marker.read_text(), "finished")
+                runner.cleanup_logical_home(container)
+                self.assertFalse(container.exists())
+                self.assertEqual(marker.read_text(), "finished", "physical HOME evidence remains")
+            finally:
+                if not released:
+                    os.write(release_write, b"x")
+                for owner in owners:
+                    if not owner.report["complete"]:
+                        self.assertTrue(real_wait(owner, time.monotonic() + 5))
+                        owner.prctl(36, owner.previous.value)
+                os.close(release_read)
+                os.close(release_write)
+                if container.exists():
+                    runner.cleanup_logical_home(container)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux setsid and child adoption")
+    def test_command_drains_detached_home_users_before_alias_cleanup(self):
+        self.detached_home_probe(False)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux setsid and child adoption")
+    def test_the_oracle_catches_foreground_exit_used_as_descendant_completion(self):
+        with self.assertRaisesRegex(AssertionError, "live HOME user"):
+            self.detached_home_probe(True)
+
+    def test_non_linux_commands_retain_the_process_group_path(self):
+        process = Mock(returncode=0)
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner.sys, "platform", "darwin"), \
+                patch.object(runner, "LinuxChildren") as owner, patch.object(runner.subprocess, "Popen", return_value=process):
+            root = Path(directory)
+            result = runner.run_command(["fixture"], root, {}, 10, root / "command.json", "mac-command")
+        owner.assert_not_called()
+        self.assertEqual(result["returncode"], 0)
+        self.assertNotIn("descendants", result)
 
     def test_setup_failure_and_cleanup_failure_are_checkpointed(self):
         with tempfile.TemporaryDirectory() as directory:

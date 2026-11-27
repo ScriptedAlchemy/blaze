@@ -328,9 +328,10 @@ impl DistConfig {
 /// recording every read and write so both granted batches and lead tails export complete values.
 pub(crate) struct DistStore<'s, 'm, D: Driver> {
     local: &'s mut HomeCodeStore<'m, D>,
+    /// Only values borrowed from a peer's not-yet-imported grant need owned bytes here.
     overlay: BTreeMap<Digest, (u8, WireVec<u8>), WireAlloc>,
-    reads: RefCell<BTreeSet<CodeKey, WireAlloc>>,
-    writes: WireVec<Value>,
+    /// Reads and successful writes name the current store value, never a copy of its bytes.
+    tracked: RefCell<BTreeSet<CodeKey, WireAlloc>>,
     alloc: WireAlloc,
 }
 
@@ -339,15 +340,13 @@ impl<'s, 'm, D: Driver> DistStore<'s, 'm, D> {
         Self {
             local,
             overlay: BTreeMap::new_in(alloc),
-            reads: RefCell::new(BTreeSet::new_in(alloc)),
-            writes: WireVec::new_in(alloc),
+            tracked: RefCell::new(BTreeSet::new_in(alloc)),
             alloc,
         }
     }
 
     pub(crate) fn clear_tracking(&mut self) {
-        self.reads.borrow_mut().clear();
-        self.writes.clear();
+        self.tracked.get_mut().clear();
     }
 
     pub(crate) fn insert_overlay(&mut self, key: Digest, kind: u8, bytes: &[u8]) {
@@ -376,7 +375,9 @@ impl<'s, 'm, D: Driver> DistStore<'s, 'm, D> {
                 }
                 _ => return Err(DistError::Store(StoreError::Failed { key, what: "unknown distributed code entry kind" })),
             }
-            self.insert_overlay(*digest, *kind, bytes.as_slice());
+            // The accepted value now lives in the home. Retaining a peer copy would both
+            // duplicate its bytes and shadow a newly accepted mutable pointer.
+            self.overlay.remove(digest);
         }
         Ok(())
     }
@@ -421,22 +422,10 @@ impl<'s, 'm, D: Driver> DistStore<'s, 'm, D> {
 
     fn drain_tracked_values(&mut self) -> Result<WireVec<Value>, StoreError> {
         let mut by_key: BTreeMap<Digest, Value, WireAlloc> = BTreeMap::new_in(self.alloc);
-        let written = core::mem::replace(&mut self.writes, WireVec::new_in(self.alloc));
-        for val in written {
-            by_key.insert(val.key, val);
-        }
-        let seen: WireVec<CodeKey> = {
-            let set = self.reads.borrow();
-            let mut list = WireVec::with_capacity_in(set.len(), self.alloc);
-            for key in set.iter() {
-                list.push(*key);
-            }
-            list
-        };
+        let seen = core::mem::replace(self.tracked.get_mut(), BTreeSet::new_in(self.alloc));
         for key in seen {
             self.export_key(key, &mut by_key)?;
         }
-        self.reads.borrow_mut().clear();
         let mut values = WireVec::with_capacity_in(by_key.len(), self.alloc);
         for (_, val) in by_key {
             values.push(val);
@@ -449,7 +438,7 @@ impl<D: Driver> CodeStore for DistStore<'_, '_, D> {
     fn get(&self, key: CodeKey) -> Result<Option<&[u8]>, StoreError> {
         let digest = key.0.0;
         if let Some((kind, bytes)) = self.overlay.get(&digest) {
-            self.reads.borrow_mut().insert(key);
+            self.tracked.borrow_mut().insert(key);
             if *kind == KIND_CODE {
                 return Ok(Some(bytes.as_slice()));
             }
@@ -457,27 +446,22 @@ impl<D: Driver> CodeStore for DistStore<'_, '_, D> {
         }
         let res = self.local.get(key)?;
         if res.is_some() {
-            self.reads.borrow_mut().insert(key);
+            self.tracked.borrow_mut().insert(key);
         }
         Ok(res)
     }
 
     fn put(&mut self, class: CodeClass, key: CodeKey, bytes: &[u8]) -> Result<(), StoreError> {
         self.local.put(class, key, bytes)?;
-        let digest = key.0.0;
-        self.overlay.insert(digest, (KIND_CODE, copy_wire_bytes(bytes, self.alloc)));
-        self.writes.push(Value {
-            key: digest,
-            kind: KIND_CODE,
-            bytes: copy_wire_bytes(bytes, self.alloc),
-        });
+        self.overlay.remove(&key.0.0);
+        self.tracked.get_mut().insert(key);
         Ok(())
     }
 
     fn pointed(&self, key: CodeKey) -> Result<Option<CodeKey>, StoreError> {
         let digest = key.0.0;
         if let Some((kind, bytes)) = self.overlay.get(&digest) {
-            self.reads.borrow_mut().insert(key);
+            self.tracked.borrow_mut().insert(key);
             if *kind == KIND_POINTER && bytes.len() == 32 {
                 let mut target = [0u8; 32];
                 target.copy_from_slice(bytes.as_slice());
@@ -487,24 +471,23 @@ impl<D: Driver> CodeStore for DistStore<'_, '_, D> {
         }
         let res = self.local.pointed(key)?;
         if let Some(target) = res {
-            self.reads.borrow_mut().insert(key);
-            self.reads.borrow_mut().insert(target);
+            self.tracked.borrow_mut().insert(key);
+            self.tracked.borrow_mut().insert(target);
         }
         Ok(res)
     }
 
     fn point(&mut self, class: CodeClass, key: CodeKey, content: CodeKey) -> Result<(), StoreError> {
         self.local.point(class, key, content)?;
-        let digest = key.0.0;
-        self.overlay.insert(digest, (KIND_POINTER, copy_wire_bytes(&content.0.0, self.alloc)));
-        self.writes.push(Value {
-            key: digest,
-            kind: KIND_POINTER,
-            bytes: copy_wire_bytes(&content.0.0, self.alloc),
-        });
+        self.overlay.remove(&key.0.0);
+        self.tracked.get_mut().insert(key);
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "engine_dist/tests.rs"]
+mod tests;
 
 /// One concrete, pre-keyed function inside a crate's distributed unit.
 struct WorkItem<'a> {

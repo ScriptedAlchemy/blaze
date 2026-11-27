@@ -12,6 +12,10 @@ on:
         description: Run one distributed build on three GitHub-hosted ARM64 machines
         type: boolean
         default: false
+      three_host_benchmark:
+        description: Compare unpaused solo and three-machine dev exports after a cold start and a private edit
+        type: boolean
+        default: false
 
 concurrency:
   # A pull request's newer push cancels its run before. Main runs one push at a time: a push
@@ -601,10 +605,14 @@ jobs:
           rustc "+$toolchain" --version --verbose > "$RUNNER_TEMP/core-evidence/rustc-version.txt"
           timeout -k 30 4200 cargo "+$toolchain" test --release --locked --all-targets -p blaze-dist -p blaze-dist-local -p blaze-wire -p blaze-serve --no-fail-fast \
             2>&1 | tee "$RUNNER_TEMP/core-evidence/tests.log"
-          while IFS= read -r case_name; do
-            grep -Eq "^test ([[:alnum:]_]+::)*$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \
-              || { echo "::error::missing executed library control: $case_name"; exit 1; }
-          done < .github/distributed-controls.txt
+          # The source compiler has no native panic-unwind runtime. Require those native
+          # controls here in addition to every control also required from source execution.
+          for controls in .github/distributed-controls.txt .github/distributed-native-controls.txt; do
+            while IFS= read -r case_name; do
+              grep -Eq "^test ([[:alnum:]_]+::)*$case_name \\.\\.\\. ok[[:space:]]*$" "$RUNNER_TEMP/core-evidence/tests.log" \
+                || { echo "::error::missing executed library control: $case_name"; exit 1; }
+            done < "$controls"
+          done
       - name: distributed library binaries and integration targets compile
         id: retained-all-targets
         if: ${{ !cancelled() && steps.pinned-cargo.outcome == 'success' }}
@@ -888,7 +896,7 @@ jobs:
           if-no-files-found: warn
 
   three-hosts:
-    if: github.event_name == 'workflow_dispatch' && inputs.three_hosts
+    if: github.event_name == 'workflow_dispatch' && (inputs.three_hosts || inputs.three_host_benchmark)
     needs: source-compiler
     permissions:
       contents: read
@@ -898,6 +906,8 @@ jobs:
     with:
       source: ${{ github.sha }}
       source_run: ${{ github.run_id }}
+      proof: ${{ inputs.three_hosts }}
+      benchmark: ${{ inputs.three_host_benchmark }}
 
   ci:
     name: ci

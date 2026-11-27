@@ -1,16 +1,17 @@
 ---
 status: current
-summary: The distributed protocol, coordinator, pack cache, dev export integration and acceptance controls.
+summary: The distributed protocol, coordinator, pack cache, dev and release export integration and acceptance controls.
 ---
 # Distributed protocol and cache
 
 The fork retains the distributed state machines, Unix transport, agent library and
 standalone pack server. They are in the active workspace and can be exercised without a
-compiler. The current `blaze export` command plans distributed dev units in
-`crates/blaze-cli/src/engine_dist.rs` and imports the records returned by the worker.
-Distributed release export currently returns a named refusal while LLVM emission and
-fold work are being integrated. The [deletion record](v2/plan/parked.md) describes the old
-daemon bridge.
+compiler. The current `blaze export` command uses
+`crates/blaze-cli/src/engine_dist.rs` for dev units and
+`crates/blaze-cli/src/engine_dist/prepared.rs` for release LLVM emission and fold work,
+then imports the records returned by the workers. Distributed release export requires
+a CLI built with the `llvm` feature; a build without it returns a named refusal.
+The [deletion record](v2/plan/parked.md) describes the old daemon bridge.
 
 This page describes the surviving implementation. The
 [publication design](v2/plan/design/distributed-publication.md),
@@ -72,8 +73,25 @@ Cleanup can find the current token of the same owned slot after promotion, witho
 claiming another slot. These transitions are implemented in the carrier and core, with
 their invariants stated in the [retirement design](v2/plan/design/distributed-retirement.md).
 
-The dev export callbacks compile or recover keyed code through the command's code store.
+Lead replacement uses accepted work calls and accepted heartbeats as evidence of helper
+liveness. A refused join, lease or result cannot create or refresh the helper's
+recent-contact timestamp. Refusal and fencing effects still reach the caller.
+
+The export callbacks compile or recover keyed code through the command's code store.
 The export command consumes those records during its reachability and layout passes.
+
+### Code-record ownership and publication
+
+`DistStore` tracks the keys a batch reads or successfully writes. The home store owns
+accepted code bytes; only unimported peer values need a temporary overlay. Accepting a
+value into the home removes that overlay entry, while a refused write leaves it intact.
+
+Draining a batch exports each key's current value once, in sorted order, and follows
+every pointer to its content, including targets cached before the batch. Repeated pointer
+writes therefore publish the final target. For `N` touched keys and `B` output bytes,
+tracking retains `O(N)` keys without extra copies of local code payloads; final emission
+copies the `B` bytes into the pack input. Temporary peer bytes remain only until acceptance.
+These are ownership and completeness properties, not measured compiler-speed results.
 
 ## When something fails
 
@@ -96,6 +114,23 @@ Main and pull-request namespaces keep executions separate. Admission and revisio
 replacement are core protocol transitions; identical published unit content can still
 be reused across those executions. The current library receives namespace and source
 identity through `agent::Config`, rather than deriving them from a workspace itself.
+
+In the generic discovery protocol, a name conflict or the lead's rejection invalidates
+both `Exported` and `FromStore` entries through `ExportInvalidated`, whether the decision
+precedes the result or follows its commit. Cache origin does not exempt an entry from
+admission. The current V2 compiler adapters use canonical roots with empty discovery and
+rejection sets; this generic rule does not establish a separate V2 importer failure.
+
+Carrier thread scopes retain their own callback-completion obligations. Forgetting a
+join handle cannot let a borrowed callback outlive its scope, including nested spawns
+and parent unwinding. A callback releases its obligation only after its captures have
+been dropped and its result stored; failed thread setup releases the same obligation.
+The completion count is shared once per callback and stays alive through its last wake;
+it needs no completion queue or disconnectable receiver.
+Forgetting a handle can still leak its result and joinable OS-thread resources. An OS
+join refusal, including a thread joining itself, leaves the live result allocation
+intact rather than treating the refusal as completion. Callback panic behavior is
+unchanged: the existing native pthread entry has an aborting extern-C panic boundary.
 
 ## Environment variables and acceptance probes
 
@@ -121,7 +156,7 @@ Implementation and tests are in `crates/blaze-dist-local/src/result_gate.rs`,
 `crates/blaze-dist-local/src/result_gate/tests.rs` and
 `crates/blaze-dist-local/src/driver.rs`.
 
-The dev export command and `harness/distv2.py` use these settings:
+The export command and `harness/distv2.py` use these settings:
 
 | Variable | Behavior |
 |---|---|
@@ -153,6 +188,19 @@ The pack server's endpoint and storage contracts are in
 Packs are named and checked by their content hash. Publication acceptance belongs to the
 coordinator; the server mirrors accepted records and checks delivery. It is not a remote
 compiler or a remote transport for the Unix coordinator.
+
+### Pack-transfer bounds
+
+The importer passes the whole `PackRef` to the fetch boundary. Its committed byte length
+bounds the response before payload allocation, for both ordinary reads and read-ahead.
+Native manifest lengths also obey the blob-size ceiling. An oversized declaration is
+refused after its bounded header; digest, key and format validation remain at admission.
+Transfer work is linear in the accepted bytes, with one receive allocation.
+
+Ordinary cache operations share one absolute deadline across connection, request headers,
+request body and response. Partial progress cannot restart the allowance. Both transfer
+paths use the same bounded socket operations. These bounds change no wire or persisted
+format and are not a measured throughput claim.
 
 ## Data shapes
 
@@ -429,6 +477,26 @@ lost workers and fencing. `crates/blaze-dist-local/tests/agent.rs` uses real soc
 the pack server with a stand-in compiler; it covers split work, cached units, cancellation,
 lead completion, publication and refusal behavior. The carrier's other tests cover wire
 and session lifetimes. `crates/blaze-serve/tests/serve.rs` exercises the HTTP server.
+
+`crates/blaze-cli/src/engine_dist/tests.rs` exercises the real home store over the
+deterministic filesystem: pointer closure in both key orders, repeated writes, peer
+precedence, failed writes and backing-allocation equality. The admission controls in
+`crates/blaze-dist/src/jobs/liveness_tests.rs` and
+`crates/blaze-dist/tests/work/invalidation.rs` vary stale contact, refused message order,
+cache origin and whether rejection precedes a result, with planted-failure controls.
+
+Transfer controls cover early length rejection under fragmented reads, allocation bounds,
+the committed size reaching the ordinary HTTP importer, exact manifest-size boundaries
+and expired budgets before each ordinary cache operation connects. End-to-end compiler
+speed and acceptance still require the real-compiler harness.
+
+`crates/blaze-dist-local/src/sys/scope_tests.rs` simulates the production completion
+tickets across failed starts, nested registrations and completion order, with a planted
+handle-ownership fault. Native controls cover forgotten borrowed callbacks, explicit
+join/drop, nested spawns, refused self-joins and parent/setup unwinding where supported.
+The native-unwind controls are additionally required by
+`.github/distributed-native-controls.txt`; `.github/distributed-controls.txt` remains
+the common receipt required from both native and source-compiler execution.
 
 `harness/distv2.py` retains real-compiler acceptance cases: two workers on one workspace,
 published reuse, edits, separate PR namespaces, killed or stopped workers, stale results,

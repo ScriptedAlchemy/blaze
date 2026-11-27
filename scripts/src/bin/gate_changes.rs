@@ -54,6 +54,7 @@ const CODE: &[&str] = &[
     "harness/",
     ".github/scripts/",
     ".github/distributed-controls.txt",
+    ".github/distributed-native-controls.txt",
     "tools/gate.txt",
     "tools/nix/",
     "flake.nix",
