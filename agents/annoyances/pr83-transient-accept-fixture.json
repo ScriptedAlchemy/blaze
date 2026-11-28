@@ -1,0 +1,19 @@
+{
+  "id": "pr83-transient-accept-fixture",
+  "date": "2026-11-28",
+  "who": "GPT-6 Astra Pro, protocol-validation lane",
+  "where": "crates/blaze-dist-local/src/server.rs",
+  "what": "The source-built transient_accept_errors_leave_the_reactor_available_to_healthy_clients test failed after 19.176238 seconds with a raw Io(Again), while 124 other local protocol tests passed. The original production artifact records no socket syscalls; it does not establish the cause of the post-connect handshake failure.",
+  "cost": "The local protocol acceptance failed and the observer did not run the wire or serve packages.",
+  "cause": "The fault-injection fixture races an independently started server against Client's five-second handshake IO timeouts. It did not separately observe the injected accept failures before asserting a healthy welcome.",
+  "whys": [
+    "The fixture used a full concurrent client handshake to test an accept-error classification.",
+    "The production reactor exposed only its unbounded run loop, so a fixture could not drive one real iteration.",
+    "The assertion therefore combined accept recovery with server startup, thread scheduling and source-compiled first-call work. The retained trace cannot apportion those costs."
+  ],
+  "class": "A fault-injection control depends on unrelated wall-clock startup before it observes the injected transition.",
+  "prevention": "The production loop delegates its unchanged tick, accept, read and write ordering to one turn. The test drives exactly three injected transient errors with a real hello already queued, proves the welcome reaches the peer, rejects a fatal error, and checks cancellation before another turn. Existing concurrent Client/server controls remain in tests/unix.rs.",
+  "workaround": "None: no additional timeout, retry, ignored test or substituted protocol implementation.",
+  "fix": "One-turn fixture and fatal-error/cancellation controls written; source-built protocol execution on the final tree remains required.",
+  "state": "open"
+}
