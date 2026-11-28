@@ -24,7 +24,7 @@ use blaze_emit::{Isa, Os};
 use blaze_id::{CrateItemKey, ItemKey as LibKey};
 use blaze_ids::producer::{CodeBuilder, ProducerId, Producers};
 use blaze_ids::{ContentId, Hasher};
-use blaze_ladder::body_ids::{BodyId, BodyIds, Counts, How, Make, Read, Stepped};
+use blaze_ladder::body_ids::{BodyId, BodyIds, Counts, How, Make, Read, Stepped, WalkObserver};
 use blaze_ladder::code_records::reads::{ReadKind, ReadPlant, Verdict};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, EntryView, MemoryStore, Settings, TierName};
 use blaze_ladder::crates::{Inputs, Toolchain, UserCrate};
@@ -333,6 +333,50 @@ fn partially_known_read_lists_still_reject_changed_answers() {
         assert!(maker.read_preparation().prepared > rejected.prepared, "the refused entry must not prove its unknown constant for the next entry");
         println!("partial read invalidation: SHARED={shared}, OTHER={other}; stale entry refused, today's entry held");
     }
+}
+
+/// Observation sees the real verification stages and preserves both acceptance and rejection,
+/// including the fact that a rejected read list must not seed later preparation proofs.
+#[test]
+fn observed_verification_preserves_read_answers_and_preparation() {
+    struct Seen<'a>(&'a core::cell::Cell<usize>);
+    impl<'a> WalkObserver for Seen<'a> {
+        type Span = Seen<'a>;
+
+        fn span(&self, _name: &'static str) -> Self::Span {
+            self.0.set(self.0.get() + 1);
+            Seen(self.0)
+        }
+    }
+
+    let before = shared_constants(2, 3);
+    let mut old_store = MemoryStore::new_in(alloc());
+    let old = walk(&before, &mut old_store, ReadPlant::None);
+    let old_mixed = old.of(fn_named(&before, "mixed"));
+    let spans = core::cell::Cell::new(0);
+    let observer = Seen(&spans);
+    for (shared, other) in [(2, 3), (5, 3), (2, 7)] {
+        let after = shared_constants(shared, other);
+        let ids = ids_of(&after);
+        let mut today_store = MemoryStore::new_in(alloc());
+        let today = walk(&after, &mut today_store, ReadPlant::None);
+        let known = today.of(fn_named(&after, "known"));
+        let mixed = today.of(fn_named(&after, "mixed"));
+        let b = builder();
+        let mut plain = Maker::new(reader(&after), Some(ids.entry), &b, alloc());
+        let mut observed = Maker::new(reader(&after), Some(ids.entry), &b, alloc());
+        for (row, store) in [(known, &today_store), (old_mixed, &old_store), (mixed, &today_store)] {
+            let key = row.key.expect("the fixture's code key");
+            let bytes = store.get(key).expect("the fixture's store").expect("the fixture's entry");
+            let expected = verify_row(&mut plain, row, store);
+            let actual = observed.verify_observed(key, key, row.tabled, &row.name, bytes, &observer)
+                .expect("the observed verifier").expect("the observed verdict");
+            assert_eq!(actual, expected, "SHARED={shared}, OTHER={other}");
+            assert_eq!(observed.read_preparation(), plain.read_preparation());
+            assert_eq!(observed.verified_from_answers(), plain.verified_from_answers());
+        }
+    }
+    assert!(spans.get() > 0, "the equality control must exercise an observing strategy");
 }
 
 /// The rows of `fresh` whose entry `kept` holds under another key: stale code served.

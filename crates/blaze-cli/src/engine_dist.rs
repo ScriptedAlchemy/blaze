@@ -32,7 +32,7 @@ use blaze_dist_local::blobs::Blobs;
 use blaze_dist_local::pack::{Value, ValueRef};
 use blaze_dist_local::sys::{append_file, path_is_file, random_id, read_file, write_file};
 use blaze_ids::ContentId;
-use blaze_ladder::body_ids::{self, BodyIds, RowKind, Scratch, Stepped, Walk};
+use blaze_ladder::body_ids::{self, BodyIds, RowKind, Scratch, Stepped, Walk, WalkObserver};
 use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, PanicStrategy, StoreError};
 use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::run::RunError;
@@ -941,6 +941,28 @@ pub(crate) fn write_output_fingerprint(output_path: &str, fp: &Digest, alloc: Wi
     let _ = write_file(fp_path.as_str(), expected.as_bytes());
 }
 
+/// Detailed publisher stages use the existing bounded, allocation-aware telemetry only when
+/// a distributed report was requested. The compiler owns no clock or reporting collection.
+struct WalkProfile<'a>(Option<&'a Cx>);
+
+struct WalkProfileSpan(Option<Cx>);
+
+impl WalkObserver for WalkProfile<'_> {
+    type Span = WalkProfileSpan;
+
+    fn span(&self, name: &'static str) -> Self::Span {
+        WalkProfileSpan(self.0.map(|cx| cx.span(name)))
+    }
+}
+
+impl WalkObserver for WalkProfileSpan {
+    type Span = WalkProfileSpan;
+
+    fn span(&self, name: &'static str) -> Self::Span {
+        WalkProfileSpan(self.0.as_ref().map(|cx| cx.span(name)))
+    }
+}
+
 /// `Granted` implementation for one workspace crate unit.
 struct UnitExecutor<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>> {
     cx: &'a Cx,
@@ -958,6 +980,7 @@ struct UnitExecutor<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>> {
     tail_instances: usize,
     tail_compiled_keys: WireVec<Digest>,
     tail_verification: TailVerification,
+    profile_walk: bool,
     ran_complete: bool,
     result_gate: Option<agent::TestResultGate<'a>>,
 }
@@ -1049,7 +1072,8 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
             reads: self.maker.read_preparation(),
             entries_from_answers: self.maker.verified_from_answers(),
         };
-        let _span = self.cx.span("export: verify distributed reachability at publisher");
+        let span = self.cx.span("export: verify distributed reachability at publisher");
+        let observer = WalkProfile(if self.profile_walk { Some(&span) } else { None });
         let mut closure = reach::Writer::new(self.plan.unit.spec, self.wire_alloc);
         self.store.clear_tracking();
         let mut walk = Walk::new_in(self.scratch_alloc);
@@ -1068,12 +1092,15 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
             next_row += 1;
             let tabled = walk.tabled(row);
             let kind = walk.kind(row);
-            let proof = self.ids.runnable(tabled).map_err(|why| {
-                let mut s = String::new_in(self.heap.alloc());
-                let _ = write!(s, "tail item not runnable: {why}");
-                DistError::Compile { shown: s }
-            })?;
-            match walk.one(
+            let proof = {
+                let _span = observer.span("check runnable proof");
+                self.ids.runnable(tabled).map_err(|why| {
+                    let mut s = String::new_in(self.heap.alloc());
+                    let _ = write!(s, "tail item not runnable: {why}");
+                    DistError::Compile { shown: s }
+                })?
+            };
+            match walk.one_observed(
                 row,
                 self.ids,
                 self.store,
@@ -1084,6 +1111,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                 &body_ids::EntryForm,
                 MOST_WALKED,
                 &mut scratch,
+                &observer,
             ) {
                 Ok(one) => {
                     self.tail_instances += 1;
@@ -1097,6 +1125,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                         }
                         Stepped::Unkeyed(_) => {}
                     }
+                    let _span = observer.span("record verified entry");
                     let entry = match one.stepped {
                         Stepped::Found(key) | Stepped::Made(key) => {
                             let recipe = scratch.queried().ok_or_else(|| {
@@ -1135,6 +1164,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
         self.tail_verification.add_delta(before, after).ok_or_else(|| {
             reach::refused(self.heap, self.plan.unit.spec, "has non-monotonic or overflowing verification counts")
         })?;
+        let _span = observer.span("publish completion values");
         let tracked = self.store.drain_tracked_values().map_err(DistError::Store)?;
         for val in tracked {
             output(val);
@@ -1251,6 +1281,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
                 tail_instances: 0,
                 tail_compiled_keys: WireVec::new_in(wire_alloc),
                 tail_verification: TailVerification::default(),
+                profile_walk: dist.report.is_some(),
                 ran_complete: false,
                 result_gate: dist.result_gate.as_ref()
                     .and_then(|gate| gate.for_unit(plan.unit_name.as_str())),

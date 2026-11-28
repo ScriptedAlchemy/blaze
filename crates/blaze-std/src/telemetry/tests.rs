@@ -11,8 +11,8 @@ use blaze_own::Vec;
 use blaze_sim::{Broken, Config, Tape, controls};
 
 use super::{
-    Brief, Cell, CellOpts, ChainPlant, Dist, DistPlant, Exit, Level, Partial, Report, ReportOpts, SpanPath, Target, TaskRec,
-    TelemetryError, TelemetryPlant, WaitRec, bucket, dist::Bracket, longest_chain,
+    Brief, Cell, CellOpts, ChainPlant, Dist, DistPlant, Exit, Field, Level, Partial, Report, ReportOpts, SPAN_ROWS, SpanPath,
+    Spans, Target, TaskRec, TelemetryError, TelemetryPlant, WaitRec, bucket, dist::Bracket, longest_chain,
     sampler::{
         NO_CALLER, OUTSIDE, Period, Regs, Ring, RingView, SamplerPlant, SamplerRow, Symbolize, Stack, Stop, fold, take, walk,
     },
@@ -403,6 +403,81 @@ fn used(n: u64) -> Brief {
     let mut brief = Brief::ZERO;
     brief.v[0] = n;
     brief
+}
+
+/// A build can fill the former 64-row table before the publisher's 18 diagnostic stages.
+/// Those late stages keep their own rows; later overflow still conserves every close, time
+/// and allocation, and no event grows the table.
+#[test]
+fn late_span_stages_are_retained_and_overflow_conserves_usage_without_allocating() {
+    const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    const STAGES: [&str; 18] = [
+        "check runnable proof",
+        "decode declarations",
+        "decode entry and known answers",
+        "decode entry read list",
+        "discover declarations",
+        "load verification dependencies",
+        "load verification heads",
+        "lookup stored entry",
+        "make missing entry",
+        "manage coroutine layouts",
+        "prepare constant values",
+        "prepare read questions",
+        "publish completion values",
+        "recheck read answers",
+        "recipe from current facts",
+        "record verified entry",
+        "store made entry",
+        "verify stored entry",
+    ];
+    let counting = blaze_own::testing::Counting::new(blaze_own::testing::TestHeap);
+    {
+        let mut spans = Spans::new(true, &counting).expect("a fixed span table");
+        let allocations = counting.allocations();
+        let reserved = counting.live_bytes();
+        let mut used = Brief::ZERO;
+        used.v[Field::Allocs as usize] = 3;
+        used.v[Field::HeapBytes as usize] = 24;
+        for first in NAMES {
+            for second in NAMES {
+                spans.close(&SpanPath::ROOT.child(first).child(second), 7, used);
+            }
+        }
+        let publisher = SpanPath::ROOT.child("publisher");
+        for name in STAGES {
+            spans.close(&publisher.child(name), 7, used);
+        }
+        assert_eq!(spans.rows().count(), 64 + STAGES.len(), "late stages must not disappear into the old bound");
+        assert_eq!(spans.other().count, 0);
+        // Exceed the new bound, then revisit every late stage after the table is full.
+        for first in NAMES {
+            for second in NAMES {
+                spans.close(&SpanPath::ROOT.child("after").child(first).child(second), 7, used);
+            }
+        }
+        for name in STAGES {
+            let path = publisher.child(name);
+            spans.close(&path, 7, used);
+            let row = spans.rows().find(|row| row.path.same(&path)).expect("a retained late stage");
+            assert_eq!((row.count, row.wall_ns, row.sum.get(Field::Allocs)), (2, 14, 6));
+        }
+        assert_eq!(spans.rows().count(), SPAN_ROWS);
+        assert_eq!(spans.other().count, (128 + STAGES.len() - SPAN_ROWS) as u64);
+        assert!(spans.other().count > 0, "the control must exercise overflow");
+        let mut total = (0, 0, 0, 0);
+        for row in spans.rows().chain(core::iter::once(spans.other())) {
+            total.0 += row.count;
+            total.1 += row.wall_ns;
+            total.2 += row.sum.get(Field::Allocs);
+            total.3 += row.sum.get(Field::HeapBytes);
+        }
+        let closes = (128 + 2 * STAGES.len()) as u64;
+        assert_eq!(total, (closes, 7 * closes, 3 * closes, 24 * closes));
+        assert_eq!(counting.allocations(), allocations, "recording a span must not allocate");
+        assert_eq!(counting.live_bytes(), reserved, "the table must keep its original reservation");
+    }
+    counting.check().expect("the span table freed");
 }
 
 /// Decision 1 of the module doc, "Spans across tasks": a span is its opener's value's life

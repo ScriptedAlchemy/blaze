@@ -48,9 +48,9 @@ use super::*;
 use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_own::AVec;
 
-use crate::body_ids::{BodyIds, Counts, EntryForm, Fixture, Grant, Make, Walk, WalkError};
+use crate::body_ids::{BodyIds, Counts, EntryForm, Fixture, Grant, Make, NoWalkObserver, Walk, WalkError, WalkObserver};
 use crate::code_records::reads::{self, Answers, ReadKind, ReadLog, ReadPlant, ReadsError, Recorded, Verdict};
-use crate::code_records::{Builder, Callee, CodeRecordError, CodeStore, Declared, EntryView, InstanceNames, VtableDatum, make_entry_with_vtables};
+use crate::code_records::{Builder, Callee, CodeKey, CodeRecordError, CodeStore, Declared, EntryView, InstanceNames, VtableDatum, make_entry_with_vtables};
 use crate::front2::const_at::{ConstNeed, ConstTable, Needs};
 use crate::front2::coroutines::Coroutines;
 use crate::front2::program::lazy::LazyRefusal;
@@ -1863,12 +1863,26 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     name: &[u8],
     entry: &[u8],
 ) -> Result<Verdict, RunError> {
-    let first = verify_ready(program, typing, state, checks, tabled, entry)?;
+    verify_instance_observed(program, typing, state, checks, tabled, name, entry, &NoWalkObserver)
+}
+
+fn verify_instance_observed<'n, T: Typing<RecordsProgram<'n>>, O: WalkObserver>(
+    program: &mut RecordsProgram<'n>,
+    typing: &mut T,
+    state: &mut MakerState,
+    checks: &mut CheckCount,
+    tabled: ItemKey,
+    name: &[u8],
+    entry: &[u8],
+    observer: &O,
+) -> Result<Verdict, RunError> {
+    let first = verify_ready(program, typing, state, checks, tabled, entry, observer)?;
     if first == Verdict::Holds {
         return Ok(first);
     }
     // The referring body supplies body-local heads. Its instance and stored questions can
     // also name a closure or an opaque type owned by a different body, such as a cached caller.
+    let owners_span = observer.span("load verification dependencies");
     let Some(i) = state.ensure(program, typing, tabled, checks)? else {
         return Ok(first);
     };
@@ -1905,28 +1919,37 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
             Err(error) => return Err(error),
         }
     }
-    verify_ready(program, typing, state, checks, tabled, entry)
+    drop(owners_span);
+    verify_ready(program, typing, state, checks, tabled, entry, observer)
 }
 
-fn verify_ready<'n, T: Typing<RecordsProgram<'n>>>(
+fn verify_ready<'n, T: Typing<RecordsProgram<'n>>, O: WalkObserver>(
     program: &mut RecordsProgram<'n>,
     typing: &mut T,
     state: &mut MakerState,
     checks: &mut CheckCount,
     tabled: ItemKey,
     entry: &[u8],
+    observer: &O,
 ) -> Result<Verdict, RunError> {
-    let Some(i) = program.head_row(tabled)? else {
+    let Some(i) = ({
+        let _span = observer.span("load verification heads");
+        program.head_row(tabled)?
+    }) else {
         return Err(RunError::OneBody { key: tabled, why: "a found code entry's fn has no row today (make_one.rs `verify_instance`)" });
     };
     let refused = |program: &RecordsProgram<'n>, error| RunError::CodeRecord { function: program.function(i).named(), error };
+    let entry_span = observer.span("decode entry and known answers");
     let view = EntryView::read(entry).map_err(|e| refused(&*program, CodeRecordError::Entry(e)))?;
     // The lazy preparation below supplies facts for questions that still need to be asked.
     // When all exact answers already hold in this maker, there is no question left to prepare.
-    if state.work.answers.covers(&view) {
+    let covered = state.work.answers.covers(&view);
+    drop(entry_span);
+    if covered {
         state.work.verified_from_answers += 1;
         return Ok(Verdict::Holds);
     }
+    let preparation_span = observer.span("prepare read questions");
     let alloc = state.work.alloc;
     let mut owners: AVec<'_, ItemKey> = blaze_own::Vec::new_in(alloc);
     // The coroutines whose states the rows read: laid again below, as the build's lay laid
@@ -2028,8 +2051,10 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>>(
         let args = state.work.ground.view().list(list).map_err(|_| refused(&*program, CodeRecordError::Reads(ReadsError::Question)))?;
         state.work.needs.push(need, args).map_err(|error| RunError::Build { function: program.function(i).named(), error, range: None })?;
     }
+    drop(preparation_span);
     // An opaque type's hidden type is its defining fn's check's (coroutines.rs `opaque_hidden`);
     // a required trait fn's RPITIT has no body and needs only its signature row (`head_row`).
+    let owners_span = observer.span("load verification dependencies");
     for &owner in owners.iter() {
         match state.ensure(program, typing, owner, checks) {
             Ok(Some(_)) => {}
@@ -2046,9 +2071,11 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>>(
             Err(_) => return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner }),
         }
     }
+    drop(owners_span);
     // Also include any coroutine held by value in the constant needs' arguments (e.g.
     // `Box::new(async move { .. })` verifying `<{coroutine} as SizedTypeProperties>::LAYOUT`),
     // laid BEFORE `const_at::pull` below so constant evaluation sees their laid `StateShape`s.
+    let coroutines_span = observer.span("manage coroutine layouts");
     if !state.work.needs.is_empty() {
         let mut need_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(alloc);
         for (_, a) in state.work.needs.iter() {
@@ -2127,8 +2154,10 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>>(
             }
         }
     }
+    drop(coroutines_span);
     // The constants the rows read, pulled as a make pulls them (`pull_constants`), with the
     // relaid coroutine states visible to constant evaluation.
+    let constants_span = observer.span("prepare constant values");
     let mut pulled = 0u32;
     let mut pull_stale = None;
     while !state.work.needs.is_empty() {
@@ -2154,12 +2183,14 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>>(
         pull_stale = Some(Verdict::Stale { kind, item: refusal.need.item() });
         break;
     }
+    drop(constants_span);
     let verdict = match pull_stale {
         Some(stale) => Ok(stale),
-        None => verify_rows(program, state, i, tabled, &view, &relaid),
+        None => verify_rows(program, state, i, tabled, &view, &relaid, observer),
     };
     // The states laid again above were built into nothing: forgotten, so a make that follows
     // lays and builds them (lay_states.rs `forget_laid`).
+    let _span = observer.span("manage coroutine layouts");
     if let Some(t) = state.tables.as_ref() {
         forget_laid_in(&t.coroutines, &recorded, state.work.ground.view());
     }
@@ -2169,7 +2200,7 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>>(
 /// [`verify_instance`]'s asking: every row of `view` asked again (code_reads.rs
 /// `verify_today`) over the states laid again (`relaid`), by rounds while the program makes
 /// what the rows noted unmade.
-fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: usize, tabled: ItemKey, view: &EntryView<'_>, relaid: &[(blaze_build::CoroutineOf, ContentId)]) -> Result<Verdict, RunError> {
+fn verify_rows<'n, O: WalkObserver>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: usize, tabled: ItemKey, view: &EntryView<'_>, relaid: &[(blaze_build::CoroutineOf, ContentId)], observer: &O) -> Result<Verdict, RunError> {
     let refused = |program: &RecordsProgram<'n>, error| RunError::CodeRecord { function: program.function(i).named(), error };
     let mut rounds = AskProgress::new_in(state.work.alloc);
     loop {
@@ -2177,6 +2208,7 @@ fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: 
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
         let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
         let verified = {
+            let _span = observer.span("recheck read answers");
             let front = FrontAdts(&*program, i, &[], &work.langs, &bodies);
             let mut today = Today { program: &*program, i, laid: relaid };
             reads::verify_today(view, &front, &mut today, &mut work.answers, true, &mut work.ground, work.alloc)
@@ -2191,6 +2223,7 @@ fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: 
             // item is gone today), the entry is stale and the make that follows meets the
             // question itself.
             Verdict::Needs { kind, item, .. } => {
+                let _span = observer.span("load verification dependencies");
                 if rounds.allow_key(Some(AskKey::Row(kind, item))) && matches!(program.make_asked(i), Ok(true)) {
                     continue;
                 }
@@ -2200,6 +2233,7 @@ fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: 
             // a fact asked of another, unmade record) and they are asked again; nothing made,
             // the entry is stale.
             stale @ Verdict::Stale { kind, item } => {
+                let _span = observer.span("load verification dependencies");
                 if rounds.allow_key(Some(AskKey::Row(kind, item))) && matches!(program.make_asked(i), Ok(true)) {
                     continue;
                 }
@@ -3255,6 +3289,26 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         Ok(())
     }
 
+    /// The one verification path, with the caller's optional stage observation. The ordinary
+    /// `Make::verify` selects the zero-sized observer; distributed diagnostics use its spans.
+    fn verify_over<O: WalkObserver>(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8], observer: &O) -> Result<Option<Verdict>, RunError> {
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        {
+            let _span = observer.span("load verification heads");
+            self.construct(tabled)?;
+        }
+        let Some((program, state)) = self.made.as_mut() else {
+            return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::verify`)" });
+        };
+        let verdict = verify_instance_observed(program, &mut self.typing, state, &mut self.checks, tabled, name, entry, observer);
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        verdict.map(Some)
+    }
+
     /// Prepare a reached instance in the same resolved phase that emits baseline records.
     #[cfg(feature = "llvm")]
     fn prepare<R>(&mut self, _grant: &G, tabled: ItemKey, name: &[u8], mut prepare: impl FnMut(Grounded<'_>) -> R) -> Result<R, RunError> {
@@ -3631,18 +3685,11 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Make for Maker<'n, G, T> {
     /// A found entry asked again ([`verify_instance`]) over the program, made here as on a
     /// first miss; as `make`, a verdict over an unanswered question is void.
     fn verify(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, RunError> {
-        if let Some(void) = self.void(tabled) {
-            return Err(void);
-        }
-        self.construct(tabled)?;
-        let Some((program, state)) = self.made.as_mut() else {
-            return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::verify`)" });
-        };
-        let verdict = verify_instance(program, &mut self.typing, state, &mut self.checks, tabled, name, entry);
-        if let Some(void) = self.void(tabled) {
-            return Err(void);
-        }
-        verdict.map(Some)
+        self.verify_over(tabled, name, entry, &NoWalkObserver)
+    }
+
+    fn verify_observed<O: WalkObserver>(&mut self, _key: CodeKey, _under: CodeKey, tabled: ItemKey, name: &[u8], entry: &[u8], observer: &O) -> Result<Option<Verdict>, RunError> {
+        self.verify_over(tabled, name, entry, observer)
     }
 }
 

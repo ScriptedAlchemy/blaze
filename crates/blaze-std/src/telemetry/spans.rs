@@ -17,9 +17,11 @@ use super::{Brief, FNV_START, TelemetryError, fnv};
 /// The most names a path keeps.
 pub const SPAN_DEPTH: usize = 4;
 
-/// The rows a worker's table holds (64 rows of 448 bytes: 28 KiB a worker, reserved only from
-/// `Spans`).
-pub const SPAN_ROWS: usize = 64;
+/// The rows a worker's table holds, reserved only from `Spans`. The extra 64 rows keep late
+/// diagnostic stages visible after a build's earlier paths; they cost
+/// `64 * size_of::<Option<SpanRow>>()` more bytes per active cell than the former 64-row table.
+/// The table remains fixed: further paths are folded into `other`.
+pub const SPAN_ROWS: usize = 128;
 
 /// A span's name path from the run's root.
 #[derive(Clone, Copy, Debug)]

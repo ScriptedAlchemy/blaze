@@ -434,6 +434,26 @@ impl Form for EntryForm {
     }
 }
 
+/// Optional observation of the record walk's fixed stages. The caller owns the clock and
+/// accounting; a span is closed by its drop and can observe stages nested inside it. No item
+/// names or per-row collection are retained here. The ordinary walk uses [`NoWalkObserver`].
+pub trait WalkObserver {
+    type Span: WalkObserver;
+
+    fn span(&self, name: &'static str) -> Self::Span;
+}
+
+/// The ordinary walk's zero-sized observation strategy: no clock, allocation or report.
+pub struct NoWalkObserver;
+
+impl WalkObserver for NoWalkObserver {
+    type Span = NoWalkObserver;
+
+    fn span(&self, _name: &'static str) -> Self::Span {
+        NoWalkObserver
+    }
+}
+
 /// The on-demand side: the front end and the builder, made on first need. One call checks,
 /// lowers, builds, emits and seals ONE instance, or makes ONE static's datum; nothing else of
 /// the program is touched.
@@ -470,6 +490,14 @@ pub trait Make {
     /// within a single checked snapshot without re-evaluating read lists. Defaults to [`Make::verify`].
     fn verify_keyed(&mut self, _key: CodeKey, _under: CodeKey, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<Verdict>, Self::Error> {
         self.verify(tabled, name, entry)
+    }
+    /// The same keyed verification with observation of its internal stages when supported.
+    /// The default preserves an implementation's keyed proof reuse, including its refusals.
+    fn verify_observed<O: WalkObserver>(&mut self, key: CodeKey, under: CodeKey, tabled: ItemKey, name: &[u8], entry: &[u8], _observer: &O) -> Result<Option<Verdict>, Self::Error>
+    where
+        Self: Sized,
+    {
+        self.verify_keyed(key, under, tabled, name, entry)
     }
 }
 
@@ -1199,20 +1227,44 @@ impl<'a> Walk<'a> {
         most: usize,
         scratch: &mut Scratch<'a>,
     ) -> Result<One<'w>, WalkError<M::Error>> {
+        self.one_observed(row, ids, store, builder, producer, make, grant, form, most, scratch, &NoWalkObserver)
+    }
+
+    /// [`Walk::one`] with the caller's observation of the same work. The stages have fixed
+    /// names and retain no per-instance state; both paths share the ordinary key and verdict
+    /// implementation.
+    pub fn one_observed<'w, M: Make, O: WalkObserver>(
+        &'w mut self,
+        row: usize,
+        ids: &dyn BodyIds,
+        store: &mut dyn CodeStore,
+        builder: &Builder,
+        producer: &ProducerId<CodeBuilder>,
+        make: &mut M,
+        grant: &M::Grant,
+        form: &dyn Form,
+        most: usize,
+        scratch: &mut Scratch<'a>,
+        observer: &O,
+    ) -> Result<One<'w>, WalkError<M::Error>> {
         scratch.made.clear();
         // The same three parts the pool drives apart (D194: begin and finish on the relay, the
         // make on a worker), here in one call: the seam test `split_steps_equal_one` holds the
         // two equal (rule 78).
-        let pending = match self.start(row, ids, store, builder, producer, make, form, most, scratch)? {
+        let pending = match self.start(row, ids, store, builder, producer, make, form, most, scratch, observer)? {
             Began::Stepped(stepped) => return Ok(One { stepped, declared: self.declared(row) }),
             Began::Make(pending) => pending,
         };
         let Scratch { name, made, declared, .. } = scratch;
-        if let Err(why) = pending.order.make(make, grant, name.as_slice(), made) {
+        let made_result = {
+            let _span = observer.span("make missing entry");
+            pending.order.make(make, grant, name.as_slice(), made)
+        };
+        if let Err(why) = made_result {
             self.how[pending.row()] = How::Waiting;
             return Err(why);
         }
-        let stepped = self.end(pending, made.as_slice(), store, form, most, declared)?;
+        let stepped = self.end(pending, made.as_slice(), store, form, most, declared, observer)?;
         Ok(One { stepped, declared: self.declared(row) })
     }
 
@@ -1238,7 +1290,7 @@ impl<'a> Walk<'a> {
         most: usize,
         scratch: &mut Scratch<'a>,
     ) -> Result<Begun<'w>, WalkError<M::Error>> {
-        Ok(match self.start(row, ids, store, builder, producer, verify, form, most, scratch)? {
+        Ok(match self.start(row, ids, store, builder, producer, verify, form, most, scratch, &NoWalkObserver)? {
             Began::Stepped(stepped) => Begun::Stepped(One { stepped, declared: self.declared(row) }),
             Began::Make(pending) => Begun::Make(pending),
         })
@@ -1251,7 +1303,7 @@ impl<'a> Walk<'a> {
     /// `one`'s.
     pub fn finish<'w, E>(&'w mut self, pending: Pending, made: &[u8], store: &mut dyn CodeStore, form: &dyn Form, most: usize, scratch: &mut Scratch<'a>) -> Result<One<'w>, WalkError<E>> {
         let row = pending.row();
-        let stepped = self.end(pending, made, store, form, most, &mut scratch.declared)?;
+        let stepped = self.end(pending, made, store, form, most, &mut scratch.declared, &NoWalkObserver)?;
         Ok(One { stepped, declared: self.declared(row) })
     }
 
@@ -1288,7 +1340,7 @@ impl<'a> Walk<'a> {
     /// [`Walk::begin`]'s work, its answer holding no borrow of the walk (so `one` may go on
     /// to the make after it).
     #[allow(clippy::too_many_arguments)]
-    fn start<M: Make>(
+    fn start<M: Make, O: WalkObserver>(
         &mut self,
         row: usize,
         ids: &dyn BodyIds,
@@ -1299,6 +1351,7 @@ impl<'a> Walk<'a> {
         form: &dyn Form,
         most: usize,
         scratch: &mut Scratch<'a>,
+        observer: &O,
     ) -> Result<Began, WalkError<M::Error>> {
         let Scratch { name, made: _, facts, items, declared, queried } = scratch;
         *queried = None;
@@ -1308,6 +1361,7 @@ impl<'a> Walk<'a> {
             How::Waiting => {}
         }
         let tabled = self.tabled[row];
+        let recipe_span = observer.span("recipe from current facts");
         name.clear();
         name.extend_from_slice(self.name(row));
         let body = ids.body_check(tabled).ok_or(WalkError::NoBody { tabled })?;
@@ -1335,17 +1389,27 @@ impl<'a> Walk<'a> {
                 Ok(record_key(self.symbols[row], &body, facts.as_slice(), builder, producer))
             }
         };
+        drop(recipe_span);
         *queried = keyed.ok();
         // Found: through the key's pointer to its content key (a key of an older walk may hold
         // its entry itself), and taken only when its read list holds today (the module doc,
         // "The read list"). A list that moved: made again, as a missing entry is.
         if let Ok(key) = keyed
-            && let Some((under, bytes)) = Walk::found(&*store, key).map_err(WalkError::Store)?
+            && let Some((under, bytes)) = {
+                let _span = observer.span("lookup stored entry");
+                Walk::found(&*store, key).map_err(WalkError::Store)?
+            }
         {
-            let rows = form.reads(bytes).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
+            let rows = {
+                let _span = observer.span("decode entry read list");
+                form.reads(bytes).map_err(|why| WalkError::Entry { tabled, found: true, why })?
+            };
             let holds = match rows {
                 0 => true,
-                rows => match verify.verify_keyed(key, under, tabled, name.as_slice(), bytes).map_err(|why| WalkError::Verify { tabled, why })? {
+                rows => match {
+                    let span = observer.span("verify stored entry");
+                    verify.verify_observed(key, under, tabled, name.as_slice(), bytes, &span).map_err(|why| WalkError::Verify { tabled, why })?
+                } {
                     None => return Err(WalkError::Unverified { tabled, rows }),
                     Some(Verdict::Holds) => {
                         self.verified += 1;
@@ -1361,9 +1425,15 @@ impl<'a> Walk<'a> {
                 },
             };
             if holds {
-                form.declared(bytes, declared).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
+                {
+                    let _span = observer.span("decode declarations");
+                    form.declared(bytes, declared).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
+                }
                 let stepped = Stepped::Found(under);
-                self.reach_declared(row, stepped, most, declared)?;
+                {
+                    let _span = observer.span("discover declarations");
+                    self.reach_declared(row, stepped, most, declared)?;
+                }
                 return Ok(Began::Stepped(stepped));
             }
         }
@@ -1378,7 +1448,7 @@ impl<'a> Walk<'a> {
 
     /// [`Walk::finish`]'s work: `made` read for its declared rows, put when keyed, the rows
     /// reached; on an error the row is waiting again.
-    fn end<E>(&mut self, pending: Pending, made: &[u8], store: &mut dyn CodeStore, form: &dyn Form, most: usize, declared: &mut DeclaredList<'a>) -> Result<Stepped, WalkError<E>> {
+    fn end<E, O: WalkObserver>(&mut self, pending: Pending, made: &[u8], store: &mut dyn CodeStore, form: &dyn Form, most: usize, declared: &mut DeclaredList<'a>, observer: &O) -> Result<Stepped, WalkError<E>> {
         let row = self.begun(&pending)?;
         let Pending { order, keyed, class, .. } = pending;
         let tabled = order.tabled;
@@ -1386,19 +1456,29 @@ impl<'a> Walk<'a> {
         // Put under its content key, and the instance's key pointed to it: an entry made again
         // because its read list moved has other bytes under the same instance key, which a put
         // under that key would refuse as two values (rule 21).
-        let content = crate::code_records::content_key(made);
-        let done = form
-            .declared(made, declared)
+        let content = {
+            let _span = observer.span("store made entry");
+            crate::code_records::content_key(made)
+        };
+        let declarations = {
+            let _span = observer.span("decode declarations");
+            form.declared(made, declared)
+        };
+        let done = declarations
             .map_err(|why| WalkError::Entry { tabled, found: false, why })
-            .and_then(|()| match keyed {
-                Ok(key) => store.put(class, content, made).and_then(|()| store.point(class, key, content)).map_err(WalkError::Store),
-                Err(_) => Ok(()),
+            .and_then(|()| {
+                let _span = observer.span("store made entry");
+                match keyed {
+                    Ok(key) => store.put(class, content, made).and_then(|()| store.point(class, key, content)).map_err(WalkError::Store),
+                    Err(_) => Ok(()),
+                }
             })
             .and_then(|()| {
                 let stepped = match keyed {
                     Ok(_) => Stepped::Made(content),
                     Err(why) => Stepped::Unkeyed(why),
                 };
+                let _span = observer.span("discover declarations");
                 self.reach_declared(row, stepped, most, declared).map(|()| stepped)
             });
         if done.is_err() {
@@ -2020,6 +2100,16 @@ mod tests {
     /// Prints "split_steps_equal_one: keyed 5 rows 5 makes; unkeyed 5 rows 5 makes".
     #[test]
     fn split_steps_equal_one() {
+        struct Seen<'a>(&'a core::cell::Cell<usize>);
+        impl<'a> WalkObserver for Seen<'a> {
+            type Span = Seen<'a>;
+
+            fn span(&self, _name: &'static str) -> Self::Span {
+                self.0.set(self.0.get() + 1);
+                Seen(self.0)
+            }
+        }
+
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
         let erased = blaze_own::Erased::new(&frame);
         let alloc = erased.handle();
@@ -2036,6 +2126,22 @@ mod tests {
             let mut serial_model = Model { alloc, calls: 0 };
             let mut serial = Walk::new_in(alloc);
             serial.run((ItemKey(MAIN), &entry), &ids, &mut serial_store, &builder, &producer, &mut serial_model, &Toy, 64).expect("the serial walk");
+
+            let spans = core::cell::Cell::new(0);
+            let observer = Seen(&spans);
+            let mut observed_store = MemoryStore::new_in(alloc);
+            let mut observed_model = Model { alloc, calls: 0 };
+            let mut observed = Walk::new_in(alloc);
+            let mut observed_scratch = Scratch::new_in(alloc);
+            observed.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("observed main is reached");
+            let mut next = 0;
+            while next < observed.len() {
+                observed.one_observed(next, &ids, &mut observed_store, &builder, &producer, &mut observed_model, &GRANT, &Toy, 64, &mut observed_scratch, &observer)
+                    .expect("the observed walk");
+                next += 1;
+            }
+            assert!(spans.get() > 0, "the control must observe the walk's stages");
+            assert_eq!((observed.len(), observed_model.calls, observed_store.puts), (serial.len(), serial_model.calls, serial_store.puts));
 
             let mut split_store = MemoryStore::new_in(alloc);
             let mut split_model = Model { alloc, calls: 0 };
@@ -2071,10 +2177,16 @@ mod tests {
             let declared = |walk: &Walk<'_>, row: usize| -> std::vec::Vec<Symbol> { walk.declared(row).iter().map(|&c| walk.symbol(c as usize)).collect() };
             for row in 0..serial.len() {
                 let other = split.row_of(&serial.symbol(row)).expect("the split walk reached every row the serial one did");
+                let watched = observed.row_of(&serial.symbol(row)).expect("the observed walk reached every serial row");
                 assert_eq!(split.how(other), serial.how(row), "row {row}");
+                assert_eq!(observed.how(watched), serial.how(row), "observed row {row}");
                 assert_eq!(declared(&split, other), declared(&serial, row), "row {row}: the entry's order");
+                assert_eq!(declared(&observed, watched), declared(&serial, row), "observed row {row}: the entry's order");
                 match serial.key(row) {
-                    Some(key) => assert_eq!(split_store.get(key).expect("read"), serial_store.get(key).expect("read"), "row {row}: one entry under one key"),
+                    Some(key) => {
+                        assert_eq!(split_store.get(key).expect("read"), serial_store.get(key).expect("read"), "row {row}: one entry under one key");
+                        assert_eq!(observed_store.get(key).expect("read"), serial_store.get(key).expect("read"), "observed row {row}: one entry under one key");
+                    }
                     None => assert!(!recorded, "row {row}: a keyed model made an unkeyed row"),
                 }
             }
