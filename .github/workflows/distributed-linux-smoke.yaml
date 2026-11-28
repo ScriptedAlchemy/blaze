@@ -1,14 +1,14 @@
 # Validation-only workflow for validation/distributed-compile-audit-linux-smoke.
-# Candidate source: 56ce85fa0d8d6fd7a528aa82e90c1b04745c170b
-# Candidate tree: d8c6fc4eeef20d90f715d648dbb0359892ac1644
-# The historical old-compiler source, manifest and artifact pins stay frozen.
+# Candidate source: d300f1ee123b4ba5cf74e78fefe6791fec1ece4e
+# Candidate tree: ffc4a0a1186eed389246391f1ce82baeedee27ce
+# The historical both-pass comparison remains failed; no old-negative premise is carried forward.
 # Canonical recipe: the source-compiler release build in blaze.yaml plus the exact
 # canonical smoke/identity recipe retained in distributed-perf-artifact-smoke.yaml
 # and successful runs 46057759000 / 46058783800. No benchmark or normal CI edits.
 # Scope: exact-tree canonical release smoke, all four native temporary-scope controls,
-# and byte-identical old/new executable Drop controls. Earlier publication/source proof is retained.
-# The historical compiler is a diagnostic control only; neither qualification replaces CI.
-name: Final Cell fixture, native scopes and canonical qualification
+# and strict current-source executable Drop acceptance. Earlier publication/source proof is retained.
+# Runtime acceptance is not an old-fail/new-pass claim and does not replace normal full CI.
+name: Final borrow-flow and direct-builder acceptance
 on:
   push:
     branches: [validation/distributed-compile-audit-linux-smoke]
@@ -30,8 +30,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 150
     env:
-      AUDIT_SOURCE_SHA: 56ce85fa0d8d6fd7a528aa82e90c1b04745c170b
-      AUDIT_SOURCE_TREE: d8c6fc4eeef20d90f715d648dbb0359892ac1644
+      AUDIT_SOURCE_SHA: d300f1ee123b4ba5cf74e78fefe6791fec1ece4e
+      AUDIT_SOURCE_TREE: ffc4a0a1186eed389246391f1ce82baeedee27ce
     steps:
       - name: Require the final immutable candidate identity
         timeout-minutes: 1
@@ -322,6 +322,37 @@ jobs:
           timeout 10 swapon --show --bytes > "$evidence/swap-after.txt"
           timeout 20 git status --short > "$evidence/source-after.txt"
           timeout 20 git diff HEAD --binary > "$evidence/source-after.patch"
+      - name: Print bounded original canonical evidence for review
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          timeout -k 5 30 python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "canonical-evidence"
+          names = (
+              "source.txt", "source-after.txt", "source-after.patch", "blaze-build.json",
+              "binaries.before.txt", "binaries.after-verify.txt", "manifest-sha256.txt",
+              "identity-before-smoke.log", "identity-after-smoke.log",
+              "quote.txt", "hello-smoke-verify.txt", "smoke-logs/hello-test.out",
+              "smoke-logs/hello-test.err", "native-temporary-scopes.exit",
+              "native-temporary-scopes.receipt.json", "source-files.sha256",
+          )
+          for name in names:
+              path = root / name
+              if not path.is_file():
+                  print("BLAZE_CANONICAL_EVIDENCE " + json.dumps({"path": name, "present": False}))
+                  continue
+              size = path.stat().st_size
+              if size > 131072:
+                  raise SystemExit(f"canonical review member exceeds its bound: {name}: {size}")
+              data = path.read_bytes()
+              print("BLAZE_CANONICAL_EVIDENCE " + json.dumps({
+                  "path": name, "present": True, "bytes": len(data),
+                  "sha256": hashlib.sha256(data).hexdigest(), "text": data.decode("utf-8"),
+              }, sort_keys=True))
+          PY
       - name: Keep canonical quote, build and shelf evidence
         if: always()
         uses: actions/upload-artifact@v7
@@ -346,15 +377,15 @@ jobs:
           retention-days: 7
 
   lazy-boolean-drop-candidate:
-    name: Lazy Boolean executable Drop control (candidate)
+    name: Exact-tree checked Drop acceptance
     needs: canonical-release-smoke
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     env:
-      AUDIT_SOURCE_SHA: 56ce85fa0d8d6fd7a528aa82e90c1b04745c170b
-      AUDIT_SOURCE_TREE: d8c6fc4eeef20d90f715d648dbb0359892ac1644
-      FIXTURE_SOURCE_SHA: 56ce85fa0d8d6fd7a528aa82e90c1b04745c170b
-      FIXTURE_SOURCE_TREE: d8c6fc4eeef20d90f715d648dbb0359892ac1644
+      AUDIT_SOURCE_SHA: d300f1ee123b4ba5cf74e78fefe6791fec1ece4e
+      AUDIT_SOURCE_TREE: ffc4a0a1186eed389246391f1ce82baeedee27ce
+      FIXTURE_SOURCE_SHA: d300f1ee123b4ba5cf74e78fefe6791fec1ece4e
+      FIXTURE_SOURCE_TREE: ffc4a0a1186eed389246391f1ce82baeedee27ce
       FIXTURE_PATH: crates/blaze-cli/tests/ladder/front2/x-drop-13-lazy-booleans
       FIXTURE_TREE: 4b03b33fce6afbd30b482474d3eccfee291b4d71
       FIXTURE_CASE_SHA256: b1d7a6e9d39e4e6acb90394197f4d7a049fc44f81157e6833558c96b57a03e03
@@ -390,7 +421,7 @@ jobs:
         if [ "$(timeout 10s cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
           timeout 10s sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
         fi
-    - name: Copy the exact tracked candidate fixture outside both compiler checkouts
+    - name: Copy the exact tracked fixture outside the compiler checkout
       timeout-minutes: 2
       run: |
         set -euo pipefail
@@ -534,7 +565,7 @@ jobs:
           '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:900,reap_seconds:30,commands:[{name:"lazy-boolean-drop-order",args:["test","--view","json","--","--run-all","--format","json","--exact",$test]}]}' \
           > "$evidence/exec-input.json"
         # Same 900-second source-command and 3300-second outer bounds as focused fixtures.
-        # The old arm is a required negative control: only the following receipt may accept its failure.
+        # Preserve the actual status; the strict acceptance receipt below requires success.
         set +e
         timeout -k 30 3300 python3 harness/v2/exec_observer.py "$evidence/exec-input.json" \
           > "$evidence/observer.stdout" 2> "$evidence/observer.stderr"
@@ -565,7 +596,7 @@ jobs:
           '{command:"verify",binaries:$bin,services:true}')
         timeout 60s python3 .github/scripts/dist_build_identity.py "$identity" \
           2>&1 | timeout 70s tee "$evidence/identity-after-fixture.log"
-    - name: Require exactly one actual test outcome and the precise old/new result
+    - name: Require exactly one actually executed passing test
       id: receipt
       if: ${{ !cancelled() && steps.observed.outcome == 'success' && steps.unchanged.outcome == 'success' }}
       timeout-minutes: 2
@@ -583,15 +614,14 @@ jobs:
         result = json.loads((out / "result.json").read_text())
         supervisor = json.loads((out / "supervisor.json").read_text())
         status = int((evidence / "observer.exit").read_text())
-        old = os.environ["DROP_ARM"] == "old-compiler"
-        expected_status = 1 if old else 0
+        expected_status = 0
         scope = "linux-command-descendants-through-exit"
         name = "lazy-boolean-drop-order"
         args = ["test", "--view", "json", "--", "--run-all", "--format", "json", "--exact", os.environ["DROP_TEST"]]
         commands = supervisor.get("commands")
         if (status != expected_status or result.get("schema") != 2 or result.get("scope") != scope
                 or result.get("command_status") != expected_status or result.get("returncode") != expected_status
-                or result.get("passed") is not (not old)
+                or result.get("passed") is not True
                 or result.get("environment", {}).get("BLAZE_NO_DAEMON") != "1"
                 or supervisor.get("schema") != 2 or supervisor.get("scope") != scope
                 or supervisor.get("complete") is not True or "stop" in supervisor
@@ -604,9 +634,7 @@ jobs:
                 or given.get("command_seconds") != 900 or given.get("reap_seconds") != 30
                 or Path(given["cwd"]) != project):
             raise SystemExit("missing exact named-test launch, exit and complete descendant evidence")
-        if old and result.get("error") != "selected Blaze command failed with status 1":
-            raise SystemExit("old compiler failed for an unrelated observer reason")
-        if not old and "error" in result:
+        if "error" in result:
             raise SystemExit("candidate observer reported an error")
         if result.get("compiler") != {key: manifest["binaries"][key] for key in ("blaze", "blaze-launcher", "blaze-fact-shim")}:
             raise SystemExit("observed compiler differs from the original sealed manifest")
@@ -621,38 +649,29 @@ jobs:
         # A single target uses its bare test path; package/target prefixes are only
         # added by test_drive::run when more than one suite is selected.
         if (path != os.environ["DROP_TEST"] or re.fullmatch(r"[0-9a-f]{64}", test.get("test") or "") is None
-                or summary.get("result") != ("failed" if old else "ok") or summary.get("ran") != 1
-                or summary.get("passed") != (0 if old else 1) or summary.get("failed") != (1 if old else 0)
+                or summary.get("result") != "ok" or summary.get("ran") != 1
+                or summary.get("passed") != 1 or summary.get("failed") != 0
                 or any(summary.get(key, 0) != 0 for key in ("reused", "ignored", "benches_not_run", "filtered_out", "flaky", "not_built"))
-                or test.get("outcome") != ("failed" if old else "passed") or test.get("ran_because") != "run_all"
-                or test.get("basis") is not None or test.get("failure") != ("panicked" if old else None)):
+                or test.get("outcome") != "passed" or test.get("ran_because") != "run_all"
+                or test.get("basis") is not None or test.get("failure") is not None):
             raise SystemExit("selected fixture test was not actually executed with the required outcome")
-        expected_message = r"assertion `left == right` failed\n[ \t]*left: 1\n[ \t]*right: 0"
-        if old:
-            if (len(failed) != 1 or failed[0].get("test") != test.get("test") or failed[0].get("path") != path
-                    or failed[0].get("ended") != "panicked" or failed[0].get("signal") is not None
-                    or failed[0].get("after_ns") is not None or failed[0].get("refused") is not None
-                    or failed[0].get("output_cut") != 0
-                    or re.fullmatch(expected_message, failed[0].get("message") or "") is None
-                    or (failed[0].get("output") or "").count("assertion `left == right` failed") != 1):
-                raise SystemExit("old compiler did not reach the exact case::check assertion (1 instead of 0)")
-        elif failed:
+        if failed:
             raise SystemExit("candidate fixture contains an unexpected failure record")
         for name, digest in fixture["file_sha256"].items():
             if hashlib.sha256((project / name).read_bytes()).hexdigest() != digest:
                 raise SystemExit(f"fixture source changed during execution: {name}")
         receipt = {
-            "scope": "causal executable temporary-drop semantics; not performance or full-CI evidence",
+            "scope": "direct-builder executable acceptance; not causal, performance or full-CI evidence",
             "arm": os.environ["DROP_ARM"], "fixture": fixture, "test": os.environ["DROP_TEST"],
             "source": manifest["source"], "compiler": result["compiler"],
             "manifest_sha256": hashlib.sha256((evidence / "blaze-build.original.json").read_bytes()).hexdigest(),
             "handoff": json.loads((evidence / "handoff-archives.json").read_text()),
             "command_args": args, "observer_status": status, "source_summary": summary,
-            "test_record": test, "failure_record": failed[0] if old else None,
+            "test_record": test, "failure_record": None,
             "unchanged_identity": True, "validation_passed": True,
         }
         (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
-        print(json.dumps({"arm": receipt["arm"], "test": receipt["test"], "validation_passed": True, "observer_status": status}))
+        print("BLAZE_ACCEPTANCE_RECEIPT " + json.dumps(receipt, sort_keys=True))
         PY
     - name: Collect final source state even when qualification fails
       if: always()
@@ -673,388 +692,3 @@ jobs:
         path: ${{ runner.temp }}/lazy-drop-evidence
         if-no-files-found: error
         retention-days: 7
-  lazy-boolean-drop-old-compiler:
-    name: Lazy Boolean executable Drop control (old-compiler)
-    needs: canonical-release-smoke
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 120
-    env:
-      AUDIT_SOURCE_SHA: 089b5f009ab48241a0c0e0fdfc22d9b08edf9398
-      AUDIT_SOURCE_TREE: 659b50805f637c8b34414173b73848deae807f6a
-      FIXTURE_SOURCE_SHA: 56ce85fa0d8d6fd7a528aa82e90c1b04745c170b
-      FIXTURE_SOURCE_TREE: d8c6fc4eeef20d90f715d648dbb0359892ac1644
-      FIXTURE_PATH: crates/blaze-cli/tests/ladder/front2/x-drop-13-lazy-booleans
-      FIXTURE_TREE: 4b03b33fce6afbd30b482474d3eccfee291b4d71
-      FIXTURE_CASE_SHA256: b1d7a6e9d39e4e6acb90394197f4d7a049fc44f81157e6833558c96b57a03e03
-      DROP_TEST: lazy_boolean_operand_drop_order
-      DROP_ARM: old-compiler
-      BLAZE_CORES: '2'
-      BLAZE_DAEMON_MEMORY_GB: '2'
-      BLAZE_TESTS: verify
-      WORKFLOW_SHA: ${{ github.workflow_sha }}
-      OLD_RUN_ID: '46081376390'
-      OLD_ARTIFACT_ID: '15238435003'
-    steps:
-    - uses: actions/checkout@v7
-      timeout-minutes: 5
-      with:
-        ref: ${{ env.FIXTURE_SOURCE_SHA }}
-        persist-credentials: false
-    - uses: ./.github/actions/locked-memory
-      timeout-minutes: 2
-    - uses: ./.github/actions/reflink
-      timeout-minutes: 15
-    - uses: ./.github/actions/apt
-      timeout-minutes: 15
-      with:
-        packages: strace bubblewrap
-    - uses: ./.github/actions/toolchain
-      timeout-minutes: 15
-      with:
-        components: rust-src
-        targets: wasm32-wasip1
-    - name: User namespaces for source test sandboxes
-      timeout-minutes: 1
-      run: |
-        set -euo pipefail
-        if [ "$(timeout 10s cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
-          timeout 10s sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
-        fi
-    - name: Copy the exact tracked candidate fixture outside both compiler checkouts
-      timeout-minutes: 2
-      run: |
-        set -euo pipefail
-        evidence="$RUNNER_TEMP/lazy-drop-evidence"
-        project="$RUNNER_TEMP/blaze-fs/lazy-boolean-fixture"
-        timeout 10s mkdir "$evidence" "$project"
-        test "$(timeout 10s uname -s -m)" = "Linux aarch64"
-        test "$(timeout 20s git rev-parse HEAD)" = "$FIXTURE_SOURCE_SHA"
-        test "$(timeout 20s git rev-parse 'HEAD^{tree}')" = "$FIXTURE_SOURCE_TREE"
-        test -z "$(timeout 20s git status --porcelain --untracked-files=all)"
-        test "$(timeout 10s git rev-parse "HEAD:$FIXTURE_PATH")" = "$FIXTURE_TREE"
-        timeout 20s git ls-tree -r "HEAD:$FIXTURE_PATH" > "$evidence/fixture.git-tree.txt"
-        timeout 20s git archive --format=tar "HEAD:$FIXTURE_PATH" > "$evidence/fixture.tar"
-        timeout 20s tar -xf "$evidence/fixture.tar" -C "$project"
-        timeout -k 5s 20s python3 - <<'PY'
-        import hashlib, json, os
-        from pathlib import Path
-        root = Path(os.environ["RUNNER_TEMP"])
-        evidence, project = root / "lazy-drop-evidence", root / "blaze-fs/lazy-boolean-fixture"
-        files = {}
-        for path in project.rglob("*"):
-            assert not path.is_symlink(), f"fixture contains a symlink: {path}"
-            if path.is_file():
-                files[str(path.relative_to(project))] = hashlib.sha256(path.read_bytes()).hexdigest()
-        assert set(files) == {"Cargo.toml", "expected", "src/main.rs", "src/case.rs"}
-        assert files["src/case.rs"] == os.environ["FIXTURE_CASE_SHA256"]
-        record = {
-            "source": {"commit": os.environ["FIXTURE_SOURCE_SHA"], "tree": os.environ["FIXTURE_SOURCE_TREE"]},
-            "path": os.environ["FIXTURE_PATH"], "fixture_tree": os.environ["FIXTURE_TREE"],
-            "case_sha256": files["src/case.rs"], "file_sha256": files,
-            "test": os.environ["DROP_TEST"], "project": str(project),
-            "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-            "workflow_sha": os.environ["WORKFLOW_SHA"],
-        }
-        (evidence / "fixture.json").write_text(json.dumps(record, indent=2) + "\n")
-        PY
-        timeout 10s cp -a "$project" "$evidence/fixture-source"
-        timeout 10s uname -a > "$evidence/kernel.txt"
-        timeout 10s lscpu > "$evidence/cpu.txt"
-    - uses: actions/checkout@v7
-      timeout-minutes: 5
-      with:
-        ref: ${{ env.AUDIT_SOURCE_SHA }}
-        persist-credentials: false
-    - name: Verify and record the compiler's pristine source checkout
-      timeout-minutes: 2
-      run: |
-        set -euo pipefail
-        evidence="$RUNNER_TEMP/lazy-drop-evidence"
-        source_sha=$(timeout 20s git rev-parse HEAD)
-        source_tree=$(timeout 20s git rev-parse 'HEAD^{tree}')
-        source_status=$(timeout 20s git status --porcelain --untracked-files=all)
-        test "$source_sha" = "$AUDIT_SOURCE_SHA"
-        test "$source_tree" = "$AUDIT_SOURCE_TREE"
-        test -z "$source_status"
-        test "$(timeout 10s cat pins/toolchain)" = "$EXPECTED_TOOLCHAIN"
-        printf '%s\n%s\n' "$source_sha" "$source_tree" > "$evidence/source.before.txt"
-        timeout 10s sha256sum .github/scripts/dist_build_identity.py harness/v2/exec_observer.py \
-          harness/v2/exec_observer_child.py > "$evidence/gate-source.sha256"
-        printf 'arm=%s\nsource_sha=%s\nsource_tree=%s\n' "$DROP_ARM" "$source_sha" "$source_tree" > "$evidence/compiler-source.txt"
-    - uses: actions/download-artifact@v8
-      timeout-minutes: 15
-      with:
-        artifact-ids: ${{ env.OLD_ARTIFACT_ID }}
-        run-id: ${{ env.OLD_RUN_ID }}
-        repository: ${{ github.repository }}
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        digest-mismatch: error
-        path: ${{ runner.temp }}/source-package
-    - name: Verify the pinned historical artifact without rebuilding or resealing
-      id: handoff
-      timeout-minutes: 10
-      run: |
-        set -euo pipefail
-        evidence="$RUNNER_TEMP/lazy-drop-evidence"
-        timeout -k 5s 120s python3 - <<'PY'
-        import hashlib, json, os
-        from pathlib import Path
-        root = Path(os.environ["RUNNER_TEMP"])
-        expected = {
-            "source-binaries.tar.gz": "e0e654c803e271d73ec0f5e902c0529d01d0257c39b446a65b2854c4708ab75c",
-            "source-toolchain.tar.gz": "2a1d124129462a6844d1b0efeaa94d4217cca68e3f84803ae8c886322b7d49fe",
-        }
-        actual = {}
-        for name in expected:
-            with (root / "source-package" / name).open("rb") as archive:
-                actual[name] = hashlib.file_digest(archive, "sha256").hexdigest()
-        assert actual == expected, "historical compiler archive differs from its original sealed receipt"
-        (root / "lazy-drop-evidence/handoff-archives.json").write_text(json.dumps({
-            "scope": "explicit historical compiler control only",
-            "source_artifact": "publication-candidate-source-compiler",
-            "artifact_id": os.environ["OLD_ARTIFACT_ID"], "artifact_run_id": os.environ["OLD_RUN_ID"],
-            "archive_sha256": actual, "verified": True,
-        }, indent=2) + "\n")
-        PY
-        timeout 10s mkdir "$RUNNER_TEMP/source-binaries" "$RUNNER_TEMP/source-shelf"
-        timeout 10s mkdir -p "$HOME/.blaze/v2"
-        timeout -k 5s 120s tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries"
-        timeout -k 5s 120s tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$HOME/.blaze/v2"
-        timeout -k 5s 120s tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$RUNNER_TEMP/source-shelf"
-        timeout -k 5s 60s python3 - <<'PY'
-        import hashlib, json, os
-        from pathlib import Path
-        root = Path(os.environ["RUNNER_TEMP"])
-        raw = (root / "source-binaries/blaze-build.json").read_bytes()
-        digest = hashlib.sha256(raw).hexdigest()
-        assert digest == "b2514ef0ba090f393198113be99baf8c2f8415e57392d111d15cb931d191944e"
-        record = json.loads(raw)
-        assert record["source"] == {"commit": "089b5f009ab48241a0c0e0fdfc22d9b08edf9398", "tree": "659b50805f637c8b34414173b73848deae807f6a"}
-        assert record["binaries"]["blaze"] == "7af65991bb1ad3368bf8b383433ad0bcab278aaa11337ce56d32ffa0715cea50"
-        (root / "lazy-drop-evidence/manifest-sha256.txt").write_text(digest + "\n")
-        PY
-        timeout 10s cp "$RUNNER_TEMP/source-binaries/blaze-build.json" "$evidence/blaze-build.original.json"
-        identity=$(timeout 10s jq -nc --arg bin "$RUNNER_TEMP/source-binaries" '{command:"verify",binaries:$bin,services:true}')
-        timeout 60s python3 .github/scripts/dist_build_identity.py "$identity" \
-          2>&1 | timeout 70s tee "$evidence/identity-before-fixture.log"
-        timeout 60s sha256sum "$RUNNER_TEMP/source-binaries"/* > "$evidence/binaries.before.sha256"
-        test ! -e "$RUNNER_TEMP/blaze-fs/lazy-boolean-drop-home"
-        test ! -L "$RUNNER_TEMP/blaze-fs/lazy-boolean-drop-home"
-        test ! -e "$evidence/exec"
-        test ! -L "$evidence/exec"
-    - name: Execute the sole named test once and retain the actual observer exit
-      id: observed
-      if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
-      timeout-minutes: 60
-      run: |
-        set -euo pipefail
-        evidence="$RUNNER_TEMP/lazy-drop-evidence"
-        timeout 60s python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-        timeout 10s jq -n --arg blaze "$RUNNER_TEMP/source-binaries/blaze" \
-          --arg cwd "$RUNNER_TEMP/blaze-fs/lazy-boolean-fixture" \
-          --arg home "$RUNNER_TEMP/blaze-fs/lazy-boolean-drop-home" \
-          --arg out "$evidence/exec" --arg shelf "$RUNNER_TEMP/source-shelf/toolchain" --arg test "$DROP_TEST" \
-          '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:900,reap_seconds:30,commands:[{name:"lazy-boolean-drop-order",args:["test","--view","json","--","--run-all","--format","json","--exact",$test]}]}' \
-          > "$evidence/exec-input.json"
-        # Same 900-second source-command and 3300-second outer bounds as focused fixtures.
-        # The old arm is a required negative control: only the following receipt may accept its failure.
-        set +e
-        timeout -k 30 3300 python3 harness/v2/exec_observer.py "$evidence/exec-input.json" \
-          > "$evidence/observer.stdout" 2> "$evidence/observer.stderr"
-        status=$?
-        set -e
-        printf '%s\n' "$status" > "$evidence/observer.exit"
-        timeout 20s cat "$evidence/observer.stdout" "$evidence/observer.stderr"
-    - name: Verify unchanged compiler source and sealed executables after the fixture
-      id: unchanged
-      if: ${{ !cancelled() && steps.handoff.outcome == 'success' && steps.observed.outcome != 'skipped' }}
-      timeout-minutes: 3
-      run: |
-        set -euo pipefail
-        evidence="$RUNNER_TEMP/lazy-drop-evidence"
-        source_sha=$(timeout 20s git rev-parse HEAD)
-        source_tree=$(timeout 20s git rev-parse 'HEAD^{tree}')
-        source_status=$(timeout 20s git status --porcelain --untracked-files=all)
-        printf '%s\n%s\n%s' "$source_sha" "$source_tree" "$source_status" > "$evidence/source.after.txt"
-        timeout 10s cp "$RUNNER_TEMP/source-binaries/blaze-build.json" "$evidence/blaze-build.after.json"
-        timeout 60s sha256sum "$RUNNER_TEMP/source-binaries"/* > "$evidence/binaries.after.sha256"
-        timeout 10s cmp "$evidence/blaze-build.original.json" "$evidence/blaze-build.after.json"
-        timeout 60s sha256sum -c "$evidence/binaries.before.sha256" > "$evidence/binaries.after-verify.txt"
-        test "$source_sha" = "$AUDIT_SOURCE_SHA"
-        test "$source_tree" = "$AUDIT_SOURCE_TREE"
-        test -z "$source_status"
-        timeout 10s cmp "$evidence/source.before.txt" "$evidence/source.after.txt"
-        identity=$(timeout 10s jq -nc --arg bin "$RUNNER_TEMP/source-binaries" \
-          '{command:"verify",binaries:$bin,services:true}')
-        timeout 60s python3 .github/scripts/dist_build_identity.py "$identity" \
-          2>&1 | timeout 70s tee "$evidence/identity-after-fixture.log"
-    - name: Require exactly one actual test outcome and the precise old/new result
-      id: receipt
-      if: ${{ !cancelled() && steps.observed.outcome == 'success' && steps.unchanged.outcome == 'success' }}
-      timeout-minutes: 2
-      run: |
-        set -euo pipefail
-        timeout -k 5s 30s python3 - <<'PY'
-        import hashlib, json, os, re
-        from pathlib import Path
-        root = Path(os.environ["RUNNER_TEMP"])
-        evidence, project = root / "lazy-drop-evidence", root / "blaze-fs/lazy-boolean-fixture"
-        out = evidence / "exec"
-        fixture = json.loads((evidence / "fixture.json").read_text())
-        manifest = json.loads((evidence / "blaze-build.original.json").read_text())
-        given = json.loads((out / "input.json").read_text())
-        result = json.loads((out / "result.json").read_text())
-        supervisor = json.loads((out / "supervisor.json").read_text())
-        status = int((evidence / "observer.exit").read_text())
-        old = os.environ["DROP_ARM"] == "old-compiler"
-        expected_status = 1 if old else 0
-        scope = "linux-command-descendants-through-exit"
-        name = "lazy-boolean-drop-order"
-        args = ["test", "--view", "json", "--", "--run-all", "--format", "json", "--exact", os.environ["DROP_TEST"]]
-        commands = supervisor.get("commands")
-        if (status != expected_status or result.get("schema") != 2 or result.get("scope") != scope
-                or result.get("command_status") != expected_status or result.get("returncode") != expected_status
-                or result.get("passed") is not (not old)
-                or result.get("environment", {}).get("BLAZE_NO_DAEMON") != "1"
-                or supervisor.get("schema") != 2 or supervisor.get("scope") != scope
-                or supervisor.get("complete") is not True or "stop" in supervisor
-                or not isinstance(commands, list) or len(commands) != 1
-                or set(commands[0]) != {"name", "pid", "returncode", "timed_out"}
-                or commands[0]["name"] != name or type(commands[0]["pid"]) is not int or commands[0]["pid"] <= 0
-                or commands[0]["returncode"] != expected_status or commands[0]["timed_out"] is not False
-                or result.get("commands") != commands or not isinstance(result.get("trace"), dict)
-                or given.get("commands") != [{"name": name, "args": args}]
-                or given.get("command_seconds") != 900 or given.get("reap_seconds") != 30
-                or Path(given["cwd"]) != project):
-            raise SystemExit("missing exact named-test launch, exit and complete descendant evidence")
-        if old and result.get("error") != "selected Blaze command failed with status 1":
-            raise SystemExit("old compiler failed for an unrelated observer reason")
-        if not old and "error" in result:
-            raise SystemExit("candidate observer reported an error")
-        if result.get("compiler") != {key: manifest["binaries"][key] for key in ("blaze", "blaze-launcher", "blaze-fact-shim")}:
-            raise SystemExit("observed compiler differs from the original sealed manifest")
-        rows = [json.loads(line) for line in (out / (name + ".log")).read_text().splitlines() if line.strip()]
-        summaries = [row for row in rows if row.get("event") == "summary"]
-        tests = [row for row in rows if row.get("event") == "test"]
-        failed = [row for row in rows if row.get("event") == "failed"]
-        if len(summaries) != 1 or len(tests) != 1:
-            raise SystemExit("fixture did not produce exactly one test and one summary")
-        summary, test = summaries[0], tests[0]
-        path = test.get("path")
-        # A single target uses its bare test path; package/target prefixes are only
-        # added by test_drive::run when more than one suite is selected.
-        if (path != os.environ["DROP_TEST"] or re.fullmatch(r"[0-9a-f]{64}", test.get("test") or "") is None
-                or summary.get("result") != ("failed" if old else "ok") or summary.get("ran") != 1
-                or summary.get("passed") != (0 if old else 1) or summary.get("failed") != (1 if old else 0)
-                or any(summary.get(key, 0) != 0 for key in ("reused", "ignored", "benches_not_run", "filtered_out", "flaky", "not_built"))
-                or test.get("outcome") != ("failed" if old else "passed") or test.get("ran_because") != "run_all"
-                or test.get("basis") is not None or test.get("failure") != ("panicked" if old else None)):
-            raise SystemExit("selected fixture test was not actually executed with the required outcome")
-        expected_message = r"assertion `left == right` failed\n[ \t]*left: 1\n[ \t]*right: 0"
-        if old:
-            if (len(failed) != 1 or failed[0].get("test") != test.get("test") or failed[0].get("path") != path
-                    or failed[0].get("ended") != "panicked" or failed[0].get("signal") is not None
-                    or failed[0].get("after_ns") is not None or failed[0].get("refused") is not None
-                    or failed[0].get("output_cut") != 0
-                    or re.fullmatch(expected_message, failed[0].get("message") or "") is None
-                    or (failed[0].get("output") or "").count("assertion `left == right` failed") != 1):
-                raise SystemExit("old compiler did not reach the exact case::check assertion (1 instead of 0)")
-        elif failed:
-            raise SystemExit("candidate fixture contains an unexpected failure record")
-        for name, digest in fixture["file_sha256"].items():
-            if hashlib.sha256((project / name).read_bytes()).hexdigest() != digest:
-                raise SystemExit(f"fixture source changed during execution: {name}")
-        receipt = {
-            "scope": "causal executable temporary-drop semantics; not performance or full-CI evidence",
-            "arm": os.environ["DROP_ARM"], "fixture": fixture, "test": os.environ["DROP_TEST"],
-            "source": manifest["source"], "compiler": result["compiler"],
-            "manifest_sha256": hashlib.sha256((evidence / "blaze-build.original.json").read_bytes()).hexdigest(),
-            "handoff": json.loads((evidence / "handoff-archives.json").read_text()),
-            "command_args": args, "observer_status": status, "source_summary": summary,
-            "test_record": test, "failure_record": failed[0] if old else None,
-            "unchanged_identity": True, "validation_passed": True,
-        }
-        (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
-        print(json.dumps({"arm": receipt["arm"], "test": receipt["test"], "validation_passed": True, "observer_status": status}))
-        PY
-    - name: Collect final source state even when qualification fails
-      if: always()
-      timeout-minutes: 2
-      run: |
-        set -euo pipefail
-        evidence="$RUNNER_TEMP/lazy-drop-evidence"
-        timeout 10s mkdir -p "$evidence"
-        timeout 20s git status --porcelain --untracked-files=all > "$evidence/source.final.status"
-        timeout 20s git diff HEAD --binary > "$evidence/source.final.patch"
-        timeout 10s free -b > "$evidence/memory-after.txt"
-    - name: Retain the complete original executable control evidence
-      if: always()
-      uses: actions/upload-artifact@v7
-      timeout-minutes: 10
-      with:
-        name: publication-lazy-boolean-old-compiler
-        path: ${{ runner.temp }}/lazy-drop-evidence
-        if-no-files-found: error
-        retention-days: 7
-    permissions:
-      contents: read
-      actions: read
-  lazy-boolean-drop-verdict:
-    name: Require byte-identical old/new executable Drop outcomes
-    needs:
-    - lazy-boolean-drop-candidate
-    - lazy-boolean-drop-old-compiler
-    if: always()
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 5
-    steps:
-    - uses: actions/download-artifact@v8
-      timeout-minutes: 3
-      with:
-        pattern: publication-lazy-boolean-*
-        path: lazy-boolean-evidence
-    - name: Refuse incomplete controls, changed fixture bytes or the wrong compiler
-      env:
-        CANDIDATE_RESULT: ${{ needs.lazy-boolean-drop-candidate.result }}
-        OLD_RESULT: ${{ needs.lazy-boolean-drop-old-compiler.result }}
-        WORKFLOW_SHA: ${{ github.workflow_sha }}
-      timeout-minutes: 1
-      run: |
-        set -euo pipefail
-        timeout -k 5s 30s python3 - <<'PY'
-        import json, os
-        from pathlib import Path
-        assert os.environ["CANDIDATE_RESULT"] == os.environ["OLD_RESULT"] == "success"
-        root = Path("lazy-boolean-evidence")
-        receipts = {arm: json.loads((root / f"publication-lazy-boolean-{arm}/receipt.json").read_text())
-            for arm in ("candidate", "old-compiler")}
-        for arm, receipt in receipts.items():
-            assert receipt["validation_passed"] is True and receipt["unchanged_identity"] is True
-            assert receipt["arm"] == arm and receipt["test"] == "lazy_boolean_operand_drop_order"
-            assert receipt["fixture"]["run_id"] == os.environ["GITHUB_RUN_ID"]
-            assert receipt["fixture"]["run_attempt"] == os.environ["GITHUB_RUN_ATTEMPT"]
-            assert receipt["fixture"]["workflow_sha"] == os.environ["WORKFLOW_SHA"]
-        new, old = receipts["candidate"], receipts["old-compiler"]
-        new_fixture = {key: value for key, value in new["fixture"].items() if key != "project"}
-        old_fixture = {key: value for key, value in old["fixture"].items() if key != "project"}
-        assert new_fixture == old_fixture, "old/new executions did not use byte-identical fixture source"
-        assert new["command_args"] == old["command_args"]
-        assert old["observer_status"] == 1 and new["observer_status"] == 0
-        assert old["manifest_sha256"] == "b2514ef0ba090f393198113be99baf8c2f8415e57392d111d15cb931d191944e"
-        assert old["source"] == {"commit": "089b5f009ab48241a0c0e0fdfc22d9b08edf9398", "tree": "659b50805f637c8b34414173b73848deae807f6a"}
-        assert old["handoff"]["artifact_id"] == "15238435003" and old["handoff"]["artifact_run_id"] == "46081376390"
-        assert new["source"] == new["fixture"]["source"] and new["source"] != old["source"]
-        assert new["handoff"]["run_id"] == os.environ["GITHUB_RUN_ID"]
-        assert new["handoff"]["run_attempt"] == os.environ["GITHUB_RUN_ATTEMPT"]
-        assert new["compiler"]["blaze"] != old["compiler"]["blaze"]
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-            summary.write("## Executable lazy-Boolean Drop control verified\n\n"
-                "The byte-identical named fixture reached the exact 1-versus-0 assertion with the pinned "
-                "historical compiler and passed with the same-run candidate compiler. Each arm executed "
-                "one actual test on a fresh HOME with complete descendant evidence and unchanged source/binaries. "
-                "This proves the focused executable semantics control, not performance or full CI.\n")
-            for arm, receipt in receipts.items():
-                summary.write(f"\n- {arm}: source `{receipt['source']['commit']}`, tree `{receipt['source']['tree']}`, "
-                    f"CLI SHA-256 `{receipt['compiler']['blaze']}`.\n")
-        PY
-
