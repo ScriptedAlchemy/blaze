@@ -790,6 +790,22 @@ jobs:
             fi
           done
           exit "$first_failure"
+      # Keep failed fault runs inspectable before the later migration and protocol suites finish.
+      - name: keep distributed fault evidence before later suites
+        if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: distributed-fault-evidence
+          path: |
+            ${{ runner.temp }}/dist-evidence
+            ${{ runner.temp }}/source-binaries/blaze-build.json
+            ${{ runner.temp }}/blaze-fs/dist-*/provenance.json
+            ${{ runner.temp }}/blaze-fs/dist-*/source.patch
+            ${{ runner.temp }}/blaze-fs/dist-*/logs
+            ${{ runner.temp }}/blaze-fs/dist-*/gates
+            ${{ runner.temp }}/blaze-fs/dist-*/artifacts.json
+            ${{ runner.temp }}/blaze-fs/dist-*/final-artifacts.json
+          if-no-files-found: warn
       - name: both complete fault runs used unchanged binaries and source
         id: distributed
         run: |
