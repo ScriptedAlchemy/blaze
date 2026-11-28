@@ -1,14 +1,14 @@
 # Validation-only workflow for validation/distributed-compile-audit-linux-smoke.
-# Candidate source: 868de5bc7c7496556e3108a87b689c9280382d8c
-# Candidate tree: a376fc7a8433ebedbcc4ca35f1c596d9bbaab8aa
+# Candidate source: f743258a2ca0ff2703bfde3f2aca3518be3e2441
+# Candidate tree: 1c16df19f5038ad810a13380a69169a9741ae609
 # The historical old-compiler source, manifest and artifact pins stay frozen.
 # Canonical recipe: the source-compiler release build in blaze.yaml plus the exact
 # canonical smoke/identity recipe retained in distributed-perf-artifact-smoke.yaml
 # and successful runs 46057759000 / 46058783800. No benchmark or normal CI edits.
-# Scope: causal native adapter proof, exact-tree canonical release smoke, independent
-# four-package source qualification and byte-identical old/new executable Drop controls.
+# Scope: exact-tree canonical release smoke, all four native temporary-scope controls,
+# and byte-identical old/new executable Drop controls. Earlier publication/source proof is retained.
 # The historical compiler is a diagnostic control only; neither qualification replaces CI.
-name: Publication source qualification and executable Drop controls
+name: Final Cell fixture, native scopes and canonical qualification
 on:
   push:
     branches: [validation/distributed-compile-audit-linux-smoke]
@@ -22,285 +22,16 @@ env:
   CARGO_TERM_COLOR: never
   RUST_BACKTRACE: "0"
   EXPECTED_TOOLCHAIN: nightly-2026-10-27
-  CAUSAL_TEST: a_stale_cache_miss_after_publication_never_compiles_a_second_tail
 
 jobs:
-  native-control:
-    name: ${{ matrix.source.arm }}
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        source:
-          - arm: old-production-plus-control
-            commit: b27cf1f45e912e28b0ef75edf88020d374f0b0cb
-            tree: 66c9087a8acd04e7dad9d2c64c823cab4f8cea7e
-          - arm: new-production-plus-control
-            commit: 868de5bc7c7496556e3108a87b689c9280382d8c
-            tree: a376fc7a8433ebedbcc4ca35f1c596d9bbaab8aa
-    env:
-      BLAZE_TESTS: verify
-      SOURCE_JSON: ${{ toJSON(matrix.source) }}
-      SOURCE_SHA: ${{ matrix.source.commit }}
-      SOURCE_TREE: ${{ matrix.source.tree }}
-      WORKFLOW_REF: ${{ github.workflow_ref }}
-      WORKFLOW_SHA: ${{ github.workflow_sha }}
-    steps:
-      - name: Require immutable snapshot identities
-        timeout-minutes: 1
-        run: |
-          set -euo pipefail
-          timeout 10s mkdir "$RUNNER_TEMP/publication-causal"
-          timeout -k 5s 20s python3 - <<'PY'
-          from dataclasses import asdict, dataclass
-          import json, os, re
-          from pathlib import Path
-          @dataclass(frozen=True)
-          class Source:
-              arm: str
-              commit: str
-              tree: str
-          source = Source(**json.loads(os.environ["SOURCE_JSON"]))
-          receipt = asdict(source) | {key: os.environ[key] for key in (
-              "WORKFLOW_REF", "WORKFLOW_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")}
-          (Path(os.environ["RUNNER_TEMP"]) / "publication-causal/source.expected.json").write_text(
-              json.dumps(receipt, indent=2) + "\n")
-          assert source.arm in {"old-production-plus-control", "new-production-plus-control"}
-          assert all(re.fullmatch(r"[0-9a-f]{40}", value) for value in (source.commit, source.tree)), \
-              "Replace every immutable commit/tree placeholder before publishing this workflow"
-          PY
-      - uses: actions/checkout@v7
-        timeout-minutes: 5
-        with:
-          ref: ${{ matrix.source.commit }}
-          persist-credentials: false
-      - name: Verify source and pinned nightly
-        timeout-minutes: 1
-        run: |
-          set -euo pipefail
-          evidence="$RUNNER_TEMP/publication-causal"
-          test "$(timeout 10s uname -s -m)" = "Linux aarch64"
-          source_sha=$(timeout 10s git rev-parse HEAD)
-          source_tree=$(timeout 10s git rev-parse 'HEAD^{tree}')
-          source_status=$(timeout 10s git status --porcelain --untracked-files=all)
-          toolchain_pin=$(timeout 10s cat pins/toolchain)
-          test "$source_sha" = "$SOURCE_SHA"
-          test "$source_tree" = "$SOURCE_TREE"
-          test -z "$source_status"
-          test "$toolchain_pin" = "$EXPECTED_TOOLCHAIN"
-          printf '%s\n%s\n' "$source_sha" "$source_tree" > "$evidence/source.before.txt"
-          timeout 10s sha256sum Cargo.lock pins/toolchain crates/blaze-dist-local/tests/agent.rs \
-            > "$evidence/source-files.sha256"
-          timeout 10s uname -a > "$evidence/kernel.txt"
-          timeout 10s cp pins/toolchain "$evidence/toolchain-pin.txt"
-      - uses: ./.github/actions/locked-memory
-        timeout-minutes: 2
-      - name: Record existing runner memory and swap
-        timeout-minutes: 1
-        run: |
-          set -euo pipefail
-          timeout 10s swapon --show --bytes | timeout 10s tee "$RUNNER_TEMP/publication-causal/runner-swap.txt"
-          timeout 10s free -b | timeout 10s tee "$RUNNER_TEMP/publication-causal/runner-memory.txt"
-      - uses: ./.github/actions/reflink
-        timeout-minutes: 10
-      - name: Fresh stores and short native paths on the verified reflink filesystem
-        timeout-minutes: 1
-        run: |
-          set -euo pipefail
-          evidence="$RUNNER_TEMP/publication-causal"
-          test "$(ulimit -l)" = unlimited
-          timeout 10s prlimit --pid "$$" --memlock > "$evidence/locked-memory.txt"
-          timeout -k 5s 20s python3 - <<'PY' > "$evidence/fresh-store.json"
-          import json, os
-          from pathlib import Path
-          paths = [Path(os.environ["BLAZE_HOME"]) / "v2/store", Path(os.environ["CARGO_TARGET_DIR"])]
-          for path in paths:
-              assert path.is_dir() and all(p.is_dir() for p in path.rglob("*")), f"nonempty fresh store: {path}"
-          print(json.dumps({"fresh": True, "paths": [str(p) for p in paths]}))
-          PY
-          test_temp="$RUNNER_TEMP/blaze-fs/publication-tmp"
-          timeout 10s mkdir "$test_temp"
-          short_temp=$(timeout 10s mktemp -d /tmp/pc.XXXXXX)
-          timeout 10s sudo mount --bind "$test_temp" "$short_temp"
-          store_device=$(timeout 10s stat -Lc %d "$BLAZE_HOME/v2/store")
-          target_device=$(timeout 10s stat -Lc %d "$CARGO_TARGET_DIR")
-          temp_device=$(timeout 10s stat -Lc %d "$short_temp")
-          test "$temp_device" = "$store_device"
-          test "$temp_device" = "$target_device"
-          printf 'TMPDIR=%s\nstore_device=%s\ntarget_device=%s\ntemp_device=%s\n' \
-            "$short_temp" "$store_device" "$target_device" "$temp_device" > "$evidence/native-filesystem.txt"
-          timeout 10s findmnt -T "$short_temp" >> "$evidence/native-filesystem.txt"
-          echo "TMPDIR=$short_temp" >> "$GITHUB_ENV"
-      - uses: ./.github/actions/toolchain
-        timeout-minutes: 15
-      - name: Build only the native agent integration target with pinned Cargo
-        timeout-minutes: 75
-        run: |
-          set -euo pipefail
-          evidence="$RUNNER_TEMP/publication-causal"
-          timeout 20s cargo "+$EXPECTED_TOOLCHAIN" --version --verbose > "$evidence/cargo-version.txt"
-          timeout 20s rustc "+$EXPECTED_TOOLCHAIN" --version --verbose > "$evidence/rustc-version.txt"
-          # This is distributed-core's existing 4200-second command bound. A build
-          # failure never counts as the expected old-production test failure.
-          set +e
-          timeout -k 30s 4200s cargo "+$EXPECTED_TOOLCHAIN" test --release --locked \
-            -p blaze-dist-local --test agent --no-run --message-format=json-render-diagnostics \
-            > "$evidence/build.jsonl" 2> "$evidence/build.stderr"
-          status=$?
-          set -e
-          printf '%s\n' "$status" > "$evidence/build.exit"
-          timeout 20s cat "$evidence/build.stderr"
-          test "$status" -eq 0
-      - name: Run once and require the exact causal receipt
-        timeout-minutes: 4
-        run: |
-          set -euo pipefail
-          timeout -k 5s 210s python3 - <<'PY'
-          import datetime, hashlib, json, os, re, subprocess
-          from pathlib import Path
-          evidence = Path(os.environ["RUNNER_TEMP"]) / "publication-causal"
-          source = json.loads((evidence / "source.expected.json").read_text())
-          case = os.environ["CAUSAL_TEST"]
-          marker = "stale cache miss invoked Reader::complete"
-          old = source["arm"] == "old-production-plus-control"
-          sha256 = lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest()
-          def git(*args):
-              return subprocess.check_output(["git", *args], text=True, timeout=10).strip()
-          messages = [json.loads(line) for line in (evidence / "build.jsonl").read_text().splitlines() if line]
-          assert [m.get("success") for m in messages if m.get("reason") == "build-finished"] == [True]
-          artifacts = [m for m in messages if m.get("reason") == "compiler-artifact"
-              and m.get("target", {}).get("name") == "agent"
-              and m["target"].get("kind") == ["test"]
-              and m.get("profile", {}).get("test") is True and m.get("executable")]
-          assert len(artifacts) == 1, "Cargo must identify exactly one integration executable"
-          artifact = artifacts[0]
-          target_source = Path(artifact["target"]["src_path"]).resolve()
-          assert target_source == (Path.cwd() / "crates/blaze-dist-local/tests/agent.rs").resolve()
-          binary = Path(artifact["executable"]).resolve(strict=True)
-          assert binary.is_relative_to(Path(os.environ["CARGO_TARGET_DIR"]).resolve())
-          (evidence / "compiler-artifact.json").write_text(json.dumps(artifact, indent=2) + "\n")
-          before = sha256(binary)
-          (evidence / "binary.before.sha256").write_text(f"{before}  {binary}\n")
-          command = ["timeout", "-k", "5s", "120s", str(binary), case,
-              "--exact", "--format", "pretty", "--color", "never"]
-          (evidence / "native-command.json").write_text(json.dumps(command, indent=2) + "\n")
-          started = datetime.datetime.now(datetime.timezone.utc).isoformat()
-          with (evidence / "native.log").open("wb") as log:
-              status = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False, timeout=135).returncode
-          ended = datetime.datetime.now(datetime.timezone.utc).isoformat()
-          (evidence / "native.exit").write_text(f"{status}\n")
-          after = sha256(binary)
-          (evidence / "binary.after.sha256").write_text(f"{after}  {binary}\n")
-          actual_commit, actual_tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
-          dirty = git("status", "--porcelain", "--untracked-files=all")
-          (evidence / "source.after.txt").write_text(f"{actual_commit}\n{actual_tree}\n{dirty}")
-          log = (evidence / "native.log").read_text()
-          print(log, end="")
-          executed = re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored[^\n]*)$", log, re.M)
-          summaries = re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; "
-              r"(\d+) ignored; (\d+) measured; (\d+) filtered out; finished in ([\d.]+)s$", log, re.M)
-          expected_summary = ("FAILED", "0", "1", "0", "0") if old else ("ok", "1", "0", "0", "0")
-          panic_threads = re.findall(r"^thread '([^']+)'(?: \([^\n)]*\))? panicked at ", log, re.M)
-          assertion = re.search(r"assertion `left == right` failed: " + re.escape(marker)
-              + r"\n[ \t]*left: 1\n[ \t]*right: 0(?:\n|$)", log)
-          checks = {
-              "native_exit": status == (101 if old else 0),
-              "one_test_started": re.findall(r"^running (\d+) tests?$", log, re.M) == ["1"],
-              "exact_test_executed": executed == [(case, "FAILED" if old else "ok")],
-              "complete_suite_receipt": len(summaries) == 1 and summaries[0][:5] == expected_summary,
-              "binary_unchanged": before == after,
-              "source_unchanged": (actual_commit, actual_tree, dirty) == (source["commit"], source["tree"], ""),
-          }
-          if old:
-              checks |= {
-                  "exact_assertion": bool(assertion) and log.count(marker) == 1,
-                  "only_expected_panic": panic_threads == [case],
-                  "named_failure_block": log.count(f"---- {case} stdout ----") == 1,
-                  "only_expected_failure": "\nfailures:\n" in log and
-                      log.rsplit("\nfailures:\n", 1)[1].split("\ntest result:", 1)[0].strip() == case,
-              }
-          else:
-              checks |= {"no_panic_or_old_marker": not panic_threads and marker not in log}
-          receipt = {
-              "source": source, "test": case, "toolchain": os.environ["EXPECTED_TOOLCHAIN"],
-              "rustc_version_sha256": sha256(evidence / "rustc-version.txt"),
-              "binary": str(binary), "binary_sha256_before": before, "binary_sha256_after": after,
-              "command": command, "started_utc": started, "ended_utc": ended, "exit_code": status,
-              "executed_tests": executed, "suite_receipts": summaries,
-              "expected_old_marker": marker if old else None, "checks": checks,
-              "validation_passed": all(checks.values()),
-              "scope": "causal native adapter proof; no latency or full-acceptance claim",
-          }
-          (evidence / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
-          assert receipt["validation_passed"], f"Rejected causal receipt: {[k for k, ok in checks.items() if not ok]}"
-          PY
-      - name: Retain complete source, build and executed-test evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        timeout-minutes: 5
-        with:
-          name: publication-causal-${{ matrix.source.arm }}
-          path: ${{ runner.temp }}/publication-causal
-          if-no-files-found: error
-
-  paired-verdict:
-    name: Require both causal native outcomes
-    needs: native-control
-    if: always()
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 5
-    steps:
-      - uses: actions/download-artifact@v8
-        timeout-minutes: 3
-        with:
-          pattern: publication-causal-*
-          path: causal-evidence
-      - name: Refuse a missing, mismatched or incomplete arm
-        timeout-minutes: 1
-        env:
-          MATRIX_RESULT: ${{ needs.native-control.result }}
-        run: |
-          set -euo pipefail
-          timeout -k 5s 30s python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          arms = ("old-production-plus-control", "new-production-plus-control")
-          receipts = [json.loads((Path("causal-evidence") / f"publication-causal-{arm}" / "receipt.json").read_text())
-              for arm in arms]
-          assert os.environ["MATRIX_RESULT"] == "success"
-          for arm, receipt in zip(arms, receipts, strict=True):
-              assert receipt["validation_passed"] and all(receipt["checks"].values())
-              assert receipt["source"]["arm"] == arm and receipt["test"] == os.environ["CAUSAL_TEST"]
-              assert receipt["source"]["GITHUB_RUN_ID"] == os.environ["GITHUB_RUN_ID"]
-              assert receipt["source"]["GITHUB_RUN_ATTEMPT"] == os.environ["GITHUB_RUN_ATTEMPT"]
-              assert receipt["toolchain"] == os.environ["EXPECTED_TOOLCHAIN"]
-          old, new = receipts
-          assert old["exit_code"] == 101 and new["exit_code"] == 0
-          assert old["source"]["commit"] != new["source"]["commit"]
-          assert old["source"]["tree"] != new["source"]["tree"]
-          assert old["rustc_version_sha256"] == new["rustc_version_sha256"]
-          assert old["source"]["WORKFLOW_SHA"] == new["source"]["WORKFLOW_SHA"]
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-              summary.write("## Native causal control verified\n\n"
-                  "The exact stale-initial-404 test failed on old production with the required Reader::complete "
-                  "counter assertion (1 instead of 0), and passed on new production. Each arm executed once "
-                  "on a fresh hosted ARM64 runner with the same pinned nightly and unchanged test deadlines. "
-                  "This is causal native adapter evidence, not latency evidence or full acceptance.\n")
-              for receipt in receipts:
-                  source = receipt["source"]
-                  summary.write(f"\n- {source['arm']}: commit `{source['commit']}`, tree `{source['tree']}`, "
-                      f"binary SHA-256 `{receipt['binary_sha256_before']}`.\n")
-          PY
-
   canonical-release-smoke:
     name: Exact-tree candidate canonical release smoke
-    # Independent of the causal matrix; retain the source-compiler's existing job bound.
+    # Retain the source-compiler's existing job bound.
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 150
     env:
-      AUDIT_SOURCE_SHA: 868de5bc7c7496556e3108a87b689c9280382d8c
-      AUDIT_SOURCE_TREE: a376fc7a8433ebedbcc4ca35f1c596d9bbaab8aa
+      AUDIT_SOURCE_SHA: f743258a2ca0ff2703bfde3f2aca3518be3e2441
+      AUDIT_SOURCE_TREE: 1c16df19f5038ad810a13380a69169a9741ae609
     steps:
       - name: Require the final immutable candidate identity
         timeout-minutes: 1
@@ -433,6 +164,122 @@ jobs:
           test "$quote_binary" = "$expected_binary"
           printf 'quote_binary_sha256=%s\noriginal_manifest_match=true\n' "$quote_binary" \
             > "$evidence/quote-identity.txt"
+      - name: Execute all four native temporary-scope controls once
+        id: native_scopes
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/canonical-evidence"
+          tc=$(timeout 10 cat pins/toolchain)
+          test "$tc" = "$EXPECTED_TOOLCHAIN"
+          # One unfiltered Cargo test invocation; retain the normal harness concurrency.
+          set +e
+          timeout -k 30 900 cargo +"$tc" test --release --locked -p blaze-ladder \
+            --test front2_if_temporaries --message-format=json \
+            2>&1 | timeout -k 5 950 tee "$evidence/native-temporary-scopes.log"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$evidence/native-temporary-scopes.exit"
+          timeout -k 5 60 python3 - <<'PY'
+          import hashlib, json, os, re
+          from pathlib import Path
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "canonical-evidence"
+          log = (evidence / "native-temporary-scopes.log").read_text()
+          status = int((evidence / "native-temporary-scopes.exit").read_text())
+          expected_tests = [
+              "an_if_conditions_temporaries_die_by_edition",
+              "lazy_boolean::lazy_boolean_operand_borrows_end_before_the_next_operand",
+              "lazy_boolean::lazy_boolean_operand_scopes_preserve_genuinely_live_borrows",
+              "lazy_boolean::lazy_boolean_operand_destructors_run_at_their_scope_boundaries",
+          ]
+          messages = []
+          for line in log.splitlines():
+              try:
+                  value = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if isinstance(value, dict):
+                  messages.append(value)
+          artifacts = [
+              row for row in messages
+              if row.get("reason") == "compiler-artifact"
+              and row.get("target", {}).get("name") == "front2_if_temporaries"
+              and row.get("target", {}).get("kind") == ["test"]
+              and row.get("profile", {}).get("test") is True
+              and row.get("executable")
+          ]
+          tests = re.findall(r"^test ([^\r\n]+?) \.\.\. (ok|FAILED|ignored[^\r\n]*)$", log, re.MULTILINE)
+          summaries = re.findall(
+              r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+              r"(\d+) measured; (\d+) filtered out; finished in [^\r\n]+$",
+              log, re.MULTILINE,
+          )
+          source = (evidence / "source.txt").read_text().splitlines()
+          checks = {
+              "command_exit_zero": status == 0,
+              "one_successful_cargo_build": [
+                  row.get("success") for row in messages if row.get("reason") == "build-finished"
+              ] == [True],
+              "one_integration_executable": len(artifacts) == 1,
+              "one_four_test_launch": re.findall(r"^running (\d+) tests$", log, re.MULTILINE) == ["4"],
+              "exact_four_executed_tests": len(tests) == 4
+                  and sorted(name for name, _ in tests) == sorted(expected_tests)
+                  and all(outcome == "ok" for _, outcome in tests),
+              "exact_four_test_summary": summaries == [("ok", "4", "0", "0", "0", "0")],
+              "exact_source": source == [os.environ["AUDIT_SOURCE_SHA"], os.environ["AUDIT_SOURCE_TREE"]],
+          }
+          binary = None
+          if len(artifacts) == 1:
+              row = artifacts[0]
+              executable = Path(row["executable"]).resolve(strict=True)
+              target = Path(os.environ["CARGO_TARGET_DIR"]).resolve(strict=True)
+              source_path = Path(row["target"]["src_path"]).resolve(strict=True)
+              checks["executable_is_in_release_target"] = executable.is_relative_to(target / "release")
+              checks["exact_target_source"] = source_path == (
+                  Path.cwd() / "crates/blaze-ladder/tests/front2_if_temporaries.rs"
+              ).resolve(strict=True)
+              with executable.open("rb") as stream:
+                  executable_sha256 = hashlib.file_digest(stream, "sha256").hexdigest()
+              binary = {
+                  "path": str(executable),
+                  "sha256_after_test": executable_sha256,
+                  "cargo_artifact": row,
+              }
+          paths = [
+              "crates/blaze-ladder/tests/front2_if_temporaries.rs",
+              "crates/blaze-ladder/tests/front2_if_temporaries/lazy_boolean.rs",
+              "crates/blaze-cli/tests/ladder/front2/x-drop-13-lazy-booleans/src/case.rs",
+          ]
+          source_files = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in paths}
+          checks["exact_shared_cell_case"] = source_files[paths[-1]] == (
+              "b1d7a6e9d39e4e6acb90394197f4d7a049fc44f81157e6833558c96b57a03e03"
+          )
+          receipt = {
+              "scope": "Four actual native temporary-scope controls; not a substitute for full CI.",
+              "source": {"commit": source[0], "tree": source[1]},
+              "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "toolchain": os.environ["EXPECTED_TOOLCHAIN"],
+              "command": [
+                  "cargo", "+" + os.environ["EXPECTED_TOOLCHAIN"], "test", "--release", "--locked",
+                  "-p", "blaze-ladder", "--test", "front2_if_temporaries", "--message-format=json",
+              ],
+              "command_status": status, "command_budget_seconds": 900,
+              "tests": tests, "summaries": summaries, "binary": binary,
+              "source_files_sha256": source_files, "checks": checks,
+              "validation_passed": all(checks.values()),
+          }
+          (evidence / "native-temporary-scopes.receipt.json").write_text(
+              json.dumps(receipt, indent=2) + "\n"
+          )
+          if not receipt["validation_passed"]:
+              raise SystemExit("Rejected native temporary-scope receipt: " + ", ".join(
+                  name for name, passed in checks.items() if not passed
+              ))
+          print(json.dumps({
+              "native_temporary_scopes": "passed", "ran": 4, "passed": 4,
+              "source": receipt["source"], "binary_sha256_after_test": binary["sha256_after_test"],
+          }))
+          PY
       - name: Verify the unchanged candidate source and sealed binaries after smoke
         if: ${{ !cancelled() && steps.source_build.outcome == 'success' && steps.smoke.outcome != 'skipped' }}
         timeout-minutes: 2
@@ -498,339 +345,19 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  early-source-protocol:
-    name: Early exact-artifact source protocol qualification
-    needs: canonical-release-smoke
-    # Separate runner, fresh protocol home, ordinary pooled compilation/test width.
-    # This is the normal production protocol gate run early, not full acceptance.
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 150
-    env:
-      # Candidate identity matches the sealed canonical build above.
-      AUDIT_SOURCE_SHA: 868de5bc7c7496556e3108a87b689c9280382d8c
-      AUDIT_SOURCE_TREE: a376fc7a8433ebedbcc4ca35f1c596d9bbaab8aa
-      BLAZE_CORES: "2"
-      BLAZE_DAEMON_MEMORY_GB: "2"
-      BLAZE_TESTS: verify
-      EXPECTED_SOURCE_CONTROLS: "112"
-    outputs:
-      protocol_tests: ${{ steps.protocol.outputs.accepted }}
-    steps:
-      - uses: actions/checkout@v7
-        timeout-minutes: 5
-        with:
-          ref: ${{ env.AUDIT_SOURCE_SHA }}
-          persist-credentials: false
-      - name: Record the immutable source and validation run
-        timeout-minutes: 2
-        env:
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          WORKFLOW_SHA: ${{ github.workflow_sha }}
-        run: |
-          set -euo pipefail
-          evidence="$RUNNER_TEMP/dist-evidence"
-          timeout 10s mkdir "$evidence"
-          test "$(timeout 10s uname -s -m)" = "Linux aarch64"
-          [[ "$AUDIT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$AUDIT_SOURCE_TREE" =~ ^[0-9a-f]{40}$ ]]
-          source_sha=$(timeout 20s git rev-parse HEAD)
-          source_tree=$(timeout 20s git rev-parse 'HEAD^{tree}')
-          source_status=$(timeout 20s git status --porcelain --untracked-files=all)
-          test "$source_sha" = "$AUDIT_SOURCE_SHA"
-          test "$source_tree" = "$AUDIT_SOURCE_TREE"
-          test -z "$source_status"
-          test "$(timeout 10s cat pins/toolchain)" = "$EXPECTED_TOOLCHAIN"
-          printf '%s\n%s\n' "$source_sha" "$source_tree" > "$evidence/source.before.txt"
-          timeout 10s cp .github/distributed-controls.txt "$evidence/distributed-controls.txt"
-          timeout 10s sha256sum .github/workflows/blaze.yaml .github/distributed-controls.txt \
-            .github/scripts/dist_build_identity.py harness/v2/exec_observer.py \
-            harness/v2/exec_observer_child.py > "$evidence/gate-source.sha256"
-          timeout 10s uname -a > "$evidence/kernel.txt"
-          timeout 10s lscpu > "$evidence/cpu.txt"
-          timeout 10s free -b > "$evidence/memory-before.txt"
-          timeout -k 5s 20s python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          record = {key: os.environ[key] for key in (
-              "WORKFLOW_REF", "WORKFLOW_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
-              "AUDIT_SOURCE_SHA", "AUDIT_SOURCE_TREE", "EXPECTED_TOOLCHAIN")}
-          record.update({
-              "scope": "early source-protocol qualification; not normal full CI or performance evidence",
-              "source_artifact": "publication-candidate-source-compiler",
-              "canonical_artifact": "publication-canonical-release-smoke-arm64",
-              "artifact_scope": "same workflow run; no cross-run download selector",
-              "expected_required_controls": int(os.environ["EXPECTED_SOURCE_CONTROLS"]),
-              "compilation_and_test_width": "normal defaults; no serialization override",
-          })
-          (Path(os.environ["RUNNER_TEMP"]) / "dist-evidence/qualification.json").write_text(
-              json.dumps(record, indent=2) + "\n")
-          PY
-      - uses: ./.github/actions/locked-memory
-        timeout-minutes: 2
-      - uses: ./.github/actions/reflink
-        timeout-minutes: 15
-      - uses: ./.github/actions/apt
-        timeout-minutes: 15
-        with:
-          packages: strace bubblewrap
-      # The same bootstrap prerequisite as production-acceptance; guest compilation
-      # remains inside the unchanged source observer, which refuses Cargo/rustc/rustdoc.
-      - uses: ./.github/actions/toolchain
-        timeout-minutes: 15
-        with:
-          components: rust-src
-          targets: wasm32-wasip1
-      - uses: ./.github/actions/script
-        timeout-minutes: 25
-        with:
-          job: production-acceptance
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-        timeout-minutes: 5
-        with:
-          version: '0.13.5'
-          checksum: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
-          enable-cache: false
-      - name: User namespaces for source test sandboxes
-        timeout-minutes: 1
-        run: |
-          set -euo pipefail
-          if [ "$(timeout 10s cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" != 0 ]; then
-            timeout 10s sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-      - uses: actions/download-artifact@v8
-        timeout-minutes: 10
-        with:
-          name: publication-candidate-source-compiler
-          path: ${{ runner.temp }}/source-package
-      - uses: actions/download-artifact@v8
-        timeout-minutes: 10
-        with:
-          name: publication-canonical-release-smoke-arm64
-          path: ${{ runner.temp }}/canonical-origin
-      - name: Verify and retain the original sealed source compiler handoff
-        id: handoff
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          evidence="$RUNNER_TEMP/dist-evidence"
-          origin="$RUNNER_TEMP/canonical-origin/canonical-evidence"
-          timeout 10s mkdir "$evidence/canonical-origin"
-          for file in blaze-build.json manifest-sha256.txt archive-sha256.txt source.txt validation.txt \
-            hello-smoke.txt hello-smoke-verify.txt quote-identity.txt; do
-            timeout 10s cp "$origin/$file" "$evidence/canonical-origin/$file"
-          done
-          timeout -k 5s 120s python3 - <<'PY'
-          import hashlib, json, os, re
-          from pathlib import Path
-          root = Path(os.environ["RUNNER_TEMP"])
-          evidence, package = root / "dist-evidence", root / "source-package"
-          origin = evidence / "canonical-origin"
-          expected = {}
-          for line in (origin / "archive-sha256.txt").read_text().splitlines():
-              digest, path = line.split(maxsplit=1)
-              name = Path(path).name
-              assert re.fullmatch(r"[0-9a-f]{64}", digest) and name not in expected
-              expected[name] = digest
-          assert set(expected) == {"source-binaries.tar.gz", "source-toolchain.tar.gz"}
-          actual = {}
-          for name in expected:
-              with (package / name).open("rb") as archive:
-                  actual[name] = hashlib.file_digest(archive, "sha256").hexdigest()
-          assert actual == expected, "downloaded archive differs from the same-run sealed handoff"
-          source = (origin / "source.txt").read_text().splitlines()
-          assert source == [os.environ["AUDIT_SOURCE_SHA"], os.environ["AUDIT_SOURCE_TREE"]]
-          manifest_bytes = (origin / "blaze-build.json").read_bytes()
-          manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-          assert (origin / "manifest-sha256.txt").read_text().split()[0] == manifest_sha256
-          manifest = json.loads(manifest_bytes)
-          assert manifest["source"] == {"commit": source[0], "tree": source[1]}
-          validation = dict(line.split("=", 1) for line in (origin / "validation.txt").read_text().splitlines())
-          assert validation["run_id"] == os.environ["GITHUB_RUN_ID"]
-          assert validation["run_attempt"] == os.environ["GITHUB_RUN_ATTEMPT"]
-          (evidence / "handoff-archives.json").write_text(json.dumps({
-              "source": manifest["source"], "archive_sha256": actual,
-              "manifest_sha256": manifest_sha256, "run_id": validation["run_id"],
-              "run_attempt": validation["run_attempt"], "verified": True,
-          }, indent=2) + "\n")
-          PY
-          timeout 10s mkdir "$RUNNER_TEMP/source-binaries" "$RUNNER_TEMP/source-shelf"
-          timeout 10s mkdir -p "$HOME/.blaze/v2"
-          timeout -k 5s 120s tar -xzf "$RUNNER_TEMP/source-package/source-binaries.tar.gz" -C "$RUNNER_TEMP/source-binaries"
-          timeout -k 5s 120s tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$HOME/.blaze/v2"
-          # Keep the observer's shelf isolated from setup's HOME, as normal acceptance does.
-          timeout -k 5s 120s tar -xzf "$RUNNER_TEMP/source-package/source-toolchain.tar.gz" -C "$RUNNER_TEMP/source-shelf"
-          timeout 10s cmp "$origin/blaze-build.json" "$RUNNER_TEMP/source-binaries/blaze-build.json"
-          timeout 10s cp "$RUNNER_TEMP/source-binaries/blaze-build.json" "$evidence/blaze-build.original.json"
-          identity=$(timeout 10s jq -nc --arg bin "$RUNNER_TEMP/source-binaries" \
-            '{command:"verify",binaries:$bin,services:true}')
-          timeout 60s python3 .github/scripts/dist_build_identity.py "$identity" \
-            2>&1 | timeout 70s tee "$evidence/identity-before-protocol.log"
-          timeout 60s sha256sum "$RUNNER_TEMP/source-binaries"/* > "$evidence/binaries.before.sha256"
-          test ! -e "$RUNNER_TEMP/blaze-fs/protocol-home"
-          test ! -L "$RUNNER_TEMP/blaze-fs/protocol-home"
-          test ! -e "$evidence/exec"
-          test ! -L "$evidence/exec"
-      - name: Install the normal acceptance pinned C toolchain
-        if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
-        uses: ./.github/actions/linux-c-shelf
-        timeout-minutes: 15
-      - name: Source protocol tests and complete execution observation
-        id: observed
-        if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
-        timeout-minutes: 60
-        run: |
-          set -euo pipefail
-          timeout 60s python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-          timeout 10s jq -n --arg blaze "$RUNNER_TEMP/source-binaries/blaze" --arg cwd "$GITHUB_WORKSPACE" --arg home "$RUNNER_TEMP/blaze-fs/protocol-home" --arg out "$RUNNER_TEMP/dist-evidence/exec" --arg shelf "$RUNNER_TEMP/source-shelf/toolchain" \
-            '{blaze:$blaze,cwd:$cwd,home:$home,out:$out,shelf:$shelf,command_seconds:3300,commands:(["blaze-dist","blaze-dist-local","blaze-wire","blaze-serve"] | map({name:.,args:["test","-p",.,"--view","json","--","--run-all","--format","json"]}))}' \
-            > "$RUNNER_TEMP/dist-evidence/exec-input.json"
-          set +e
-          timeout -k 30 3500 python3 harness/v2/exec_observer.py "$RUNNER_TEMP/dist-evidence/exec-input.json" \
-            > "$RUNNER_TEMP/dist-evidence/observer.stdout" 2> "$RUNNER_TEMP/dist-evidence/observer.stderr"
-          status=$?
-          set -e
-          printf '%s\n' "$status" > "$RUNNER_TEMP/dist-evidence/observer.exit"
-          timeout 20s cat "$RUNNER_TEMP/dist-evidence/observer.stdout" "$RUNNER_TEMP/dist-evidence/observer.stderr"
-          exit "$status"
-      - name: Verify unchanged source and sealed executables after the observer
-        id: unchanged
-        if: ${{ !cancelled() && steps.handoff.outcome == 'success' && steps.observed.outcome != 'skipped' }}
-        timeout-minutes: 3
-        run: |
-          set -euo pipefail
-          evidence="$RUNNER_TEMP/dist-evidence"
-          source_sha=$(timeout 20s git rev-parse HEAD)
-          source_tree=$(timeout 20s git rev-parse 'HEAD^{tree}')
-          source_status=$(timeout 20s git status --porcelain --untracked-files=all)
-          printf '%s\n%s\n%s' "$source_sha" "$source_tree" "$source_status" > "$evidence/source.after.txt"
-          timeout 10s cp "$RUNNER_TEMP/source-binaries/blaze-build.json" "$evidence/blaze-build.after.json"
-          timeout 60s sha256sum "$RUNNER_TEMP/source-binaries"/* > "$evidence/binaries.after.sha256"
-          timeout 10s cmp "$evidence/blaze-build.original.json" "$evidence/blaze-build.after.json"
-          timeout 60s sha256sum -c "$evidence/binaries.before.sha256" > "$evidence/binaries.after-verify.txt"
-          test "$source_sha" = "$AUDIT_SOURCE_SHA"
-          test "$source_tree" = "$AUDIT_SOURCE_TREE"
-          test -z "$source_status"
-          timeout 10s cmp "$evidence/source.before.txt" "$evidence/source.after.txt"
-          identity=$(timeout 10s jq -nc --arg bin "$RUNNER_TEMP/source-binaries" \
-            '{command:"verify",binaries:$bin,services:true}')
-          timeout 60s python3 .github/scripts/dist_build_identity.py "$identity" \
-            2>&1 | timeout 70s tee "$evidence/identity-after-protocol.log"
-      - name: Complete source protocol receipt and all 112 executed required controls
-        id: protocol
-        if: ${{ !cancelled() && steps.observed.outcome == 'success' && steps.unchanged.outcome == 'success' }}
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-          timeout -k 5s 30s python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          out = Path(os.environ["RUNNER_TEMP"]) / "dist-evidence/exec"
-          result = json.loads((out / "result.json").read_text())
-          supervisor = json.loads((out / "supervisor.json").read_text())
-          packages = ["blaze-dist", "blaze-dist-local", "blaze-wire", "blaze-serve"]
-          scope = "linux-command-descendants-through-exit"
-          commands = supervisor.get("commands")
-          if (result.get("schema") != 2 or result.get("passed") is not True or result.get("returncode") != 0
-                  or result.get("scope") != scope or result.get("command_status") != 0
-                  or result.get("environment", {}).get("BLAZE_NO_DAEMON") != "1"
-                  or supervisor.get("schema") != 2 or supervisor.get("scope") != scope
-                  or supervisor.get("complete") is not True or "stop" in supervisor
-                  or not isinstance(commands, list) or len(commands) != len(packages)
-                  or any(not isinstance(row, dict) or set(row) != {"name","pid","returncode","timed_out"}
-                         or row["name"] != name or type(row["pid"]) is not int or row["pid"] <= 0
-                         or row["returncode"] != 0 or row["timed_out"] is not False
-                         for row, name in zip(commands, packages))
-                  or result.get("commands") != commands):
-              raise SystemExit("missing complete source protocol launch, exit and descendant evidence")
-          passed = []
-          for package in packages:
-              rows = [json.loads(line) for line in (out / (package + ".log")).read_text().splitlines() if line.strip()]
-              summaries = [row for row in rows if row.get("event") == "summary"]
-              tests = [row for row in rows if row.get("event") == "test"]
-              if len(summaries) != 1:
-                  raise SystemExit(f"{package}: no one source test summary")
-              summary = summaries[0]
-              ran = summary.get("ran")
-              if (summary.get("result") != "ok" or type(ran) is not int or ran <= 0
-                      or summary.get("passed") != ran or len(tests) != ran
-                      or any(summary.get(key, 0) != 0 for key in ("failed","reused","filtered_out","flaky","not_built"))
-                      or any(row.get("outcome") != "passed" or row.get("ran_because") != "run_all"
-                             or row.get("failure") is not None or row.get("basis") is not None for row in tests)):
-                  raise SystemExit(f"{package}: source tests did not all execute and pass")
-              for row in tests:
-                  path = row.get("path")
-                  parts = path.split("/") if isinstance(path, str) else []
-                  if len(parts) != 3 or parts[0] != package or not parts[1] or not parts[2]:
-                      raise SystemExit(f"{package}: invalid source test path {path!r}")
-                  passed.append(parts[2])
-          required = Path(".github/distributed-controls.txt").read_text().splitlines()
-          missing = [name for name in required if not any(path == name or path.endswith("::" + name) for path in passed)]
-          if not required or missing:
-              raise SystemExit(f"missing executed source protocol controls: {missing}")
-          # Everything above is the unchanged normal production receipt verifier.
-          # Add a retained match map and exact expected inventory count for this qualification.
-          import hashlib
-          if len(required) != int(os.environ["EXPECTED_SOURCE_CONTROLS"]):
-              raise SystemExit(f"required source control inventory changed: {len(required)}")
-          matches = {name: [path for path in passed if path == name or path.endswith("::" + name)] for name in required}
-          manifest = json.loads((out.parent / "blaze-build.original.json").read_text())
-          if result.get("compiler") != {name: manifest["binaries"][name] for name in (
-                  "blaze", "blaze-launcher", "blaze-fact-shim")}:
-              raise SystemExit("observer compiler identities differ from the original sealed handoff")
-          summaries_by_package = {}
-          for package in packages:
-              rows = [json.loads(line) for line in (out / (package + ".log")).read_text().splitlines() if line.strip()]
-              summaries_by_package[package] = next(row for row in rows if row.get("event") == "summary")
-          receipt = {
-              "scope": "early source-protocol qualification; not normal full CI",
-              "source": manifest["source"], "compiler": result["compiler"],
-              "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-              "packages": summaries_by_package, "required_count": len(required),
-              "required_manifest_sha256": hashlib.sha256(Path(".github/distributed-controls.txt").read_bytes()).hexdigest(),
-              "required_matches": matches, "executed_tests": len(passed), "passed": True,
-          }
-          (out.parent / "protocol-required-controls.json").write_text(json.dumps(receipt, indent=2) + "\n")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-              summary.write("## Early source protocol qualification passed\n\n"
-                  f"All four normal source test commands executed and passed, with all {len(required)} required "
-                  f"controls matched among {len(passed)} executed tests. The original sealed compiler and "
-                  "source stayed unchanged. This is an early qualification receipt, not normal full CI.\n")
-          PY
-          timeout 60s python3 .github/scripts/dist_build_identity.py "{\"command\":\"verify\",\"binaries\":\"$RUNNER_TEMP/source-binaries\",\"services\":true}"
-          echo 'accepted=true' >> "$GITHUB_OUTPUT"
-      - name: Collect final source state even when qualification fails
-        if: always()
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-          evidence="$RUNNER_TEMP/dist-evidence"
-          timeout 10s mkdir -p "$evidence"
-          timeout 20s git status --porcelain --untracked-files=all > "$evidence/source.final.status"
-          timeout 20s git diff HEAD --binary > "$evidence/source.final.patch"
-          timeout 10s free -b > "$evidence/memory-after.txt"
-      - name: Retain complete original source protocol and mandatory-control evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        timeout-minutes: 10
-        with:
-          name: publication-early-source-protocol-evidence
-          path: ${{ runner.temp }}/dist-evidence
-          if-no-files-found: error
-          retention-days: 7
-
   lazy-boolean-drop-candidate:
     name: Lazy Boolean executable Drop control (candidate)
     needs: canonical-release-smoke
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     env:
-      AUDIT_SOURCE_SHA: 868de5bc7c7496556e3108a87b689c9280382d8c
-      AUDIT_SOURCE_TREE: a376fc7a8433ebedbcc4ca35f1c596d9bbaab8aa
-      FIXTURE_SOURCE_SHA: 868de5bc7c7496556e3108a87b689c9280382d8c
-      FIXTURE_SOURCE_TREE: a376fc7a8433ebedbcc4ca35f1c596d9bbaab8aa
+      AUDIT_SOURCE_SHA: f743258a2ca0ff2703bfde3f2aca3518be3e2441
+      AUDIT_SOURCE_TREE: 1c16df19f5038ad810a13380a69169a9741ae609
+      FIXTURE_SOURCE_SHA: f743258a2ca0ff2703bfde3f2aca3518be3e2441
+      FIXTURE_SOURCE_TREE: 1c16df19f5038ad810a13380a69169a9741ae609
       FIXTURE_PATH: crates/blaze-cli/tests/ladder/front2/x-drop-13-lazy-booleans
-      FIXTURE_TREE: 747ba698aab027e7b5c3ebc16ec0b6ee2123b78b
-      FIXTURE_CASE_SHA256: 5581b7fbc6e1c6661067b9002cb50f379ae9171a77e7b314faded3ad905c4eb5
+      FIXTURE_TREE: 4b03b33fce6afbd30b482474d3eccfee291b4d71
+      FIXTURE_CASE_SHA256: b1d7a6e9d39e4e6acb90394197f4d7a049fc44f81157e6833558c96b57a03e03
       DROP_TEST: lazy_boolean_operand_drop_order
       DROP_ARM: candidate
       BLAZE_CORES: '2'
@@ -1154,11 +681,11 @@ jobs:
     env:
       AUDIT_SOURCE_SHA: 089b5f009ab48241a0c0e0fdfc22d9b08edf9398
       AUDIT_SOURCE_TREE: 659b50805f637c8b34414173b73848deae807f6a
-      FIXTURE_SOURCE_SHA: 868de5bc7c7496556e3108a87b689c9280382d8c
-      FIXTURE_SOURCE_TREE: a376fc7a8433ebedbcc4ca35f1c596d9bbaab8aa
+      FIXTURE_SOURCE_SHA: f743258a2ca0ff2703bfde3f2aca3518be3e2441
+      FIXTURE_SOURCE_TREE: 1c16df19f5038ad810a13380a69169a9741ae609
       FIXTURE_PATH: crates/blaze-cli/tests/ladder/front2/x-drop-13-lazy-booleans
-      FIXTURE_TREE: 747ba698aab027e7b5c3ebc16ec0b6ee2123b78b
-      FIXTURE_CASE_SHA256: 5581b7fbc6e1c6661067b9002cb50f379ae9171a77e7b314faded3ad905c4eb5
+      FIXTURE_TREE: 4b03b33fce6afbd30b482474d3eccfee291b4d71
+      FIXTURE_CASE_SHA256: b1d7a6e9d39e4e6acb90394197f4d7a049fc44f81157e6833558c96b57a03e03
       DROP_TEST: lazy_boolean_operand_drop_order
       DROP_ARM: old-compiler
       BLAZE_CORES: '2'
