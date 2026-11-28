@@ -137,6 +137,7 @@ fn snapshot(fixture: Fixture) -> Snapshot {
     );
     let proc_macro = fixture.answer.is_some();
     let dep_name = if proc_macro { "macros" } else { "std" };
+    let called = [(dep_name, 0)];
     let dependency = CrateInput {
         name: dep_name, key: DEPENDENCY, edition: Edition::E2021,
         implicit: Implicit { proc_macro, ..RUST }, root: DEP_ROOT, shown_from: "/",
@@ -146,7 +147,6 @@ fn snapshot(fixture: Fixture) -> Snapshot {
     let dep = resolve_crate(&dependency, &[], Sysroot::default(), &fixture, 1, &metered, prepares, bump)
         .unwrap_or_else(|error| panic!("the fixture dependency resolves: {error:?}"));
     let deps = [aligned(&dep.record, bump)];
-    let called = [(dep_name, 0)];
     let owner = CrateInput {
         name: "fixture", key: OWNER, edition: Edition::E2021, implicit: RUST,
         root: ROOT, shown_from: "/", features: &[], deps: &called, cfg: &[], script: None,
