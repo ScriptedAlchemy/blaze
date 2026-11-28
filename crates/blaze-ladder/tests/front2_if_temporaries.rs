@@ -15,9 +15,19 @@
 //! tempo is a 2024 workspace: every `if let Some(x) = m.lock().get(..) { } else { .. }` in it
 //! was held too long in the else arm (false "borrowed" notes). Every verdict is printed first.
 
+#![feature(allocator_api)]
+
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::refusal::SourceFile;
+
+#[path = "front2_if_temporaries/lazy_boolean.rs"]
+mod lazy_boolean;
+
+fn toolchain() -> Toolchain {
+    let home = std::env::var("HOME").expect("HOME");
+    Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain")
+}
 
 const SOURCE: &str = r#"
 pub struct G<'a>(&'a mut u32);
@@ -40,8 +50,7 @@ fn main() {}
 /// clean, `None` refused (not checked), with the verdict printed.
 fn verdicts(edition: &str) -> Vec<(&'static str, Option<bool>)> {
     let alloc = blaze_own::testing::heap().alloc();
-    let home = std::env::var("HOME").expect("HOME");
-    let tc = Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+    let tc = toolchain();
     let root = "/ift/src/main.rs";
     let files = [(root.to_owned(), SOURCE.to_owned())];
     let user = UserCrate {

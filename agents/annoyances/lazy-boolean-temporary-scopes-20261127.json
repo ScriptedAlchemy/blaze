@@ -1,0 +1,20 @@
+{
+  "id": "lazy-boolean-temporary-scopes-20261127",
+  "date": "2026-11-27",
+  "who": "GPT-6 Astra Pro, distributed compile review",
+  "where": "crates/blaze-flow-lower/src/lib.rs and crates/blaze-body-lower/src/{expr.rs,control.rs}",
+  "what": "PR85 source acceptance run 46083117935 rejected the unchanged distributed resolution simulation helper with E0502, although pinned Rust accepted it. All 130 existing core tests executed and passed; four new controls were not built, so later source suites and the final receipt check did not run. Original artifact 15240647237 matched SHA-256 2c471eeb7c9293f6325ee5cecb8e43de0925e7da9198b7f4e0d57f3770cf6011.",
+  "cost": "The four real-source admission controls cannot qualify. The same missing scope in execution lowering can delay an operand temporary's destructor until after a later operand has run.",
+  "cause": "Lazy Boolean operands are lowered without their own temporary-scope boundaries. The shared borrow carried by committed_packs(...).unwrap().is_some() is kept drop-live until the surrounding if ends, across the following mutable lease call. The existing two-phase activation check correctly rejects that overlong lowered lifetime.",
+  "whys": [
+    "Blaze rejected the shared lookup followed by a mutable operation in a short-circuit condition.",
+    "The Option containing an opaque iterator was still drop-live when the later mutable receiver activated.",
+    "Borrow-flow lowering cleaned the temporary only after the entire if condition, rather than after its Boolean operand.",
+    "The lazy-Boolean paths in borrow-flow and executable lowering omitted operand-local temporary scopes; flattened let chains also need to distinguish ordinary Boolean links from pattern scrutinees.",
+    "Existing condition and borrow controls did not require an owned reference-carrying operand temporary to finish before a sibling operand, with observable destructor order and a genuinely live-borrow negative."
+  ],
+  "class": "lowered control flow omits language-defined temporary lifetime boundaries",
+  "prevention": "Give ordinary lazy operands explicit scopes in both lowerings, keep Boolean destinations alive outside those scopes, and preserve let-chain scrutinees and bindings. Add causal borrow-acceptance and actual destructor-order controls plus a live-borrow rejection; retain the unchanged distributed helper as full source acceptance. The Rust Reference specifies each lazy Boolean operand as a temporary scope: https://doc.rust-lang.org/reference/destructors.html#temporary-scopes.",
+  "fix": "Borrow-flow BranchOperand preserves the Boolean outside each operand's temporary scope, closes the scope, then branches. Structural traversal stays linear. Executable lowering uses the existing open/close machinery for both lazy operands and ordinary Boolean links in let chains; pattern scrutinees retain their condition/body scope. The existing temporary-lifetime integration target now checks six valid cases and three genuinely live E0502 controls with completed borrow checking, and executes a shared destructor-order oracle. The distributed helper and all loan/conflict rules remain unchanged.",
+  "state": "Source repair and independent review complete. Exact-tree qualification is recorded with PR85 and is required before merge: the unchanged distributed source suite, the reduced ARM64 borrow controls, and identical executable fixture bytes on the frozen old compiler and the new compiler. The retained original failure remains evidence; this repair does not explain the earlier heap-corruption or helper-entry failures."
+}

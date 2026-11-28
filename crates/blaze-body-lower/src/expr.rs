@@ -1231,11 +1231,27 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         Ok(())
     }
 
-    /// `lhs && rhs` and `lhs || rhs`: `rhs` runs only when `lhs` does not decide.
+    /// A Boolean operand's value outlives its temporary scope. The result is an unscheduled
+    /// scratch: closing the scope drops the operand's temporaries before its caller branches.
+    pub(crate) fn scoped_bool_operand(&mut self, e: ExprId) -> Result<Operand, LowerError> {
+        let ty = self.adjusted_ty(e)?;
+        let dest = self.scratch(e, ty);
+        self.scoped_bool_into(dest, e)?;
+        Ok(Operand::Copy(dest))
+    }
+
+    fn scoped_bool_into(&mut self, dest: Place, e: ExprId) -> Result<(), LowerError> {
+        self.open();
+        self.lower_into(dest, e)?;
+        self.close(self.span(e))
+    }
+
+    /// `lhs && rhs` and `lhs || rhs`: `rhs` runs only when `lhs` does not decide. Each
+    /// operand's temporaries die before the next operand or the enclosing expression resumes.
     fn lazy_bool(&mut self, dest: Place, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId) -> Result<(), LowerError> {
         let span = self.span(e);
         let ty = self.expr_ty(e)?;
-        let l = self.operand(lhs)?;
+        let l = self.scoped_bool_operand(lhs)?;
         let right = self.b.new_block(BlockKind::Normal);
         let short = self.b.new_block(BlockKind::Normal);
         let join = self.b.new_block(BlockKind::Normal);
@@ -1248,7 +1264,7 @@ impl<'b, 'v, 'c, F: BodyFacts, A: Allocator + Copy> Lower<'b, 'v, 'c, F, A> {
         self.b.assign(dest, Value::Use(v), span);
         self.goto(join, span);
         self.b.start(right);
-        self.lower_into(dest, rhs)?;
+        self.scoped_bool_into(dest, rhs)?;
         self.goto(join, span);
         self.b.start(join);
         Ok(())

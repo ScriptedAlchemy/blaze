@@ -454,7 +454,7 @@ impl<F: BodyFacts, A: Allocator + Copy> Lower<'_, '_, '_, F, A> {
                     self.schedule(&out);
                 }
                 _ => {
-                    let c = self.operand(link)?;
+                    let c = self.scoped_bool_operand(link)?;
                     let link_ok = self.b.new_block(BlockKind::Normal);
                     let link_fail = self.b.new_block(BlockKind::Normal);
                     let cases = self.b.cases(&[(0, link_fail)]);
