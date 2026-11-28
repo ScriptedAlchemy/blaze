@@ -6,7 +6,8 @@
 use blaze_ladder::crates::{Inputs, UserCrate};
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::refusal::SourceFile;
-use blaze_ladder::run::{FrontChoice, NewFront, run_with};
+use blaze_ladder::run::{FrontChoice, NewFront, RunError, run_with};
+use blaze_ladder::trap::TrapCode;
 use blaze_own::Vec;
 use blaze_toolchain::Shelf;
 
@@ -132,11 +133,18 @@ fn lazy_boolean_operand_scopes_preserve_genuinely_live_borrows() {
 
 /// This executes generated ARM64 code, as the other `run_with` ladder tests do. Both this
 /// wrapper and the hosted `blaze test` fixture use the installed core's `Cell` and `Drop`.
+/// Checked overflow under the same wrapper must reach its panic handler's abort trap.
 #[test]
 fn lazy_boolean_operand_destructors_run_at_their_scope_boundaries() {
-    const MAIN: &str = "#![no_main]
+    const MAIN: &str = "#![feature(core_intrinsics)]
+#![no_std]
+#![no_main]
 use core::ops::Drop;
 mod case;
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    core::intrinsics::abort_immediate()
+}
 #[unsafe(no_mangle)]
 pub extern \"C\" fn main() -> i32 { case::check() as i32 }
 ";
@@ -149,4 +157,23 @@ pub extern \"C\" fn main() -> i32 { case::check() as i32 }
     let new = NewFront { package: "lazy", edition: "2024", shelf: Some(shelf.place()), overflow: blaze_build::OverflowChecks::On };
     let got = run_with(&files, "src/main.rs", None, FrontChoice::New(new), blaze_own::testing::heap().shared());
     assert!(matches!(got, Ok(0)), "executed lazy-Boolean Drop oracle: {got:?}");
+
+    // The same checked boundary must fail through core's panic entry, not return a wrapped
+    // zero or accept a frontend refusal as evidence that the panic handler ran.
+    const OVERFLOW: &str = "fn overflow(value: u8) -> u8 { value + 1 }
+pub fn check() -> u8 { overflow(255) }
+";
+    let overflow_files = [
+        SourceFile { path: "src/main.rs", text: MAIN },
+        SourceFile { path: "src/case.rs", text: OVERFLOW },
+    ];
+    let ended = run_with(&overflow_files, "src/main.rs", None, FrontChoice::New(new), blaze_own::testing::heap().shared());
+    assert!(
+        matches!(
+            &ended,
+            Err(RunError::Trapped { trap })
+                if matches!(trap.code(), TrapCode::Lir(code) if u32::from(code) == blaze_build::intrinsics::ABORT_TRAP)
+        ),
+        "checked u8 overflow must reach the wrapper's abort trap: {ended:?}",
+    );
 }
