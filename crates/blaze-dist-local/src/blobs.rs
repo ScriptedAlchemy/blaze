@@ -119,6 +119,19 @@ impl Blobs {
         alloc: A,
     ) -> Result<(u16, Vec<u8, A>), Error> {
         let deadline = TcpDeadline::after(self.timeout)?;
+        self.request_matching_until(method, path, body, previous, deadline, alloc)
+    }
+
+    fn request_matching_until<A: Allocator>(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        previous: Option<&Digest>,
+        deadline: TcpDeadline,
+        alloc: A,
+    ) -> Result<(u16, Vec<u8, A>), Error> {
+        let deadline = deadline.earlier(TcpDeadline::after(self.timeout)?);
         let mut stream = TcpStream::connect_until(self.address, deadline)?;
         stream.set_nodelay(true)?;
         let head = self.request_head(method, path, body.len(), previous);
@@ -147,8 +160,20 @@ impl Blobs {
         pack: &Pack<impl Allocator>,
         alloc: impl Allocator,
     ) -> Result<(), Error> {
+        self.put_pack_until(pack, TcpDeadline::after(self.timeout)?, alloc)
+    }
+
+    /// Uploads an immutable pack within both the request's deadline and the operation limit.
+    pub fn put_pack_until(
+        &self,
+        pack: &Pack<impl Allocator>,
+        deadline: TcpDeadline,
+        alloc: impl Allocator,
+    ) -> Result<(), Error> {
         let path = format_in!(self.alloc, "/v1/blob/packs/{}.pack", hex(&pack.reference.pack));
-        let (status, body) = self.request("PUT", path.as_str(), &pack.bytes, alloc)?;
+        let (status, body) = self.request_matching_until(
+            "PUT", path.as_str(), &pack.bytes, None, deadline, alloc,
+        )?;
         match status {
             200..=299 => Ok(()),
             _ => Err(Error::Protocol(format_in!(
@@ -206,6 +231,7 @@ impl Blobs {
 
     fn get<A: Allocator>(&self, path: &str, bound: Option<ReadBound>, alloc: A) -> Result<Option<Vec<u8, A>>, Error> {
         let (status, body) = if let Some(ReadBound { deadline, pack_ceiling }) = bound {
+            let deadline = deadline.earlier(TcpDeadline::after(self.timeout)?);
             let mut stream = TcpStream::connect_until(self.address, deadline)?;
             stream.set_nodelay(true)?;
             let head = self.request_head("GET", path, 0, None);
@@ -254,12 +280,24 @@ impl Blobs {
     /// Publishes a full unit. A first writer may choose a different pack partition,
     /// but its verified logical keys, kinds and bytes must be identical.
     pub fn publish(&self, spec: &Digest, list: &[u8], alloc: impl Allocator) -> Result<(), Error> {
+        self.publish_until(spec, list, TcpDeadline::after(self.timeout)?, alloc)
+    }
+
+    /// Publication and any first-writer verification consume one absolute deadline.
+    /// A conflict does not restart the allowance for its GET or either pack import.
+    pub fn publish_until(
+        &self,
+        spec: &Digest,
+        list: &[u8],
+        deadline: TcpDeadline,
+        alloc: impl Allocator,
+    ) -> Result<(), Error> {
         let path = format_in!(self.alloc, "/v1/list/manifests/{}", hex(spec));
         // After sending a publication, a lost response cannot tell us whether
         // the server committed the immutable key. It cannot authorize fallback.
         let (status, body) = publication_response(
             path.as_str(),
-            self.request("PUT", path.as_str(), list, &alloc),
+            self.request_matching_until("PUT", path.as_str(), list, None, deadline, &alloc),
             self.alloc,
         )?;
         publish_verdict(
@@ -268,14 +306,14 @@ impl Blobs {
             path.as_str(),
             list,
             self.alloc,
-            || self.published(spec, &alloc),
+            || self.published_until(spec, deadline, &alloc),
             |existing, proposed| {
                 let existing = blaze_wire::pack_list::decode(existing, &alloc)
                     .map_err(|error| Error::Committed(format_in!(self.alloc, "{error}")))?;
                 let proposed = blaze_wire::pack_list::decode(proposed, &alloc)
                     .map_err(|error| Error::Committed(format_in!(self.alloc, "{error}")))?;
-                Ok(crate::agent::import(self, &existing, &alloc)?
-                    == crate::agent::import(self, &proposed, &alloc)?)
+                Ok(crate::agent::import_until(self, &existing, deadline, &alloc)?
+                    == crate::agent::import_until(self, &proposed, deadline, &alloc)?)
             },
         )
     }
@@ -951,6 +989,22 @@ mod tests {
             blobs.put_pack(&pack, alloc).unwrap_err(),
         ] {
             assert!(matches!(error, Error::Io(why) if why.is_timed_out()));
+        }
+        let list = blaze_wire::pack_list::encode(&[pack.reference], alloc);
+        for error in [
+            blobs.publish(&[0; 32], &list, alloc).unwrap_err(),
+            Blobs { timeout: Duration::from_secs(30), ..blobs }
+                .publish_until(&[0; 32], &list, TcpDeadline::at_monotonic_nanos(0), alloc)
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(&error, Error::Committed(why) if why.contains("errno: TimedOut")),
+                "expired publication must retain its timeout cause: {error}",
+            );
+            assert!(matches!(
+                crate::agent::decide(&blaze_wire::LocalPolicy::Fallback, error, alloc),
+                Err(Error::Committed(_))
+            ));
         }
     }
 

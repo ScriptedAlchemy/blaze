@@ -1,0 +1,20 @@
+{
+  "id": "source-native-fault-evidence-20261127",
+  "date": "2026-11-27",
+  "who": "GPT-6 Astra Pro, distributed compile review",
+  "where": "crates/blaze-cli/src/test_drive.rs, crates/blaze-cli/src/run_fault.rs and crates/blaze-launch-rt/src/run_mode/fault_report.rs",
+  "what": "Source acceptance run 46056228918 reported corrupted double-linked list and a native SIGSEGV in the launcher control thread while running transient_accept_errors_leave_the_reactor_available_to_healthy_clients. The retained report has an unmapped native PC and an unreadable caller frame, but no raw fault registers, same-process native maps, native-library identities or core. Up::Fault already carried the registers transiently; the test driver retained only the formatted report.",
+  "cost": "Later passing processes cannot resolve the failed process's ASLR-dependent PC. The original corruption remains unexplained despite the later diagnostic passing that control, and the performance candidate's failed acceptance cannot be cleared by the separate stale-miss fix.",
+  "cause": "The retained fault presentation loses the raw machine-state evidence when no placed guest function or readable caller identifies the fault.",
+  "whys": [
+    "The native fault could not be attributed to an instruction or caller.",
+    "The original artifact had no native mapping or readable caller and omitted the captured register values.",
+    "The driver decoded Up::Fault but persisted only run_fault::Report text.",
+    "The report prioritizes placed guest functions and caller walking, which supplied neither identity for this fault.",
+    "Diagnostic retention was not held to preserving the evidence needed for a failure outside placed guest code."
+  ],
+  "class": "lossy fault presentation discards machine-state evidence needed for native crash attribution",
+  "prevention": "Retain the existing bounded raw fault message, same-process native mappings and library identities on the next natural full pooled source-protocol run; a bounded core would additionally retain heap metadata. Preserve scheduling and compiler mode so the capture does not become a serialization experiment.",
+  "fix": "No speculative allocator or ownership change. The bounded source audit found no supported corrupting path; the paired stale-miss regression proves only the separate duplicate-tail repair.",
+  "state": "Open. The original heap-corruption and helper-entry failures remain unproved; later passes and the admission fix are not recorded as their resolution."
+}

@@ -4,11 +4,11 @@
 //!
 //! 1. A list published for this unit names everything an earlier build made: its packs are read
 //!    and nothing is scheduled ([`Blobs::published`]).
-//! 2. Otherwise the agent submits the unit (equal content joins the running execution), claims
-//!    the executor assigned to it, and runs the holder ([`run_holder_until`]) while a watcher asks
-//!    whether the compile phase is done. A batch is sealed into a pack and uploaded before its
-//!    result is posted, so a committed result's bytes exist; a lease that moved is refused by the
-//!    core, whatever this process believes.
+//! 2. Otherwise Submit returns an already accepted result or joins the one resolving flight.
+//!    The current lead resolves the immutable catalog under its claimed attempt before the core
+//!    permits grants or the full tail. The initial cache miss carries no compilation authority.
+//!    Holders run ([`run_holder_until`]) only after that resolution; a batch is uploaded before
+//!    its result is posted, and a moved lease is refused by the core.
 //! 3. The current lead reads the committed packs, completes the ordinary unit build, and
 //!    uploads its remaining values. The coordinator accepts its full manifest atomically
 //!    against the lead attempt; only then is that immutable record mirrored to the cache.
@@ -44,7 +44,7 @@ use crate::driver::{DriverConfig, run_holder_until};
 use crate::pack::{Pack, Value, ValueRef, read};
 use crate::protocol::{self as carrier, Answer, Binding, Command};
 use crate::server::random_id;
-use crate::sys::{SystemClock, ThreadFailed, current_pid, env_is_set, scope, sleep};
+use crate::sys::{SystemClock, TcpDeadline, ThreadFailed, current_pid, env_is_set, scope, sleep};
 
 mod grant_events;
 mod published_ahead;
@@ -196,7 +196,7 @@ pub enum BackendKind {
 /// How a unit's values arrived.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
-    /// A list published by an earlier build: nothing was scheduled.
+    /// An immutable published result: this agent compiled no work for the unit.
     Published,
     /// This build's execution.
     Executed,
@@ -352,6 +352,19 @@ impl UnitBudget {
     fn check_active(self, unit: &Unit, clock: SystemClock, alloc: WireAlloc) -> Result<(), Error> {
         if self.epoch.is_some() && self.remaining(clock).is_zero() {
             return Err(pr_expired(unit, alloc));
+        }
+        Ok(())
+    }
+
+    fn check_request(self, unit: &Unit, clock: SystemClock, alloc: WireAlloc) -> Result<(), Error> {
+        self.check_active(unit, clock, alloc)?;
+        if self.remaining(clock).is_zero() {
+            return Err(Error::Protocol(format_in!(
+                alloc,
+                "unit {}: request deadline expired after {:?}",
+                hex(&unit.spec),
+                self.limit
+            )));
         }
         Ok(())
     }
@@ -629,6 +642,21 @@ pub fn import<A: AllocatorClone>(
     import_using(packs, |reference| blobs.committed_pack(reference, &alloc), alloc.clone(), blobs.alloc)
 }
 
+/// Bounded imports use a copyable handle; comparison-only callers borrow their allocator.
+pub(crate) fn import_until<A: AllocatorClone + Copy>(
+    blobs: &Blobs,
+    packs: &[PackRef],
+    deadline: TcpDeadline,
+    alloc: A,
+) -> Result<BTreeMap<Digest, (u8, Vec<u8, A>), A>, Error> {
+    import_using(
+        packs,
+        |reference| blobs.pack_until(&reference.pack, reference.size, deadline, &alloc),
+        alloc,
+        blobs.alloc,
+    )
+}
+
 /// The retrieval boundary is injected so loss and corruption of a committed pack can be
 /// tested without replacing the real pack decoder or requiring a live cache server.
 fn import_using<A: AllocatorClone, B: Allocator>(
@@ -686,6 +714,90 @@ fn published_packs<A: Allocator>(
             hex(spec)
         ))
     })
+}
+
+fn read_published(blobs: &Blobs, spec: &Digest) -> Result<Option<Publication>, Error> {
+    read_published_until(blobs, spec, TcpDeadline::after(blobs.timeout)?)
+}
+
+fn read_published_until(
+    blobs: &Blobs,
+    spec: &Digest,
+    deadline: TcpDeadline,
+) -> Result<Option<Publication>, Error> {
+    let alloc = blobs.alloc;
+    blobs
+        .published_until(spec, deadline, alloc)?
+        .map(|list| {
+            let packs = published_packs(spec, &list, alloc, alloc)?;
+            Ok(Publication { packs, first: None })
+        })
+        .transpose()
+}
+
+fn import_published(blobs: &Blobs, publication: Publication) -> Result<Arrived, Error> {
+    let alloc = blobs.alloc;
+    let Publication { packs, mut first } = publication;
+    let values = import_using(
+        &packs,
+        |reference| {
+            if first.as_ref().is_some_and(|pack| pack.key == reference.pack) {
+                return Ok(first.take().map(|BufferedPack { bytes, .. }| bytes));
+            }
+            blobs.committed_pack(reference, alloc)
+        },
+        alloc,
+        alloc,
+    )?;
+    Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None, alloc) })
+}
+
+/// A compiler borrow exists only after a validated carrier response grants this attempt
+/// compilation authority. The core rechecks the attempt at Join and every work lease.
+struct ResolvedCompiler<'a, G: Granted + ?Sized> {
+    compiler: &'a mut G,
+    permit: carrier::CompileReady,
+}
+
+enum TailCompletion {
+    Complete,
+    Lost,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationKnowledge {
+    Unknown,
+    Present,
+}
+
+impl PublicationKnowledge {
+    fn observe(&mut self, next: Self) {
+        if next == Self::Present {
+            *self = next;
+        }
+    }
+
+    fn finish<T>(self, unit: &Unit, result: Result<T, Error>, alloc: WireAlloc) -> Result<T, Error> {
+        match self {
+            Self::Unknown => result,
+            Self::Present => after_publication(unit, result, alloc),
+        }
+    }
+}
+
+impl<G: Granted + ?Sized> ResolvedCompiler<'_, G> {
+    fn complete(
+        &mut self,
+        lost: &AtomicBool,
+        values: &mut dyn Iterator<Item = ValueRef<'_>>,
+        output: &mut dyn FnMut(Value),
+    ) -> Result<TailCompletion, G::Error> {
+        if lost.load(Ordering::Acquire) {
+            return Ok(TailCompletion::Lost);
+        }
+        self.compiler.complete(values, output)?;
+        Ok(TailCompletion::Complete)
+    }
 }
 
 /// How long an agent waits between asks at most, however long it has waited: what it asks is a
@@ -748,27 +860,12 @@ impl ExportBudget<'_> {
         };
         let published = match ready {
             Some(published) => Some(published),
-            None => config.blobs.published(&unit.spec, alloc)?
-                .map(|list| {
-                    let packs = published_packs(&unit.spec, &list, alloc, alloc)?;
-                    Ok::<_, Error>(Publication { packs, first: None })
-                })
-                .transpose()?,
+            None => read_published(&config.blobs, &unit.spec)?,
         };
-        if let Some(Publication { packs, mut first }) = published {
-            let values = import_using(
-                &packs,
-                |reference| {
-                    if first.as_ref().is_some_and(|pack| pack.key == reference.pack) {
-                        return Ok(first.take().map(|BufferedPack { bytes, .. }| bytes));
-                    }
-                    config.blobs.committed_pack(reference, alloc)
-                },
-                alloc,
-                alloc,
-            )?;
+        if let Some(published) = published {
+            let arrived = import_published(&config.blobs, published)?;
             ensure_not_cancelled(unit, cancelled, alloc)?;
-            return Ok(Arrived { values, packs, ..Arrived::none(Source::Published, None, alloc) });
+            return Ok(arrived);
         }
         let clock = SystemClock;
         let before_handshake = clock.monotonic_nanos()?;
@@ -828,6 +925,9 @@ fn run_connected(
         let submit = Command::Submit(carrier::submission(&job, NEED, alloc));
         match client.call(submit)? {
             Answer::Binding(binding) => break binding,
+            Answer::AcceptedPublication(publication) => {
+                return receive_accepted(config, unit, cancelled, clock, budget, client, publication);
+            }
             Answer::Error(error) if error.code() == Some(blaze_wire::ErrorCode::Busy) => {
                 ensure_not_cancelled(unit, cancelled, alloc)?;
                 budget.check_active(unit, clock, alloc)?;
@@ -860,7 +960,8 @@ fn run_connected(
         alloc,
     );
     let result = ensure_not_cancelled(unit, cancelled, alloc).and(result);
-    if result.is_err() {
+    if result.is_err() || matches!(&result, Ok(arrived) if arrived.source == Source::Published) {
+        // Session release alone does not detach this exact subscription.
         leave(client, &binding);
     }
     // execute has joined every compiler/heartbeat scope. Only its recorded slots
@@ -882,6 +983,134 @@ fn run_connected(
     result.and_then(|arrived| after_publication(unit, acknowledged, alloc).map(|()| arrived))
 }
 
+/// A resolved result has no subscription to revive or cancel. Its original execution may
+/// already be terminal; only this request's own cancellation and deadline govern the read.
+#[allow(clippy::too_many_arguments)]
+fn receive_accepted(
+    config: &Config,
+    unit: &Unit,
+    cancelled: &AtomicBool,
+    clock: SystemClock,
+    budget: UnitBudget,
+    client: &mut Client,
+    publication: carrier::AcceptedPublication,
+) -> Result<Arrived, Error> {
+    let alloc = config.blobs.alloc;
+    after_publication(
+        unit,
+        (|| {
+            ensure_not_cancelled(unit, cancelled, alloc)?;
+            budget.check_request(unit, clock, alloc)?;
+            let deadline = TcpDeadline::after(budget.remaining(clock))?;
+            let values = import_until(&config.blobs, &publication.packs, deadline, alloc)?;
+            ensure_not_cancelled(unit, cancelled, alloc)?;
+            budget.check_request(unit, clock, alloc)?;
+            if !publication.delivered {
+                let expected = list_of(&publication.packs, alloc);
+                config.blobs.publish_until(&unit.spec, &expected, deadline, alloc)?;
+                ensure_not_cancelled(unit, cancelled, alloc)?;
+                budget.check_request(unit, clock, alloc)?;
+                record_delivery(
+                    client,
+                    publication.content,
+                    publication.execution,
+                    &publication.packs,
+                    alloc,
+                )?;
+            }
+            ensure_not_cancelled(unit, cancelled, alloc)?;
+            budget.check_request(unit, clock, alloc)?;
+            Ok(Arrived {
+                values,
+                packs: publication.packs,
+                publication_attempt: Some(u64::from(publication.accepted_attempt.0)),
+                ..Arrived::none(Source::Published, None, alloc)
+            })
+        })(),
+        alloc,
+    )
+}
+
+/// The only authoritative negative lookup happens after a flight has a current lead.
+/// The completion names that attempt; a delayed response cannot enable its replacement.
+#[allow(clippy::too_many_arguments)]
+fn resolve_publication(
+    config: &Config,
+    unit: &Unit,
+    content: blaze_wire::JobContent,
+    execution: ExecutionId,
+    executor: &str,
+    attempt: Attempt,
+    cancelled: &AtomicBool,
+    clock: SystemClock,
+    budget: UnitBudget,
+    now_ms: &(impl Fn() -> u64 + Sync),
+    client: &mut Client,
+) -> Result<PublicationKnowledge, Error> {
+    let alloc = config.blobs.alloc;
+    let mut accepted = false;
+    let resolved = heartbeat_during(
+        config,
+        unit,
+        content,
+        execution,
+        executor,
+        attempt,
+        budget,
+        clock,
+        now_ms,
+        cancelled,
+        |lost| {
+            ensure_not_cancelled(unit, cancelled, alloc)?;
+            budget.check_request(unit, clock, alloc)?;
+            let deadline = TcpDeadline::after(budget.remaining(clock))?;
+            let cached = read_published_until(&config.blobs, &unit.spec, deadline)?;
+            accepted = cached.is_some();
+            ensure_not_cancelled(unit, cancelled, alloc)?;
+            budget.check_request(unit, clock, alloc)?;
+            if lost.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let reply = client.call(Command::ResolvePublication(carrier::ResolvePublication {
+                content,
+                execution,
+                attempt,
+                executor: WireString::from_str_in(executor, alloc),
+                packs: cached.map(|publication| publication.packs),
+            }))?;
+            match reply {
+                Answer::AdmissionState(carrier::AdmissionState::Compile(_)) => Ok(()),
+                Answer::AdmissionState(carrier::AdmissionState::Accepted(_)) => {
+                    accepted = true;
+                    Ok(())
+                }
+                Answer::Error(error)
+                    if matches!(
+                        Refusal::of(&error),
+                        Some(Refusal::AttemptMoved | Refusal::NotHolder | Refusal::Ended)
+                    ) =>
+                {
+                    // Observe the current claim/publication again; this stale lookup grants
+                    // nothing, and neither a new execution nor a local build is started here.
+                    Ok(())
+                }
+                other => Err(Error::Protocol(format_in!(
+                    alloc,
+                    "unit {}: publication resolution answered {other:?}",
+                    hex(&unit.spec)
+                ))),
+            }
+        },
+    );
+    if accepted {
+        after_publication(unit, resolved, alloc)?;
+        Ok(PublicationKnowledge::Present)
+    } else {
+        resolved?;
+        Ok(PublicationKnowledge::Unknown)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute<A: AllocatorClone>(
     config: &Config,
@@ -899,62 +1128,180 @@ fn execute<A: AllocatorClone>(
     let wire_alloc = config.blobs.alloc;
     let content = binding.subscription.content;
     let execution = binding.subscription.execution;
-    let mut arrived = Arrived::none(Source::Executed, Some(execution.0), wire_alloc);
-    let mut waited = config.poll;
-    loop {
-        ensure_not_cancelled(unit, cancelled, wire_alloc)?;
-        budget.check_active(unit, clock, wire_alloc)?;
-        if budget.epoch.is_none()
-            && elapsed_since(clock, budget.started_ns) > budget.limit.saturating_add(GRACE)
-        {
-            return Err(Error::Protocol(format_in!(
-                wire_alloc,
-                "unit {}: its execution did not finish in {:?}",
-                hex(&unit.spec),
-                budget.limit
-            )));
-        }
-        // Claim before reading phase completion: even a subscriber arriving after that
-        // phase must know whether it is the current lead or a reader of the lead's tail.
-        let claim =
-            Command::Claim(carrier::Claim { content, execution, claimant: config.claimant });
-        let claimed = match client.call(claim)? {
-            Answer::Claimed(claimed) => Some(claimed),
-            Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => None,
-            other => {
-                return Err(Error::Protocol(format_in!(wire_alloc, "claim answered {other:?}")));
+    let request_deadline = TcpDeadline::after(budget.remaining(clock))?;
+    let mut knowledge = PublicationKnowledge::Unknown;
+    let result = (|| {
+        let mut arrived = Arrived::none(Source::Executed, Some(execution.0), wire_alloc);
+        let mut waited = config.poll;
+        loop {
+            ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+            budget.check_active(unit, clock, wire_alloc)?;
+            if budget.epoch.is_none()
+                && elapsed_since(clock, budget.started_ns) > budget.limit.saturating_add(GRACE)
+            {
+                return Err(Error::Protocol(format_in!(
+                    wire_alloc,
+                    "unit {}: its execution did not finish in {:?}",
+                    hex(&unit.spec),
+                    budget.limit
+                )));
             }
-        };
-        if let Some(claimed) = &claimed
-            && let Some(executor) = &claimed.executor
-        {
-            arrived.attempt = Some(u64::from(claimed.attempt.0));
-            let label = String::from_str_in(executor.as_str(), alloc.clone());
-            assignments.insert((label, claimed.attempt));
-        }
-        if let carrier::Publication {
-            packs: Some(packs),
-            attempt,
-            accepted_attempt: Some(accepted),
-        } = publication(client, content, execution, wire_alloc)?
-        {
-            arrived.attempt = Some(u64::from(attempt.0));
-            arrived.publication_attempt = Some(u64::from(accepted.0));
-            let take = || {
-                arrived.values = import(&config.blobs, &packs, wire_alloc)?;
-                arrived.packs = packs;
-                ensure_not_cancelled(unit, cancelled, wire_alloc)?;
-                // Delivery carries no new output authority, even after lead replacement.
-                mirror(config, unit, &arrived.packs)?;
-                ensure_not_cancelled(unit, cancelled, wire_alloc)?;
-                deliver(client, binding, &arrived.packs, wire_alloc)?;
-                Ok(())
+            // Claim before reading phase completion: even a subscriber arriving after that
+            // phase must know whether it is the current lead or a reader of the lead's tail.
+            let claim =
+                Command::Claim(carrier::Claim { content, execution, claimant: config.claimant });
+            let mut claimed = match client.call(claim)? {
+                Answer::Claimed(claimed) => Some(claimed),
+                Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => None,
+                other => {
+                    return Err(Error::Protocol(format_in!(wire_alloc, "claim answered {other:?}")));
+                }
             };
-            let completed = if let Some(claimed) = &claimed
-                && claimed.lead
+            if let Some(claimed) = &claimed
                 && let Some(executor) = &claimed.executor
             {
-                heartbeat_during(
+                arrived.attempt = Some(u64::from(claimed.attempt.0));
+                let label = String::from_str_in(executor.as_str(), alloc.clone());
+                assignments.insert((label, claimed.attempt));
+            }
+            let mut durable = false;
+            let published = if let Some(claimed) = &mut claimed
+                && let carrier::AdmissionState::Accepted(record) = &mut claimed.admission
+            {
+                knowledge.observe(PublicationKnowledge::Present);
+                durable = record.delivered;
+                carrier::Publication {
+                    packs: Some(core::mem::replace(&mut record.packs, Vec::new_in(wire_alloc))),
+                    attempt: claimed.attempt,
+                    accepted_attempt: Some(record.accepted_attempt),
+                }
+            } else {
+                publication(client, content, execution, wire_alloc)?
+            };
+            if let carrier::Publication {
+                packs: Some(packs),
+                attempt,
+                accepted_attempt: Some(accepted),
+            } = published
+            {
+                knowledge.observe(PublicationKnowledge::Present);
+                arrived.attempt = Some(u64::from(attempt.0));
+                arrived.publication_attempt = Some(u64::from(accepted.0));
+                let take = || {
+                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                    budget.check_request(unit, clock, wire_alloc)?;
+                    arrived.values = import_until(&config.blobs, &packs, request_deadline, wire_alloc)?;
+                    arrived.packs = packs;
+                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                    budget.check_request(unit, clock, wire_alloc)?;
+                    // Delivery carries no new output authority, even after lead replacement.
+                    if !durable {
+                        mirror(config, unit, &arrived.packs, request_deadline)?;
+                    }
+                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                    budget.check_request(unit, clock, wire_alloc)?;
+                    deliver(client, binding, &arrived.packs, wire_alloc)?;
+                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                    budget.check_request(unit, clock, wire_alloc)?;
+                    Ok(())
+                };
+                let completed = if let Some(claimed) = &claimed
+                    && claimed.lead
+                    && let Some(executor) = &claimed.executor
+                {
+                    heartbeat_during(
+                        config,
+                        unit,
+                        content,
+                        execution,
+                        executor.as_str(),
+                        claimed.attempt,
+                        budget,
+                        clock,
+                        now_ms,
+                        cancelled,
+                        |_| take(),
+                    )
+                } else {
+                    take()
+                };
+                after_publication(unit, completed, wire_alloc)?;
+                return Ok(arrived);
+            }
+            let Some(claimed) = claimed else {
+                return Err(ended(client, binding, wire_alloc));
+            };
+            let Some(executor) = claimed.executor else {
+                sleep(budget.poll_wait(clock, waited));
+                waited = waited.saturating_mul(2).min(POLL_MOST);
+                continue;
+            };
+            let permit = match claimed.admission {
+                carrier::AdmissionState::Compile(permit) => permit,
+                carrier::AdmissionState::Resolving(_) => {
+                    if claimed.lead {
+                        knowledge.observe(resolve_publication(
+                            config,
+                            unit,
+                            content,
+                            execution,
+                            executor.as_str(),
+                            claimed.attempt,
+                            cancelled,
+                            clock,
+                            budget,
+                            now_ms,
+                            client,
+                        )?);
+                    } else {
+                        sleep(budget.poll_wait(clock, waited));
+                        waited = waited.saturating_mul(2).min(POLL_MOST);
+                    }
+                    continue;
+                }
+                carrier::AdmissionState::Accepted(_) => {
+                    return Err(Error::Committed(format_in!(
+                        wire_alloc,
+                        "unit {}: accepted publication disappeared while its execution was bound",
+                        hex(&unit.spec)
+                    )));
+                }
+            };
+            let mut compiler = ResolvedCompiler { compiler: &mut *granted, permit };
+            arrived.joined = true;
+            if claimed.lead {
+                // A replacement must agree on the retained root set before taking the tail,
+                // even when all work committed before it acquired the lead attempt.
+                let join = Command::Join(carrier::Join {
+                    content,
+                    executor: executor.clone(),
+                    request: blaze_wire::WorkJoinRequest {
+                        execution,
+                        attempt: claimed.attempt,
+                        roots: root_set(unit, wire_alloc),
+                        rejected: Set::new(Vec::new_in(wire_alloc)),
+                    },
+                });
+                match answer(client, join, "the lead joining the unit", wire_alloc)? {
+                    Answer::Join(_) => {}
+                    other => {
+                        return Err(Error::Protocol(format_in!(
+                            wire_alloc,
+                            "join answered {other:?}"
+                        )));
+                    }
+                }
+            }
+            if let Some(packs) = committed(client, content, execution, wire_alloc)?.packs {
+                if !claimed.lead {
+                    // The helper's work is committed, but the whole unit is not. It must not
+                    // independently compile the tail during the lead's publication window.
+                    sleep(budget.poll_wait(clock, waited));
+                    waited = waited.saturating_mul(2).min(POLL_MOST);
+                    continue;
+                }
+                let publication_accepted = AtomicBool::new(false);
+                let committed = heartbeat_during(
                     config,
                     unit,
                     content,
@@ -965,231 +1312,180 @@ fn execute<A: AllocatorClone>(
                     clock,
                     now_ms,
                     cancelled,
-                    |_| take(),
-                )
-            } else {
-                take()
-            };
-            after_publication(unit, completed, wire_alloc)?;
-            return Ok(arrived);
-        }
-        let Some(claimed) = claimed else {
-            return Err(ended(client, binding, wire_alloc));
-        };
-        let Some(executor) = claimed.executor else {
-            sleep(budget.poll_wait(clock, waited));
-            waited = waited.saturating_mul(2).min(POLL_MOST);
-            continue;
-        };
-        arrived.joined = true;
-        if claimed.lead {
-            // A replacement must agree on the retained root set before taking the tail,
-            // even when all work committed before it acquired the lead attempt.
-            let join = Command::Join(carrier::Join {
-                content,
-                executor: executor.clone(),
-                request: blaze_wire::WorkJoinRequest {
-                    execution,
-                    attempt: claimed.attempt,
-                    roots: root_set(unit, wire_alloc),
-                    rejected: Set::new(Vec::new_in(wire_alloc)),
-                },
-            });
-            match answer(client, join, "the lead joining the unit", wire_alloc)? {
-                Answer::Join(_) => {}
-                other => {
-                    return Err(Error::Protocol(format_in!(
-                        wire_alloc,
-                        "join answered {other:?}"
-                    )));
-                }
+                    |lost| {
+                        arrived.values = import_until(&config.blobs, &packs, request_deadline, wire_alloc)?;
+                        ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                        budget.check_request(unit, clock, wire_alloc)?;
+                        let mut refuse = |why: WireString| {
+                            if !lost.load(Ordering::Acquire) {
+                                let _ = verdict(
+                                    client,
+                                    content,
+                                    execution,
+                                    executor.as_str(),
+                                    claimed.attempt,
+                                    Outcome::Failed,
+                                    wire_alloc,
+                                );
+                            }
+                            Error::Refused(format_in!(wire_alloc, "unit {}: {why}", hex(&unit.spec)))
+                        };
+                        let mut extra = Vec::new_in(wire_alloc);
+                        {
+                            let mut values = arrived.values.iter().map(|(key, (kind, bytes))| {
+                                ValueRef { key: *key, kind: *kind, bytes: bytes.as_slice() }
+                            });
+                            if matches!(
+                                compiler
+                                    .complete(lost, &mut values, &mut |value| extra.push(value))
+                                    .map_err(|error| refuse(format_in!(wire_alloc, "{error}")))?,
+                                TailCompletion::Lost
+                            ) {
+                                return Ok(None);
+                            }
+                        }
+                        ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                        budget.check_request(unit, clock, wire_alloc)?;
+                        if lost.load(Ordering::Acquire) {
+                            return Ok(None);
+                        }
+                        // A tail's own packs may be canonical yet disagree with the phase it
+                        // completed. Check the whole buffer before any upload or immutable
+                        // publication, while these committed values are still borrowed here.
+                        for value in &extra {
+                            if let Some((kind, bytes)) = arrived.values.get(&value.key)
+                                && (*kind != value.kind || bytes.as_slice() != value.bytes.as_slice())
+                            {
+                                return Err(refuse(format_in!(
+                                    wire_alloc,
+                                    "full output conflicts with the committed value under key {}",
+                                    hex(&value.key)
+                                )));
+                            }
+                        }
+                        let mut packs = packs;
+                        if !extra.is_empty() {
+                            for pack in Pack::batches(extra, wire_alloc).map_err(|why| {
+                                refuse(format_in!(wire_alloc, "full output cannot be packed: {why}"))
+                            })? {
+                                config.blobs.put_pack_until(&pack, request_deadline, wire_alloc)?;
+                                packs.push(pack.reference);
+                            }
+                        }
+                        packs.sort();
+                        packs.dedup();
+                        ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                        budget.check_request(unit, clock, wire_alloc)?;
+                        let commit = Command::CommitPublication(carrier::CommitPublication {
+                            content,
+                            execution,
+                            attempt: claimed.attempt,
+                            executor: executor.clone(),
+                            packs,
+                        });
+                        // The commit may have succeeded even if its reply was lost.
+                        // A transport failure cannot permit a local rebuild under
+                        // this unit's immutable key.
+                        let reply = client.call(commit).map_err(|error| {
+                            Error::Committed(format_in!(
+                                wire_alloc,
+                                "unit {}: publication commit outcome unknown: {error}",
+                                hex(&unit.spec)
+                            ))
+                        })?;
+                        match reply {
+                            Answer::Publication(carrier::Publication {
+                                packs: Some(packs),
+                                accepted_attempt: Some(accepted),
+                                ..
+                            }) => {
+                                publication_accepted.store(true, Ordering::Release);
+                                arrived.publication_attempt = Some(u64::from(accepted.0));
+                                after_publication(
+                                    unit,
+                                    (|| {
+                                        ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                                        mirror(config, unit, &packs, request_deadline)?;
+                                        ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                                        budget.check_request(unit, clock, wire_alloc)?;
+                                        deliver(client, binding, &packs, wire_alloc)?;
+                                        Ok(Some(packs))
+                                    })(),
+                                    wire_alloc,
+                                )
+                            }
+                            Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => {
+                                Err(ended(client, binding, wire_alloc))
+                            }
+                            Answer::Error(error)
+                                if matches!(
+                                    Refusal::of(&error),
+                                    Some(Refusal::AttemptMoved | Refusal::NotHolder)
+                                ) =>
+                            {
+                                Ok(None)
+                            }
+                            other => Err(Error::Committed(format_in!(
+                                wire_alloc,
+                                "unit {}: publication commit outcome unknown: {other:?}",
+                                hex(&unit.spec)
+                            ))),
+                        }
+                    },
+                );
+                // A failed heartbeat after successful publication is not evidence
+                // the manifest was never accepted by the coordinator.
+                let committed = if publication_accepted.load(Ordering::Acquire) {
+                    after_publication(unit, committed, wire_alloc)?
+                } else {
+                    committed?
+                };
+                let Some(packs) = committed else {
+                    // This attempt was fenced during its tail. Uploaded immutable blobs are
+                    // harmless; only a current lead may make their manifest visible.
+                    continue;
+                };
+                knowledge.observe(PublicationKnowledge::Present);
+                arrived.values = import_until(&config.blobs, &packs, request_deadline, wire_alloc)?;
+                ensure_not_cancelled(unit, cancelled, wire_alloc)?;
+                budget.check_request(unit, clock, wire_alloc)?;
+                arrived.packs = packs;
+                return Ok(arrived);
             }
-        }
-        if let Some(packs) = committed(client, content, execution, wire_alloc)?.packs {
-            if !claimed.lead {
-                // The helper's work is committed, but the whole unit is not. It must not
-                // independently compile the tail during the lead's publication window.
-                sleep(budget.poll_wait(clock, waited));
-                waited = waited.saturating_mul(2).min(POLL_MOST);
-                continue;
-            }
-            let publication_accepted = AtomicBool::new(false);
-            let committed = heartbeat_during(
+            waited = config.poll;
+            let stopped = hold(
                 config,
                 unit,
-                content,
-                execution,
+                binding,
                 executor.as_str(),
-                claimed.attempt,
+                claimed.lead,
                 budget,
                 clock,
                 now_ms,
+                &mut compiler,
                 cancelled,
-                |lost| {
-                    arrived.values = import(&config.blobs, &packs, wire_alloc)?;
-                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
-                    budget.check_active(unit, clock, wire_alloc)?;
-                    let mut refuse = |why: WireString| {
-                        if !lost.load(Ordering::Acquire) {
-                            let _ = verdict(
-                                client,
-                                content,
-                                execution,
-                                executor.as_str(),
-                                claimed.attempt,
-                                Outcome::Failed,
-                                wire_alloc,
-                            );
-                        }
-                        Error::Refused(format_in!(wire_alloc, "unit {}: {why}", hex(&unit.spec)))
-                    };
-                    let mut extra = Vec::new_in(wire_alloc);
-                    {
-                        let mut values = arrived.values.iter().map(|(key, (kind, bytes))| {
-                            ValueRef { key: *key, kind: *kind, bytes: bytes.as_slice() }
-                        });
-                        granted
-                            .complete(&mut values, &mut |value| extra.push(value))
-                            .map_err(|error| refuse(format_in!(wire_alloc, "{error}")))?;
-                    }
-                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
-                    if lost.load(Ordering::Acquire) {
-                        return Ok(None);
-                    }
-                    // A tail's own packs may be canonical yet disagree with the phase it
-                    // completed. Check the whole buffer before any upload or immutable
-                    // publication, while these committed values are still borrowed here.
-                    for value in &extra {
-                        if let Some((kind, bytes)) = arrived.values.get(&value.key)
-                            && (*kind != value.kind || bytes.as_slice() != value.bytes.as_slice())
-                        {
-                            return Err(refuse(format_in!(
-                                wire_alloc,
-                                "full output conflicts with the committed value under key {}",
-                                hex(&value.key)
-                            )));
-                        }
-                    }
-                    let mut packs = packs;
-                    if !extra.is_empty() {
-                        for pack in Pack::batches(extra, wire_alloc).map_err(|why| {
-                            refuse(format_in!(wire_alloc, "full output cannot be packed: {why}"))
-                        })? {
-                            config.blobs.put_pack(&pack, wire_alloc)?;
-                            packs.push(pack.reference);
-                        }
-                    }
-                    packs.sort();
-                    packs.dedup();
-                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
-                    budget.check_active(unit, clock, wire_alloc)?;
-                    let commit = Command::CommitPublication(carrier::CommitPublication {
-                        content,
-                        execution,
-                        attempt: claimed.attempt,
-                        executor: executor.clone(),
-                        packs,
-                    });
-                    // The commit may have succeeded even if its reply was lost.
-                    // A transport failure cannot permit a local rebuild under
-                    // this unit's immutable key.
-                    let reply = client.call(commit).map_err(|error| {
-                        Error::Committed(format_in!(
-                            wire_alloc,
-                            "unit {}: publication commit outcome unknown: {error}",
-                            hex(&unit.spec)
-                        ))
-                    })?;
-                    match reply {
-                        Answer::Publication(carrier::Publication {
-                            packs: Some(packs),
-                            accepted_attempt: Some(accepted),
-                            ..
-                        }) => {
-                            publication_accepted.store(true, Ordering::Release);
-                            arrived.publication_attempt = Some(u64::from(accepted.0));
-                            after_publication(
-                                unit,
-                                (|| {
-                                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
-                                    mirror(config, unit, &packs)?;
-                                    ensure_not_cancelled(unit, cancelled, wire_alloc)?;
-                                    deliver(client, binding, &packs, wire_alloc)?;
-                                    Ok(Some(packs))
-                                })(),
-                                wire_alloc,
-                            )
-                        }
-                        Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => {
-                            Err(ended(client, binding, wire_alloc))
-                        }
-                        Answer::Error(error)
-                            if matches!(
-                                Refusal::of(&error),
-                                Some(Refusal::AttemptMoved | Refusal::NotHolder)
-                            ) =>
-                        {
-                            Ok(None)
-                        }
-                        other => Err(Error::Committed(format_in!(
-                            wire_alloc,
-                            "unit {}: publication commit outcome unknown: {other:?}",
-                            hex(&unit.spec)
-                        ))),
-                    }
-                },
-            );
-            // A failed heartbeat after successful publication is not evidence
-            // the manifest was never accepted by the coordinator.
-            let committed = if publication_accepted.load(Ordering::Acquire) {
-                after_publication(unit, committed, wire_alloc)?
-            } else {
-                committed?
-            };
-            let Some(packs) = committed else {
-                // This attempt was fenced during its tail. Uploaded immutable blobs are
-                // harmless; only a current lead may make their manifest visible.
-                continue;
-            };
-            arrived.values = import(&config.blobs, &packs, wire_alloc)?;
-            ensure_not_cancelled(unit, cancelled, wire_alloc)?;
-            arrived.packs = packs;
-            return Ok(arrived);
-        }
-        waited = config.poll;
-        let stopped = hold(
-            config,
-            unit,
-            binding,
-            executor.as_str(),
-            claimed.lead,
-            budget,
-            clock,
-            execution,
-            claimed.attempt,
-            now_ms,
-            granted,
-            cancelled,
-            &mut arrived,
-        )?;
-        match stopped {
-            StopWhy::Ended | StopWhy::Cancelled | StopWhy::AttemptMoved => {}
-            StopWhy::FrontEndDiffers => {
-                return Err(Error::Protocol(format_in!(
-                    wire_alloc,
-                    "unit {}: another executor's front end differs from this one's",
-                    hex(&unit.spec)
-                )));
+                &mut arrived,
+            )?;
+            match stopped {
+                StopWhy::Ended | StopWhy::Cancelled | StopWhy::AttemptMoved => {}
+                StopWhy::FrontEndDiffers => {
+                    return Err(Error::Protocol(format_in!(
+                        wire_alloc,
+                        "unit {}: another executor's front end differs from this one's",
+                        hex(&unit.spec)
+                    )));
+                }
+                StopWhy::Protocol(why) => return Err(Error::Protocol(why)),
             }
-            StopWhy::Protocol(why) => return Err(Error::Protocol(why)),
         }
-    }
+    })();
+    knowledge.finish(unit, result, wire_alloc)
 }
 
-fn mirror(config: &Config, unit: &Unit, packs: &[PackRef]) -> Result<(), Error> {
+fn mirror(config: &Config, unit: &Unit, packs: &[PackRef], deadline: TcpDeadline) -> Result<(), Error> {
     let alloc = config.blobs.alloc;
     let expected = list_of(packs, alloc);
-    config.blobs.publish(&unit.spec, &expected, alloc)?;
+    config.blobs.publish_until(&unit.spec, &expected, deadline, alloc)?;
     // A 412 is accepted only after the existing and proposed full outputs were
     // verified equal, even if their native pack partitions differ. Missing or
     // corrupt committed packs refuse delivery; they never start another compile.
@@ -1375,16 +1671,16 @@ fn hold(
     lead: bool,
     budget: UnitBudget,
     clock: SystemClock,
-    execution: ExecutionId,
-    attempt: Attempt,
     now_ms: &(impl Fn() -> u64 + Sync),
-    granted: &mut (impl Granted + ?Sized),
+    granted: &mut ResolvedCompiler<'_, impl Granted + ?Sized>,
     cancelled: &AtomicBool,
     arrived: &mut Arrived,
 ) -> Result<StopWhy, Error> {
     let alloc = config.blobs.alloc;
     budget.check_active(unit, clock, alloc)?;
     let content = binding.subscription.content;
+    let execution = granted.permit.execution;
+    let attempt = granted.permit.attempt;
     let mut holder = Holder::new(
         executor,
         execution,
@@ -1404,7 +1700,7 @@ fn hold(
     let driver = DriverConfig {
         // The stale-attempt probe gates the lead because its intentional silence moves
         // the attempt. The shared-execution probe gates every participating holder.
-        result_gate: granted
+        result_gate: granted.compiler
             .test_result_gate()
             .filter(|gate| lead || gate.scope == ResultGateScope::All)
             .map(|gate| crate::result_gate::ResultGate::new(WireString::from_str_in(gate.directory, alloc), gate_timeout, alloc))
@@ -1414,7 +1710,7 @@ fn hold(
     let mut batches = Batches {
         unit,
         blobs: &config.blobs,
-        granted,
+        granted: &mut *granted.compiler,
         compiled: 0,
         stored: 0,
         grants: 0,
@@ -1497,29 +1793,43 @@ fn deliver(
     packs: &[PackRef],
     alloc: WireAlloc,
 ) -> Result<(), Error> {
+    record_delivery(
+        client,
+        binding.subscription.content,
+        binding.subscription.execution,
+        packs,
+        alloc,
+    )?;
+    match client.call(Command::Terminal(binding.subscription.clone()))? {
+        Answer::Terminal(carrier::Terminal { value: Some(value), .. })
+            if value.termination.is_valid() && value.termination.outcome == Outcome::Passed =>
+        {
+            Ok(())
+        }
+        Answer::Terminal(carrier::Terminal { value: Some(value), .. }) => {
+            Err(Error::Ended(value.termination))
+        }
+        other => Err(Error::Protocol(format_in!(
+            alloc,
+            "publication delivery has no terminal verdict: {other:?}"
+        ))),
+    }
+}
+
+fn record_delivery(
+    client: &mut Client,
+    content: blaze_wire::JobContent,
+    execution: ExecutionId,
+    packs: &[PackRef],
+    alloc: WireAlloc,
+) -> Result<(), Error> {
     let command = Command::DeliverPublication(carrier::DeliverPublication {
-        content: binding.subscription.content,
-        execution: binding.subscription.execution,
+        content,
+        execution,
         packs: Vec::from_slice_in(packs, alloc),
     });
-    match client.call(command)? {
-        Answer::Error(error) if Refusal::of(&error) == Some(Refusal::Ended) => {
-            Err(ended(client, binding, alloc))
-        }
-        Answer::Ack(_) => match client.call(Command::Terminal(binding.subscription.clone()))? {
-            Answer::Terminal(carrier::Terminal { value: Some(value), .. })
-                if value.termination.is_valid() && value.termination.outcome == Outcome::Passed =>
-            {
-                Ok(())
-            }
-            Answer::Terminal(carrier::Terminal { value: Some(value), .. }) => {
-                Err(Error::Ended(value.termination))
-            }
-            other => Err(Error::Protocol(format_in!(
-                alloc,
-                "publication delivery has no terminal verdict: {other:?}"
-            ))),
-        },
+    match answer(client, command, "recording durable publication", alloc)? {
+        Answer::Ack(_) => Ok(()),
         other => Err(Error::Protocol(format_in!(alloc, "publication delivery answered {other:?}"))),
     }
 }
@@ -1956,6 +2266,117 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[derive(Debug)]
+    enum ObservationBroken {
+        RebuildAfterPublication,
+        TailAfterKnownLoss,
+    }
+
+    impl fmt::Display for ObservationBroken {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(match self {
+                Self::RebuildAfterPublication => "a later error forgot the accepted result",
+                Self::TailAfterKnownLoss => "known ownership loss still invoked the compiler tail",
+            })
+        }
+    }
+
+    blaze_sim::plants! {
+        enum ObservationPlant breaks ObservationBroken {
+            None,
+            ForgetPublication => ObservationBroken::RebuildAfterPublication,
+            IgnoreKnownLoss => ObservationBroken::TailAfterKnownLoss,
+        }
+    }
+
+    fn publication_and_ownership_observations(
+        tape: &blaze_sim::Tape,
+        plant: ObservationPlant,
+    ) -> Result<(), blaze_sim::Broken<ObservationBroken>> {
+        let alloc = test_alloc();
+        let unit = Unit { spec: [0x72; 32], names: Vec::new_in(alloc) };
+        let mut knowledge = PublicationKnowledge::Unknown;
+        knowledge.observe(PublicationKnowledge::Present);
+        for _ in 0..tape.int_in(1..=8, "later claim observations") {
+            knowledge.observe(if tape.coin("later claim repeats acceptance") {
+                PublicationKnowledge::Present
+            } else {
+                PublicationKnowledge::Unknown
+            });
+        }
+        if plant == ObservationPlant::ForgetPublication {
+            knowledge = PublicationKnowledge::Unknown;
+        }
+        let failure = if tape.coin("claim transport fails after resolution") {
+            Error::Io(IoError::from_errno(Errno::ConnReset))
+        } else {
+            Error::Protocol(WireString::from_str_in("claim response was lost", alloc))
+        };
+        let failed = knowledge.finish(&unit, Err::<(), _>(failure), alloc).unwrap_err();
+        if !matches!(decide(&LocalPolicy::Fallback, failed, alloc), Err(Error::Committed(_))) {
+            return Err(blaze_sim::Broken::Oracle(ObservationBroken::RebuildAfterPublication));
+        }
+
+        struct Compiler {
+            tails: u32,
+        }
+        impl Granted for Compiler {
+            type Error = core::convert::Infallible;
+
+            fn compile(&mut self, _: &[usize]) -> Result<Grant, Self::Error> {
+                unreachable!("this simulation reaches only the full-tail boundary")
+            }
+
+            fn complete(
+                &mut self,
+                _: &mut dyn Iterator<Item = ValueRef<'_>>,
+                _: &mut dyn FnMut(Value),
+            ) -> Result<(), Self::Error> {
+                self.tails += 1;
+                Ok(())
+            }
+        }
+        let lost = AtomicBool::new(false);
+        let mut compiler = Compiler { tails: 0 };
+        let before_loss = tape.int_in(0..=3, "tails before ownership is lost");
+        for step in 0..=before_loss {
+            if step == before_loss {
+                // The heartbeat's loss becomes visible while phase import is finishing.
+                lost.store(true, Ordering::Release);
+            }
+            let mut values = core::iter::empty();
+            let mut output = |_: Value| {};
+            if plant == ObservationPlant::IgnoreKnownLoss {
+                compiler.complete(&mut values, &mut output).unwrap();
+            } else {
+                ResolvedCompiler {
+                    compiler: &mut compiler,
+                    permit: carrier::CompileReady { execution: ExecutionId(4), attempt: Attempt(2) },
+                }
+                .complete(&lost, &mut values, &mut output)
+                .unwrap();
+            }
+        }
+        if u64::from(compiler.tails) != before_loss {
+            return Err(blaze_sim::Broken::Oracle(ObservationBroken::TailAfterKnownLoss));
+        }
+        Ok(())
+    }
+
+    /// The invariant (simulated): observing an accepted publication permanently prevents local fallback
+    /// for that request, and ownership loss observed before completion prevents its tail callback.
+    #[test]
+    fn accepted_publication_and_known_loss_guard_later_compiler_calls() {
+        blaze_sim::check(blaze_sim::Config::cases(64), |tape| {
+            publication_and_ownership_observations(tape, ObservationPlant::None)
+        });
+    }
+
+    #[test]
+    fn the_oracle_catches_forgotten_publication_and_ownership_observations() {
+        blaze_sim::controls(blaze_sim::Config::cases(64), publication_and_ownership_observations);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use blaze_dist::admission::{Admission, AdmissionConfig};
 use blaze_dist::jobs::{
-    AssignmentToken, Effect, ExecState, Execution, ExecutionConfig, Jobs, Subscriber,
+    AssignmentToken, Effect, ExecState, Execution, ExecutionConfig, Jobs, SubmitAnswer, Subscriber,
     SubscriberState,
 };
 use blaze_dist::work::EndWhy;
@@ -19,6 +19,15 @@ use blaze_wire::{
 
 fn heap() -> WireAlloc {
     blaze_own::testing::heap().shared()
+}
+
+fn attached(
+    answer: Result<SubmitAnswer, (blaze_dist::Refusal, Option<u64>)>,
+) -> blaze_wire::JobAnswer {
+    match answer {
+        Ok(SubmitAnswer::Attached(answer)) => answer,
+        other => panic!("expected an attached test request: {other:?}"),
+    }
 }
 
 fn execution(alloc: WireAlloc) -> Execution {
@@ -242,13 +251,13 @@ fn resubmission_cannot_revive_an_execution_past_its_last_deadline() {
         let (mut jobs, _) = registry(alloc);
         let mut req = request(1);
         req.deadline_ms = 10;
-        let first = jobs.submit(0, &req, reservation(), &mut Vec::new_in(alloc)).unwrap();
+        let first = attached(jobs.submit(0, &req, reservation(), &mut Vec::new_in(alloc)));
         if running {
             jobs.tick(0, &mut Vec::new_in(alloc));
         }
         req.deadline_ms = 100;
         let mut effects = Vec::new_in(alloc);
-        let second = jobs.submit(11, &req, reservation(), &mut effects).unwrap();
+        let second = attached(jobs.submit(11, &req, reservation(), &mut effects));
         assert_ne!(second.execution, first.execution);
         assert_eq!(
             jobs.execution(first.execution).unwrap().state(),
@@ -270,11 +279,11 @@ fn resubmission_still_coalesces_when_an_existing_subscriber_is_live() {
     let (mut jobs, _) = registry(alloc);
     let mut req = request(1);
     req.deadline_ms = 10;
-    let first = jobs.submit(0, &req, reservation(), &mut Vec::new_in(alloc)).unwrap();
+    let first = attached(jobs.submit(0, &req, reservation(), &mut Vec::new_in(alloc)));
     req.deadline_ms = 100;
-    let live = jobs.submit(1, &req, reservation(), &mut Vec::new_in(alloc)).unwrap();
+    let live = attached(jobs.submit(1, &req, reservation(), &mut Vec::new_in(alloc)));
     req.deadline_ms = 200;
-    let next = jobs.submit(11, &req, reservation(), &mut Vec::new_in(alloc)).unwrap();
+    let next = attached(jobs.submit(11, &req, reservation(), &mut Vec::new_in(alloc)));
     assert_eq!(first.execution, live.execution);
     assert_eq!(next.execution, live.execution);
     assert_eq!(
@@ -297,7 +306,7 @@ fn review_a_late_kill_ack_cannot_release_a_new_execution() {
         );
         let mut jobs = Jobs::new(admission, ExecutionConfig::default(), alloc);
         let mut effects = Vec::new_in(alloc);
-        let first = jobs.submit(0, &request(1), reservation(), &mut effects).unwrap();
+        let first = attached(jobs.submit(0, &request(1), reservation(), &mut effects));
         jobs.tick(0, &mut effects);
         jobs.unsubscribe(1, first.execution, first.subscriber, &mut effects).unwrap();
         jobs.killed(
@@ -307,7 +316,7 @@ fn review_a_late_kill_ack_cannot_release_a_new_execution() {
             true,
         );
 
-        let second = jobs.submit(2, &request(2), reservation(), &mut effects).unwrap();
+        let second = attached(jobs.submit(2, &request(2), reservation(), &mut effects));
         jobs.tick(2, &mut effects);
         assert_eq!(jobs.execution(second.execution).unwrap().lead(), Some(builder.as_str()));
         // A duplicated or reordered acknowledgement belongs to the first assignment.
@@ -322,7 +331,7 @@ fn review_a_late_kill_ack_cannot_release_a_new_execution() {
             Some((second.execution, Attempt(1))),
         );
 
-        let third = jobs.submit(4, &request(3), reservation(), &mut effects).unwrap();
+        let third = attached(jobs.submit(4, &request(3), reservation(), &mut effects));
         jobs.tick(4, &mut effects);
         assert_eq!(jobs.execution(second.execution).unwrap().state(), ExecState::Running);
         assert_eq!(jobs.execution(third.execution).unwrap().state(), ExecState::Queued);
@@ -341,10 +350,10 @@ fn review_pr_supersession_follows_source_and_preserves_shared_executions() {
     macos.platform = [2; 32];
     let mut release = linux.clone();
     release.unit = [0x70; 32];
-    let first = jobs.submit(0, &linux, reservation(), &mut effects).unwrap();
-    let second = jobs.submit(0, &macos, reservation(), &mut effects).unwrap();
-    let shared = jobs.submit(0, &release, reservation(), &mut effects).unwrap();
-    let other = jobs.submit(0, &release, reservation(), &mut effects).unwrap();
+    let first = attached(jobs.submit(0, &linux, reservation(), &mut effects));
+    let second = attached(jobs.submit(0, &macos, reservation(), &mut effects));
+    let shared = attached(jobs.submit(0, &release, reservation(), &mut effects));
+    let other = attached(jobs.submit(0, &release, reservation(), &mut effects));
     assert_eq!(shared.execution, other.execution);
     for id in [first.execution, second.execution, shared.execution] {
         assert_eq!(jobs.execution(id).unwrap().state(), ExecState::Queued);
@@ -353,7 +362,7 @@ fn review_pr_supersession_follows_source_and_preserves_shared_executions() {
     let mut next_push = linux.clone();
     next_push.unit = request(2).unit;
     next_push.source = request(2).source;
-    let next = jobs.submit(1, &next_push, reservation(), &mut effects).unwrap();
+    let next = attached(jobs.submit(1, &next_push, reservation(), &mut effects));
     for id in [first.execution, second.execution] {
         assert_eq!(jobs.execution(id).unwrap().state(), ExecState::Ended(Outcome::Cancelled));
     }
@@ -372,7 +381,7 @@ fn review_pr_supersession_follows_source_and_preserves_shared_executions() {
     jobs.unsubscribe(2, other.execution, other.subscriber, &mut effects).unwrap();
     next_push.unit = request(3).unit;
     next_push.source = request(3).source;
-    let latest = jobs.submit(3, &next_push, reservation(), &mut effects).unwrap();
+    let latest = attached(jobs.submit(3, &next_push, reservation(), &mut effects));
     for id in [shared.execution, next.execution] {
         assert_eq!(jobs.execution(id).unwrap().state(), ExecState::Ended(Outcome::Cancelled));
     }
@@ -566,7 +575,7 @@ fn registry(alloc: WireAlloc) -> (blaze_dist::jobs::Jobs, WireString) {
 }
 
 fn submit(jobs: &mut blaze_dist::jobs::Jobs, tag: u64, alloc: WireAlloc) -> ExecutionId {
-    jobs.submit(
+    attached(jobs.submit(
         0,
         &blaze_wire::JobRequest {
             unit: [u8::try_from(tag & 0xff).unwrap(); 32],
@@ -578,8 +587,7 @@ fn submit(jobs: &mut blaze_dist::jobs::Jobs, tag: u64, alloc: WireAlloc) -> Exec
         },
         reservation(),
         &mut Vec::new_in(alloc),
-    )
-    .unwrap()
+    ))
     .execution
 }
 
@@ -760,7 +768,7 @@ fn an_idle_builder_is_assigned_as_a_helper_and_both_workers_lease() {
     );
     let mut jobs = Jobs::new(admission, ExecutionConfig::default(), alloc);
     let mut out = Vec::new_in(alloc);
-    let id = jobs.submit(0, &request(7), reservation(), &mut out).unwrap().execution;
+    let id = attached(jobs.submit(0, &request(7), reservation(), &mut out)).execution;
     out.clear();
     jobs.tick(0, &mut out);
     let assigned = Vec::from_iter_in(
@@ -854,6 +862,7 @@ fn absent_assignments_and_an_expired_late_helper_do_not_strand_roots() {
     );
     e.assign(0, "lead", &["late", "absent-a", "absent-b", "absent-c"], &mut log).unwrap();
     let attempt = e.attempt();
+    e.resolve_publication(0, "lead", attempt, None, &mut log).unwrap();
     let join = WorkJoinRequest {
         execution: e.id,
         attempt,
@@ -898,6 +907,10 @@ fn absent_assignments_and_an_expired_late_helper_do_not_strand_roots() {
     );
     e.commit_publication(13, "lead", attempt, &[], &mut log).unwrap();
     e.commit_publication(13, "lead", attempt, &[], &mut log).unwrap();
+    for _ in 0..2 {
+        assert_eq!(e.join(13, "late", &join, &mut log), Err(blaze_dist::Refusal::Ended));
+        assert_eq!(e.lease(13, "late", &lease, &mut log), Err(blaze_dist::Refusal::Ended));
+    }
     assert_eq!(
         e.stages().iter().filter(|(stage, _)| *stage == blaze_wire::Stage::Published).count(),
         1
@@ -938,8 +951,8 @@ fn idle_helpers_are_shared_round_robin_between_running_builds() {
     // it enqueues, so the first build's helper is assigned inside the second
     // submit, not in the tick below.
     let mut out = Vec::new_in(alloc);
-    let a = jobs.submit(0, &request(7), reservation(), &mut out).unwrap().execution;
-    let b = jobs.submit(0, &request(8), reservation(), &mut out).unwrap().execution;
+    let a = attached(jobs.submit(0, &request(7), reservation(), &mut out)).execution;
+    let b = attached(jobs.submit(0, &request(8), reservation(), &mut out)).execution;
     assert_ne!(a, b);
     jobs.tick(0, &mut out);
     assert_eq!(jobs.execution(a).unwrap().state(), ExecState::Running);
@@ -985,7 +998,7 @@ mod claim {
     use blaze_own::Vec;
     use blaze_wire::{JobRequest, LocalPolicy, Namespace, Reservation, WireAlloc, WireString};
 
-    use super::heap;
+    use super::{attached, heap};
 
     fn started(executors: u32, alloc: WireAlloc) -> (Jobs, blaze_wire::ExecutionId) {
         let need = Reservation { memory: 1, cpus: 1, disk: 1 };
@@ -1004,7 +1017,7 @@ mod claim {
             local: LocalPolicy::Never,
         };
         let mut out = Vec::new_in(alloc);
-        let answer = jobs.submit(0, &request, need, &mut out).unwrap();
+        let answer = attached(jobs.submit(0, &request, need, &mut out));
         (jobs, answer.execution)
     }
 
@@ -1056,7 +1069,7 @@ mod claim {
         let subscriber = jobs.execution(first).unwrap().subscribers().next().unwrap().id;
         jobs.unsubscribe(2, first, subscriber, &mut out).unwrap();
         let need = Reservation { memory: 1, cpus: 1, disk: 1 };
-        let next = jobs.submit(3, &super::request(7), need, &mut out).unwrap().execution;
+        let next = attached(jobs.submit(3, &super::request(7), need, &mut out)).execution;
         let (other, _) =
             jobs.claim(3, next, [2; 32], &mut out).unwrap().expect("unstarted helper was released");
         let other = WireString::from_str_in(other, alloc);

@@ -1314,6 +1314,9 @@ enum Task {
     /// ([`Lower::discard_stmt`]).
     DiscardStmt(ExprId),
     Branch(ExprId, Block, Block),
+    /// A lazy Boolean operand: its value survives its own temporary scope, except that a
+    /// pattern condition keeps its scrutinee in the enclosing condition's scope.
+    BranchOperand(ExprId, Block, Block),
     BranchOn(ExprId, Block, Block),
     LetBranch(PatId, ExprId, Block, Block),
     TailStore(Option<Local>, ExprId),
@@ -4901,6 +4904,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             },
             Task::DiscardStmt(e) => self.discard_stmt(e),
             Task::Branch(e, t, f) => self.branch(e, t, f),
+            Task::BranchOperand(e, t, f) => self.branch_operand(e, t, f),
             Task::BranchOn(e, t, f) => {
                 let v = self.pop(e)?;
                 let p = self.as_place(v, e)?;
@@ -8850,15 +8854,15 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Expr::Paren(i) => self.tasks.push(Task::Branch(i, t, f)),
             Expr::Binary { op: BinOp::And, lhs, rhs } => {
                 let mid = self.b.block();
-                self.tasks.push(Task::Branch(rhs, t, f));
+                self.tasks.push(Task::BranchOperand(rhs, t, f));
                 self.tasks.push(Task::Start(mid));
-                self.tasks.push(Task::Branch(lhs, mid, f));
+                self.tasks.push(Task::BranchOperand(lhs, mid, f));
             }
             Expr::Binary { op: BinOp::Or, lhs, rhs } => {
                 let mid = self.b.block();
-                self.tasks.push(Task::Branch(rhs, t, f));
+                self.tasks.push(Task::BranchOperand(rhs, t, f));
                 self.tasks.push(Task::Start(mid));
-                self.tasks.push(Task::Branch(lhs, t, mid));
+                self.tasks.push(Task::BranchOperand(lhs, t, mid));
             }
             Expr::Unary { op: UnOp::Not, operand } if self.adjust_rows(e).0 == self.adjust_rows(e).1 && self.callee_of(e).is_none() => {
                 self.tasks.push(Task::Branch(operand, f, t));
@@ -8870,6 +8874,34 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             _ => {
                 self.tasks.push(Task::BranchOn(e, t, f));
                 self.tasks.push(Task::Eval(e, false));
+            }
+        }
+        Ok(())
+    }
+
+    /// Each lazy Boolean operand is a temporary scope (Reference, "Temporary scopes").
+    /// Preserve its Boolean in the outer scope before dropping its temporaries, so both
+    /// outgoing edges observe the cleanup. Structural links are visited once; `let`
+    /// scrutinees retain the enclosing conditional scope rather than being dropped here.
+    fn branch_operand(&mut self, e: ExprId, t: Block, f: Block) -> Result<(), Refusal> {
+        match self.expr(e)? {
+            Expr::Paren(inner) => self.tasks.push(Task::BranchOperand(inner, t, f)),
+            Expr::Binary { op: BinOp::And | BinOp::Or, .. } | Expr::Let { .. } => {
+                self.tasks.push(Task::Branch(e, t, f));
+            }
+            Expr::Unary { op: UnOp::Not, operand } if self.adjust_rows(e).0 == self.adjust_rows(e).1 && self.callee_of(e).is_none() => {
+                self.tasks.push(Task::BranchOperand(operand, f, t));
+            }
+            _ => {
+                let ty = TyD::of(self.adjusted_ty(e)?);
+                let dest = self.temp(ty, e)?;
+                let result = Val { at: At::Place(self.place_of(dest)), ty };
+                self.tasks.push(Task::BranchOn(e, t, f));
+                self.tasks.push(Task::PushVal(result));
+                self.tasks.push(Task::CloseTemps(e));
+                self.tasks.push(Task::TailStore(Some(dest), e));
+                self.tasks.push(Task::Eval(e, false));
+                self.tasks.push(Task::OpenTemps);
             }
         }
         Ok(())

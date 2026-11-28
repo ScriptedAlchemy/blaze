@@ -21,7 +21,7 @@ use blaze_dist_local::pack::{Pack, Value, ValueRef};
 use blaze_dist_local::protocol::{Answer, Command, submission};
 use blaze_dist_local::server::{MonotonicClock, Server, random_id};
 use blaze_dist_local::sys::{
-    JoinHandle, Mutex, Receiver, Sender, SystemClock, TcpListener, TcpStream, TempDir, channel,
+    JoinHandle, Mutex, Receiver, RecvTimeoutError, Sender, SystemClock, TcpListener, TcpStream, TempDir, channel,
     create_dir_all, scope, sleep, sleep_ms, spawn, unlink_path,
 };
 use blaze_own::{Arc, BTreeMap, BTreeSet, Vec, format_in};
@@ -87,6 +87,23 @@ fn world_with(namespaces: &[Namespace], work: WorkConfig, carrier: CarrierConfig
 }
 
 fn world_for_execution(namespaces: &[Namespace], execution: ExecutionConfig, carrier: CarrierConfig) -> World {
+    world_from(WorldOptions { namespaces, execution, carrier, workers: StartWorkers::OnAssignment })
+}
+
+enum StartWorkers {
+    OnAssignment,
+    OnClaim,
+}
+
+struct WorldOptions<'a> {
+    namespaces: &'a [Namespace],
+    execution: ExecutionConfig,
+    carrier: CarrierConfig,
+    workers: StartWorkers,
+}
+
+fn world_from(options: WorldOptions<'_>) -> World {
+    let WorldOptions { namespaces, execution, carrier, workers } = options;
     let alloc = test_alloc();
     let dir = TempDir::new("ba", alloc).unwrap();
     let store = dir.join("blobs");
@@ -146,6 +163,10 @@ fn world_for_execution(namespaces: &[Namespace], execution: ExecutionConfig, car
     assert_eq!(admission.used("machine"), capacity);
     admission.check().unwrap();
     let jobs = Jobs::new(admission, execution, alloc);
+    let jobs = match workers {
+        StartWorkers::OnAssignment => jobs,
+        StartWorkers::OnClaim => jobs.start_on_claim(),
+    };
     let socket = dir.join("a.sock");
     let server = Server::bind(
         socket.as_str(),
@@ -1463,4 +1484,402 @@ fn a_late_subscriber_waits_for_the_one_leads_full_tail() {
         assert_eq!(tails.load(Ordering::SeqCst), 1);
         let _ = observer.release();
     });
+}
+
+fn fixture_error(alloc: WireAlloc, action: &str, why: impl fmt::Debug) -> TestError {
+    TestError(format_in!(alloc, "{action}: {why:?}"))
+}
+
+struct RefusesCompilation<'a> {
+    compiles: &'a AtomicUsize,
+    tails: &'a AtomicUsize,
+    alloc: WireAlloc,
+}
+
+impl Granted for RefusesCompilation<'_> {
+    type Error = TestError;
+
+    fn compile(&mut self, _: &[usize]) -> Result<Grant, Self::Error> {
+        self.compiles.fetch_add(1, Ordering::SeqCst);
+        Err(TestError(WireString::from_str_in("reader compiled an accepted unit", self.alloc)))
+    }
+
+    fn complete(
+        &mut self,
+        _: &mut dyn Iterator<Item = ValueRef<'_>>,
+        _: &mut dyn FnMut(Value),
+    ) -> Result<(), Self::Error> {
+        self.tails.fetch_add(1, Ordering::SeqCst);
+        Err(TestError(WireString::from_str_in("reader completed an accepted unit", self.alloc)))
+    }
+}
+
+struct GatedTail {
+    entered: Sender<()>,
+    release: Receiver<()>,
+    extra: Value,
+    alloc: WireAlloc,
+}
+
+impl Granted for GatedTail {
+    type Error = TestError;
+
+    fn compile(&mut self, _: &[usize]) -> Result<Grant, Self::Error> {
+        Err(TestError(WireString::from_str_in("the gated unit has no grant names", self.alloc)))
+    }
+
+    fn complete(
+        &mut self,
+        _: &mut dyn Iterator<Item = ValueRef<'_>>,
+        output: &mut dyn FnMut(Value),
+    ) -> Result<(), Self::Error> {
+        self.entered.send(()).map_err(|why| fixture_error(self.alloc, "tail entered", why))?;
+        self.release
+            .recv_timeout(Duration::from_secs(20))
+            .map_err(|why| fixture_error(self.alloc, "tail release", why))?;
+        output(self.extra.clone());
+        Ok(())
+    }
+}
+
+/// Only the reader uses this proxy. The first real manifest miss is held across the
+/// original lead's completion; subsequent requests use the unchanged real cache server.
+struct StaleMissProxy<'a> {
+    listener: &'a TcpListener,
+    origin: &'a Blobs,
+    missed: &'a Sender<()>,
+    release: &'a Receiver<()>,
+    stop: &'a Receiver<()>,
+}
+
+impl StaleMissProxy<'_> {
+    fn run(&self) -> Result<(), TestError> {
+        let alloc = self.origin.alloc;
+        let clock = SystemClock;
+        let until = clock.monotonic_nanos()
+            .map_err(|why| fixture_error(alloc, "proxy clock", why))?
+            .saturating_add(120_000_000_000);
+        let mut exchanges = 0;
+        loop {
+            if clock.monotonic_nanos().map_err(|why| fixture_error(alloc, "proxy clock", why))?
+                >= until
+            {
+                return Err(TestError(WireString::from_str_in("proxy exchange deadline", alloc)));
+            }
+            let mut client = match self.listener.accept() {
+                Ok(client) => client,
+                Err(why) if why.is_would_block() => {
+                    // This wait observes shutdown; no timed delay establishes test ordering.
+                    match self.stop.recv_timeout(Duration::from_millis(1)) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                        Err(RecvTimeoutError::Timeout) => continue,
+                    }
+                }
+                Err(why) => return Err(fixture_error(alloc, "proxy accept", why)),
+            };
+            exchanges += 1;
+            if exchanges > 64 {
+                return Err(TestError(WireString::from_str_in("proxy exchange count", alloc)));
+            }
+            client.set_read_timeout(Some(Duration::from_secs(30)))
+                .map_err(|why| fixture_error(alloc, "proxy read deadline", why))?;
+            client.set_write_timeout(Some(Duration::from_secs(30)))
+                .map_err(|why| fixture_error(alloc, "proxy write deadline", why))?;
+            let request = proxy_request(&mut client, alloc)?;
+            let mut upstream = TcpStream::connect_timeout(self.origin.address, Duration::from_secs(30))
+                .map_err(|why| fixture_error(alloc, "proxy upstream", why))?;
+            upstream.set_read_timeout(Some(Duration::from_secs(30)))
+                .map_err(|why| fixture_error(alloc, "upstream read deadline", why))?;
+            upstream.set_write_timeout(Some(Duration::from_secs(30)))
+                .map_err(|why| fixture_error(alloc, "upstream write deadline", why))?;
+            upstream.write_all(&request)
+                .map_err(|why| fixture_error(alloc, "proxy request", why))?;
+            let mut response = Vec::new_in(alloc);
+            let mut buffer = [0u8; 4096];
+            loop {
+                let n = upstream.read(&mut buffer)
+                    .map_err(|why| fixture_error(alloc, "proxy response", why))?;
+                if n == 0 {
+                    break;
+                }
+                if response.len().saturating_add(n) > 1 << 20 {
+                    return Err(TestError(WireString::from_str_in("proxy response size", alloc)));
+                }
+                response.extend_from_slice(&buffer[..n]);
+            }
+            if exchanges == 1 {
+                if !request.starts_with(b"GET /v1/list/manifests/")
+                    || !response.starts_with(b"HTTP/1.1 404 ")
+                {
+                    return Err(TestError(WireString::from_str_in(
+                        "proxy must capture a real initial manifest miss", alloc,
+                    )));
+                }
+                self.missed.send(()).map_err(|why| fixture_error(alloc, "captured miss", why))?;
+                self.release.recv_timeout(Duration::from_secs(20))
+                    .map_err(|why| fixture_error(alloc, "stale miss release", why))?;
+            }
+            client.write_all(&response).map_err(|why| fixture_error(alloc, "relayed reply", why))?;
+        }
+    }
+}
+
+fn proxy_request(client: &mut TcpStream, alloc: WireAlloc) -> Result<WireVec<u8>, TestError> {
+    let mut request = Vec::new_in(alloc);
+    let mut buffer = [0u8; 4096];
+    let end = loop {
+        let n = client.read(&mut buffer).map_err(|why| fixture_error(alloc, "request head", why))?;
+        if n == 0 || request.len().saturating_add(n) > 1 << 20 {
+            return Err(TestError(WireString::from_str_in("proxy incomplete or oversized head", alloc)));
+        }
+        request.extend_from_slice(&buffer[..n]);
+        if let Some(at) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+            break at + 4;
+        }
+    };
+    let headers = core::str::from_utf8(&request[..end])
+        .map_err(|why| fixture_error(alloc, "request head encoding", why))?;
+    let length = headers.lines().filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim().parse::<usize>())
+        .transpose().map_err(|why| fixture_error(alloc, "request body length", why))?
+        .unwrap_or(0);
+    let size = end.checked_add(length).filter(|size| *size <= 1 << 20)
+        .ok_or_else(|| TestError(WireString::from_str_in("proxy request size", alloc)))?;
+    while request.len() < size {
+        let n = client.read(&mut buffer).map_err(|why| fixture_error(alloc, "request body", why))?;
+        if n == 0 || request.len().saturating_add(n) > size {
+            return Err(TestError(WireString::from_str_in("proxy incomplete or oversized body", alloc)));
+        }
+        request.extend_from_slice(&buffer[..n]);
+    }
+    Ok(request)
+}
+
+struct EndProxy<'a> {
+    stop: &'a Sender<()>,
+    release: &'a Sender<()>,
+}
+
+impl Drop for EndProxy<'_> {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        let _ = self.stop.send(());
+    }
+}
+
+/// The HTTP miss and Unix admission use different transports. This real-socket control
+/// holds the actual negative reply across durable completion, without a scheduling sleep.
+/// It deliberately uses only the v5 public API so the old production adapter is a control.
+#[test]
+fn a_stale_cache_miss_after_publication_never_compiles_a_second_tail() {
+    let world = world_from(WorldOptions {
+        namespaces: &[Namespace::Main],
+        execution: ExecutionConfig {
+            completion: CompletionMode::PublishedWork,
+            ..ExecutionConfig::default()
+        },
+        carrier: CarrierConfig::default(),
+        workers: StartWorkers::OnClaim,
+    });
+    let alloc = world.alloc;
+    let unit = unit(84, 0, alloc);
+    let extra = value_of(&[85; 32], alloc);
+    let never = AtomicBool::new(false);
+    let compiles = AtomicUsize::new(0);
+    let tails = AtomicUsize::new(0);
+    let (entered, completing) = channel(alloc);
+    let (release_lead, gate) = channel(alloc);
+    let (missed, captured) = channel(alloc);
+    let (release_miss, held) = channel(alloc);
+    let (stop, stopped) = channel(alloc);
+    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut reader_config = config(world.socket.as_str(), &world.blobs);
+    reader_config.blobs.address = listener.local_addr();
+    let mut observer = Client::connect(world.socket.as_str(), random_id().unwrap(), alloc).unwrap();
+    let (first, second) = scope(alloc, |s| {
+        let proxy = StaleMissProxy {
+            listener: &listener, origin: &world.blobs, missed: &missed, release: &held, stop: &stopped,
+        };
+        let proxy = s.spawn(move || proxy.run()).unwrap();
+        let end_proxy = EndProxy { stop: &stop, release: &release_miss };
+        let lead_config = config(world.socket.as_str(), &world.blobs);
+        let unit = &unit;
+        let never = &never;
+        let mut compiler = GatedTail { entered, release: gate, extra: extra.clone(), alloc };
+        let lead = s.spawn(move || agent::run(&lead_config, unit, &mut compiler, never)).unwrap();
+        completing.recv_timeout(Duration::from_secs(20)).unwrap();
+        let observing = observer_subscribes(&mut observer, unit, alloc);
+        let mut reader = RefusesCompilation { compiles: &compiles, tails: &tails, alloc };
+        let reader = s.spawn(move || agent::run(&reader_config, unit, &mut reader, never)).unwrap();
+        captured.recv_timeout(Duration::from_secs(20)).unwrap();
+        release_lead.send(()).unwrap();
+        let first = lead.join().unwrap().unwrap();
+        assert_eq!(first.execution, Some(observing.subscription.execution.0));
+        let Answer::Terminal(terminal) = observer
+            .call(Command::Terminal(observing.subscription)).unwrap()
+        else {
+            panic!("the completed lead lost its observer terminal")
+        };
+        assert_eq!(terminal.value.unwrap().termination.outcome, blaze_wire::Outcome::Passed);
+        assert_eq!(
+            world.blobs.published(&unit.spec, alloc).unwrap().unwrap(),
+            blaze_wire::pack_list::encode(&first.packs, alloc),
+        );
+        release_miss.send(()).unwrap();
+        let second = reader.join().unwrap();
+        drop(end_proxy);
+        proxy.join().unwrap().unwrap();
+        (first, second)
+    });
+    assert_eq!(tails.load(Ordering::SeqCst), 0, "stale cache miss invoked Reader::complete");
+    assert_eq!(compiles.load(Ordering::SeqCst), 0, "stale cache miss invoked Reader::compile");
+    let second = second.unwrap();
+    assert_eq!(second.values, first.values);
+    assert_eq!(second.packs, first.packs);
+    assert_eq!(second.values.get(&extra.key), Some(&(extra.kind, extra.bytes)));
+    assert_eq!(second.compiled_here, 0);
+
+    // The one builder cannot be reused until every owned assignment is stopped and acked.
+    // A leaked reader interest/reservation would leave this unrelated unit unassigned.
+    one_slot_is_reusable(&mut observer, alloc);
+    observer.release().unwrap();
+}
+
+fn one_slot_is_reusable(observer: &mut Client, alloc: WireAlloc) {
+    let next = Unit { spec: [86; 32], names: Vec::new_in(alloc) };
+    let queued = observer_subscribes(observer, &next, alloc);
+    let Answer::Claimed(claim) = observer.call(Command::Claim(blaze_dist_local::protocol::Claim {
+        content: queued.subscription.content,
+        execution: queued.subscription.execution,
+        claimant: [86; 32],
+    })).unwrap() else {
+        panic!("the publication reader prevented a new unit's claim")
+    };
+    let executor = claim.executor.expect("the publication reader leaked the only worker slot");
+    let content = queued.subscription.content;
+    let execution = queued.subscription.execution;
+    assert!(matches!(observer.call(Command::Cancel(queued)).unwrap(), Answer::Ack(_)));
+    assert!(matches!(observer.call(Command::KillAck(blaze_dist_local::protocol::KillAck {
+        content, execution, executor, attempt: claim.attempt, alive: true,
+    })).unwrap(), Answer::KillAck(blaze_dist_local::protocol::KillAnswer { accepted: true })));
+}
+
+enum AcceptedPack {
+    Present,
+    Missing,
+}
+
+fn accepted_before_mirror(pack_state: AcceptedPack) {
+    let world = world_from(WorldOptions {
+        namespaces: &[Namespace::Main],
+        execution: ExecutionConfig {
+            completion: CompletionMode::PublishedWork,
+            ..ExecutionConfig::default()
+        },
+        carrier: CarrierConfig { max_subscribers: 1, ..CarrierConfig::default() },
+        workers: StartWorkers::OnClaim,
+    });
+    let alloc = world.alloc;
+    let unit = unit(87, 0, alloc);
+    let extra = value_of(&[88; 32], alloc);
+    let mut values = Vec::new_in(alloc);
+    values.push(extra.clone());
+    let pack = Pack::of(values, alloc).unwrap();
+    world.blobs.put_pack(&pack, alloc).unwrap();
+    let mut original = Client::connect(world.socket.as_str(), random_id().unwrap(), alloc).unwrap();
+    let binding = observer_subscribes(&mut original, &unit, alloc);
+    let content = binding.subscription.content;
+    let execution = binding.subscription.execution;
+    let Answer::Claimed(claim) = original.call(Command::Claim(blaze_dist_local::protocol::Claim {
+        content, execution, claimant: [87; 32],
+    })).unwrap() else {
+        panic!("the publication fixture could not own its lead")
+    };
+    assert!(matches!(claim.admission, blaze_dist_local::protocol::AdmissionState::Resolving(_)));
+    let executor = claim.executor.unwrap();
+    let attempt = claim.attempt;
+    let resolved = original.call(Command::ResolvePublication(blaze_dist_local::protocol::ResolvePublication {
+        content, execution, attempt, executor: executor.clone(), packs: None,
+    })).unwrap();
+    assert!(matches!(resolved, Answer::AdmissionState(blaze_dist_local::protocol::AdmissionState::Compile(_))));
+    assert!(matches!(original.call(Command::Join(blaze_dist_local::protocol::Join {
+        content,
+        executor: executor.clone(),
+        request: blaze_wire::WorkJoinRequest {
+            execution, attempt, roots: agent::root_set(&unit, alloc),
+            rejected: blaze_wire::Set::new(Vec::new_in(alloc)),
+        },
+    })).unwrap(), Answer::Join(_)));
+    let accepted = original.call(Command::CommitPublication(blaze_dist_local::protocol::CommitPublication {
+        content, execution, attempt, executor: executor.clone(),
+        packs: Vec::from_slice_in(&[pack.reference.clone()], alloc),
+    })).unwrap();
+    assert!(matches!(accepted, Answer::Publication(blaze_dist_local::protocol::Publication {
+        packs: Some(_), accepted_attempt: Some(_), ..
+    })));
+    assert!(world.blobs.published(&unit.spec, alloc).unwrap().is_none());
+    assert!(matches!(original.call(Command::Cancel(binding.clone())).unwrap(), Answer::Ack(_)));
+    let Answer::Terminal(cancelled) = original.call(Command::Terminal(binding.subscription.clone())).unwrap()
+    else {
+        panic!("the original subscriber lost its cancellation terminal")
+    };
+    assert_eq!(cancelled.value.as_ref().unwrap().termination.outcome, blaze_wire::Outcome::Cancelled);
+    // This fixture executed no compiler. Its manually owned assignment is stopped now.
+    assert!(matches!(original.call(Command::KillAck(blaze_dist_local::protocol::KillAck {
+        content, execution, attempt, executor, alive: true,
+    })).unwrap(), Answer::KillAck(blaze_dist_local::protocol::KillAnswer { accepted: true })));
+    original.release().unwrap();
+
+    let pack_hex = format_in!(alloc, "{}", blaze_wire::json::hex(&pack.reference.pack));
+    if matches!(pack_state, AcceptedPack::Missing) {
+        let relative = format_in!(alloc, "blobs/packs/{pack_hex}.pack");
+        unlink_path(world.dir.join(relative.as_str()).as_str()).unwrap();
+    }
+    let compiles = AtomicUsize::new(0);
+    let tails = AtomicUsize::new(0);
+    let mut reader = RefusesCompilation { compiles: &compiles, tails: &tails, alloc };
+    let cfg = config(world.socket.as_str(), &world.blobs);
+    let never = AtomicBool::new(false);
+    let result = agent::run(&cfg, &unit, &mut reader, &never);
+    assert_eq!(compiles.load(Ordering::SeqCst), 0, "accepted output invoked Reader::compile");
+    assert_eq!(tails.load(Ordering::SeqCst), 0, "accepted output invoked Reader::complete");
+    let arrived = match pack_state {
+        AcceptedPack::Present => result.unwrap(),
+        AcceptedPack::Missing => {
+            let failure = result.unwrap_err();
+            assert!(matches!(&failure, Error::Committed(why) if why.contains(pack_hex.as_str())), "{failure}");
+            assert!(matches!(agent::decide(&LocalPolicy::Fallback, failure, alloc), Err(Error::Committed(_))));
+            assert!(world.blobs.published(&unit.spec, alloc).unwrap().is_none());
+            // Remove only the fault. The same retained accepted handle is consumable;
+            // neither failure nor restoration is permission to repeat compilation.
+            world.blobs.put_pack(&pack, alloc).unwrap();
+            agent::run(&cfg, &unit, &mut reader, &never).unwrap()
+        }
+    };
+    assert_eq!(arrived.source, Source::Published);
+    assert_eq!(arrived.packs.as_slice(), &[pack.reference.clone()]);
+    assert_eq!(arrived.values.get(&extra.key), Some(&(extra.kind, extra.bytes)));
+    assert_eq!(arrived.compiled_here, 0);
+    assert_eq!(compiles.load(Ordering::SeqCst), 0);
+    assert_eq!(tails.load(Ordering::SeqCst), 0);
+    assert_eq!(world.blobs.published(&unit.spec, alloc).unwrap().unwrap(),
+        blaze_wire::pack_list::encode(&arrived.packs, alloc));
+    let mut observer = Client::connect(world.socket.as_str(), random_id().unwrap(), alloc).unwrap();
+    assert_eq!(observer.call(Command::Terminal(binding.subscription)).unwrap(), Answer::Terminal(cancelled));
+    one_slot_is_reusable(&mut observer, alloc);
+    observer.release().unwrap();
+}
+
+/// The real carrier accepts the full manifest before the cache mirror exists. A new
+/// session must finish delivery after the sole original subscriber cancelled and left.
+#[test]
+fn accepted_output_survives_last_cancellation_before_the_cache_mirror() {
+    accepted_before_mirror(AcceptedPack::Present);
+}
+
+#[test]
+fn a_missing_accepted_pack_after_last_cancellation_refuses_without_rebuilding() {
+    accepted_before_mirror(AcceptedPack::Missing);
 }

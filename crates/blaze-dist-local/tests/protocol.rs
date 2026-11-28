@@ -16,14 +16,14 @@ fn test_alloc() -> WireAlloc {
 fn hello_golden_separates_transport_global_codec_and_terminal_versions() {
     let alloc = test_alloc();
     let value = ClientFrame::Hello(LocalHello {
-        transport: 5,
+        transport: 6,
         codec: 1,
         terminal: 2,
         nonce: [0; 32],
         epoch: None,
         resume: None,
     });
-    let mut expected = Vec::from_slice_in(&[0x82, 0, 0xa6, 0, 5, 1, 1, 2, 2, 3, 0x58, 0x20], alloc);
+    let mut expected = Vec::from_slice_in(&[0x82, 0, 0xa6, 0, 6, 1, 1, 2, 2, 3, 0x58, 0x20], alloc);
     expected.extend_from_slice(&[0; 32]);
     expected.extend_from_slice(&[4, 0xf6, 5, 0xf6]);
     assert_eq!(encode(&value, alloc), expected);
@@ -67,7 +67,7 @@ fn carrier_envelopes_roundtrip_all_variants_without_json() {
 #[test]
 fn retirement_has_an_exact_owned_assignment_schema_in_transport_five() {
     let alloc = test_alloc();
-    assert_eq!(TRANSPORT_VERSION, 5);
+    assert_eq!(TRANSPORT_VERSION, 6);
     let value = Command::RetireAssignment(RetireAssignment {
         content: JobContent([0x11; 32]),
         executor: WireString::from_str_in("lead", alloc),
@@ -121,7 +121,7 @@ fn retirement_has_an_exact_owned_assignment_schema_in_transport_five() {
 #[test]
 fn owned_assignment_lookup_has_exact_request_and_answer_shapes() {
     let alloc = test_alloc();
-    assert_eq!(TRANSPORT_VERSION, 5);
+    assert_eq!(TRANSPORT_VERSION, 6);
     let value = Command::OwnedAssignment(OwnedAssignment {
         content: JobContent([0x11; 32]),
         executor: WireString::from_str_in("lead", alloc),
@@ -176,5 +176,85 @@ fn owned_assignment_lookup_has_exact_request_and_answer_shapes() {
     assert_eq!(
         decode::<ServerFrame>(&encode(&response, alloc), &Limits::DOCUMENTED, alloc).unwrap(),
         response
+    );
+}
+
+#[test]
+fn publication_resolution_and_accepted_results_have_exact_transport_six_shapes() {
+    let alloc = test_alloc();
+    assert_eq!(TRANSPORT_VERSION, 6);
+    let value = Command::ResolvePublication(ResolvePublication {
+        content: JobContent([0x11; 32]),
+        execution: ExecutionId(7),
+        attempt: Attempt(3),
+        executor: WireString::from_str_in("lead", alloc),
+        packs: None,
+    });
+    let mut expected = Vec::from_slice_in(&[0x82, 19, 0xa5, 0, 0x58, 0x20], alloc);
+    expected.extend_from_slice(&[0x11; 32]);
+    expected.extend_from_slice(&[1, 7, 2, 3, 3, 0x64, b'l', b'e', b'a', b'd', 4, 0xf6]);
+    assert_eq!(encode(&value, alloc), expected);
+    assert_eq!(decode::<Command>(&expected, &Limits::DOCUMENTED, alloc).unwrap(), value);
+    let mut missing_decision = expected;
+    missing_decision[2] = 0xa4;
+    missing_decision.truncate(missing_decision.len() - 2);
+    assert!(decode::<Command>(&missing_decision, &Limits::DOCUMENTED, alloc).is_err());
+
+    let ready = Answer::AdmissionState(AdmissionState::Compile(CompileReady {
+        execution: ExecutionId(7),
+        attempt: Attempt(3),
+    }));
+    let encoded = [0x82, 15, 0x82, 1, 0xa2, 0, 7, 1, 3];
+    assert_eq!(encode(&ready, alloc).as_slice(), &encoded);
+    assert_eq!(decode::<Answer>(&encoded, &Limits::DOCUMENTED, alloc).unwrap(), ready);
+
+    let accepted = Answer::AcceptedPublication(AcceptedPublication {
+        content: JobContent([0x11; 32]),
+        execution: ExecutionId(7),
+        accepted_attempt: Attempt(3),
+        packs: Vec::new_in(alloc),
+        delivered: false,
+    });
+    let mut encoded = Vec::from_slice_in(&[0x82, 14, 0xa5, 0, 0x58, 0x20], alloc);
+    encoded.extend_from_slice(&[0x11; 32]);
+    encoded.extend_from_slice(&[1, 7, 2, 3, 3, 0x80, 4, 0xf4]);
+    assert_eq!(encode(&accepted, alloc), encoded);
+    assert_eq!(decode::<Answer>(&encoded, &Limits::DOCUMENTED, alloc).unwrap(), accepted);
+
+    let claim = Answer::Claimed(Claimed {
+        executor: None,
+        attempt: Attempt(3),
+        lead: false,
+        admission: AdmissionState::Resolving(Ack {}),
+    });
+    let encoded = [0x82, 10, 0xa4, 0, 0xf6, 1, 3, 2, 0xf4, 3, 0x82, 0, 0xa0];
+    assert_eq!(encode(&claim, alloc).as_slice(), &encoded);
+    assert_eq!(decode::<Answer>(&encoded, &Limits::DOCUMENTED, alloc).unwrap(), claim);
+    // A v5 claim did not carry readiness. It must not decode as compilation authority.
+    let unresolved = [0x82, 10, 0xa3, 0, 0xf6, 1, 3, 2, 0xf4];
+    assert!(decode::<Answer>(&unresolved, &Limits::DOCUMENTED, alloc).is_err());
+
+    let packs = Vec::new_in(alloc);
+    let manifest_bytes = encode(&packs, alloc).len();
+    let largest = ServerFrame::Response(Response {
+        epoch: [0xff; 32],
+        session: [0xff; 32],
+        sequence: u64::MAX,
+        answer: Answer::Claimed(Claimed {
+            executor: Some(WireString::from_str_in("exec:18446744073709551615", alloc)),
+            attempt: Attempt(u32::MAX),
+            lead: true,
+            admission: AdmissionState::Accepted(AcceptedPublication {
+                content: JobContent([0xff; 32]),
+                execution: ExecutionId(u64::MAX),
+                accepted_attempt: Attempt(u32::MAX),
+                packs,
+                delivered: true,
+            }),
+        }),
+    });
+    assert!(
+        encode(&largest, alloc).len() <= manifest_bytes + 256,
+        "the publication admission reserve must cover the largest claim envelope",
     );
 }

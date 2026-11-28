@@ -1,0 +1,20 @@
+{
+  "id": "distributed-cache-admission-race-20261127",
+  "date": "2026-11-27",
+  "who": "GPT-6 Astra Pro, main distributed compile review lane",
+  "where": "crates/blaze-dist-local/src/agent.rs and crates/blaze-dist/src/jobs.rs",
+  "what": "Source protocol diagnostic run 46070408800 failed a_late_subscriber_waits_for_the_one_leads_full_tail with 'late subscriber ran a second tail'. Source inspection found that a publication miss can be delayed across another execution's mirror, delivery and removal from Jobs::running, after which Submit creates a fresh execution without another publication check.",
+  "cost": "A requester can acquire authority to repeat a full compiler tail whose immutable result is already published. The diagnostic does not retain execution IDs, so its exact binding is inferred; a forced-order causal regression is required.",
+  "cause": "The publication lookup precedes admission, while live coalescing ends when the previous execution completes. Neither side closes the interval between the cache miss and the new binding.",
+  "whys": [
+    "A late requester was allowed to run a second tail.",
+    "A cache miss can remain in flight until the previous execution has delivered its immutable publication and left the live index.",
+    "Submit coalesces only live executions, and the agent proceeds from its new binding using the earlier miss.",
+    "The publication oracle starts with one Execution and cannot exercise cache lookup across two admissions; the socket test did not gate the reader's own admission.",
+    "The cache and scheduler have distinct authority, but the client lacked an admission invariant spanning both."
+  ],
+  "class": "stale absence observations authorize work after publication and live-execution retirement",
+  "prevention": "The independent rule-66 architecture review required a keyed resolving flight, attempt-fenced cache resolution before compiler admission, and retained accepted output independent of subscriber lifetime. Actual Jobs and framed-carrier simulations cover stale completions, cancellation, capacity, delivery loss and restart with planted faults. A forced-order native control delays an initial 404 until the old execution has published and retired.",
+  "fix": "Implemented the approved resolve-or-join and bounded accepted-result lifetime design, replacing the proposed standalone second lookup. Local carrier v6 returns accepted results directly without resurrecting old subscriptions. Compiler entry requires resolved authority; committed-result knowledge remains terminal across later errors, and imports, uploads and mirror share the request deadline. CommitPublication is explicitly epoch-local acceptance; cross-epoch reuse begins at durable catalog publication.",
+  "state": "The resolving-flight and retained-result rules are implemented and have actual-core, framed-carrier and adapter simulations with planted controls. Landing requires the shared control inventory, the paired old/new stale-miss regression, normal source CI and exact-tree smoke receipts. This correctness change does not clear the performance candidate's original source protocol failure or establish a latency improvement."
+}

@@ -165,7 +165,7 @@ fn join_through_registry<A: Allocator + Clone>(
     admission.add_machine("machine", [1; 32], reservation.clone());
     let lead = admission.add_builder(0, "machine", reservation.clone(), base).unwrap();
     let mut jobs = Jobs::new(admission, Default::default(), base);
-    let answer = jobs
+    let answer = jobs::attached_for_test(jobs
         .submit(
             0,
             &JobRequest {
@@ -178,8 +178,7 @@ fn join_through_registry<A: Allocator + Clone>(
             },
             reservation,
             &mut Vec::new_in(base),
-        )
-        .unwrap();
+        ));
     jobs.tick(0, &mut Vec::new_in(base));
     let attempt = jobs.execution(answer.execution).unwrap().attempt();
 

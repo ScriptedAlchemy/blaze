@@ -55,17 +55,27 @@ defines the compiler work and its keys.
 
 1. If a published list exists for the unit, the agent reads and verifies its packs without
    scheduling work. A committed pack that is missing or corrupt is a terminal error.
-2. Otherwise it submits the unit. Equal job content joins an existing execution. An agent
-   claims its assigned executor, joins the canonical work set and receives leases for
-   batches. Its supplied compiler callback makes or retrieves the values. The agent
-   uploads each pack before reporting the batch's result.
+2. Otherwise it submits the unit. Submit returns an already accepted result, joins an
+   existing flight, or creates a resolving flight. Its current lead claims ownership and
+   resolves the immutable cache before the core permits compilation. The initial miss
+   grants no authority. A durable hit resolves the flight directly; otherwise that exact
+   attempt may join the canonical work set and receive batch leases. The agent uploads
+   each batch's pack before reporting its result.
 3. The current lead reads the committed phase values and calls the supplied completion
    callback once for the final unit work. It uploads the remaining values and submits a
    full manifest. The coordinator accepts that manifest against the live lead attempt
    before any cache mirror can establish publication.
 4. Helpers and late subscribers take the accepted full manifest. Publication identity
    does not change when a later attempt delivers the accepted record. Accepted output
-   cannot be replaced by compiling a different tail.
+   cannot be replaced by compiling a different tail. Cancelling the last subscriber does
+   not remove an accepted, undelivered result from discovery. A future requester can
+   deliver it without reviving that subscriber, including when retention capacity is full.
+
+Acceptance is protected within the current coordinator epoch. Durable publication in the
+manifest catalog is the restart-stable boundary, acknowledged by `DeliverPublication`.
+A coordinator crash before that durable boundary can lose its unmirrored acceptance.
+The optional direct cache-hit path saves a coordinator session; a genuinely cold flight
+pays for that first miss and its separate lookup under current ownership.
 
 Ownership is bound to the transport session. Retirement fences an owned assignment and
 requests its stop; its reservation is released only after a matching stop acknowledgment.

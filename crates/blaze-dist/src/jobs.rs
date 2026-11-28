@@ -1,7 +1,9 @@
 //! Executions of jobs (docs/distributed.md).
 //!
 //! A job's content (`JobContent`: its unit, platform and namespace) has at most one running
-//! execution: an equal request joins it as another subscriber. Each subscriber has its own
+//! execution: an equal request joins it as another subscriber. Accepted output awaiting
+//! durable delivery remains indexed after the execution ends, without retaining live workers.
+//! Each subscriber has its own
 //! deadline and `LocalPolicy`; the execution runs until its latest live subscriber's deadline,
 //! and ends when its last subscriber leaves. A lead that misses three heartbeats loses the job:
 //! it is reassigned once with a new `Attempt`, and the dead attempt's late events and work
@@ -62,6 +64,62 @@ pub enum CompletionMode {
     /// artifacts or an already-built test shard). The lead still reports the final verdict.
     /// This is a driver decision, not a worker claim or inference from an empty unit.
     NoCompileWork,
+}
+
+/// An immutable accepted manifest held by the existing execution record. It remains
+/// discoverable without a subscriber until its durable delivery is acknowledged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedPublication {
+    /// The complete sharing identity, including its namespace.
+    pub content: JobContent,
+    /// The execution retaining the record in this coordinator epoch.
+    pub execution: ExecutionId,
+    /// The lead attempt that first accepted it, independent of later delivery attempts.
+    pub accepted_attempt: Attempt,
+    /// The canonical immutable packs containing its full output.
+    pub packs: WireVec<PackRef>,
+    /// Whether the authoritative catalog has durably accepted this exact record.
+    pub delivered: bool,
+}
+
+/// The atomic result of keyed admission. Taking an accepted result creates no subscriber.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubmitAnswer {
+    /// A new interest in a resolving or compiling execution.
+    Attached(JobAnswer),
+    /// The existing immutable result, including after every original subscriber ended.
+    Accepted(AcceptedPublication),
+}
+
+/// Evidence that this execution's current attempt may enter its compile protocol.
+/// Construction belongs to the execution; a saved permit does not bypass later fencing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompilePermit {
+    execution: ExecutionId,
+    attempt: Attempt,
+}
+
+impl CompilePermit {
+    /// The execution whose completion contract enabled work.
+    pub fn execution(&self) -> ExecutionId {
+        self.execution
+    }
+
+    /// The current attempt at the time this permit was observed.
+    pub fn attempt(&self) -> Attempt {
+        self.attempt
+    }
+}
+
+/// A snapshot of admission authority. Actual work calls revalidate the execution's state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdmissionState {
+    /// No current compile authority; the published-work lead must resolve its lookup.
+    Resolving,
+    /// The current attempt may join and lease work under its completion contract.
+    Compile(CompilePermit),
+    /// Compilation is over; the immutable result can be consumed and delivered.
+    Accepted(AcceptedPublication),
 }
 
 impl Default for ExecutionConfig {
@@ -197,6 +255,8 @@ pub struct Execution {
     events: WireVec<EventItem>,
     stages: WireVec<(Stage, Millis)>,
     compiled: Option<(Attempt, u64)>,
+    /// Only the current published-work lead's cache-absence completion constructs this.
+    resolved: Option<CompilePermit>,
     /// The full manifest accepted while its publisher held the current lead attempt. It is
     /// immutable across retries and lead replacement; copying it to a cache is delivery.
     publication: Option<WireVec<PackRef>>,
@@ -240,6 +300,7 @@ impl Execution {
             events: Vec::new_in(alloc),
             stages: Vec::new_in(alloc),
             compiled: None,
+            resolved: None,
             publication: None,
             publication_attempt: None,
             publication_delivered: false,
@@ -384,6 +445,7 @@ impl Execution {
         if self.lead.is_some() || self.work.is_some() {
             self.attempt = Attempt(self.attempt.0 + 1);
         }
+        self.resolved = None;
         let existing = Vec::from_iter_in(
             self.executors().map(|name| WireString::from_str_in(name, self.alloc)),
             self.alloc,
@@ -503,9 +565,21 @@ impl Execution {
             return Err(Refusal::AttemptMoved);
         }
         self.member(from)?;
+        if self.publication.is_some() {
+            // A holder may already be in its loop when the full output is accepted.
+            // End that loop normally so its agent consumes the immutable publication;
+            // a protocol refusal here could incorrectly authorize local fallback.
+            return Err(Refusal::Ended);
+        }
         if self.config.completion == CompletionMode::NoCompileWork {
             return Err(Refusal::Malformed(WireString::from_str_in(
                 "work call in no-compile-work execution",
+                self.alloc,
+            )));
+        }
+        if self.compile_permit().is_none() {
+            return Err(Refusal::Malformed(WireString::from_str_in(
+                "work call before current-attempt absence resolution",
                 self.alloc,
             )));
         }
@@ -641,6 +715,116 @@ impl Execution {
         self.publication_attempt
     }
 
+    /// Whether delivery of the accepted record reached the durable manifest catalog.
+    pub fn publication_delivered(&self) -> bool {
+        self.publication_delivered
+    }
+
+    /// Accepted output must remain discoverable and retained until durable delivery.
+    pub fn publication_pending(&self) -> bool {
+        self.publication.is_some() && !self.publication_delivered
+    }
+
+    /// Copies the bounded manifest handle, without creating interest in the execution.
+    pub fn accepted_publication(&self) -> Option<AcceptedPublication> {
+        Some(AcceptedPublication {
+            content: self.content,
+            execution: self.id,
+            accepted_attempt: self.publication_attempt?,
+            packs: Vec::from_slice_in(self.publication.as_deref()?, self.alloc),
+            delivered: self.publication_delivered,
+        })
+    }
+
+    /// The current compile or accepted-result authority, independent of subscriber interest.
+    pub fn admission_state(&self) -> AdmissionState {
+        if let Some(publication) = self.accepted_publication() {
+            AdmissionState::Accepted(publication)
+        } else if let Some(permit) = self.compile_permit() {
+            AdmissionState::Compile(permit)
+        } else {
+            AdmissionState::Resolving
+        }
+    }
+
+    fn compile_permit(&self) -> Option<CompilePermit> {
+        if self.state != ExecState::Running || self.lead.is_none() || self.publication.is_some() {
+            return None;
+        }
+        let permit = CompilePermit { execution: self.id, attempt: self.attempt };
+        match self.config.completion {
+            CompletionMode::PublishedWork => (self.resolved == Some(permit)).then_some(permit),
+            CompletionMode::WorkProtocol => Some(permit),
+            CompletionMode::NoCompileWork => None,
+        }
+    }
+
+    /// Completes the current lead's authoritative cache lookup. A miss enables this attempt;
+    /// a verified durable hit accepts its full record without inventing completed work.
+    pub fn resolve_publication(
+        &mut self,
+        now: Millis,
+        from: &str,
+        attempt: Attempt,
+        cached: Option<&[PackRef]>,
+        out: &mut Vec<Effect, impl Allocator + Clone>,
+    ) -> Result<AdmissionState, Refusal> {
+        self.tick(now, out);
+        if matches!(self.state, ExecState::Ended(_)) {
+            return Err(Refusal::Ended);
+        }
+        if attempt != self.attempt {
+            return Err(Refusal::AttemptMoved);
+        }
+        if self.lead.as_deref() != Some(from) {
+            return Err(Refusal::NotHolder);
+        }
+        if self.config.completion != CompletionMode::PublishedWork {
+            return Err(Refusal::Malformed(WireString::from_str_in(
+                "publication resolution in an execution with a different completion contract",
+                self.alloc,
+            )));
+        }
+        if self.refused {
+            self.end(now, Outcome::Refused, EndWhy::Reported, out);
+            return Err(Refusal::Ended);
+        }
+        if let Some(packs) = cached
+            && packs.windows(2).any(|pair| matches!(pair, [a, b] if a >= b))
+        {
+            return Err(Refusal::Malformed(WireString::from_str_in(
+                "publication packs are not canonical",
+                self.alloc,
+            )));
+        }
+        if let Some(publication) = &self.publication {
+            if cached.is_some_and(|packs| packs != publication.as_slice()) {
+                return Err(Refusal::Malformed(WireString::from_str_in(
+                    "publication changed after its commit",
+                    self.alloc,
+                )));
+            }
+            return Ok(self.admission_state());
+        }
+        if let Some(packs) = cached {
+            if self.resolved.is_some() {
+                return Err(Refusal::Malformed(WireString::from_str_in(
+                    "publication resolution changed after absence",
+                    self.alloc,
+                )));
+            }
+            self.publication = Some(Vec::from_slice_in(packs, self.alloc));
+            self.publication_attempt = Some(attempt);
+            self.stage(now, Stage::Published, out);
+            self.deliver_publication(now, packs, out)?;
+        } else {
+            self.resolved = Some(CompilePermit { execution: self.id, attempt });
+            self.lead_heard = now;
+            self.heard.insert(WireString::from_str_in(from, self.alloc), now);
+        }
+        Ok(self.admission_state())
+    }
+
     /// Atomically accepts one full output record from the current lead. This is the
     /// publication linearization point, not a liveness check preceding an unfenced PUT.
     /// A replacement lead can deliver the accepted record but cannot replace its contents.
@@ -706,7 +890,7 @@ impl Execution {
         Ok(())
     }
 
-    /// A subscriber delivered the exact accepted record to the shared cache. Delivery is
+    /// A requester delivered the exact accepted record to the shared cache. Delivery is
     /// idempotent and carries no new output authority, so a helper can finish it after the
     /// lead dies. A terminal outcome is never resurrected or replaced.
     pub fn deliver_publication(
@@ -722,12 +906,10 @@ impl Execution {
                 self.alloc,
             )));
         }
-        match &self.state {
-            ExecState::Ended(_) if self.publication_delivered => return Ok(()),
-            ExecState::Ended(_) => return Err(Refusal::Ended),
-            ExecState::Queued | ExecState::Running => {}
-        }
         self.publication_delivered = true;
+        if matches!(self.state, ExecState::Ended(_)) {
+            return Ok(());
+        }
         let outcome = if self.refused { Outcome::Refused } else { Outcome::Passed };
         self.end(now, outcome, EndWhy::Reported, out);
         Ok(())
@@ -735,11 +917,12 @@ impl Execution {
 
     fn work_ready(&self) -> bool {
         self.config.completion == CompletionMode::NoCompileWork
-            || self.work.as_ref().is_some_and(|work| {
-                work.is_done()
-                    && work.lead_joined()
-                    && self.compiled == Some((self.attempt, work.root_epoch()))
-            })
+            || self.compile_permit().is_some()
+                && self.work.as_ref().is_some_and(|work| {
+                    work.is_done()
+                        && work.lead_joined()
+                        && self.compiled == Some((self.attempt, work.root_epoch()))
+                })
     }
 
     /// A full manifest remains authoritative after lead replacement, even before that lead
@@ -786,6 +969,7 @@ impl Execution {
     /// Both heartbeat expiry and owned retirement use the same bounded reassignment rule.
     fn lose_lead(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator + Clone>) {
         let Some(lost) = self.lead.take() else { return };
+        self.resolved = None;
         self.lost.insert(WireString::from_str_in(lost.as_str(), self.alloc));
         out.push(Effect::Kill { executor: lost, assignment: self.assignment() });
         self.losses += 1;
@@ -797,7 +981,8 @@ impl Execution {
 
     /// When the compile phase is done, the stream says so: the lead reads it and assembles.
     fn after_work(&mut self, now: Millis, out: &mut Vec<Effect, impl Allocator + Clone>) {
-        if let Some(work) = &self.work
+        if self.compile_permit().is_some()
+            && let Some(work) = &self.work
             && work.is_done()
             && work.lead_joined()
             && self.compiled != Some((self.attempt, work.root_epoch()))
@@ -989,13 +1174,14 @@ pub fn local_action(
     })
 }
 
-/// The server's executions: one per running `JobContent`, admitted in admission's order.
+/// The server's executions: one per running or accepted-undelivered `JobContent`.
 #[derive(Clone, Debug)]
 pub struct Jobs {
     alloc: WireAlloc,
     config: ExecutionConfig,
     admission: Admission,
     executions: BTreeMap<ExecutionId, Execution, WireAlloc>,
+    /// Live work and terminal accepted output awaiting durable delivery share one index.
     running: BTreeMap<JobContent, ExecutionId, WireAlloc>,
     platforms: BTreeMap<ExecutionId, (Digest, Reservation), WireAlloc>,
     pr_jobs: BTreeMap<u64, PrJobs, WireAlloc>,
@@ -1018,7 +1204,8 @@ struct PrJobs {
     /// The latest accepted export deadline in this namespace. Between units there can be no
     /// live execution even though that export can still submit work.
     retain_through: Millis,
-    /// Live executions of this pull request, including older revisions kept by subscribers.
+    /// Live work or accepted-undelivered output of this pull request. Pending output keeps
+    /// source supersession history alive even after its last subscriber's deadline.
     executions: BTreeMap<ExecutionId, Digest, WireAlloc>,
 }
 
@@ -1082,6 +1269,21 @@ impl Jobs {
     /// One execution.
     pub fn execution(&self, id: ExecutionId) -> Option<&Execution> {
         self.executions.get(&id)
+    }
+
+    /// Allocation-free capacity preflight for an existing accepted result. This does not
+    /// authorize a request: `submit` still checks its PR source and request deadline.
+    pub fn has_accepted_for(&self, content: JobContent) -> bool {
+        self.running
+            .get(&content)
+            .and_then(|id| self.executions.get(id))
+            .is_some_and(|execution| execution.publication.is_some())
+    }
+
+    /// Reads the already accepted result through the same content index used by admission.
+    /// It does not create a subscriber or authorize a PR source; use `submit` for that.
+    pub fn accepted_for(&self, content: JobContent) -> Option<AcceptedPublication> {
+        self.executions.get(self.running.get(&content)?)?.accepted_publication()
     }
 
     /// Typed response for the additive v2 subscriber-terminal endpoint. A v1 Done event is
@@ -1171,18 +1373,22 @@ impl Jobs {
         self.work_route(now, req.lease.execution, out, |e, log| e.result(now, from, req, log))
     }
 
-    /// Forget a terminal execution only once all assignment-stop acknowledgments arrived.
+    /// Forget a terminal execution only after all stops and durable output delivery.
     /// A transport supplies its own retention time and calls this after it elapsed.
     pub fn forget_terminal(&mut self, execution: ExecutionId) -> bool {
         if self.assignments.values().any(|assignment| assignment.token.execution == execution)
             || self
                 .executions
                 .get(&execution)
-                .is_none_or(|e| !matches!(e.state(), ExecState::Ended(_)))
+                .is_none_or(|e| !matches!(e.state(), ExecState::Ended(_)) || e.publication_pending())
         {
             return false;
         }
-        self.executions.remove(&execution);
+        if let Some(e) = self.executions.remove(&execution)
+            && self.running.get(&e.content) == Some(&execution)
+        {
+            self.running.remove(&e.content);
+        }
         self.platforms.remove(&execution);
         true
     }
@@ -1282,11 +1488,12 @@ impl Jobs {
     ) -> Result<Option<impl Iterator<Item = &PackRef>>, Refusal> {
         let e = self.executions.get(&execution).ok_or(Refusal::NoExecution)?;
         let Some(work) = e.work() else { return Ok(None) };
-        Ok(work.is_done().then(|| work.packs()))
+        Ok((e.compile_permit().is_some() && e.work_ready()).then(|| work.packs()))
     }
 
     /// Submits a job, with the reservation the server measured for its lead. An equal
-    /// `JobContent` running already is joined, not started again. A pull request's new push
+    /// `JobContent` running already is joined, not started again. Accepted output is returned
+    /// atomically without another subscriber, even after the execution ended. A PR's new push
     /// cancels earlier-source executions when nothing else subscribes to them; units and
     /// platforms of the same source run together, and a unit of a source the pull request
     /// already replaced is refused ([`Refusal::Superseded`]).
@@ -1296,12 +1503,12 @@ impl Jobs {
         req: &JobRequest,
         need: Reservation,
         out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
-    ) -> Result<JobAnswer, (Refusal, Option<u64>)> {
+    ) -> Result<SubmitAnswer, (Refusal, Option<u64>)> {
         if matches!(&req.namespace, Namespace::Pr(_)) && now > req.deadline_ms {
             return Err((Refusal::PrDeadlineExpired, None));
         }
-        // Coalescing is only for live executions. Expire prior subscribers before a new
-        // deadline can extend their execution, even when the driver's timer has not run.
+        // Expire prior subscribers before a new deadline can extend their execution, even
+        // when the driver's timer has not run. Accepted output outlives this expiration.
         self.tick(now, out);
         if let Namespace::Pr(pr) = &req.namespace {
             let known = self.pr_jobs.get(&pr.n);
@@ -1322,6 +1529,10 @@ impl Jobs {
             },
             out.allocator().clone(),
         );
+        if let Some(publication) = self.accepted_for(content) {
+            self.pr_submitted(now, req, publication.execution, out);
+            return Ok(SubmitAnswer::Accepted(publication));
+        }
         let subscriber = Subscriber {
             id: self.next_subscriber,
             deadline_ms: req.deadline_ms,
@@ -1333,7 +1544,11 @@ impl Jobs {
             execution.subscribe(subscriber).map_err(|r| (r, None))?;
             self.next_subscriber += 1;
             self.pr_submitted(now, req, id, out);
-            return Ok(JobAnswer { content, execution: id, subscriber: self.next_subscriber - 1 });
+            return Ok(SubmitAnswer::Attached(JobAnswer {
+                content,
+                execution: id,
+                subscriber: self.next_subscriber - 1,
+            }));
         }
         let id = ExecutionId(self.next_execution);
         let waiting = Waiting {
@@ -1362,7 +1577,7 @@ impl Jobs {
         self.running.insert(content, id);
         self.platforms.insert(id, (req.platform, need));
         self.pr_submitted(now, req, id, out);
-        Ok(JobAnswer { content, execution: id, subscriber: subscriber.id })
+        Ok(SubmitAnswer::Attached(JobAnswer { content, execution: id, subscriber: subscriber.id }))
     }
 
     fn pr_submitted(
@@ -1452,6 +1667,23 @@ impl Jobs {
         answer
     }
 
+    /// Completes the current lead's cache lookup under the registry's attempt and lifecycle
+    /// tracking. Only a resolved absence can enable published-work grants or the full tail.
+    pub fn resolve_publication(
+        &mut self,
+        now: Millis,
+        execution: ExecutionId,
+        from: &str,
+        attempt: Attempt,
+        cached: Option<&[PackRef]>,
+        out: &mut Vec<(ExecutionId, Effect), impl Allocator + Clone>,
+    ) -> Result<AdmissionState, Refusal> {
+        self.tick(now, out);
+        self.work_route(now, execution, out, |e, log| {
+            e.resolve_publication(now, from, attempt, cached, log)
+        })
+    }
+
     /// Commit a full manifest with the same attempt fencing as work results. The record
     /// survives lead replacement, while the normal assignment effects remain authoritative.
     pub fn commit_publication(
@@ -1471,7 +1703,7 @@ impl Jobs {
         answer
     }
 
-    /// Records delivery of the immutable full manifest and ends its execution once.
+    /// Records durable delivery, ending live work or preserving an existing terminal.
     pub fn deliver_publication(
         &mut self,
         now: Millis,
@@ -1593,7 +1825,7 @@ impl Jobs {
                 .values()
                 .filter(|e| {
                     matches!(e.state(), ExecState::Running)
-                        && e.config.completion != CompletionMode::NoCompileWork
+                        && e.compile_permit().is_some()
                         && e.lead().is_some()
                         && e.work().is_some_and(|w| !w.is_done())
                 })
@@ -1749,11 +1981,12 @@ impl Jobs {
         }
         let Some(e) = self.executions.get(&id) else { return };
         if let ExecState::Ended(_) = e.state() {
-            if self.running.get(&e.content) == Some(&id) {
+            if !e.publication_pending() && self.running.get(&e.content) == Some(&id) {
                 self.running.remove(&e.content);
             }
             self.admission.dequeue(id);
-            if let Namespace::Pr(pr) = &e.namespace
+            if !e.publication_pending()
+                && let Namespace::Pr(pr) = &e.namespace
                 && let Some(jobs) = self.pr_jobs.get_mut(&pr.n)
             {
                 jobs.executions.remove(&id);
@@ -1763,6 +1996,16 @@ impl Jobs {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn attached_for_test(
+    answer: Result<SubmitAnswer, (Refusal, Option<u64>)>,
+) -> JobAnswer {
+    match answer {
+        Ok(SubmitAnswer::Attached(answer)) => answer,
+        other => panic!("expected an attached test request: {other:?}"),
     }
 }
 
@@ -1797,17 +2040,17 @@ mod retention_tests {
         for pr in 1..=128 {
             let now = (pr - 1) * 4;
             let mut effects = Vec::new_in(alloc);
-            let first = jobs.submit(now, &request(pr, 1), need.clone(), &mut effects).unwrap();
+            let first = attached_for_test(jobs.submit(now, &request(pr, 1), need.clone(), &mut effects));
             let mut other_platform = request(pr, 1);
             other_platform.platform = [3; 32];
-            let sibling = jobs.submit(now, &other_platform, need.clone(), &mut effects).unwrap();
+            let sibling = attached_for_test(jobs.submit(now, &other_platform, need.clone(), &mut effects));
             jobs.unsubscribe(now + 1, first.execution, first.subscriber, &mut effects).unwrap();
             assert_eq!(jobs.pr_jobs.get(&pr).unwrap().executions.len(), 1);
             assert!(jobs.pr_jobs.get(&pr).unwrap().executions.contains_key(&sibling.execution));
 
             let mut next_source = request(pr, 2);
             next_source.deadline_ms = 90_000;
-            let next = jobs.submit(now + 2, &next_source, need.clone(), &mut effects).unwrap();
+            let next = attached_for_test(jobs.submit(now + 2, &next_source, need.clone(), &mut effects));
             assert_eq!(
                 jobs.execution(sibling.execution).unwrap().state(),
                 ExecState::Ended(Outcome::Cancelled)
@@ -1842,7 +2085,7 @@ mod retention_tests {
         let need = Reservation { memory: 4, cpus: 4, disk: 4 };
         let mut effects = Vec::new_in(alloc);
         let mut old = request(7, 1);
-        let first = jobs.submit(0, &old, need.clone(), &mut effects).unwrap();
+        let first = attached_for_test(jobs.submit(0, &old, need.clone(), &mut effects));
         jobs.work_route(1, first.execution, &mut effects, |execution, log| {
             execution.end(1, Outcome::Passed, EndWhy::Reported, log);
             Ok(())
@@ -1855,7 +2098,7 @@ mod retention_tests {
         assert!(jobs.forget_terminal(first.execution));
         assert_eq!(jobs.executions().count(), 0, "the old build is between units");
 
-        let new = jobs.submit(2, &request(7, 2), need.clone(), &mut effects).unwrap();
+        let new = attached_for_test(jobs.submit(2, &request(7, 2), need.clone(), &mut effects));
         old.unit = [3; 32];
         assert_eq!(jobs.submit(3, &old, need.clone(), &mut effects).unwrap_err().0, Refusal::Superseded);
         assert_eq!(jobs.execution(new.execution).unwrap().state(), ExecState::Queued);
@@ -1885,7 +2128,7 @@ mod retention_tests {
         for index in 0..PR_SOURCES_MOST {
             let bytes = index.to_le_bytes();
             current.source[..bytes.len()].copy_from_slice(&bytes);
-            let accepted = jobs.submit(0, &current, need.clone(), &mut effects).unwrap();
+            let accepted = attached_for_test(jobs.submit(0, &current, need.clone(), &mut effects));
             jobs.unsubscribe(0, accepted.execution, accepted.subscriber, &mut effects).unwrap();
             assert!(jobs.forget_terminal(accepted.execution));
             effects.clear();
@@ -1900,7 +2143,7 @@ mod retention_tests {
             jobs.submit(2, &request(7, 0), need.clone(), &mut effects).unwrap_err().0,
             Refusal::Superseded
         );
-        let same_source = jobs.submit(2, &current, need.clone(), &mut effects).unwrap();
+        let same_source = attached_for_test(jobs.submit(2, &current, need.clone(), &mut effects));
         jobs.unsubscribe(3, same_source.execution, same_source.subscriber, &mut effects).unwrap();
         assert_eq!(jobs.pr_sources, PR_SOURCES_MOST);
 
@@ -1921,3 +2164,6 @@ mod retirement_tests;
 
 #[cfg(test)]
 mod liveness_tests;
+
+#[cfg(test)]
+mod resolution_tests;
