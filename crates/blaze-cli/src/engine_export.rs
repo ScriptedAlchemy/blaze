@@ -83,6 +83,8 @@ pub enum ExportCliError {
     },
     /// Stepping an instance/static/TLS row in the reachability walk failed.
     Walk { symbol: [u8; 32], shown: AString<'static> },
+    /// Completing the maker's source-frozen heads refused its source or a known import.
+    Heads(Box<RunError, Alloc<'static>>),
     /// Whole-program cross-function LIR inlining and LTO emission failed.
     Lto { shown: AString<'static> },
     /// Making a special record (TLS getter or ender) failed.
@@ -144,6 +146,7 @@ impl fmt::Display for ExportCliError {
                 Hex(symbol)
             ),
             ExportCliError::Walk { symbol, shown } => write!(f, "blaze export: compiling symbol {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Heads(error) => write!(f, "blaze export: completing frozen dependency heads: {error}"),
             ExportCliError::Lto { shown } => write!(f, "blaze export: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::Special { what, shown } => write!(f, "blaze export: building {what}: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::Store { symbol, shown } => write!(f, "blaze export: reading code entry {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
@@ -984,10 +987,11 @@ fn export_program<'f>(
     // The snapshot owns the bytes; this stack-owned finder only classifies current crates
     // and derives the same Signature keys used by checking. It precedes names so both are
     // borrowed for the maker's lifetime, and its small crate list drops with this export.
+    let head_tools = crate::engine_store::tools(&standing.tools);
     let known_heads = crate::engine_seeds::DependencyFinder::new(
         found.snapshot(),
         crate::engine_seeds::crates_by(list, &|name| (standing.names)(name).map(|input| input.at), heap.shared()),
-        crate::engine_seeds::tool_of(&crate::engine_store::tools(&standing.tools)),
+        crate::engine_seeds::tool_of(&head_tools),
     );
     let names = run_names::names_of(cx, root, &found, owner, &mut *standing.store, &mut facts.bodies, &mut read, env, &pack_dirs, procs, &seen, frame, heap).map_err(CliError::RunNames)?;
 
@@ -1347,13 +1351,34 @@ fn export_program<'f>(
     drop(data);
     drop(seen_data);
     let walked = codes.reached();
-    let toolchain_made = codes.toolchain_made();
+    let mut toolchain_made = codes.toolchain_made();
     drop(codes);
+    {
+        let head_cx = cx.span("export: publish frozen dependency heads");
+        // Consuming completion checks the names log and every known-head failure after all
+        // code/source-position reads. It owns the detached freezer: no RefCell guard crosses
+        // the writer's I/O, and only source-frozen cells carry forward to the next command.
+        let finished = maker.finish_heads().map_err(|why| box_err(ExportCliError::Heads(Box::new_in(why, heap.alloc())), heap))?;
+        let head_names = |krate: &crate::engine_seeds::CrateAt| krate.names_at;
+        let batch = crate::engine_seeds::publish::Batch::stage(crate::engine_seeds::publish::StageOpts {
+            heads: finished.heads().map(|head| crate::engine_seeds::publish::FreshHead { cell: head.cell, krate: head.krate, bytes: head.bytes }),
+            crates: known_heads.crates(), names: &head_names, tool: known_heads.tool(), alloc,
+        }).map_err(CliError::HeadPublication)?;
+        let head_root = crate::engine_seeds::root_name(&head_tools, frame);
+        let prior = crate::engine_seeds::publish::RootState::read(&*standing.store, head_root.as_str())?;
+        toolchain_made.extend(batch.toolchain_keys().map(|key| blaze_cas::Key(key.0)));
+        let mut ledger = crate::engine_store::Ledger::new();
+        phases.export_head_publication = Some(batch.commit(crate::engine_seeds::publish::CommitOpts {
+            cx: &head_cx, store: &mut *standing.store, root: head_root.as_str(), prior, added: &[],
+            stage: blaze_engine::Stage::Heads, ledger: &mut ledger,
+        })?);
+    }
     crate::store::roots::keep_export(lent, &export_id, &walked)
         .map_err(|why| box_err(ExportCliError::KeepCode(why), heap))?;
-    if let Err(why) = crate::store::roots::keep_toolchain(lent, builder.toolchain, &toolchain_made, &[]) {
-        standing.err.line(cx, format_args!("blaze export: warning: toolchain code was not kept: {why}")).map_err(CliError::Out)?;
-    }
+    toolchain_made.sort_unstable();
+    toolchain_made.dedup();
+    crate::store::roots::keep_toolchain(lent, builder.toolchain, &toolchain_made, &[])
+        .map_err(|why| box_err(ExportCliError::KeepCode(why), heap))?;
 
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
     if let (Some(path), Some(keys)) = (receipt_path, receipt_keys) {

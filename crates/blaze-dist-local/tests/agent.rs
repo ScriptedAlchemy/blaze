@@ -801,15 +801,17 @@ fn a_cancelled_helper_releases_its_slot_only_after_its_compiler_stops() {
     let world = world(2, WorkConfig { grant_roots: 1, ..Default::default() });
     let alloc = world.alloc;
     let original = unit(94, 6, alloc);
-    let next = unit(95, 0, alloc);
+    let next = unit(95, 1, alloc);
     let (mut lead, lead_waiting, release_lead) = hold_first(&original, alloc);
     let (mut helper, helper_waiting, release_helper) = hold_first(&original, alloc);
+    let (mut next_compiler, next_waiting, release_next) = hold_first(&next, alloc);
     let cancelled = AtomicBool::new(false);
     let never = AtomicBool::new(false);
     let mut observer = Client::connect(world.socket.as_str(), random_id().unwrap(), alloc).unwrap();
     let surviving = observer_subscribes(&mut observer, &original, alloc);
     scope(alloc, |s| {
-        let (world, original, never, cancelled) = (&world, &original, &never, &cancelled);
+        let (world, original, next) = (&world, &original, &next);
+        let (never, cancelled) = (&never, &cancelled);
         let leading = s
             .spawn(move || {
                 agent::run(&config(world.socket.as_str(), &world.blobs), original, &mut lead, never)
@@ -829,7 +831,7 @@ fn a_cancelled_helper_releases_its_slot_only_after_its_compiler_stops() {
             .unwrap();
         helper_waiting.recv_timeout(Duration::from_secs(20)).unwrap();
         cancelled.store(true, Ordering::Release);
-        let queued = observer_subscribes(&mut observer, &next, alloc);
+        let queued = observer_subscribes(&mut observer, next, alloc);
         let Answer::Claimed(claim) = observer
             .call(Command::Claim(blaze_dist_local::protocol::Claim {
                 content: queued.subscription.content,
@@ -850,13 +852,29 @@ fn a_cancelled_helper_releases_its_slot_only_after_its_compiler_stops() {
             panic!("the surviving subscriber's terminal lookup was refused")
         };
         assert!(terminal.value.is_none(), "the helper's cancellation must leave its lead running");
-        let mut next_config = config(world.socket.as_str(), &world.blobs);
-        next_config.deadline = Duration::from_secs(2);
-        let completed = agent::run(&next_config, &next, &mut Vanishes(alloc), never).unwrap();
+        let running_next = s
+            .spawn(move || {
+                agent::run(
+                    &config(world.socket.as_str(), &world.blobs),
+                    next,
+                    &mut next_compiler,
+                    never,
+                )
+            })
+            .unwrap();
+        // The lead remains held until the next compiler actually enters. Its entry proves
+        // that helper retirement and the exact ACK made the second builder available.
+        let entered = next_waiting.recv_timeout(Duration::from_secs(20));
+        // Release both gates before reporting a failed observation, so unwinding cannot
+        // strand a compiler behind this test's own gate.
+        let lead_released = release_lead.send(());
+        let next_released = release_next.send(());
+        entered.expect("the next compiler enters while the original lead is still held");
+        lead_released.unwrap();
+        next_released.unwrap();
+        let completed = running_next.join().unwrap().unwrap();
         assert_eq!(completed.execution, Some(queued.subscription.execution.0));
-        // The lead is still held. Only retirement plus its exact ACK could have
-        // made one of this coordinator's two builders available to the next unit.
-        release_lead.send(()).unwrap();
+        assert_eq!(completed.values.len(), next.names.len());
         let completed = leading.join().unwrap();
         assert_eq!(completed.execution, Some(surviving.subscription.execution.0));
         assert_eq!(completed.values.len(), original.names.len());

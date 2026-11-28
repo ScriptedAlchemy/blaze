@@ -102,8 +102,9 @@ pub enum LazyRefusal {
     /// asked (or an earlier make of this session asked): what was made over them is void
     /// (source.rs module docs). `first` is the first error the records' log kept, as it names
     /// itself (the crate, the record, the item); `kept` how many the log kept, `dropped` how
-    /// many past its bound it counted.
-    RecordsVoid { tabled: ItemKey, first: Box<str>, kept: usize, dropped: u32 },
+    /// many past its bound it counted. `tabled` is absent when a session is completed before
+    /// any instance was requested; an existing source error still voids that empty session.
+    RecordsVoid { tabled: Option<ItemKey>, first: Box<str>, kept: usize, dropped: u32 },
     /// Static `item`'s value or kind is missing from the program's sorted tables after it was
     /// made (fill.rs `static_value`: the two tables are filed together).
     NoStatic { item: ItemKey },
@@ -149,11 +150,13 @@ impl core::fmt::Display for LazyRefusal {
             LazyRefusal::NeedsSolvedNames { helper, item } => write!(f, "front2 (lazy): `{helper}` (asked about `{item}`) reads only solved names, not each crate's records"),
             LazyRefusal::Unanswered { question, item } => write!(f, "front2 (lazy): the names source did not answer `{question}` about `{item}` (its error is in the source's log)"),
             LazyRefusal::Table { function } => write!(f, "front2 (lazy): the types table did not fork for `{function}`"),
-            LazyRefusal::RecordsVoid { tabled, first, kept, dropped } => write!(
-                f,
-                "front2 (lazy): the names records did not answer while the instance of fn {:032x} was made, so it is void: {first} ({kept} errors kept, {dropped} more counted)",
-                tabled.0
-            ),
+            LazyRefusal::RecordsVoid { tabled, first, kept, dropped } => {
+                match tabled {
+                    Some(tabled) => write!(f, "front2 (lazy): the names records did not answer while the instance of fn {:032x} was made, so it is void", tabled.0)?,
+                    None => write!(f, "front2 (lazy): the names records did not answer before the empty maker session completed, so it is void")?,
+                }
+                write!(f, ": {first} ({kept} errors kept, {dropped} more counted)")
+            }
             LazyRefusal::FmtArgument { function, why } => write!(f, "front2 (lazy): `{function}`: {why}"),
             LazyRefusal::Typed { function, gap } => write!(f, "front2 (lazy): `{function}`'s checked columns from the check's record: {gap}"),
             LazyRefusal::NoStatic { item } => write!(f, "front2 (lazy): the static {:032x} was made, and its value and kind are not both in the program's tables (fill.rs `static_value` files them together)", item.0),
@@ -550,6 +553,28 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     alloc: Alloc<'n>,
 }
 
+/// A successful source freeze, with the full crate identity from the names source that
+/// made it. The bytes borrow their finished maker's owned freezer, never a `RefCell` guard.
+pub struct FrozenHeadRow<'a> {
+    pub cell: crate::front2::heads::Want,
+    pub krate: Option<blaze_id::CrateItemKey>,
+    pub bytes: &'a [u8],
+}
+
+/// Detached only when a maker is consumed. Origin lookups happen before its final validity
+/// guard; publication can then wait on the store without holding a lazy-program borrow.
+pub(crate) struct SourceHeads<'n, S: NamesSource<'n>> {
+    heads: Option<crate::front2::tables::head::SeededHeads<'n, 'n, S>>,
+    crates: AVec<'n, Option<blaze_id::CrateItemKey>>,
+}
+
+impl<'n, S: NamesSource<'n>> SourceHeads<'n, S> {
+    pub(crate) fn rows(&self) -> impl Iterator<Item = FrozenHeadRow<'_>> {
+        self.heads.as_ref().into_iter().flat_map(|heads| heads.frozen_from(0)).zip(self.crates.iter())
+            .map(|((cell, bytes), krate)| FrozenHeadRow { cell, krate: *krate, bytes })
+    }
+}
+
 impl<'n, S: NamesSource<'n>> Drop for LazyProgram<'n, S> {
     fn drop(&mut self) {
         if let Some(seed) = self.seed.take() {
@@ -698,6 +723,17 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let guard = seed.heads.borrow();
         let Some(heads) = guard.as_ref() else { return HeadCounts::default() };
         HeadCounts { taken: heads.taken, lowered: heads.lowered, eval_lowered: heads.eval_lowered, attempts: heads.attempts }
+    }
+
+    /// Move source-frozen cells out for a consuming maker completion. The caller checks the
+    /// source log and retained known-head refusal both before and after these origin lookups.
+    pub(crate) fn take_source_heads(&mut self) -> SourceHeads<'n, S> {
+        let heads = self.seed.and_then(|seed| seed.heads.borrow_mut().take());
+        let mut crates = Vec::new_in(self.alloc);
+        for (cell, _) in heads.as_ref().into_iter().flat_map(|heads| heads.frozen_from(0)) {
+            crates.push(self.front.names.crate_of(cell.key()).and_then(|krate| self.front.names.crate_key(krate)));
+        }
+        SourceHeads { heads, crates }
     }
 
     /// A known-record failure remains terminal even if an intermediate query normally turns

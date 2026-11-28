@@ -496,7 +496,7 @@ pub(crate) mod refusal_tests {
         let symbol = [17; 32];
         let item = ItemKey(3);
         let make = |why| ParentError::Walk { symbol, why: WalkError::Make { tabled: item, why } };
-        let void = || RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled: item, first: "no record answers yet".into(), kept: 1, dropped: 0 }));
+        let void = || RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled: Some(item), first: "no record answers yet".into(), kept: 1, dropped: 0 }));
         assert_eq!(instance_site(&make(void())), Some((symbol, Some((item, 0)))));
         let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(void()), not_built: 1, reached: 2 };
         assert_eq!(instance_site(&make(carried)), Some((symbol, Some((item, 0)))), "twin: a carried void is the test's too");

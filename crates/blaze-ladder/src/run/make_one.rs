@@ -3062,6 +3062,18 @@ pub struct NamesRecords<'n> {
 /// The one lazy program the maker makes: over the names records.
 pub type RecordsProgram<'n> = crate::front2::program::lazy::LazyProgram<'n, &'n crate::front2::source::Records<'n>>;
 
+/// Successful source-frozen cells from a consumed maker whose source log and known imports
+/// passed their final validity guard. It owns the freezer until publication finishes.
+pub struct FinishedHeads<'n> {
+    source: Option<crate::front2::program::lazy::SourceHeads<'n, &'n crate::front2::source::Records<'n>>>,
+}
+
+impl FinishedHeads<'_> {
+    pub fn heads(&self) -> impl Iterator<Item = crate::front2::program::lazy::FrozenHeadRow<'_>> {
+        self.source.as_ref().into_iter().flat_map(|source| source.rows())
+    }
+}
+
 /// An instance for a person ([`Maker::instance_shown`]): its item by the one printer, and its
 /// ground arguments as Rust spells them (`None`: it has none).
 pub struct InstanceShown {
@@ -3094,6 +3106,9 @@ pub struct Maker<'n, G: Grant = Fixture, T: Typing<RecordsProgram<'n>> = SecondC
     /// Where its program starts: the front's roots' say (run/special.rs `MakerStart`).
     start: crate::run::special::MakerStart,
     made: Option<(RecordsProgram<'n>, MakerState)>,
+    /// The first attempted construction, retained even if it failed before making a row.
+    /// A final source/import refusal names that request, including an empty failed session.
+    first_request: Option<ItemKey>,
     isa: Isa,
     overflow: OverflowChecks,
     ub: blaze_build::UbChecks,
@@ -3216,6 +3231,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             entry,
             start,
             made: None,
+            first_request: None,
             isa: builder.isa,
             overflow: builder.settings.overflow_checks,
             // `ub_checks()` follows the key's debug assertions, as rustc's `ub_checks` cfg
@@ -3263,6 +3279,21 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// Frozen-head reuse and source lowering in this maker's lazy program.
     pub fn head_counts(&self) -> crate::front2::program::lazy::HeadCounts {
         self.made.as_ref().map(|(program, _)| program.head_counts()).unwrap_or_default()
+    }
+
+    /// End this maker and hand its successful source freezes to an explicit persistent
+    /// writer. No later make can append a cell or invalidate the completed session. Known
+    /// cells are excluded, and origin lookups finish before the final source validity check.
+    pub fn finish_heads(mut self) -> Result<FinishedHeads<'n>, RunError> {
+        let tabled = self.first_request.or(self.entry);
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        let source = self.made.as_mut().map(|(program, _)| program.take_source_heads());
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        Ok(FinishedHeads { source })
     }
 
     /// Entries proved from this maker's already verified read answers.
@@ -3328,13 +3359,15 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     }
 
     /// The refusal of a make over unanswered source records or a failed saved-head import.
-    fn void(&self, tabled: ItemKey) -> Option<RunError> {
+    fn void(&self, tabled: impl Into<Option<ItemKey>>) -> Option<RunError> {
+        let tabled = tabled.into();
         let log = self.names.records.log();
         let errors = log.errors();
         if let Some(first) = errors.first() {
             let first = std::format!("{first}").into_boxed_str();
             return Some(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, first, kept: errors.len(), dropped: log.dropped() })));
         }
+        let tabled = tabled?;
         self.made.as_ref().and_then(|(program, _)| program.check_known_heads(tabled).err())
             .map(|error| RunError::Front2(Front2Refusal::Lazy(error)))
     }
@@ -3594,6 +3627,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// The lazy program over the records, made on the first make of either kind (`first`: the
     /// item that make is of).
     fn construct(&mut self, tabled: ItemKey) -> Result<(), RunError> {
+        self.first_request.get_or_insert(tabled);
         if self.made.is_none() {
             let program = program_of(self.names, self.entry, self.start, self.known_heads, self.alloc)?;
             self.checks.constructed += 1;

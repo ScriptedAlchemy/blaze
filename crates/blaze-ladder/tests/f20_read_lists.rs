@@ -382,7 +382,7 @@ pub extern \"C-unwind\" fn main() -> i32 { 0 }
             let b = builder();
             let mut maker = Maker::new(names, Some(key), &b, alloc());
             assert!(matches!(maker.verify(key, &[], &[]),
-                Err(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, .. }))) if tabled == key),
+                Err(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, .. }))) if tabled == Some(key)),
                 "the source log must void verification before entry decoding");
         }
     }

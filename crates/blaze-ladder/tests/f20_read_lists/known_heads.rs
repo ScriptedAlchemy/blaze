@@ -579,7 +579,7 @@ fn a_known_macro_member_still_requires_current_text_and_nested_origins() {
                 builder: &b, known_heads: Some(KnownSource { heads: &provider, errors: blaze_own::testing::heap().shared() }), alloc: alloc(),
             });
             assert!(matches!(maker.verify(key, &[], &[]),
-                Err(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, .. }))) if tabled == key),
+                Err(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, .. }))) if tabled == Some(key)),
                 "the current-source refusal retains RecordsVoid precedence before entry decoding");
         }
     }

@@ -18,22 +18,23 @@ use bstd::mem::{Frame, Tag};
 
 use super::{ContentId, CrateAt, DependencyFinder, HeadRecords, Key, Known, KnownError, KnownHeads, Tool, Unreadable, Want, dependency_key};
 
-const CRATE: CrateItemKey = CrateItemKey(ContentId([49; 32]));
-const NAMES: Key = Key(ContentId([50; 32]));
-const TOOL: Tool = Tool(ContentId([51; 32]));
+pub(super) const CRATE: CrateItemKey = CrateItemKey(ContentId([49; 32]));
+pub(super) const NAMES: Key = Key(ContentId([50; 32]));
+pub(super) const TOOL: Tool = Tool(ContentId([51; 32]));
 const TEXT: &str = "#![no_core]\npub fn sample() {}\n";
 
-struct Files;
+struct Files(&'static str);
 
 impl<'a> SourceTexts<'a> for Files {
     fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
-        (krate == 0 && path == "/dep/lib.rs").then_some(TEXT)
+        (krate == 0 && path == "/dep/lib.rs").then_some(self.0)
     }
 }
 
 struct OneCrate<'a> {
     names: &'a [u8],
     items: &'a [u8],
+    text: &'static str,
 }
 
 impl<'a> Load<'a> for OneCrate<'a> {
@@ -46,7 +47,7 @@ impl<'a> Load<'a> for OneCrate<'a> {
     }
 
     fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'a str> {
-        (krate == 0 && path.as_str() == "lib.rs").then_some(TEXT)
+        (krate == 0 && path.as_str() == "lib.rs").then_some(self.text)
     }
 
     fn expansion(&self, _krate: usize, _call: ItemKey) -> Option<LoadedExpansion<'a>> {
@@ -54,12 +55,16 @@ impl<'a> Load<'a> for OneCrate<'a> {
     }
 }
 
-struct Fixture {
-    cell: Want,
-    frozen: Frozen<'static>,
+pub(super) struct Fixture {
+    pub(super) cell: Want,
+    pub(super) frozen: Frozen<'static>,
 }
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
+    fixture_for(TEXT, "sample")
+}
+
+pub(super) fn fixture_for(text: &'static str, wanted: &str) -> Fixture {
     let g = blaze_own::testing::heap().alloc();
     let frame = Frame::new(Tag::Infer).expect("the head fixture frame");
     let erased = Erased::new(&frame);
@@ -69,12 +74,12 @@ fn fixture() -> Fixture {
         implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false },
         root: "/dep/lib.rs", shown_from: "/dep", features: &[], deps: &[], cfg: &[], script: None,
     }];
-    let solved = resolve_crates(&inputs, Sysroot::default(), &Files, &blaze_scope::task::Serial, bump)
+    let solved = resolve_crates(&inputs, Sysroot::default(), &Files(text), &blaze_scope::task::Serial, bump)
         .unwrap_or_else(|error| panic!("the head fixture resolves: {error}"));
     let [krate] = solved.crates() else { panic!("the fixture has one crate") };
     let names = blaze_scope::names_record::encode(krate, g).expect("the names record");
     let items = blaze_scope::items_record::encode(krate, g).expect("the items record");
-    let load = OneCrate { names: aligned(&names, bump), items: aligned(&items, bump) };
+    let load = OneCrate { names: aligned(&names, bump), items: aligned(&items, bump), text };
     let keys = [CRATE];
     // Records borrows itself through its NamesSource implementation. Keep the reader and
     // its buffers in the explicit frame so that borrow is independent of stack drop order.
@@ -82,7 +87,7 @@ fn fixture() -> Fixture {
     let records = &*frame.alloc(Records::new(&keys, &load, log, &frame, erased.handle()));
     let mut function = None;
     records.each_item(0, &mut |key, _| {
-        if records.name_of(key) == Some("sample") {
+        if records.name_of(key) == Some(wanted) {
             function = Some(key);
         }
     });
