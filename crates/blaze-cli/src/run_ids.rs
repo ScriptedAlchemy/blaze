@@ -1992,6 +1992,18 @@ impl<'a> RunIds<'a> {
         hash.part(self.crates).part(self.bodies);
     }
 
+    /// The exact rows hashed above, for bounded distributed-input diagnostics. Keys
+    /// identify rows independently of their position; the complete bytes retain the
+    /// verdict, text and check identity that a work-plan summary does not report.
+    pub(crate) fn each_export_input(&self, mut each: impl FnMut(&'static str, &[u8], &[u8])) {
+        for row in self.crates.chunks_exact(CRATE_ROW) {
+            each("run_ids.crate", &row[..8], row);
+        }
+        for row in self.bodies.chunks_exact(BODY_ROW) {
+            each("run_ids.body", &row[..16], row);
+        }
+    }
+
     /// The body ids of a command: `toolchain` the cut it opened, `crates` the `UnitGraph`
     /// record's crate list, `tools` its kinds' tools (home.rs `tools`), `workspace` the bodies
     /// of the checkout and `edges` the tree they were found by ([`workspace_of`]'s), and `answer`

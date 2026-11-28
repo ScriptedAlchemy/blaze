@@ -488,6 +488,7 @@ jobs:
             ${{ runner.temp }}/blaze-fs/host-case/**/*.json
             ${{ runner.temp }}/blaze-fs/host-case/**/*.jsonl
             ${{ runner.temp }}/blaze-fs/host-case/**/*.plans
+            ${{ runner.temp }}/blaze-fs/host-case/**/*.context
             ${{ runner.temp }}/blaze-fs/host-case/**/gate
             ${{ runner.temp }}/blaze-fs/host-case/**/blobs/manifests/*
             ${{ runner.temp }}/blaze-fs/host-case/**/blobs/packs/*.pack

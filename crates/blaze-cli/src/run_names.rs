@@ -505,6 +505,18 @@ impl Program {
         }
     }
 
+    /// The values consumed by `hash_export_inputs`, labelled for a distributed
+    /// context mismatch. These are content identities, never local record keys.
+    pub(crate) fn each_export_input(&self, mut each: impl FnMut(&'static str, &[u8], &[u8])) {
+        each("program.graph", &[], &self.graph.out.0);
+        each("program.owner", &[], &self.list.key(self.owner).0.0);
+        for (kind, inputs) in [("program.crate", &self.crates), ("program.script", &self.scripts)] {
+            for (at, input) in inputs.iter() {
+                each(kind, &self.list.key(*at).0.0, &input.out.0);
+            }
+        }
+    }
+
     /// The program's crates for its native image (engine_native.rs `image_for`): its own crate
     /// first, then every other crate of its check scope, each by its key and its names row.
     /// Read from the one crate list this program already holds: the unit graph is not read

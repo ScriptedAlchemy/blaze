@@ -1041,7 +1041,8 @@ fn export_program<'f>(
             &mut dist_store,
             &roots,
             native_export.key,
-            crate::engine_dist::reach_inputs::context(&standing, program_found, &ids),
+            crate::engine_dist::reach_inputs::context(&standing, program_found, &ids, dist_cfg.report.as_deref())
+                .map_err(|error| box_err(ExportCliError::Dist(error), heap))?,
             release,
             output_path,
             alloc,
