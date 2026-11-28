@@ -1986,7 +1986,10 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>, O: WalkObserver>(
             continue;
         }
         state.work.read_preparation.prepared += 1;
-        let (kind, extra, item, list) = reads::question(bytes, &mut state.work.ground, alloc).map_err(|e| refused(&*program, CodeRecordError::Reads(e)))?;
+        let (kind, extra, item, list) = {
+            let _span = preparation_span.span("decode preparation question");
+            reads::question(bytes, &mut state.work.ground, alloc).map_err(|e| refused(&*program, CodeRecordError::Reads(e)))?
+        };
         let stale = Verdict::Stale { kind, item };
         let expr = u32::try_from(extra).ok().map(blaze_typeck::ExprId);
         let need = match kind {
@@ -2003,13 +2006,21 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>, O: WalkObserver>(
             // Each answered from the fn's row (lazy front_end.rs: tabled rows only): its row
             // made from its head; the row's answer decides whether it holds.
             ReadKind::Abi | ReadKind::Nounwind | ReadKind::TrackCaller | ReadKind::CVariadic | ReadKind::LegacyConstGenerics | ReadKind::ForeignFn => {
-                if program.head_row(item).is_err() {
+                let failed = {
+                    let _span = preparation_span.span("load called function heads");
+                    program.head_row(item).is_err()
+                };
+                if failed {
                     return Ok(stale);
                 }
                 continue;
             }
             ReadKind::ObjectTrait => {
-                if program.object_table(item).is_err() {
+                let failed = {
+                    let _span = preparation_span.span("load preparation object tables");
+                    program.object_table(item).is_err()
+                };
+                if failed {
                     return Ok(stale);
                 }
                 continue;
@@ -2031,7 +2042,11 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>, O: WalkObserver>(
                 continue;
             }
             ReadKind::Static => {
-                if program.make_static_value(item).is_err() {
+                let failed = {
+                    let _span = preparation_span.span("load preparation static values");
+                    program.make_static_value(item).is_err()
+                };
+                if failed {
                     return Ok(stale);
                 }
                 continue;

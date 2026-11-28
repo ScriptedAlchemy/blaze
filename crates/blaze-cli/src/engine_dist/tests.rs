@@ -59,6 +59,12 @@ fn late_span_stages_are_retained_and_overflow_conserves_usage_without_allocating
         "store made entry",
         "verify stored entry",
     ];
+    const PREPARATION_STAGES: [&str; 4] = [
+        "decode preparation question",
+        "load called function heads",
+        "load preparation object tables",
+        "load preparation static values",
+    ];
     let counting = blaze_own::testing::Counting::new(blaze_own::testing::TestHeap);
     {
         let mut cell = Cell::new(CellOpts { worker: 0, level: Level::Spans }, &counting).expect("a fixed worker telemetry cell");
@@ -82,6 +88,10 @@ fn late_span_stages_are_retained_and_overflow_conserves_usage_without_allocating
         for name in STAGES {
             close(&publisher, name);
         }
+        let preparation = publisher.child("verify stored entry").child("prepare read questions");
+        for name in PREPARATION_STAGES {
+            close(&preparation, name);
+        }
         // Fill past the new bound, then revisit every stage while the table is full.
         for first in NAMES {
             for second in NAMES {
@@ -91,8 +101,11 @@ fn late_span_stages_are_retained_and_overflow_conserves_usage_without_allocating
         for name in STAGES {
             close(&publisher, name);
         }
+        for name in PREPARATION_STAGES {
+            close(&preparation, name);
+        }
         cell.stop(wall);
-        assert_eq!(cell.unrecorded(), 0, "all 164 opens and closes reached their hooks");
+        assert_eq!(cell.unrecorded(), 0, "all 172 opens and closes reached their hooks");
         assert_eq!(cell.open_spans(), 0);
         assert_eq!(counting.allocations(), allocations, "recording span hooks must not allocate");
         assert_eq!(counting.live_bytes(), reserved, "event hooks keep their original reservation");
@@ -101,13 +114,20 @@ fn late_span_stages_are_retained_and_overflow_conserves_usage_without_allocating
         let mut report = Report::new(ReportOpts { level: Level::Spans, most_workers: 1 }, &counting).expect("a one-worker report");
         report.merge(&blaze_meter::Tally::ZERO, &cell).expect("the worker's telemetry merges once");
         report.finish(Exit::Returned).expect("the completed telemetry report");
-        for name in STAGES {
-            let path = publisher.child(name);
+        for path in STAGES.into_iter().map(|name| publisher.child(name))
+            .chain(PREPARATION_STAGES.into_iter().map(|name| preparation.child(name)))
+        {
             let row = report.spans().iter().find(|row| row.path.same(&path)).expect("a retained late publisher stage, lost with the old 64-row bound");
             assert_eq!((row.count, row.wall_ns, row.sum.get(Field::Allocs), row.sum.get(Field::HeapBytes)), (2, 14, 6, 48));
         }
+        for name in PREPARATION_STAGES {
+            let path = preparation.child(name);
+            let row = report.spans().iter().find(|row| row.path.same(&path)).expect("a retained preparation stage at depth four");
+            assert_eq!(row.path.depth(), 4);
+            assert!(!row.path.deeper(), "a preparation child must not be folded into deeper work");
+        }
         assert_eq!(report.spans().len(), 128, "the worker keeps a fixed 128-row reservation");
-        assert_eq!(report.other_span().count, 18, "all 18 distinct paths beyond the reservation are accounted for");
+        assert_eq!(report.other_span().count, 22, "all 22 distinct paths beyond the reservation are accounted for");
         let mut total = (0, 0, 0, 0);
         for row in report.spans().iter().chain(core::iter::once(report.other_span())) {
             total.0 += row.count;
@@ -115,7 +135,7 @@ fn late_span_stages_are_retained_and_overflow_conserves_usage_without_allocating
             total.2 += row.sum.get(Field::Allocs);
             total.3 += row.sum.get(Field::HeapBytes);
         }
-        assert_eq!(total, (164, 7 * 164, 3 * 164, 24 * 164));
+        assert_eq!(total, (172, 7 * 172, 3 * 172, 24 * 172));
     }
     counting.check().expect("the worker telemetry and report freed every reservation");
 }
