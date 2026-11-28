@@ -1,6 +1,6 @@
 # Validation-only workflow for validation/distributed-compile-audit-linux-smoke.
-# Candidate source: f743258a2ca0ff2703bfde3f2aca3518be3e2441
-# Candidate tree: 1c16df19f5038ad810a13380a69169a9741ae609
+# Candidate source: 56ce85fa0d8d6fd7a528aa82e90c1b04745c170b
+# Candidate tree: d8c6fc4eeef20d90f715d648dbb0359892ac1644
 # The historical old-compiler source, manifest and artifact pins stay frozen.
 # Canonical recipe: the source-compiler release build in blaze.yaml plus the exact
 # canonical smoke/identity recipe retained in distributed-perf-artifact-smoke.yaml
@@ -30,8 +30,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 150
     env:
-      AUDIT_SOURCE_SHA: f743258a2ca0ff2703bfde3f2aca3518be3e2441
-      AUDIT_SOURCE_TREE: 1c16df19f5038ad810a13380a69169a9741ae609
+      AUDIT_SOURCE_SHA: 56ce85fa0d8d6fd7a528aa82e90c1b04745c170b
+      AUDIT_SOURCE_TREE: d8c6fc4eeef20d90f715d648dbb0359892ac1644
     steps:
       - name: Require the final immutable candidate identity
         timeout-minutes: 1
@@ -351,10 +351,10 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     env:
-      AUDIT_SOURCE_SHA: f743258a2ca0ff2703bfde3f2aca3518be3e2441
-      AUDIT_SOURCE_TREE: 1c16df19f5038ad810a13380a69169a9741ae609
-      FIXTURE_SOURCE_SHA: f743258a2ca0ff2703bfde3f2aca3518be3e2441
-      FIXTURE_SOURCE_TREE: 1c16df19f5038ad810a13380a69169a9741ae609
+      AUDIT_SOURCE_SHA: 56ce85fa0d8d6fd7a528aa82e90c1b04745c170b
+      AUDIT_SOURCE_TREE: d8c6fc4eeef20d90f715d648dbb0359892ac1644
+      FIXTURE_SOURCE_SHA: 56ce85fa0d8d6fd7a528aa82e90c1b04745c170b
+      FIXTURE_SOURCE_TREE: d8c6fc4eeef20d90f715d648dbb0359892ac1644
       FIXTURE_PATH: crates/blaze-cli/tests/ladder/front2/x-drop-13-lazy-booleans
       FIXTURE_TREE: 4b03b33fce6afbd30b482474d3eccfee291b4d71
       FIXTURE_CASE_SHA256: b1d7a6e9d39e4e6acb90394197f4d7a049fc44f81157e6833558c96b57a03e03
@@ -681,8 +681,8 @@ jobs:
     env:
       AUDIT_SOURCE_SHA: 089b5f009ab48241a0c0e0fdfc22d9b08edf9398
       AUDIT_SOURCE_TREE: 659b50805f637c8b34414173b73848deae807f6a
-      FIXTURE_SOURCE_SHA: f743258a2ca0ff2703bfde3f2aca3518be3e2441
-      FIXTURE_SOURCE_TREE: 1c16df19f5038ad810a13380a69169a9741ae609
+      FIXTURE_SOURCE_SHA: 56ce85fa0d8d6fd7a528aa82e90c1b04745c170b
+      FIXTURE_SOURCE_TREE: d8c6fc4eeef20d90f715d648dbb0359892ac1644
       FIXTURE_PATH: crates/blaze-cli/tests/ladder/front2/x-drop-13-lazy-booleans
       FIXTURE_TREE: 4b03b33fce6afbd30b482474d3eccfee291b4d71
       FIXTURE_CASE_SHA256: b1d7a6e9d39e4e6acb90394197f4d7a049fc44f81157e6833558c96b57a03e03
