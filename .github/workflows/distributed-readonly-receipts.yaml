@@ -1,4 +1,4 @@
-name: Read original source protocol receipt
+name: Read original benchmark receipts
 
 on:
   push:
@@ -11,11 +11,11 @@ permissions:
 
 jobs:
   receipts:
-    name: Verify and print the original source protocol receipt
+    name: Verify and print the original benchmark receipts
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 12
     steps:
-      - name: Read the exact original source protocol artifact
+      - name: Read the exact original benchmark artifact
         timeout-minutes: 11
         env:
           GH_TOKEN: ${{ github.token }}
@@ -27,25 +27,25 @@ jobs:
           import urllib.parse, urllib.request, zipfile
           from pathlib import PurePosixPath
           
-          PINS = [{"role":"source-protocol","id":15243670468,"name":"publication-early-source-protocol-evidence","size":573169,"sha256":"16bff8222e472600bd0453bef6f0ef77f4f76eeca2796513e9b9440411a72472"}]
-          RUN = 46093805674
-          HEAD = "c26770486896313738d29b9420c52a4df57583f9"
-          CANDIDATE = {"commit": "868de5bc7c7496556e3108a87b689c9280382d8c",
-                       "tree": "a376fc7a8433ebedbcc4ca35f1c596d9bbaab8aa"}
-          OLD = {"commit": "089b5f009ab48241a0c0e0fdfc22d9b08edf9398",
-                 "tree": "659b50805f637c8b34414173b73848deae807f6a"}
+          PINS = [{"role":"benchmark","id":15249129690,"name":"blaze-46108319982-1-primary-evidence","size":98795077,"sha256":"098128781b5fdfd22d0fd8839a95c3722945b9855673eeed03a27387fae43168"}]
+          RUN = 46108319982
+          HEAD = "f863d6a6fcd31e0286a92fe18bd8194292fca628"
+          CANDIDATE = {"commit": "f863d6a6fcd31e0286a92fe18bd8194292fca628",
+                       "tree": "5688cd16fda44f32fd2f4890d366496615a4ecd2"}
           REPO = "ScriptedAlchemy/blaze"
           API = "https://api.github.com/repos/" + REPO
-          MAX_ZIP = 2 * 1024 * 1024
-          MAX_FILE = 256 * 1024
-          MAX_OUTPUT = 2 * 1024 * 1024
+          MAX_ZIP = 128 * 1024 * 1024
+          MAX_FILE = 1024 * 1024
+          MAX_OBSERVER = 8 * 1024 * 1024
+          MAX_OUTPUT = 4 * 1024 * 1024
+          ERROR_RESERVE = 4096
           stage, output_bytes = "start", 0
           
           def emit(value):
               global output_bytes
               encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
               size = len(encoded.encode()) + 1
-              if size > 65536 or output_bytes + size > MAX_OUTPUT:
+              if size > 65536 or output_bytes + size > MAX_OUTPUT - ERROR_RESERVE:
                   raise ValueError("output limit")
               output_bytes += size
               print(encoded, flush=True)
@@ -136,7 +136,9 @@ jobs:
           
           def members(archive):
               rows = archive.infolist()
-              assert len(rows) <= 4096 and sum(row.file_size for row in rows) <= 32 * 1024 * 1024
+              # No member is extracted. Only the fixed selection below is decompressed,
+              # under per-member limits; unselected expanded sizes do not consume memory.
+              assert len(rows) <= 65536
               result = {}
               for row in rows:
                   path = PurePosixPath(row.filename)
@@ -147,7 +149,6 @@ jobs:
                   assert row.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
                   mode = stat.S_IFMT(row.external_attr >> 16)
                   assert mode in (0, stat.S_IFREG, stat.S_IFDIR)
-                  assert row.file_size <= 16 * 1024 * 1024
                   result[row.filename] = row
               return result
           
@@ -159,10 +160,13 @@ jobs:
                   return None
               assert len(matches) == 1, "ambiguous requested member"
               name = matches[0]
-              assert rows[name].file_size <= MAX_FILE
+              assert stat.S_IFMT(rows[name].external_attr >> 16) in (0, stat.S_IFREG)
+              assert not rows[name].external_attr & 0x10, "selected member is a directory"
+              limit = MAX_OBSERVER if suffix in ("exec/result.json", "exec/supervisor.json") else MAX_FILE
+              assert rows[name].file_size <= limit
               with archive.open(rows[name]) as stream:
-                  data = stream.read(MAX_FILE + 1)
-              assert len(data) == rows[name].file_size <= MAX_FILE
+                  data = stream.read(limit + 1)
+              assert len(data) == rows[name].file_size <= limit
               emit({"kind": "original-file", "artifact_id": pin["id"], "path": name,
                     "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
               return data
@@ -170,20 +174,22 @@ jobs:
           def show_file(archive, rows, suffix, pin, kind):
               data = read_member(archive, rows, suffix, pin)
               if data is None:
-                  return
+                  return False
               if kind == "json":
                   value = json.loads(data)
                   omitted = []
                   if suffix in ("exec/result.json", "exec/supervisor.json"):
                       keys = {"schema", "scope", "passed", "complete", "returncode", "command_status",
-                              "commands", "compiler", "error", "stop"}
+                              "commands", "compiler", "error", "stop", "environment", "tracer_sha256"}
+                      if "environment" in value:
+                          assert isinstance(value["environment"], dict)
+                          assert set(value["environment"]) <= {"HOME", "BLAZE_NO_DAEMON"}
                       omitted = sorted(set(value) - keys)
                       value = {key: value[key] for key in keys if key in value}
                   emit({"kind": "original-json", "artifact_id": pin["id"], "requested": suffix,
                         "omitted_top_level_keys": omitted, "value": value})
-                  if suffix in ("blaze-build.json", "blaze-build.original.json", "blaze-build.after.json"):
-                      expected = OLD if pin["role"] == "drop-old" else CANDIDATE
-                      assert value["source"] == expected
+                  if PurePosixPath(suffix).name in ("blaze-build.json", "blaze-build.original.json", "blaze-build.after.json"):
+                      assert value["source"] == CANDIDATE
               else:
                   # Emit every character of the small original command log, including all diagnostics.
                   # Numbered fragments preserve line endings; nothing is filtered or silently omitted.
@@ -193,6 +199,7 @@ jobs:
                           emit({"kind": "original-text-fragment", "artifact_id": pin["id"],
                                 "requested": suffix, "line": line_number, "offset_chars": offset,
                                 "text": line[offset:offset + 2048]})
+              return True
           
           def main():
               global stage
@@ -203,30 +210,22 @@ jobs:
               run = api_json(f"/actions/runs/{RUN}")
               assert (run["id"], run["head_sha"], run["run_attempt"]) == (RUN, HEAD, 1)
               assert run["repository"]["full_name"] == REPO
-              assert run["path"] == ".github/workflows/distributed-linux-smoke.yaml"
+              assert run["path"] == ".github/workflows/blaze.yaml"
               emit({"kind": "original-run", "run_id": RUN, "workflow_head": HEAD,
                     "status": run["status"], "conclusion": run["conclusion"],
                     "candidate_source": CANDIDATE,
                     "scope": "Read original bytes only; no checkout, build, test, or acceptance inference."})
-              # The strict original receipt carries all four package summaries and the
-              # complete required-control match map. Emit it as numbered text fragments
-              # to preserve its exact bytes without a 65 KiB JSON record assumption.
-              # Per-test logs and process traces are intentionally outside this selection.
+              # Read the three retained benchmark reports and their sealed source identity.
+              # Numbered fragments preserve every original report byte without a large JSON record.
               source = [
-                  ("protocol-required-controls.json", "text"),
-                  ("blaze-build.original.json", "json"), ("blaze-build.after.json", "json"),
-                  ("canonical-origin/manifest-sha256.txt", "text"),
-                  ("canonical-origin/source.txt", "text"), ("canonical-origin/validation.txt", "text"),
-                  ("canonical-origin/archive-sha256.txt", "text"), ("handoff-archives.json", "json"),
-                  ("source.before.txt", "text"), ("source.after.txt", "text"),
-                  ("source.final.status", "text"), ("source.final.patch", "text"),
-                  ("exec-input.json", "json"), ("exec/input.json", "json"),
-                  ("exec/result.json", "json"), ("exec/supervisor.json", "json"),
-                  ("observer.exit", "text"), ("observer.stdout", "text"), ("observer.stderr", "text"),
-                  ("identity-before-protocol.log", "text"), ("identity-after-protocol.log", "text"),
-                  ("binaries.before.sha256", "text"), ("binaries.after.sha256", "text"),
-                  ("binaries.after-verify.txt", "text"),
+                  ("worker-sample-1/three-host-latency.json", "text"),
+                  ("worker-sample-2/three-host-latency.json", "text"),
+                  ("worker-sample-3/three-host-latency.json", "text"),
+                  ("host-evidence/blaze-build.json", "json"),
+                  ("host-evidence/identity-before.log", "text"),
+                  ("host-evidence/identity-after.log", "text"),
               ]
+              missing = []
               for pin in PINS:
                   stage = pin["role"] + ":metadata"
                   metadata = api_json(f"/actions/artifacts/{pin['id']}")
@@ -242,7 +241,11 @@ jobs:
                       rows = members(archive)
                       for suffix, kind in source:
                           stage = pin["role"] + ":" + suffix
-                          show_file(archive, rows, suffix, pin, kind)
+                          if not show_file(archive, rows, suffix, pin, kind):
+                              missing.append({"artifact_id": pin["id"], "requested": suffix})
+              if missing:
+                  emit({"kind": "relay-incomplete", "run_id": RUN, "missing": missing})
+                  raise ValueError("required original evidence missing")
               emit({"kind": "relay-complete", "run_id": RUN, "artifacts": [pin["id"] for pin in PINS],
                     "acceptance_inferred": False, "output_bytes_before_record": output_bytes})
           
@@ -250,7 +253,10 @@ jobs:
               main()
           except Exception as error:
               # Never render exception text: HTTP errors can contain signed storage URLs.
-              print(json.dumps({"kind": "relay-error", "stage": stage,
-                                "error_type": type(error).__name__}), flush=True)
+              # emit() reserves space for this bounded terminal error even at the output cap.
+              footer = json.dumps({"kind": "relay-error", "stage": stage,
+                                   "error_type": type(error).__name__})
+              assert len(footer.encode()) + 1 <= ERROR_RESERVE
+              print(footer, flush=True)
               raise SystemExit(1)
           PY
