@@ -229,12 +229,14 @@ pub extern \"C-unwind\" fn main() -> i32 { 0 }
         kept: &'a Kept,
         calls: [LibKey; 2],
         reads: [Cell<usize>; 2],
+        file_reads: Cell<usize>,
+        file_bytes: Cell<usize>,
         plant: Plant,
     }
 
     impl<'a> MemberLoad<'a> {
         fn new(kept: &'a Kept, calls: [LibKey; 2], plant: Plant) -> Self {
-            Self { kept, calls, reads: core::array::from_fn(|_| Cell::new(0)), plant }
+            Self { kept, calls, reads: core::array::from_fn(|_| Cell::new(0)), file_reads: Cell::new(0), file_bytes: Cell::new(0), plant }
         }
 
         fn counts(&self) -> [usize; 2] {
@@ -245,7 +247,12 @@ pub extern \"C-unwind\" fn main() -> i32 { 0 }
     impl<'n> Load<'n> for MemberLoad<'_> {
         fn names(&self, krate: usize) -> Option<&'n [u8]> { self.kept.names(krate) }
         fn items(&self, krate: usize) -> Option<&'n [u8]> { self.kept.items(krate) }
-        fn file(&self, krate: usize, path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'n str> { self.kept.file(krate, path) }
+        fn file(&self, krate: usize, path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'n str> {
+            let text = self.kept.file(krate, path)?;
+            self.file_reads.set(self.file_reads.get() + 1);
+            self.file_bytes.set(self.file_bytes.get() + text.len());
+            Some(text)
+        }
         fn expansion(&self, krate: usize, call: LibKey) -> Option<LoadedExpansion<'n>> {
             for (watched, count) in self.calls.iter().zip(&self.reads) {
                 if *watched == call {
@@ -287,12 +294,17 @@ pub extern \"C-unwind\" fn main() -> i32 { 0 }
             let opened = names.records.opened();
             let reads = usize::from(want == MemberWant::WithText);
             assert_eq!(load.counts(), [reads, reads]);
+            // The file-written macro-call placeholder needs its current FileItems range;
+            // NameOnly avoids generated member texts, not that containing file check.
+            let files = load.file_reads.get();
+            let file_bytes = load.file_bytes.get();
+            assert_eq!(files, 1, "the member row opens its one containing file");
             if want == MemberWant::NameOnly {
-                assert_eq!(opened.items.texts, before.items.texts);
-                assert_eq!(opened.items.text_bytes, before.items.text_bytes);
+                assert_eq!(opened.items.texts, before.items.texts + files);
+                assert_eq!(opened.items.text_bytes, before.items.text_bytes + file_bytes);
             } else {
-                assert!(opened.items.texts >= before.items.texts + 2);
-                assert!(opened.items.text_bytes > before.items.text_bytes);
+                assert!(opened.items.texts >= before.items.texts + files + 2);
+                assert!(opened.items.text_bytes > before.items.text_bytes + file_bytes);
             }
             assert!(names.records.errors().is_empty());
 
