@@ -1,4 +1,4 @@
-name: Read original distributed validation receipts
+name: Read original source protocol receipt
 
 on:
   push:
@@ -11,11 +11,11 @@ permissions:
 
 jobs:
   receipts:
-    name: Verify and print original validation receipts
+    name: Verify and print the original source protocol receipt
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 12
     steps:
-      - name: Read the three exact original artifacts
+      - name: Read the exact original source protocol artifact
         timeout-minutes: 11
         env:
           GH_TOKEN: ${{ github.token }}
@@ -27,7 +27,7 @@ jobs:
           import urllib.parse, urllib.request, zipfile
           from pathlib import PurePosixPath
           
-          PINS = [{"role":"canonical","id":15242701805,"name":"publication-canonical-release-smoke-arm64","size":95217,"sha256":"9b145eb760b148c5dfc191d1162ae80a7de5618c1ba3e264493c9fcc4c6348de"},{"role":"drop-candidate","id":15243111420,"name":"publication-lazy-boolean-candidate","size":28787,"sha256":"866b8bb2532ccd0590dba1931dd304969314403da3e8b678a202f97b2bfa2922"},{"role":"drop-old","id":15243187293,"name":"publication-lazy-boolean-old-compiler","size":26151,"sha256":"c3bf4a864109c11a97cbfc0a5cf609ca24a975a52643d87646e26f0b5ed9a7f9"}]
+          PINS = [{"role":"source-protocol","id":15243670468,"name":"publication-early-source-protocol-evidence","size":573169,"sha256":"16bff8222e472600bd0453bef6f0ef77f4f76eeca2796513e9b9440411a72472"}]
           RUN = 46093805674
           HEAD = "c26770486896313738d29b9420c52a4df57583f9"
           CANDIDATE = {"commit": "868de5bc7c7496556e3108a87b689c9280382d8c",
@@ -208,25 +208,22 @@ jobs:
                     "status": run["status"], "conclusion": run["conclusion"],
                     "candidate_source": CANDIDATE,
                     "scope": "Read original bytes only; no checkout, build, test, or acceptance inference."})
-              canonical = [
-                  ("blaze-build.json", "json"), ("manifest-sha256.txt", "text"),
-                  ("source.txt", "text"), ("validation.txt", "text"),
-                  ("archive-sha256.txt", "text"),
-                  ("identity-before-smoke.log", "text"), ("identity-after-smoke.log", "text"),
-                  ("smoke-logs/hello-test.out", "text"), ("smoke-logs/hello-test.err", "text"),
-                  ("hello-smoke.txt", "text"), ("hello-smoke-verify.txt", "text"),
-                  ("quote-identity.txt", "text"), ("binaries.before.txt", "text"),
-                  ("binaries.after-verify.txt", "text"), ("source-after.txt", "text"),
-              ]
-              drop = [
-                  ("exec/lazy-boolean-drop-order.log", "text"),
-                  ("exec/lazy-boolean-drop-order.stderr", "text"),
-                  ("observer.exit", "text"), ("receipt.json", "json"),
-                  ("exec-input.json", "json"), ("observer.stdout", "text"), ("observer.stderr", "text"),
-                  ("identity-before-fixture.log", "text"), ("identity-after-fixture.log", "text"),
-                  ("exec/result.json", "json"), ("exec/supervisor.json", "json"),
+              # The strict original receipt carries all four package summaries and the
+              # complete required-control match map. Emit it as numbered text fragments
+              # to preserve its exact bytes without a 65 KiB JSON record assumption.
+              # Per-test logs and process traces are intentionally outside this selection.
+              source = [
+                  ("protocol-required-controls.json", "text"),
                   ("blaze-build.original.json", "json"), ("blaze-build.after.json", "json"),
-                  ("fixture.json", "json"), ("source.before.txt", "text"), ("source.after.txt", "text"),
+                  ("canonical-origin/manifest-sha256.txt", "text"),
+                  ("canonical-origin/source.txt", "text"), ("canonical-origin/validation.txt", "text"),
+                  ("canonical-origin/archive-sha256.txt", "text"), ("handoff-archives.json", "json"),
+                  ("source.before.txt", "text"), ("source.after.txt", "text"),
+                  ("source.final.status", "text"), ("source.final.patch", "text"),
+                  ("exec-input.json", "json"), ("exec/input.json", "json"),
+                  ("exec/result.json", "json"), ("exec/supervisor.json", "json"),
+                  ("observer.exit", "text"), ("observer.stdout", "text"), ("observer.stderr", "text"),
+                  ("identity-before-protocol.log", "text"), ("identity-after-protocol.log", "text"),
                   ("binaries.before.sha256", "text"), ("binaries.after.sha256", "text"),
                   ("binaries.after-verify.txt", "text"),
               ]
@@ -243,7 +240,7 @@ jobs:
                         "original": f"https://github.com/{REPO}/actions/runs/{RUN}/artifacts/{pin['id']}"})
                   with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                       rows = members(archive)
-                      for suffix, kind in (canonical if pin["role"] == "canonical" else drop):
+                      for suffix, kind in source:
                           stage = pin["role"] + ":" + suffix
                           show_file(archive, rows, suffix, pin, kind)
               emit({"kind": "relay-complete", "run_id": RUN, "artifacts": [pin["id"] for pin in PINS],
