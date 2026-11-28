@@ -34,7 +34,8 @@ Checks, each on what the build itself reports (BLAZE_DIST_REPORT) and on running
                  or by another worker, and raw emitted keys are all published
     cold cache   a third process with an empty store takes published units and compiles none
     warm         a build with nothing changed reports no execution
-    edit         one edited function: only what it reaches is worked again
+    edit         one edited function: only what it reaches is worked again; for dev, a
+                 warm primary consumes the final reachability published by the helper
     other PR     another checkout, in a pull request's namespace, with one crate edited: the
                  units it shares with what was published come from the cache, and the edited
                  ones compile; a newer revision of that pull request supersedes an older one
@@ -724,6 +725,40 @@ def control(run: Run, project: Path | None = None) -> tuple[str, str]:
     return run.behaviour("solo", project)
 
 
+def private_edit_handoff(run: Run, baseline: tuple[str, str]) -> None:
+    source = run.project / "app" / "src" / "main.rs"
+    original = source.read_text()
+    marker = "wrapping_mul(0x100000001b3)"
+    check(original.count(marker) == 1, "the private main body contains one edit marker")
+    edit(source, marker, "wrapping_mul(0x100000001b5)")
+    try:
+        # Both homes are warm. Let the helper publish the edited final unit before the
+        # primary sees this revision, so primary cannot win a lead race.
+        rows_before = {home: len(run.report(home)) for home in ("a", "b")}
+        mark = len(run.events())
+        code, output = run.build("a")
+        require_build(code, output, "private edit helper builds", run.root / "logs" / f"a.{run.sequence}.log")
+        helper = run.report("a")[rows_before["a"]:]
+        helper_events = run.events()[mark:]
+        wanted = control(run)
+        check(wanted[0] != baseline[0] and wanted[1] != baseline[1], "the private body edit changes stdout and artifact bytes")
+        check(run.behaviour("a") == wanted, "the private edit helper equals solo in bytes and behavior")
+
+        start_profile = run.project / ".blaze" / "v2" / "start.txt"
+        start_profile.unlink(missing_ok=True)
+        code, output = run.build("b")
+        require_build(code, output, "private edit primary builds", run.root / "logs" / f"b.{run.sequence}.log")
+        saved_profile = run.root / "logs" / "private-edit-primary.start.txt"
+        shutil.copyfile(start_profile, saved_profile)
+        primary = run.report("b")[rows_before["b"]:]
+        evidence.cached(primary)
+        evidence.verified_reach_handoff(run.root / "blobs", run.given.program, helper, primary, helper_events, saved_profile)
+        evidence.no_local_emission("private edit primary", output)
+        check(run.behaviour("b") == wanted, "the private edit primary consumes helper reachability and equals solo in bytes and behavior")
+    finally:
+        source.write_text(original)
+
+
 def latency_export(run: Run, placements: dict[str, list[int]], projects: dict[str, Path], *,
                    dist: bool) -> list[dict]:
     """Time invocation to successful exit. Qualify that time with the artifact oracle after both exit."""
@@ -830,6 +865,9 @@ def latency_round(run: Run, placements: dict[str, dict[str, list[int]]], modes: 
                   "the changed unit executes through the coordinator")
             evidence.no_duplicate_compile(rows)
             evidence.publication(run.root / "blobs", rows, run.events())
+        for worker in results["two_workers"]["workers"]:
+            home = worker["home"]
+            worker["work"] = distributed_work(run.report(home)[rows_before[home]:], Path(worker["profiles"]["start.txt"]))
         samples.extend(results.values())
     verify_run_identity(run)
     return samples
@@ -1332,6 +1370,8 @@ def main(given: Input) -> None:
         check(code == 0, f"the edit control builds: {text[-400:] if code else ''}")
         check(run.behaviour("a") == run.behaviour("solo"), "the edited artifact equals solo in bytes and behavior")
         edit(edited, 'format!("3 edited:{sum}', 'format!("3:{sum}')
+        if "--release" not in given.args:
+            private_edit_handoff(run, solo)
 
         # A file a unit includes is an input of its keys, and so a new unit: nothing stale is taken.
         included = run.project / "shapes" / "included.txt"
@@ -1813,7 +1853,7 @@ def host_artifact(root: Path, expected: str, timeout: int) -> dict:
     return {"stdout": output, "sha256": file_hash(path)}
 
 
-def host_latency_work(log_path: Path, report_path: Path | None) -> dict:
+def host_latency_work(log_path: Path, report_path: Path | None, start_profile: Path) -> dict:
     prefix = "export stats: "
     lines = [line.removeprefix(prefix) for line in log_path.read_text().splitlines() if line.startswith(prefix)]
     evidence.require(len(lines) == 1, f"{log_path}: expected one final export stats line")
@@ -1825,13 +1865,24 @@ def host_latency_work(log_path: Path, report_path: Path | None) -> dict:
         return work
     rows = evidence.jsonl(report_path)
     evidence.require(bool(rows), f"{report_path}: workspace-distributed export reported no units")
+    return {**work, **distributed_work(rows, start_profile)}
+
+
+def distributed_work(rows: list[dict], start_profile: Path) -> dict:
     for row in rows:
         evidence.compiled(row)
-        evidence.require(row["source"] in ("executed", "published"), f"{report_path}: unknown unit source")
-    for name in ("grants", "compiled_for_work", "stored_for_work", "tail_compiled", "from_store"):
-        work[name] = sum(row[name] for row in rows)
+        evidence.require(row["source"] in ("executed", "published"), f"{row['unit']}: unknown unit source")
+    work = {name: sums(rows, name) for name in ("grants", "compiled_for_work", "stored_for_work", "tail_compiled", "from_store")}
     for source in ("executed", "published"):
         work[f"{source}_units"] = sum(row["source"] == source for row in rows)
+    work["verified_reachability"] = [
+        {name: row[name] for name in ("unit", "unit_digest", "source", "completed_here", "verified_reach_rows", "verified_reach_digest")}
+        for row in rows if row.get("verified_reach_rows", 0) > 0
+    ]
+    placed = evidence.placed_verified_reach_rows(start_profile)
+    if work["verified_reachability"]:
+        evidence.require(placed is not None, f"{start_profile}: missing verified reachability placement counter")
+    work["placed_verified_reach_rows"] = placed
     return work
 
 
@@ -1872,7 +1923,7 @@ def host_latency_export(given: HostWorker, root: Path, project: Path, env: dict,
     evidence.require(host_fixture_digest(project) == source, f"{project}: {phase} fixture changed during export")
     for name in profiles:
         shutil.copyfile(state / name, phase_dir / name)
-    work = host_latency_work(log_path, report_path)
+    work = host_latency_work(log_path, report_path, phase_dir / "start.txt")
     work["body_pool_workers"] = host_body_workers(phase_dir / "profile.txt", given.cores)
     work_path = phase_dir / "work.json"
     host_write_json(work_path, work)

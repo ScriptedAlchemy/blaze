@@ -114,6 +114,14 @@ The acceptance harness reads these fields from the compiler, worker and coordina
 - `attempt`: final successful attempt number, or `-1` when no execution was joined.
 - `publication_attempt`: the attempt that first accepted the immutable manifest; it can be
   older than `attempt` when a replacement lead delivers that accepted record.
+- `completed_here`: whether this worker finished the unit by running its completion step.
+- `verified_reach_rows`, `verified_reach_digest`: the count and content digest of the verified
+  reachability record used to place the final dev artifact. The dev acceptance edits the private
+  `main` body and lets one warm worker publish the final unit before another warm worker requests
+  it. Both artifacts must match solo in bytes and stdout. The primary must hit the helper's
+  publication and report no local emission. The harness counts keyed rows in the native packs and
+  requires the primary's `start.txt` to report placing exactly those rows. Benchmark samples retain
+  the completion flag and verified placement count alongside work counters and timings per participant.
 - `work_compiled_keys`, `tail_compiled_keys`: arrays of actual compiled **store template keys**
   as lowercase hex, counted by `compiled_for_work` and `tail_compiled`, respectively. Include every
   real compile, even a duplicate; do not deduplicate these arrays or include store hits. These let

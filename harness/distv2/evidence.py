@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import re
 import struct
 
 
@@ -320,6 +321,54 @@ def cached(rows: list[dict]) -> None:
     for row in rows:
         require(row["source"] == "published" and row["execution"] == -1 and not row["joined"], f"{row['unit']}: cold build scheduled work")
         require(row["grants"] == 0 and row["stored_for_work"] == 0 and not compiled(row), f"{row['unit']}: cold build did work")
+
+
+def placed_verified_reach_rows(profile: Path) -> int | None:
+    matches = re.findall(r"^export\s+([0-9]+) keyed rows placed from verified distributed reachability$",
+                         profile.read_text(), re.MULTILINE)
+    require(len(matches) <= 1, f"{profile}: duplicate verified reachability placement counters")
+    return int(matches[0]) if matches else None
+
+
+def verified_reach_handoff(blobs: Path, unit: str, helper: list[dict], primary: list[dict], events: list[dict],
+                           profile: Path) -> None:
+    from blake3 import blake3
+
+    def final(rows: list[dict], role: str) -> dict:
+        candidates = [row for row in rows if row["unit"] == unit]
+        require(len(candidates) == 1, f"{role}: expected one report for final unit {unit}")
+        return candidates[0]
+
+    sent = final(helper, "helper")
+    received = final(primary, "primary")
+    require(sent["source"] == "executed" and sent["joined"] and sent["execution"] >= 0
+            and sent.get("completed_here") is True,
+            f"{unit}: helper must execute the edited final unit")
+    require(received["unit_digest"] == sent["unit_digest"] and received["source"] == "published"
+            and received.get("completed_here") is False,
+            f"{unit}: primary must consume the helper's published final unit")
+    publication(blobs, [sent], events)
+    count = received.get("verified_reach_rows")
+    digest_value = received.get("verified_reach_digest")
+    require(type(count) is int and count > 0 and digest(digest_value),
+            f"{unit}: primary did not report a verified reachability record for artifact placement")
+    require(count == sent.get("verified_reach_rows") and digest_value == sent.get("verified_reach_digest"),
+            f"{unit}: helper and primary placed different verified reachability records")
+    packs, _ = manifest(blobs, sent["unit_digest"])
+    values = logical_outputs(blobs, packs)
+    domain = "blaze distributed dev reachability 1"
+    unit_digest = bytes.fromhex(sent["unit_digest"])
+    reach_key = blake3(unit_digest, derive_key_context=domain).hexdigest()
+    require(reach_key in values, f"{unit}: helper's native packs omit the final reachability record")
+    kind, value = values[reach_key]
+    row_bytes = 1 + 16 + 32 + 32 + 32 + 32  # step tag, item, symbol, recipe, entry key, content identity
+    require(kind == 2 and value.startswith(unit_digest) and len(value) == len(unit_digest) + count * row_bytes
+            and blake3(value, derive_key_context=domain).hexdigest() == digest_value,
+            f"{unit}: verified reachability disagrees with the helper's native pack bytes")
+    keyed = sum(tag == 0 for tag in value[len(unit_digest)::row_bytes])
+    placed = placed_verified_reach_rows(profile)
+    require(keyed > 0 and placed == keyed,
+            f"{unit}: primary placed {placed} verified keyed rows, helper published {keyed}")
 
 
 def overlap_accepted(events: list[dict], grant: dict) -> int | None:

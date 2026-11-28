@@ -515,6 +515,48 @@ class Oracles(unittest.TestCase):
             with self.assertRaises(e.Failed):
                 e.manifest(blobs, UNIT)
 
+    def test_final_reach_handoff_rejects_independent_or_unverified_placement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blobs = Path(directory)
+            (blobs / "packs").mkdir()
+            (blobs / "manifests").mkdir()
+            domain = "blaze distributed dev reachability 1"
+            unit = bytes.fromhex(UNIT)
+            reach_key = blake3(unit, derive_key_context=domain).hexdigest()
+            reach = unit + bytes(145) + b"\x02" + bytes(144)
+            reach_digest = blake3(reach, derive_key_context=domain).hexdigest()
+            name, size = write_pack(blobs, sorted([(KEY, 1, b"compiled"), (reach_key, 2, reach)]))
+            (blobs / "manifests" / UNIT).write_text(f"{name} {size} {e.pack_keys_digest({KEY, reach_key})}\n")
+            events = [
+                {"event": "published", "unit_digest": UNIT, "execution": 7, "attempt": 2, "packs": [name]},
+                {"event": "done", "unit_digest": UNIT, "execution": 7, "attempt": 2, "outcome": "Passed"},
+            ]
+            helper = row(verified_reach_rows=2, verified_reach_digest=reach_digest, completed_here=True)
+            primary = {**helper, "source": "published", "completed_here": False}
+            profile = blobs / "start.txt"
+            placement = "export       1 keyed rows placed from verified distributed reachability\n"
+            profile.write_text(placement)
+            e.verified_reach_handoff(blobs, "mathy", [helper], [primary], events, profile)
+            work = h.distributed_work([row(**primary, from_store=0)], profile)
+            self.assertFalse(work["verified_reachability"][0]["completed_here"])
+            self.assertEqual(work["placed_verified_reach_rows"], 1)
+            for plant, diagnostic in (
+                ({"source": "executed"}, "consume the helper's published final unit"),
+                ({"verified_reach_rows": 0}, "did not report a verified reachability record"),
+                ({"verified_reach_digest": KEY}, "placed different verified reachability records"),
+            ):
+                with self.subTest(plant=plant), self.assertRaisesRegex(e.Failed, diagnostic):
+                    e.verified_reach_handoff(blobs, "mathy", [helper], [{**primary, **plant}], events, profile)
+            with self.assertRaisesRegex(e.Failed, "no accepted full output"):
+                e.verified_reach_handoff(blobs, "mathy", [helper], [primary], events[1:], profile)
+            with self.assertRaisesRegex(e.Failed, "disagrees with the helper's native pack bytes"):
+                e.verified_reach_handoff(blobs, "mathy", [{**helper, "verified_reach_rows": 3}],
+                                         [{**primary, "verified_reach_rows": 3}], events, profile)
+            for planted in ("", placement.replace("1 keyed", "2 keyed")):
+                profile.write_text(planted)
+                with self.subTest(profile=planted), self.assertRaisesRegex(e.Failed, "helper published 1"):
+                    e.verified_reach_handoff(blobs, "mathy", [helper], [primary], events, profile)
+
     def test_publication_keeps_accepting_attempt_and_compares_logical_pack_values(self):
         with tempfile.TemporaryDirectory() as directory:
             blobs = Path(directory)

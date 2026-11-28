@@ -819,6 +819,7 @@ fn append_report_row(
     instances: usize,
     tail_compiled_keys: &[Digest],
     reach: Option<&reach::Closure>,
+    completed_here: bool,
     alloc: WireAlloc,
 ) {
     let Some(path) = report_path else { return };
@@ -839,7 +840,7 @@ fn append_report_row(
             "{{\"unit\":\"{}\",\"source\":\"{}\",\"execution\":{},\"joined\":{},\"grants\":{},",
             "\"compiled_for_work\":{},\"stored_for_work\":{},\"arrived\":{},\"tail_compiled\":{},\"from_store\":{},\"instances\":{},",
             "\"unit_digest\":\"{}\",\"attempt\":{},\"publication_attempt\":{},\"work_compiled_keys\":{},\"tail_compiled_keys\":{},",
-            "\"verified_reach_rows\":{},\"verified_reach_digest\":\"{}\"}}\n",
+            "\"verified_reach_rows\":{},\"verified_reach_digest\":\"{}\",\"completed_here\":{}}}\n",
         ),
         unit_name,
         source,
@@ -859,6 +860,7 @@ fn append_report_row(
         tail_keys.as_str(),
         reach.map_or(0, reach::Closure::len),
         reach_digest,
+        completed_here,
     );
     let _ = append_file(path, line.as_bytes());
 }
@@ -1225,6 +1227,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             let tail_compiled = exec.tail_compiled;
             let tail_from_store = exec.tail_from_store;
             let tail_instances = exec.tail_instances;
+            let completed_here = exec.ran_complete && plan.is_final;
             let tail_keys = exec.tail_compiled_keys;
             let work_compiled = usize::try_from(arrived.compiled_here).unwrap_or(0);
             let work_stored = usize::try_from(arrived.stored_here).unwrap_or(0);
@@ -1245,6 +1248,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
                 tail_instances,
                 tail_keys.as_slice(),
                 verified.as_ref(),
+                completed_here,
                 wire_alloc,
             );
         }

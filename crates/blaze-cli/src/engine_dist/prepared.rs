@@ -464,6 +464,7 @@ where
                     krate.members.len(),
                     &[],
                     None,
+                    false,
                     wire,
                 );
             }
