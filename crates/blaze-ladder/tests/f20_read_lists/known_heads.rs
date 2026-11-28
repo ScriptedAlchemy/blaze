@@ -54,7 +54,7 @@ fn records<'n>(f: &Fixture, load: &'n dyn Load<'n>, frame: &'n blaze_mem::Frame,
     NamesRecords { records, frame, lang_crates: &LANG_CRATES, body_sources: None }
 }
 
-fn named(records: &Records<'_>, name: &str) -> LibKey {
+fn named<'a>(records: &'a Records<'a>, name: &str) -> LibKey {
     let mut found = None;
     assert!(records.each_item(0, &mut |key, _| {
         if records.name_of(key) == Some(name) && records.member_owner(key).is_none() {
