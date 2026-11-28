@@ -1,13 +1,17 @@
 //! Executable oracle for the Reference's "Temporary scopes": each operand of a lazy
 //! Boolean expression is a scope. The log records actual destructor calls, not lowered
-//! instruction shapes. Global counters keep this independent of borrow-check acceptance.
+//! instruction shapes. Stack-owned Cells let the strict source gate check the oracle.
 
+use core::cell::Cell;
 use crate::Drop;
 
-static mut LOG: u32 = 0;
-static mut MADE: u32 = 0;
+struct Counters {
+    log: Cell<u32>,
+    made: Cell<u32>,
+}
 
-struct Probe {
+struct Probe<'a> {
+    counters: &'a Counters,
     id: u32,
     flag: bool,
 }
@@ -17,13 +21,13 @@ enum Maybe<T> {
     None,
 }
 
-impl Drop for Probe {
+impl Drop for Probe<'_> {
     fn drop(&mut self) {
-        unsafe { LOG = LOG * 10 + self.id };
+        self.counters.log.set(self.counters.log.get() * 10 + self.id);
     }
 }
 
-impl Probe {
+impl Probe<'_> {
     fn test(&self) -> bool {
         self.flag
     }
@@ -33,24 +37,22 @@ impl Probe {
     }
 }
 
-fn make(id: u32, flag: bool) -> Probe {
-    unsafe { MADE = MADE * 10 + id };
-    Probe { id, flag }
+fn make(counters: &Counters, id: u32, flag: bool) -> Probe<'_> {
+    counters.made.set(counters.made.get() * 10 + id);
+    Probe { counters, id, flag }
 }
 
-fn reset() {
-    unsafe {
-        LOG = 0;
-        MADE = 0;
-    }
+fn reset(counters: &Counters) {
+    counters.log.set(0);
+    counters.made.set(0);
 }
 
-fn log() -> u32 {
-    unsafe { LOG }
+fn log(counters: &Counters) -> u32 {
+    counters.log.get()
 }
 
-fn made() -> u32 {
-    unsafe { MADE }
+fn made(counters: &Counters) -> u32 {
+    counters.made.get()
 }
 
 fn pair(value: bool, dropped: u32) -> bool {
@@ -58,102 +60,104 @@ fn pair(value: bool, dropped: u32) -> bool {
 }
 
 pub fn check() -> u8 {
+    let counters = Counters { log: Cell::new(0), made: Cell::new(0) };
+
     // The left operand dies before the evaluated right operand, for both operators.
-    reset();
-    let left_or = make(1, false).test() || log() == 1;
-    if !left_or || log() != 1 || made() != 1 {
+    reset(&counters);
+    let left_or = make(&counters, 1, false).test() || log(&counters) == 1;
+    if !left_or || log(&counters) != 1 || made(&counters) != 1 {
         return 1;
     }
-    reset();
-    let left_and = make(1, true).test() && log() == 1;
-    if !left_and || log() != 1 || made() != 1 {
+    reset(&counters);
+    let left_and = make(&counters, 1, true).test() && log(&counters) == 1;
+    if !left_and || log(&counters) != 1 || made(&counters) != 1 {
         return 2;
     }
 
     // The evaluated right operand dies before a later argument of the enclosing call.
-    reset();
-    if !pair(false || make(2, true).test(), log()) || log() != 2 {
+    reset(&counters);
+    if !pair(false || make(&counters, 2, true).test(), log(&counters)) || log(&counters) != 2 {
         return 3;
     }
 
     // A skipped operand is never constructed or dropped.
-    reset();
-    let short_or = make(1, true).test() || make(2, false).test();
-    if !short_or || made() != 1 || log() != 1 {
+    reset(&counters);
+    let short_or = make(&counters, 1, true).test() || make(&counters, 2, false).test();
+    if !short_or || made(&counters) != 1 || log(&counters) != 1 {
         return 4;
     }
-    reset();
-    let short_and = make(1, false).test() && make(2, true).test();
-    if short_and || made() != 1 || log() != 1 {
+    reset(&counters);
+    let short_and = make(&counters, 1, false).test() && make(&counters, 2, true).test();
+    if short_and || made(&counters) != 1 || log(&counters) != 1 {
         return 5;
     }
 
     // Nested operands end in evaluation order, rather than at the outer statement.
-    reset();
-    let nested = (make(1, false).test() || make(2, true).test()) && log() == 12;
-    if !nested || log() != 12 || made() != 12 {
+    reset(&counters);
+    let nested = (make(&counters, 1, false).test() || make(&counters, 2, true).test()) && log(&counters) == 12;
+    if !nested || log(&counters) != 12 || made(&counters) != 12 {
         return 6;
     }
 
     // Copy the operand's Boolean result before dropping its enclosing temporary.
-    reset();
-    let field = make(4, false).flag || log() == 4;
-    if !field || log() != 4 {
+    reset(&counters);
+    let field = make(&counters, 4, false).flag || log(&counters) == 4;
+    if !field || log(&counters) != 4 {
         return 7;
     }
 
     // Pattern scrutinees live through the then arm, while ordinary Boolean links do not.
-    reset();
-    let inside = if let Maybe::Some(value) = make(5, true).peek()
+    reset(&counters);
+    let inside = if let Maybe::Some(value) = make(&counters, 5, true).peek()
         && value
-        && make(6, true).test()
+        && make(&counters, 6, true).test()
     {
-        log()
+        log(&counters)
     } else {
         99
     };
-    if inside != 6 || log() != 65 || made() != 56 {
+    if inside != 6 || log(&counters) != 65 || made(&counters) != 56 {
         return 8;
     }
-    reset();
-    let in_else = if let Maybe::Some(value) = make(7, true).peek()
+    reset(&counters);
+    let in_else = if let Maybe::Some(value) = make(&counters, 7, true).peek()
         && value
-        && make(8, false).test()
+        && make(&counters, 8, false).test()
     {
         99
     } else {
-        log()
+        log(&counters)
     };
-    if in_else != 87 || log() != 87 || made() != 78 {
+    if in_else != 87 || log(&counters) != 87 || made(&counters) != 78 {
         return 9;
     }
 
     // An operand scope never takes ownership of a named local from the surrounding block.
-    reset();
+    reset(&counters);
     {
-        let held = make(9, false);
-        let result = held.test() || log() == 0;
-        if !result || log() != 0 {
+        let held = make(&counters, 9, false);
+        let result = held.test() || log(&counters) == 0;
+        if !result || log(&counters) != 0 {
             return 10;
         }
     }
-    if log() != 9 {
+    if log(&counters) != 9 {
         return 11;
     }
 
     // The same separation applies on a loop back edge and on a failed Boolean link.
-    reset();
+    reset(&counters);
     let mut turn = 0;
-    while let Maybe::Some(value) = make(3, turn == 0).peek()
+    while let Maybe::Some(value) = make(&counters, 3, turn == 0).peek()
         && value
-        && make(4, true).test()
+        && make(&counters, 4, true).test()
     {
-        if log() != 4 {
+        if log(&counters) != 4 {
             return 12;
         }
         turn = 1;
     }
-    if turn != 1 || log() != 433 || made() != 343 {
+    if turn != 1 || log(&counters) != 433 || made(&counters) != 343 {
         return 13;
     }
     0

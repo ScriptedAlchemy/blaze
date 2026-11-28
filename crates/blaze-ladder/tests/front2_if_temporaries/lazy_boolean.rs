@@ -8,6 +8,7 @@ use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::run::{FrontChoice, NewFront, run_with};
 use blaze_own::Vec;
+use blaze_toolchain::Shelf;
 
 const SOURCE: &str = r#"
 struct State(u8);
@@ -129,28 +130,23 @@ fn lazy_boolean_operand_scopes_preserve_genuinely_live_borrows() {
     ]);
 }
 
-/// This executes generated ARM64 code, as the other `run_with` ladder tests do. The hosted
-/// fixture also runs this same oracle through `blaze test` with an exactly-one-test receipt.
+/// This executes generated ARM64 code, as the other `run_with` ladder tests do. Both this
+/// wrapper and the hosted `blaze test` fixture use the installed core's `Cell` and `Drop`.
 #[test]
 fn lazy_boolean_operand_destructors_run_at_their_scope_boundaries() {
-    const MAIN: &str = "#![feature(no_core, lang_items, intrinsics, rustc_attrs, unboxed_closures, arbitrary_self_types)]
-#![no_core]
-#![no_main]
-#![allow(internal_features)]
-mod prelude;
-use prelude::Drop;
+    const MAIN: &str = "#![no_main]
+use core::ops::Drop;
 mod case;
 #[unsafe(no_mangle)]
 pub extern \"C\" fn main() -> i32 { case::check() as i32 }
 ";
-    const PRELUDE: &str = include_str!("../../../blaze-cli/tests/ladder/front2/x0-async-01/src/prelude.rs");
     const CASE: &str = include_str!("../../../blaze-cli/tests/ladder/front2/x-drop-13-lazy-booleans/src/case.rs");
     let files = [
         SourceFile { path: "src/main.rs", text: MAIN },
-        SourceFile { path: "src/prelude.rs", text: PRELUDE },
         SourceFile { path: "src/case.rs", text: CASE },
     ];
-    let new = NewFront { package: "lazy", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
+    let shelf = super::shelf();
+    let new = NewFront { package: "lazy", edition: "2024", shelf: Some(shelf.place()), overflow: blaze_build::OverflowChecks::On };
     let got = run_with(&files, "src/main.rs", None, FrontChoice::New(new), blaze_own::testing::heap().shared());
     assert!(matches!(got, Ok(0)), "executed lazy-Boolean Drop oracle: {got:?}");
 }

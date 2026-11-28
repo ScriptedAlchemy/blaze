@@ -24,9 +24,13 @@ use blaze_ladder::refusal::SourceFile;
 #[path = "front2_if_temporaries/lazy_boolean.rs"]
 mod lazy_boolean;
 
-fn toolchain() -> Toolchain {
+fn shelf() -> DirShelf {
     let home = std::env::var("HOME").expect("HOME");
-    Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain")
+    DirShelf::new(format!("{home}/.blaze/v2/toolchain"))
+}
+
+fn toolchain() -> Toolchain {
+    Toolchain::open(&mut shelf()).expect("installed toolchain")
 }
 
 const SOURCE: &str = r#"
