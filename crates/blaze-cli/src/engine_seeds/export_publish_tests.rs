@@ -98,7 +98,11 @@ fn fixture() -> Fixture {
     let names = blaze_scope::names_record::encode(krate, g).expect("names record");
     let items = blaze_scope::items_record::encode(krate, g).expect("items record");
     let names_at = Key(ContentId::of("export publication fixture names", &names));
-    Fixture { names, items, names_at }
+    Fixture {
+        names: AVec::from_slice_in(&names, g),
+        items: AVec::from_slice_in(&items, g),
+        names_at,
+    }
 }
 
 fn records<'n>(f: &Fixture, frame: &'n Frame, memory: Alloc<'n>, bump: Bump<'n>) -> NamesRecords<'n> {
