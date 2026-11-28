@@ -282,7 +282,8 @@ mod tests {
                 assert!(text.contains("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"), "the published identity is full-width");
             }
             if matches!(mismatch, Mismatch::Symbol { .. } | Mismatch::Recipe { .. }) {
-                assert!(text.contains("fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe"), "the current identity is full-width");
+                let current = concat!("fefefefefefefefe", "fefefefefefefefe", "fefefefefefefefe", "fefefefefefefefe");
+                assert!(text.contains(current), "the current identity is full-width");
             }
         }
         let mut shown = Text { bytes: [0; 256], len: 0 };
