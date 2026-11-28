@@ -493,6 +493,18 @@ pub(crate) struct Program {
 }
 
 impl Program {
+    /// Values visible to the maker in its crate graph, expanded names and build-script
+    /// environments. The same output can be reached under different local task histories.
+    pub(crate) fn hash_export_inputs(&self, hash: &mut blaze_ids::Hasher) {
+        hash.id(&self.graph.out).id(&self.list.key(self.owner).0);
+        for inputs in [&self.crates, &self.scripts] {
+            hash.update(&u64::try_from(inputs.len()).unwrap_or(u64::MAX).to_le_bytes());
+            for (at, input) in inputs.iter() {
+                hash.id(&self.list.key(*at).0).id(&input.out);
+            }
+        }
+    }
+
     /// The program's crates for its native image (engine_native.rs `image_for`): its own crate
     /// first, then every other crate of its check scope, each by its key and its names row.
     /// Read from the one crate list this program already holds: the unit graph is not read

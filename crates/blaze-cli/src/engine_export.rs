@@ -43,6 +43,7 @@ use bstd::report::Code;
 use crate::body_types::{SyncPackDirs, TreesSeen};
 use crate::code_store::HomeCodeStore;
 use crate::engine_check::{Standing, check_for_start};
+use crate::engine_dist::reach;
 use crate::engine_records::EngineRecords;
 use crate::engine_start::{RunProcs, StartError, body_ids, end_procs, start_facts, write_start_profile};
 use crate::phases::Phases;
@@ -628,6 +629,7 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
     codes: &mut dyn CodeStore,
     roots: &ProductRoots<'_>,
     tier: Tier,
+    closure: Option<&reach::Closure>,
     alloc: Alloc<'a>,
     frame: &Frame,
     heap: &'static blaze_own::Heap,
@@ -651,28 +653,61 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
 
     let mut next_row = 0usize;
     {
-        let _walk_span = cx.span("export: walk reachable functions");
+        let _walk_span = cx.span(if closure.is_some() {
+            "export: place checked distributed reachability"
+        } else {
+            "export: walk reachable functions"
+        });
         while next_row < walk.len() {
             let row = next_row;
             next_row += 1;
             let tabled = walk.tabled(row);
             let symbol = walk.symbol(row);
             let kind = walk.kind(row);
+            let bad_closure = || box_err(
+                ExportCliError::Walk {
+                    symbol: symbol.0,
+                    shown: owned_fmt(format_args!("distributed reachability disagrees at row {row}"), frame, heap.alloc()),
+                },
+                heap,
+            );
             let proof = ids.runnable(tabled).map_err(|why| {
                 let krate = crate_of_item(list, tabled, heap.alloc());
                 box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
             })?;
+            let expected = closure.map(|closure| {
+                closure.at(row, tabled, symbol, || scratch.key_for(&walk, row, ids, builder)).ok_or_else(bad_closure)
+            }).transpose()?;
+            if let Some(reach::Step::Keyed { key, .. }) = expected {
+                let entry = codes.get(key)
+                    .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
+                    .ok_or_else(bad_closure)?;
+                walk.follow_checked::<RunError>(row, key, entry, MOST_WALKED, &mut scratch)
+                    .map_err(|why| box_err(ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
+                cached += 1;
+                outcomes.push(RowOutcome::Keyed(key));
+                continue;
+            }
             match walk.one(row, ids, codes, builder, &builder.producer, maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
                 Ok(one) => match one.stepped {
                     Stepped::Found(key) => {
+                        if expected.is_some() {
+                            return Err(bad_closure());
+                        }
                         cached += 1;
                         outcomes.push(RowOutcome::Keyed(key));
                     }
                     Stepped::Made(key) => {
+                        if expected.is_some() {
+                            return Err(bad_closure());
+                        }
                         compiled += 1;
                         outcomes.push(RowOutcome::Keyed(key));
                     }
                     Stepped::Unkeyed(_) => {
+                        if expected.is_some_and(|step| step != reach::Step::Unkeyed(blaze_ladder::code_records::content_key(scratch.made()))) {
+                            return Err(bad_closure());
+                        }
                         unkeyed += 1;
                         let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
                         copied.extend_from_slice(scratch.made());
@@ -680,6 +715,9 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
                     }
                 },
                 Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
+                    if expected.is_some_and(|step| step != reach::Step::Stub) {
+                        return Err(bad_closure());
+                    }
                     let msg = bstd::mem::format_in!(frame, "blaze export: called unbuilt function: {why}");
                     let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
                     stubs += 1;
@@ -692,6 +730,15 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
                     ));
                 }
             }
+        }
+        if closure.is_some_and(|closure| closure.len() != next_row) {
+            return Err(box_err(
+                ExportCliError::Walk {
+                    symbol: [0; 32],
+                    shown: owned_fmt(format_args!("distributed reachability has rows outside the selected roots"), frame, heap.alloc()),
+                },
+                heap,
+            ));
         }
     }
 
@@ -978,10 +1025,12 @@ fn export_program<'f>(
 
     // Optional distributed compilation pass over workspace crates (D11).
     let mut dist_fp: Option<blaze_wire::Digest> = None;
+    let mut dist_reach = None;
     if let Some(dist_cfg) = dist.filter(|_| !release) {
         let _dist_span = cx.span("export: distributed dev code");
         let mut dist_store = crate::engine_dist::DistStore::new(&mut codes, dist_cfg.wire_alloc);
         let (outcome, fp) = crate::engine_dist::run_distributed(
+            cx,
             dist_cfg,
             names,
             closure.as_slice(),
@@ -992,6 +1041,7 @@ fn export_program<'f>(
             &mut dist_store,
             &roots,
             native_export.key,
+            crate::engine_dist::reach_inputs::context(&standing, program_found, &ids),
             release,
             output_path,
             alloc,
@@ -1008,8 +1058,9 @@ fn export_program<'f>(
                 end_procs(cx, &maker_procs, standing.err, "export")?;
                 return Ok(unchanged());
             }
-            crate::engine_dist::DistExportOutcome::Completed { .. } => {
+            crate::engine_dist::DistExportOutcome::Completed { reach, .. } => {
                 dist_fp = Some(fp);
+                dist_reach = Some(reach);
             }
             crate::engine_dist::DistExportOutcome::FallbackLocal => {
                 if let Some(path) = receipt_path {
@@ -1068,9 +1119,10 @@ fn export_program<'f>(
     };
     let PreparedExport { walk, outcomes, tls, compiled, cached, unkeyed, stubs, lto_bodies, lto_inlined } = match native_prepared {
         Some(prepared) => prepared,
-        None => prepare_export(cx, list, &ids, &builder, &mut maker, &mut codes, &roots, tier, alloc, frame, heap, after_walk)?,
+        None => prepare_export(cx, list, &ids, &builder, &mut maker, &mut codes, &roots, tier, dist_reach.as_ref(), alloc, frame, heap, after_walk)?,
     };
     phases.export_verified_from_answers = Some(maker.verified_from_answers());
+    phases.export_distributed_reach = dist_reach.as_ref().map(|_| cached);
 
     // Assemble `ProgramIn` functions and data (zero-copy for cached positionless records).
     let mut functions: AVec<'_, Function<'_>> = Vec::with_capacity_in(outcomes.len() + 2, alloc);

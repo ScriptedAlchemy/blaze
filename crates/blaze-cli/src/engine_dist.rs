@@ -50,10 +50,14 @@ use blaze_wire::{
 };
 use bstd::env::{Env, VarName};
 use bstd::mem::Frame;
+use bstd::Cx;
 
 use crate::code_store::HomeCodeStore;
 use crate::engine_seeds::CrateAt;
 use crate::run_ids::RunIds;
+
+pub(crate) mod reach;
+pub(crate) mod reach_inputs;
 
 #[cfg(feature = "llvm")]
 pub(crate) mod prepared;
@@ -814,6 +818,7 @@ fn append_report_row(
     from_store: usize,
     instances: usize,
     tail_compiled_keys: &[Digest],
+    reach: Option<&reach::Closure>,
     alloc: WireAlloc,
 ) {
     let Some(path) = report_path else { return };
@@ -826,13 +831,15 @@ fn append_report_row(
     let pub_attempt = arrived.publication_attempt.and_then(|v| i64::try_from(v).ok()).unwrap_or(-1);
     let work_keys = json_digests(arrived.compiled_keys.as_slice(), alloc);
     let tail_keys = json_digests(tail_compiled_keys, alloc);
+    let reach_digest = hex(reach.map_or(&[][..], |closure| closure.digest.as_slice()));
     let mut line = WireString::new_in(alloc);
     let _ = write!(
         line,
         concat!(
             "{{\"unit\":\"{}\",\"source\":\"{}\",\"execution\":{},\"joined\":{},\"grants\":{},",
             "\"compiled_for_work\":{},\"stored_for_work\":{},\"arrived\":{},\"tail_compiled\":{},\"from_store\":{},\"instances\":{},",
-            "\"unit_digest\":\"{}\",\"attempt\":{},\"publication_attempt\":{},\"work_compiled_keys\":{},\"tail_compiled_keys\":{}}}\n",
+            "\"unit_digest\":\"{}\",\"attempt\":{},\"publication_attempt\":{},\"work_compiled_keys\":{},\"tail_compiled_keys\":{},",
+            "\"verified_reach_rows\":{},\"verified_reach_digest\":\"{}\"}}\n",
         ),
         unit_name,
         source,
@@ -841,7 +848,7 @@ fn append_report_row(
         arrived.grants,
         arrived.compiled_here,
         arrived.stored_here,
-        arrived.values.len(),
+        arrived.values.len() + usize::from(reach.is_some()),
         tail_compiled,
         from_store,
         instances,
@@ -850,6 +857,8 @@ fn append_report_row(
         pub_attempt,
         work_keys.as_str(),
         tail_keys.as_str(),
+        reach.map_or(0, reach::Closure::len),
+        reach_digest,
     );
     let _ = append_file(path, line.as_bytes());
 }
@@ -859,7 +868,7 @@ pub(crate) enum DistExportOutcome {
     /// Output executable is already up to date (exact fingerprint hit); no unit was run.
     NoOp,
     /// Distributed units finished; `DistStore` holds all committed/compiled records for export.
-    Completed { compiled: usize, cached: usize },
+    Completed { compiled: usize, cached: usize, reach: reach::Closure },
     /// Coordinator was unavailable under `BLAZE_DIST_LOCAL=fallback`; caller runs local walk.
     FallbackLocal,
 }
@@ -900,6 +909,7 @@ pub(crate) fn write_output_fingerprint(output_path: &str, fp: &Digest, alloc: Wi
 
 /// `Granted` implementation for one workspace crate unit.
 struct UnitExecutor<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>> {
+    cx: &'a Cx,
     plan: &'a CratePlan<'a>,
     ids: &'a RunIds<'b>,
     builder: &'a Builder,
@@ -1000,6 +1010,8 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
         if !self.plan.is_final {
             return Ok(());
         }
+        let _span = self.cx.span("export: verify distributed reachability at publisher");
+        let mut closure = reach::Writer::new(self.plan.unit.spec, self.wire_alloc);
         self.store.clear_tracking();
         let mut walk = Walk::new_in(self.scratch_alloc);
         for i in 0..self.roots.len() {
@@ -1046,11 +1058,30 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                         }
                         Stepped::Unkeyed(_) => {}
                     }
+                    let entry = match one.stepped {
+                        Stepped::Found(key) | Stepped::Made(key) => {
+                            let recipe = scratch.queried().ok_or_else(|| {
+                                reach::refused(self.heap, self.plan.unit.spec, "lost the checked instance key")
+                            })?;
+                            let content = if recipe == key {
+                                let bytes = self.store.get(key).map_err(DistError::Store)?
+                                    .ok_or(DistError::Store(StoreError::Failed { key, what: "missing verified reachability entry" }))?;
+                                blaze_ladder::code_records::content_key(bytes)
+                            } else {
+                                key
+                            };
+                            reach::Step::Keyed { recipe, key, content }
+                        }
+                        Stepped::Unkeyed(_) => reach::Step::Unkeyed(blaze_ladder::code_records::content_key(scratch.made())),
+                    };
+                    closure.push(tabled, walk.symbol(row), entry);
                 }
                 Err(why)
                     if row >= root_count
                         && kind == RowKind::Instance
-                        && why.scope() == blaze_ladder::scope::Scope::One => {}
+                        && why.scope() == blaze_ladder::scope::Scope::One => {
+                    closure.push(tabled, walk.symbol(row), reach::Step::Stub);
+                }
                 Err(why) => {
                     let mut s = String::new_in(self.heap.alloc());
                     let _ = write!(s, "tail compile: {why}");
@@ -1062,6 +1093,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
         for val in tracked {
             output(val);
         }
+        output(closure.finish());
         Ok(())
     }
 }
@@ -1070,6 +1102,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
 /// fingerprint, and executes every unit through `blaze_dist_local::agent::ExportBudget`.
 #[expect(clippy::too_many_arguments, reason = "explicit distributed export capabilities")]
 pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>>(
+    cx: &'a Cx,
     dist: &DistConfig,
     names: NamesRecords<'b>,
     closure: &[CrateAt],
@@ -1080,6 +1113,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
     store: &'a mut DistStore<'s, 'm, D>,
     roots: &'a ProductRoots<'a>,
     native_image: blaze_drive::Key,
+    checked: ContentId,
     release: bool,
     output_path: &str,
     scratch_alloc: Alloc<'a>,
@@ -1107,12 +1141,15 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             work_names.push(item.key.0.0);
         }
         let is_final = idx == 0;
-        let mut extra: AVec<'a, Digest> = Vec::with_capacity_in(2 + if is_final { prior_digests.len() + 1 } else { 0 }, scratch_alloc);
+        let mut extra: AVec<'a, Digest> = Vec::with_capacity_in(2 + if is_final { prior_digests.len() + 4 } else { 0 }, scratch_alloc);
         extra.push(key.0.0);
         extra.push(data.0);
         if is_final {
             extra.extend_from_slice(prior_digests.as_slice());
             extra.push(program_roots_digest(program_crate_name, roots, builder.settings.panic));
+            extra.push(checked.0);
+            extra.push(native_image.0.0);
+            extra.push(reach::protocol());
         }
         let spec = unit_digest_of(cname, builder, release, work_names.as_slice(), extra.as_slice(), scratch_alloc);
         prior_digests.push(spec);
@@ -1148,10 +1185,12 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         let cancelled = AtomicBool::new(false);
         let mut total_compiled = 0usize;
         let mut total_cached = 0usize;
+        let mut verified = None;
 
         for (index, plan) in plans.iter().enumerate() {
             let next = plans.get(index + 1).filter(|plan| !plan.is_final).map(|plan| plan.unit.spec);
             let mut exec = UnitExecutor {
+                cx,
                 plan,
                 ids,
                 builder,
@@ -1169,7 +1208,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
                 result_gate: dist.result_gate.as_ref()
                     .and_then(|gate| gate.for_unit(plan.unit_name.as_str())),
             };
-            let arrived = match budget.run_with_next(&plan.unit, next, &mut exec, &cancelled) {
+            let mut arrived = match budget.run_with_next(&plan.unit, next, &mut exec, &cancelled) {
                 Ok(arrived) => arrived,
                 Err(err) => match agent::decide(&dist.config.local, err, wire_alloc) {
                     Ok(()) => return Ok((DistExportOutcome::FallbackLocal, fp)),
@@ -1191,6 +1230,10 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             let work_stored = usize::try_from(arrived.stored_here).unwrap_or(0);
             total_compiled += work_compiled + tail_compiled;
             total_cached += work_stored + tail_from_store;
+            if plan.is_final {
+                let _span = cx.span("export: authenticate distributed reachability entries");
+                verified = Some(reach::Closure::read(plan.unit.spec, &mut arrived.values, heap)?);
+            }
             store.merge_arrived(&arrived.values)?;
             append_report_row(
                 dist.report.as_ref().map(|s| s.as_str()),
@@ -1201,11 +1244,13 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
                 tail_from_store,
                 tail_instances,
                 tail_keys.as_slice(),
+                verified.as_ref(),
                 wire_alloc,
             );
         }
 
-        Ok((DistExportOutcome::Completed { compiled: total_compiled, cached: total_cached }, fp))
+        let reach = verified.ok_or_else(|| reach::refused(heap, fp, "has no program unit"))?;
+        Ok((DistExportOutcome::Completed { compiled: total_compiled, cached: total_cached, reach }, fp))
     })
     .map_err(DistError::PublishedRead)?
 }

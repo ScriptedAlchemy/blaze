@@ -165,6 +165,19 @@ pub fn instance_key(
     producer: &ProducerId<CodeBuilder>,
     alloc: Alloc<'_>,
 ) -> Option<CodeKey> {
+    instance_key_in(symbol, tabled, name, ids, builder, producer, &mut Vec::new_in(alloc), &mut Vec::new_in(alloc))
+}
+
+fn instance_key_in(
+    symbol: Symbol,
+    tabled: ItemKey,
+    name: &[u8],
+    ids: &dyn BodyIds,
+    builder: &Builder,
+    producer: &ProducerId<CodeBuilder>,
+    items: &mut AVec<'_, ItemKey>,
+    facts: &mut AVec<'_, Read>,
+) -> Option<CodeKey> {
     let body = ids.body_check(tabled)?;
     if body.reads.is_empty() {
         return None;
@@ -174,17 +187,28 @@ pub fn instance_key(
             return None;
         }
     }
-    let mut items: AVec<'_, ItemKey> = Vec::new_in(alloc);
-    each_item(name, |item| items.push(item)).ok()?;
+    name_facts::<core::convert::Infallible>(tabled, name, ids, items, facts).ok()?;
+    Some(record_key(symbol, &body, facts.as_slice(), builder, producer))
+}
+
+fn name_facts<E>(
+    tabled: ItemKey,
+    name: &[u8],
+    ids: &dyn BodyIds,
+    items: &mut AVec<'_, ItemKey>,
+    facts: &mut AVec<'_, Read>,
+) -> Result<(), WalkError<E>> {
+    items.clear();
+    each_item(name, |item| items.push(item)).map_err(|why| WalkError::Name { tabled, why })?;
     items.sort_unstable();
     items.dedup();
-    let mut facts: AVec<'_, Read> = Vec::with_capacity_in(items.len(), alloc);
+    facts.clear();
     for &item in items.iter() {
-        facts.push(ids.instance_fact(item)?);
+        facts.push(ids.instance_fact(item).ok_or(WalkError::NoCrateFact { tabled, item })?);
     }
     facts.sort_unstable();
     facts.dedup();
-    Some(record_key(symbol, &body, facts.as_slice(), builder, producer))
+    Ok(())
 }
 
 /// Why an instance name's items cannot be listed.
@@ -818,6 +842,8 @@ pub const WALK_MOST_NAME: usize = crate::symbols::NAME_MOST_BYTES + 24 + 4 * cra
 /// The buffers one step of the walk ([`Walk::one`]) fills, made once by the caller and reused
 /// by every step, so a step allocates nothing once they have grown.
 pub struct Scratch<'a> {
+    /// The instance key queried by the latest step, before following its content pointer.
+    queried: Option<CodeKey>,
     /// The instance name of the row being done (copied out of the walk's arena).
     name: AVec<'a, u8>,
     /// The entry the maker made in the last step; empty when that step made nothing.
@@ -829,7 +855,17 @@ pub struct Scratch<'a> {
 
 impl<'a> Scratch<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> Scratch<'a> {
-        Scratch { name: Vec::new_in(alloc), made: Vec::new_in(alloc), facts: Vec::new_in(alloc), items: Vec::new_in(alloc), declared: DeclaredList::new_in(alloc) }
+        Scratch { queried: None, name: Vec::new_in(alloc), made: Vec::new_in(alloc), facts: Vec::new_in(alloc), items: Vec::new_in(alloc), declared: DeclaredList::new_in(alloc) }
+    }
+
+    pub fn queried(&self) -> Option<CodeKey> {
+        self.queried
+    }
+
+    /// Recompute a walked row's recipe from today's body and name inputs without reading code.
+    pub fn key_for(&mut self, walk: &Walk<'_>, row: usize, ids: &dyn BodyIds, builder: &Builder) -> Option<CodeKey> {
+        instance_key_in(walk.symbol(row), walk.tabled(row), walk.name(row), ids, builder,
+            &builder.producer, &mut self.items, &mut self.facts)
     }
 
     /// The entry bytes the maker made in the last [`Walk::one`], when its row's [`One::stepped`]
@@ -925,6 +961,23 @@ impl<'a> Walk<'a> {
 
     pub fn is_empty(&self) -> bool {
         self.symbols.is_empty()
+    }
+
+    /// Follow a fetched entry whose semantic reads were checked by the producer for the
+    /// same checked input and whose content and row identity the caller has checked.
+    pub fn follow_checked<E>(
+        &mut self,
+        row: usize,
+        key: CodeKey,
+        entry: &[u8],
+        most: usize,
+        scratch: &mut Scratch<'a>,
+    ) -> Result<(), WalkError<E>> {
+        let tabled = self.tabled(row);
+        scratch.declared.clear();
+        EntryForm.declared(entry, &mut scratch.declared)
+            .map_err(|why| WalkError::Entry { tabled, found: true, why })?;
+        self.reach_declared(row, Stepped::Found(key), most, &scratch.declared)
     }
 
     pub fn symbol(&self, row: usize) -> Symbol {
@@ -1247,7 +1300,8 @@ impl<'a> Walk<'a> {
         most: usize,
         scratch: &mut Scratch<'a>,
     ) -> Result<Began, WalkError<M::Error>> {
-        let Scratch { name, made: _, facts, items, declared } = scratch;
+        let Scratch { name, made: _, facts, items, declared, queried } = scratch;
+        *queried = None;
         match self.how[row] {
             How::Done(stepped) => return Ok(Began::Stepped(stepped)),
             How::Making => return Err(WalkError::Making { tabled: self.tabled[row] }),
@@ -1273,20 +1327,15 @@ impl<'a> Walk<'a> {
                 // The name's items, each once, before any fact is looked up: a name lists an
                 // item once per distinct node (symbols.rs' forest), so `items` is at most the
                 // name's bytes / 21 long, and `facts` is as long as the distinct items.
-                items.clear();
-                each_item(name.as_slice(), |item| items.push(item)).map_err(|why| WalkError::Name { tabled, why })?;
-                items.sort_unstable();
-                items.dedup();
-                self.most_name_items = self.most_name_items.max(items.len());
-                facts.clear();
-                for &item in items.iter() {
-                    facts.push(ids.instance_fact(item).ok_or(WalkError::NoCrateFact { tabled, item })?);
+                let named = name_facts(tabled, name.as_slice(), ids, items, facts);
+                if !matches!(named, Err(WalkError::Name { .. })) {
+                    self.most_name_items = self.most_name_items.max(items.len());
                 }
-                facts.sort_unstable();
-                facts.dedup();
+                named?;
                 Ok(record_key(self.symbols[row], &body, facts.as_slice(), builder, producer))
             }
         };
+        *queried = keyed.ok();
         // Found: through the key's pointer to its content key (a key of an older walk may hold
         // its entry itself), and taken only when its read list holds today (the module doc,
         // "The read list"). A list that moved: made again, as a missing entry is.

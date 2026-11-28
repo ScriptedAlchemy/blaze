@@ -1986,6 +1986,12 @@ pub(crate) struct RunIds<'a> {
 }
 
 impl<'a> RunIds<'a> {
+    /// Canonically ordered crate facts, body identities and checked verdicts. The
+    /// consumer checks each reached instance's current recipe against its proof.
+    pub(crate) fn hash_export_inputs(&self, hash: &mut blaze_ids::Hasher) {
+        hash.part(self.crates).part(self.bodies);
+    }
+
     /// The body ids of a command: `toolchain` the cut it opened, `crates` the `UnitGraph`
     /// record's crate list, `tools` its kinds' tools (home.rs `tools`), `workspace` the bodies
     /// of the checkout and `edges` the tree they were found by ([`workspace_of`]'s), and `answer`
