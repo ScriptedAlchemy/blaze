@@ -2,11 +2,11 @@
 //! bytes restores source freezes; a refused record never becomes a source lowering or a
 //! stale code-entry verdict. The producer here is the actual records-backed SeededHeads.
 
-use super::{Fixture, Kept, LANG_CRATES, alloc, builder, fixture, fn_named, ids_of, producer, walk};
+use super::{Fixture, Kept, LANG_CRATES, alloc, builder, fixture, fn_named, producer, walk};
 use blaze_drive::key::Key;
 use blaze_id::ItemKey as LibKey;
-use blaze_ids::ContentId;
-use blaze_ladder::body_ids::Make;
+use blaze_ids::{ContentId, Hasher};
+use blaze_ladder::body_ids::{BodyId, BodyIds, Make, Read};
 use blaze_ladder::code_records::reads::{self, ReadKind, ReadPlant};
 use blaze_ladder::code_records::{CodeKey, CodeStore, EntryView, MemoryStore};
 use blaze_ladder::front2::Front2;
@@ -424,11 +424,31 @@ fn a_known_callee_failure_cannot_become_a_stale_code_entry() {
     }
 }
 
+/// This fixed-source equality walk also reaches locals filed during lowering, which the
+/// persisted top-level TextIds cannot list. As in d106_records/local_statics, its command
+/// stand-in keys every reached item deterministically; the real Maker still lowers/checks it.
+struct EveryItem;
+
+impl BodyIds for EveryItem {
+    fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
+        Some(BodyId { key: Hasher::new("f20 known heads every item").part(&item.0.to_le_bytes()[..]).finish(), reads: &super::READS })
+    }
+
+    fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
+        (*fact == super::READS[0].fact).then_some(super::READS[0].digest)
+    }
+
+    fn crate_fact(&self, _item: ItemKey) -> Option<Read> {
+        Some(Read { fact: [8; 32], digest: [9; 32] })
+    }
+}
+
 #[test]
 fn known_heads_preserve_body_local_lowering_and_emitted_entries() {
     let f = fixture("const N: i32 = 3;\nfn value() -> i32 { fn local() -> i32 { 7 } local() + N }\n#[unsafe(no_mangle)]\npub extern \"C-unwind\" fn main() -> i32 { value() }\n");
     let saved = produce(&f, &[("main", Want::Fn), ("value", Want::Fn)]);
-    let ids = ids_of(&f);
+    let entry = fn_named(&f, "main");
+    let ids = EveryItem;
     let mut baseline = None;
     for supply in [Supply::Absent, Supply::RefuseLocals] {
         let provider = Provider::new(&saved, supply);
@@ -438,11 +458,11 @@ fn known_heads_preserve_body_local_lowering_and_emitted_entries() {
         let names = records(&f, &load, &frame, memory.handle());
         let b = builder();
         let mut maker: Maker<'_> = Maker::of_start(MakerOpts {
-            names, entry: Some(ids.entry), start: MakerStart::ByRule, typing: SecondCheck,
+            names, entry: Some(entry), start: MakerStart::ByRule, typing: SecondCheck,
             builder: &b, known_heads: Some(KnownSource { heads: &provider, errors: blaze_own::testing::heap().shared() }), alloc: alloc(),
         });
         let mut store = MemoryStore::new_in(alloc());
-        let (walk, _) = walk_records(ids.entry, &ids, &mut store, &b, &producer(), &mut maker, alloc()).expect("the walk containing a body-local function and a constant");
+        let (walk, _) = walk_records(entry, &ids, &mut store, &b, &producer(), &mut maker, alloc()).expect("the walk containing a body-local function and a constant");
         let mut rows: AVec<'_, (ItemKey, Option<CodeKey>)> = blaze_own::Vec::new_in(alloc());
         for row in 0..walk.len() {
             rows.push((walk.tabled(row), walk.key(row)));
