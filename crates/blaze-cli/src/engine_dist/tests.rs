@@ -8,6 +8,29 @@ use blaze_core::{FileName, sim::{Faults, Sim}};
 use blaze_own::{BTreeMap, CollectIn};
 use crate::store::plain_place::{Facts, StoreAlloc, after_answer, config, open, test_cx};
 
+#[test]
+fn completion_verification_counts_exclude_grants_and_refuse_invalid_deltas() {
+    let counts = |prepared, reused, entries_from_answers| TailVerification {
+        reads: ReadPreparation { prepared, reused },
+        entries_from_answers,
+    };
+    let mut reported = TailVerification::default();
+    assert_eq!(reported.add_delta(counts(100, 200, 30), counts(107, 211, 35)), Some(()));
+    assert_eq!(reported, counts(7, 11, 5));
+    // Work between completion calls, such as another grant, does not enter the report.
+    assert_eq!(reported.add_delta(counts(500, 600, 70), counts(503, 613, 72)), Some(()));
+    assert_eq!(reported, counts(10, 24, 7));
+    let before = reported;
+    for after in [counts(0, 2, 3), counts(1, 0, 3), counts(1, 2, 0)] {
+        assert_eq!(reported.add_delta(counts(1, 2, 3), after), None);
+        assert_eq!(reported, before, "a refused delta must not partially update the report");
+    }
+    for after in [counts(usize::MAX, 0, 0), counts(0, usize::MAX, 0), counts(0, 0, usize::MAX)] {
+        assert_eq!(reported.add_delta(TailVerification::default(), after), None);
+        assert_eq!(reported, before, "overflow must not wrap or partially update the report");
+    }
+}
+
 fn process(sim: Sim, nonce: u64) -> Lent<Sim, StoreAlloc> {
     let alloc = blaze_own::testing::heap().alloc();
     let cfg = config(

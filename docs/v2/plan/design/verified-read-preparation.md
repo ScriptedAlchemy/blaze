@@ -39,6 +39,17 @@ They include distributed completion if this host led it and the following export
 a repeated preparation pass counts its visits again. There is no new owned collection or
 allocation on the path.
 
+Each distributed unit report also records `tail_prepared_reads`, `tail_reused_reads`,
+and `tail_known_entries`. These are checked differences of the maker's counters around
+this executor's final completion walk, excluding prior grants and later placement. The
+first two count preparation row visits; the last counts whole entries accepted from
+known answers. Repeated completion calls accumulate their separate differences. Peers
+that do not complete the unit report zero, distinguished by `completed_here`.
+The paired benchmark retains these fields in `publisher_verification` beside the unit
+identity. Historical reports without the fields remain unknown, rather than zero.
+The counts attribute skipped preparation to the publisher; the existing publisher span
+and process timing remain the time measurements.
+
 The causal test verifies two entries that share a constant but have another distinct
 constant. A fresh maker is the control: it must prepare the shared question again while
 the retained maker reuses it. Changed shared and previously unknown constant values must

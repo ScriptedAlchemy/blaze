@@ -557,6 +557,31 @@ class Oracles(unittest.TestCase):
                 with self.subTest(profile=planted), self.assertRaisesRegex(e.Failed, "helper published 1"):
                     e.verified_reach_handoff(blobs, "mathy", [helper], [primary], events, profile)
 
+    def test_publisher_verification_reports_only_completion_deltas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "start.txt"
+            profile.write_text("")
+            counters = {"tail_prepared_reads": 7, "tail_reused_reads": 11, "tail_known_entries": 5}
+            publisher = row(from_store=0, completed_here=True, **counters)
+            peer = row(unit="dependency", from_store=0, completed_here=False,
+                       **dict.fromkeys(counters, 0))
+            work = h.distributed_work([peer, publisher], profile)
+            self.assertEqual(work["publisher_verification"], [{"unit": "mathy", "unit_digest": UNIT, **counters}])
+            self.assertEqual(h.distributed_work([peer], profile)["publisher_verification"], [])
+            self.assertIsNone(h.distributed_work([row(from_store=0)], profile)["publisher_verification"],
+                              "an older compiler's absent counters must remain unknown")
+            for name in counters:
+                missing = {key: value for key, value in publisher.items() if key != name}
+                for malformed in [missing, *({**publisher, name: value} for value in (-1, True, 1 << 64))]:
+                    with self.subTest(name=name, row=malformed), self.assertRaisesRegex(e.Failed, "invalid publisher verification counter"):
+                        h.distributed_work([malformed], profile)
+                with self.subTest(name=name), self.assertRaisesRegex(e.Failed, "non-publisher reported"):
+                    h.distributed_work([{**peer, name: 1}], profile)
+            with self.assertRaisesRegex(e.Failed, "invalid publisher verification counter"):
+                h.distributed_work([publisher, row(from_store=0, completed_here=False)], profile)
+            with self.assertRaisesRegex(e.Failed, "missing publisher verification ownership"):
+                h.distributed_work([{**publisher, "completed_here": 1}], profile)
+
     def test_publication_keeps_accepting_attempt_and_compares_logical_pack_values(self):
         with tempfile.TemporaryDirectory() as directory:
             blobs = Path(directory)

@@ -1879,6 +1879,22 @@ def distributed_work(rows: list[dict], start_profile: Path) -> dict:
         {name: row[name] for name in ("unit", "unit_digest", "source", "completed_here", "verified_reach_rows", "verified_reach_digest")}
         for row in rows if row.get("verified_reach_rows", 0) > 0
     ]
+    counters = ("tail_prepared_reads", "tail_reused_reads", "tail_known_entries")
+    work["publisher_verification"] = None
+    if any(name in row for row in rows for name in counters):
+        for row in rows:
+            evidence.require(type(row.get("completed_here")) is bool,
+                             f"{row['unit']}: missing publisher verification ownership")
+            for name in counters:
+                value = row.get(name)
+                evidence.require(type(value) is int and 0 <= value < 1 << 64,
+                                 f"{row['unit']}: invalid publisher verification counter {name}")
+                evidence.require(row["completed_here"] or value == 0,
+                                 f"{row['unit']}: non-publisher reported completion verification work")
+        work["publisher_verification"] = [
+            {name: row[name] for name in ("unit", "unit_digest", *counters)}
+            for row in rows if row["completed_here"]
+        ]
     placed = evidence.placed_verified_reach_rows(start_profile)
     if work["verified_reachability"]:
         evidence.require(placed is not None, f"{start_profile}: missing verified reachability placement counter")

@@ -465,6 +465,7 @@ where
                     &[],
                     None,
                     false,
+                    super::TailVerification::default(),
                     wire,
                 );
             }
