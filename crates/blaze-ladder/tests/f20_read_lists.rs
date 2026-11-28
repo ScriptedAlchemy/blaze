@@ -24,8 +24,8 @@ use blaze_emit::{Isa, Os};
 use blaze_id::{CrateItemKey, ItemKey as LibKey};
 use blaze_ids::producer::{CodeBuilder, ProducerId, Producers};
 use blaze_ids::{ContentId, Hasher};
-use blaze_ladder::body_ids::{BodyId, BodyIds, Counts, How, Read, Stepped};
-use blaze_ladder::code_records::reads::{ReadKind, ReadPlant};
+use blaze_ladder::body_ids::{BodyId, BodyIds, Counts, How, Make, Read, Stepped};
+use blaze_ladder::code_records::reads::{ReadKind, ReadPlant, Verdict};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, EntryView, MemoryStore, Settings, TierName};
 use blaze_ladder::crates::{Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::keys::checker_of;
@@ -255,6 +255,84 @@ fn walk(f: &Fixture, store: &mut MemoryStore<'static>, plant: ReadPlant) -> Walk
         .map(|row| Row { tabled: walk.tabled(row), name: walk.name(row).to_vec(), key: walk.key(row), found: matches!(walk.how(row), How::Done(Stepped::Found(_))) })
         .collect();
     Walked { counts, rows }
+}
+
+fn shared_constants(shared: usize, other: usize) -> Fixture {
+    let body = blaze_own::format_in!(alloc(),
+        "const SHARED: usize = {shared};\n\nconst OTHER: usize = {other};\n\n\
+         fn known() -> usize {{\n    SHARED\n}}\n\n\
+         fn mixed() -> usize {{\n    SHARED + OTHER\n}}\n\n\
+         #[unsafe(no_mangle)]\npub extern \"C-unwind\" fn main() -> i32 {{\n    (known() + mixed()) as i32\n}}\n"
+    );
+    fixture(body.as_str())
+}
+
+fn verify_row(maker: &mut Maker<'static>, row: &Row, store: &MemoryStore<'static>) -> Verdict {
+    let Some(key) = row.key else { panic!("the fixture's row must have a code key") };
+    let bytes = match store.get(key) {
+        Ok(Some(bytes)) => bytes,
+        other => panic!("the fixture's code record: {other:?}"),
+    };
+    match maker.verify(row.tabled, &row.name, bytes) {
+        Ok(Some(verdict)) => verdict,
+        other => panic!("the fixture's verification: {other:?}"),
+    }
+}
+
+/// Removing the earlier proof with a fresh maker prepares both constants. Keeping it prepares
+/// only the other constant, while the real verifier still accepts the same complete read list.
+#[test]
+fn partially_known_read_lists_prepare_only_unanswered_rows() {
+    let f = shared_constants(2, 3);
+    let ids = ids_of(&f);
+    let mut store = MemoryStore::new_in(alloc());
+    let made = walk(&f, &mut store, ReadPlant::None);
+    let known = made.of(fn_named(&f, "known"));
+    let mixed = made.of(fn_named(&f, "mixed"));
+    let b = builder();
+    let mut maker = Maker::new(reader(&f), Some(ids.entry), &b, alloc());
+    assert_eq!(verify_row(&mut maker, known, &store), Verdict::Holds);
+    let before = maker.read_preparation();
+    assert_eq!(verify_row(&mut maker, mixed, &store), Verdict::Holds);
+    let after = maker.read_preparation();
+    let prepared = after.prepared - before.prepared;
+    let reused = after.reused - before.reused;
+    assert!(prepared > 0, "the second entry must contain an unanswered preparation row");
+    assert!(reused > 0, "the second entry must reuse a proved preparation row");
+
+    let mut fresh = Maker::new(reader(&f), Some(ids.entry), &b, alloc());
+    assert_eq!(verify_row(&mut fresh, mixed, &store), Verdict::Holds);
+    let control = fresh.read_preparation();
+    assert_eq!(control.reused, 0, "a fresh maker has no earlier proof to reuse");
+    assert_eq!(control.prepared, prepared + reused, "removing the proof must restore its preparation work");
+    println!("partial read preparation: retained maker prepared {prepared}, reused {reused}; fresh maker {control:?}");
+}
+
+/// A shared question with a different stored answer and an unknown question whose dependency
+/// changed both leave the entry stale. Neither case may seed the still-unproved other answer.
+#[test]
+fn partially_known_read_lists_still_reject_changed_answers() {
+    let before = shared_constants(2, 3);
+    let mut old_store = MemoryStore::new_in(alloc());
+    let old = walk(&before, &mut old_store, ReadPlant::None);
+    let old_mixed = old.of(fn_named(&before, "mixed"));
+
+    for (shared, other) in [(5, 3), (2, 7)] {
+        let after = shared_constants(shared, other);
+        let ids = ids_of(&after);
+        let mut today_store = MemoryStore::new_in(alloc());
+        let today = walk(&after, &mut today_store, ReadPlant::None);
+        let known = today.of(fn_named(&after, "known"));
+        let mixed = today.of(fn_named(&after, "mixed"));
+        let b = builder();
+        let mut maker = Maker::new(reader(&after), Some(ids.entry), &b, alloc());
+        assert_eq!(verify_row(&mut maker, known, &today_store), Verdict::Holds);
+        assert!(matches!(verify_row(&mut maker, old_mixed, &old_store), Verdict::Stale { kind: ReadKind::Const, .. }), "an edited constant must invalidate the old entry");
+        let rejected = maker.read_preparation();
+        assert_eq!(verify_row(&mut maker, mixed, &today_store), Verdict::Holds);
+        assert!(maker.read_preparation().prepared > rejected.prepared, "the refused entry must not prove its unknown constant for the next entry");
+        println!("partial read invalidation: SHARED={shared}, OTHER={other}; stale entry refused, today's entry held");
+    }
 }
 
 /// The rows of `fresh` whose entry `kept` holds under another key: stale code served.

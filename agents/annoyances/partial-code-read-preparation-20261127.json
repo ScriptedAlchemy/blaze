@@ -1,0 +1,20 @@
+{
+  "id": "partial-code-read-preparation-20261127",
+  "date": "2026-11-27",
+  "who": "GPT-6 Astra Pro, compiler_worker_bridge lane",
+  "where": "crates/blaze-ladder/src/run/make_one.rs: verify_ready; distributed benchmark run 46016703786",
+  "what": "The benchmark's warm primary reachability walks took 15 s twice and 232 ms once despite all three finding 10,847 cached records and compiling none. The fast primary had already verified the final distributed tail in the same Maker; its start.txt counted 14,698 known-answer entry hits versus 3,926 and 3,986 in the other samples.",
+  "cost": "Peer recipients repeated expensive verification preparation after waiting for the leader. The benchmark reported about 17 million allocations in each slow walk; the contribution of individual preparation kinds is not yet measured.",
+  "cause": "Whole-entry read-answer reuse is process-local. Additionally, a partially known entry prepares every preparation row even when a prior successful entry already proved its exact question and answer.",
+  "whys": [
+    "The distributed leader completes the transitive walk, then each exporter performs its own walk over the received records.",
+    "Only the leader's Maker retains the answers proved by that first walk.",
+    "The verifier's existing fast path tests whether the entire entry is known; a partial miss re-enters preparation for all preparation rows.",
+    "verify_today already reuses individual exact answers, but the earlier preparation loop did not consult that proof."
+  ],
+  "class": "Preparation repeats work already covered by a narrower proof whenever a coarse proof misses.",
+  "prevention": "Consult the same exact Answers proof before decoding and preparing non-coroutine rows. Preserve re-lay roots for temporary coroutine layouts and validate every read through verify_today. Causal tests compare a retained maker with a fresh one and reject changed known and unknown constant answers.",
+  "workaround": "none; do not warm up the benchmark or trust peer arrival as verification",
+  "fix": "Implemented exact partial-row proof reuse and cumulative maker preparation counters. Native f20_read_lists passed 10/10 and six selected d106 records/coroutine controls passed; the release CLI check passed. A matched benchmark of baseline and candidate source/binary identities remains pending, so no speedup is claimed.",
+  "state": "open; native validation passed, matched benchmark pending"
+}
