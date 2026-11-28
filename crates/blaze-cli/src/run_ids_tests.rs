@@ -1223,11 +1223,11 @@ fn checked_export_replaces_the_workspace_scope_and_its_current_fact_together() {
 
     let scope = blaze_drive::key::crate_scope_name(&owner);
     assert!(matches!(retained.for_checked_export(|_| None, bump), Err(RunIdsError::EngineAnswer { name, .. }) if name == scope));
-    let mut missing = Vec::from_slice_in(retained.today, bump);
+    let mut missing = blaze_own::Vec::from_slice_in(retained.today, bump);
     missing.retain(|read| read.fact != fact);
     let missing = RunIds { today: missing.into_bump_slice(), ..retained };
     assert!(matches!(missing.for_checked_export(|_| Some(witnessed), bump), Err(RunIdsError::EngineAnswer { name, .. }) if name == scope));
-    let mut moved = Vec::from_slice_in(retained.today, bump);
+    let mut moved = blaze_own::Vec::from_slice_in(retained.today, bump);
     moved.iter_mut().find(|read| read.fact == fact).unwrap().digest = [84; 32];
     let moved = RunIds { today: moved.into_bump_slice(), ..retained };
     assert!(matches!(moved.for_checked_export(|_| Some(witnessed), bump), Err(RunIdsError::TwoDigests { fact: actual }) if actual == fact));
