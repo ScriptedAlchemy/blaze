@@ -3,14 +3,9 @@
 
 use blaze_ids::{ContentId, Hasher};
 
-use crate::{engine_check::Standing, run_ids::RunIds, run_names::Program, sweep::Leaf};
+use crate::{engine_check::Standing, run_ids::RunIds, run_names::Program};
 
 const DOMAIN: &str = "blaze distributed dev verification inputs 1";
-
-fn add_leaf(hash: &mut Hasher, path: &str, leaf: &Leaf) {
-    let (flags, content) = leaf.state();
-    hash.update(&[leaf.kind as u8, flags]).part(path.as_bytes()).id(&content);
-}
 
 pub(crate) fn context(standing: &Standing<'_, '_>, program: &Program, ids: &RunIds<'_>) -> ContentId {
     let mut hash = Hasher::new(DOMAIN);
@@ -23,7 +18,7 @@ pub(crate) fn context(standing: &Standing<'_, '_>, program: &Program, ids: &RunI
     // Leaves are validated on open in (kind, logical path) order. The sweep used
     // stat stamps to establish these contents locally; only their values travel.
     for index in 0..standing.leaves.len() {
-        add_leaf(&mut hash, standing.leaves.path(index), &standing.leaves.row(index));
+        standing.leaves.row(index).hash_state(standing.leaves.path(index), &mut hash);
     }
     hash.finish()
 }
@@ -31,13 +26,13 @@ pub(crate) fn context(standing: &Standing<'_, '_>, program: &Program, ids: &RunI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sweep::{LeafKind, Stamp};
+    use crate::sweep::{Leaf, LeafKind, Stamp};
 
     #[test]
     fn leaf_identity_survives_a_different_checkout_but_tracks_its_source() {
         let digest = |path, leaf: &Leaf| {
             let mut hash = Hasher::new(DOMAIN);
-            add_leaf(&mut hash, path, leaf);
+            leaf.hash_state(path, &mut hash);
             hash.finish()
         };
         let mut leaf = Leaf { kind: LeafKind::Slot, path: 0, flags: 0, stamp: None, id: ContentId([1; 32]) };
