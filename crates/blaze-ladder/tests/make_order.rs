@@ -48,7 +48,7 @@ use blaze_ladder::code_records::{Builder, MemoryStore, Settings, TierName};
 use blaze_ladder::crates::UserCrate;
 use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::front2::source::{NamesSource, Records};
-use blaze_ladder::run::make_one::{Maker, NamesRecords, walk_records};
+use blaze_ladder::run::make_one::{Maker, MakerOpts, NamesRecords, walk_records};
 use blaze_ladder::run::{OverflowChecks, RunError};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::ItemKind;
@@ -587,20 +587,20 @@ fn test_b() -> u32 {
     let names_a = prog.reader();
     let lib_a = lib_fn_named(names_a.records, "test_a");
     let key_a = checker_of(lib_a);
-    let fresh_a = Maker::of_start(names_a, Some(key_a), MakerStart::Direct(lib_a), SecondCheck, &b, alloc());
+    let fresh_a = Maker::of_start(MakerOpts { names: names_a, entry: Some(key_a), start: MakerStart::Direct(lib_a), typing: SecondCheck, builder: &b, known_heads: None, alloc: alloc() });
     let (fresh_a, fresh_entries_a) = walk_one_test(fresh_a, key_a);
 
     let names_b = prog.reader();
     let lib_b = lib_fn_named(names_b.records, "test_b");
     let key_b = checker_of(lib_b);
-    let fresh_b = Maker::of_start(names_b, Some(key_b), MakerStart::Direct(lib_b), SecondCheck, &b, alloc());
+    let fresh_b = Maker::of_start(MakerOpts { names: names_b, entry: Some(key_b), start: MakerStart::Direct(lib_b), typing: SecondCheck, builder: &b, known_heads: None, alloc: alloc() });
     let (fresh_b, fresh_entries_b) = walk_one_test(fresh_b, key_b);
     assert_eq!(fresh_a.checks().check_one, 3, "fresh test_a checks test_a + shared_helper + leaf");
     assert_eq!(fresh_b.checks().check_one, 3, "fresh test_b re-checks test_b + shared_helper + leaf");
 
     // Shared suite Maker: ONE maker started at `Direct(lib_a)`, then retargeted to `Direct(lib_b)`.
     let names_shared = prog.reader();
-    let shared = Maker::of_start(names_shared, Some(key_a), MakerStart::Direct(lib_a), SecondCheck, &b, alloc());
+    let shared = Maker::of_start(MakerOpts { names: names_shared, entry: Some(key_a), start: MakerStart::Direct(lib_a), typing: SecondCheck, builder: &b, known_heads: None, alloc: alloc() });
     assert_eq!(shared.made_for(), MakerKind::Direct);
 
     let (mut shared, shared_entries_a) = walk_one_test(shared, key_a);
@@ -630,7 +630,7 @@ fn test_b() -> u32 {
 
     // Control: a `ByRule` maker must report `MakerKind::ByRule` and refuse `set_direct_entry`.
     let names_rule = prog.reader();
-    let mut by_rule: Maker<'static> = Maker::of_start(names_rule, Some(key_a), MakerStart::ByRule, SecondCheck, &b, alloc());
+    let mut by_rule: Maker<'static> = Maker::of_start(MakerOpts { names: names_rule, entry: Some(key_a), start: MakerStart::ByRule, typing: SecondCheck, builder: &b, known_heads: None, alloc: alloc() });
     assert_eq!(by_rule.made_for(), MakerKind::ByRule(Some(key_a)));
     assert!(!by_rule.set_direct_entry(Some(key_b), MakerStart::Direct(lib_b)), "ByRule maker must refuse direct retarget");
 }

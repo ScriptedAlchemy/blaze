@@ -33,7 +33,7 @@ use blaze_ladder::body_ids::{
 use blaze_ladder::code_records::statics::{STATIC_ENTRY_MAGIC, StaticEntryView, each_static_named, each_vtable_datum, entry_record};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, EntryView, content_key};
 use blaze_ladder::code_records::reads::Verdict;
-use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, MakeWatch, Maker, NamesRecords};
+use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, MakeWatch, Maker, MakerOpts, NamesRecords};
 use blaze_ladder::run::special::{MakerKind, MakerStart, Roots, StartHead};
 use blaze_ladder::run::RunError as LadderRunError;
 use blaze_launch::wire::RecordId;
@@ -185,7 +185,11 @@ impl<'h> LazyVerifyingMaker<'_, 'h> {
     fn ensure_maker(&mut self) -> Result<&mut RunMaker<'h>, LadderRunError> {
         let want = MakerKind::of(self.entry, self.start);
         let maker = self.maker.get_or_insert_with(|| {
-            let mut maker = Maker::of_start(self.names, self.entry, self.start, ByKind::new(self.typed.over(self.ids)), self.builder, self.tables);
+            let mut maker = Maker::of_start(MakerOpts {
+                names: self.names, entry: self.entry, start: self.start,
+                typing: ByKind::new(self.typed.over(self.ids)), builder: self.builder,
+                known_heads: None, alloc: self.tables,
+            });
             maker.watch(self.make_watch);
             maker
         });

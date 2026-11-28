@@ -46,6 +46,7 @@ use blaze_hash::HashMap as Map;
 use blaze_own::{AString, AVec};
 
 use crate::front2::source::NamesSource;
+use crate::front2::tables::head::{Known, KnownHeadFailure, KnownHeads};
 
 /// Why the lazy program did not answer, naming the method or step and the item (rule 19).
 #[derive(Debug)]
@@ -78,6 +79,9 @@ pub enum LazyRefusal {
     Row { function: Box<str>, refusal: Box<Front2Refusal> },
     /// A head (a fn's signature, its container's) could not be made.
     Head { item: Box<str>, why: Box<str> },
+    /// A known head's provider or import failed. This program remains invalid, even when a
+    /// caller normally treats an unanswered head as a stale cached code entry.
+    KnownHead { item: ItemKey, failure: KnownHeadFailure },
     /// An ADT the body's types name has no row.
     Adt { adt: Box<str>, why: Box<str> },
     /// A constant the body reads by value: the evaluator refused it.
@@ -138,6 +142,7 @@ impl core::fmt::Display for LazyRefusal {
             }
             LazyRefusal::Row { refusal, .. } => write!(f, "front2 (lazy): {refusal}"),
             LazyRefusal::Head { item, why } => write!(f, "front2 (lazy): the head of `{item}`: {why}"),
+            LazyRefusal::KnownHead { item, failure } => write!(f, "front2 (lazy): known heads for item {:032x}: {failure}", item.0),
             LazyRefusal::Adt { adt, why } => write!(f, "front2 (lazy): the ADT `{adt}`'s row: {why}"),
             LazyRefusal::Const { constant, why } => write!(f, "front2 (lazy): the constant `{constant}`: {why}"),
             LazyRefusal::NotLazyYet { method, item } => write!(f, "front2 (lazy): `{method}` about `{item}` has no per-body form yet"),
@@ -246,6 +251,16 @@ pub struct LazyCounts {
     pub live: u32,
 }
 
+/// Work performed by this program's existing head source. Taking a known record must add no
+/// source-freeze attempts or lowered heads; a genuine miss retains the normal source path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeadCounts {
+    pub taken: u32,
+    pub lowered: u32,
+    pub eval_lowered: u32,
+    pub attempts: u32,
+}
+
 /// The program filled one body at a time (module docs).
 struct LazyConsts<'n, S> {
     names: S,
@@ -335,12 +350,17 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::head::ConstValues<'n> for Sh
 /// On-the-spot head seeder for [`LazyProgram`]: freezes each requested head cell once into a
 /// per-program [`SeededHeads`] cache and files it into `&Store` in place during `check_body` and
 /// `in_world` queries (`BodyWorld::store_want`, `BodyWorld::impl_question`, and ADT layout
-/// lookups). Any head that belongs to a body-local item or cannot be frozen falls back cleanly to
-/// [`Seeded::Lower`] so the existing lowering + `eval_len` path handles it identically.
+/// lookups). Body-local items and source-only freezes that need the enclosing evaluator keep
+/// the existing [`Seeded::Lower`] path. A known-record failure is terminal and retained for
+/// every later operation on the program.
 struct LazySeed<'n, S> {
     names: S,
     heads: RefCell<Option<crate::front2::tables::head::SeededHeads<'n, 'n, S>>>,
     consts: &'n RefCell<Option<LazyConsts<'n, S>>>,
+    known: Option<&'n dyn KnownHeads>,
+    /// The first actual known-record failure, retained until this program is dropped. This
+    /// is an invalid-session cause, never a flag permitting a different source path.
+    failure: RefCell<Option<KnownHeadFailure>>,
 }
 
 impl<'n, S> LazySeed<'n, S> {
@@ -351,6 +371,44 @@ impl<'n, S> LazySeed<'n, S> {
         if let Ok(mut guard) = self.consts.try_borrow_mut() {
             let _ = guard.take();
         }
+        let _ = self.failure.borrow_mut().take();
+    }
+
+    fn refuse(&self, failure: KnownHeadFailure) -> crate::front2::tables::seeds::SeedError {
+        let mut retained = self.failure.borrow_mut();
+        let first = retained.get_or_insert(failure);
+        crate::front2::tables::seeds::SeedError::Known(first.retained())
+    }
+}
+
+impl<'n, S: NamesSource<'n>> LazySeed<'n, S> {
+    fn seed_error(
+        &self,
+        heads: &crate::front2::tables::head::SeededHeads<'n, 'n, S>,
+        error: crate::front2::tables::head::FreezeError,
+    ) -> Result<crate::front2::heads::Seeded, crate::front2::tables::seeds::SeedError> {
+        match heads.known_failure(&error) {
+            Some(failure) => Err(self.refuse(failure)),
+            // The existing source-only path may require the enclosing store's locals or
+            // constant evaluator. It has attempted no failed known-record import.
+            None => Ok(crate::front2::heads::Seeded::Lower),
+        }
+    }
+
+    fn unavailable(
+        &self,
+        need: crate::front2::heads::Want,
+    ) -> Result<crate::front2::heads::Seeded, crate::front2::tables::seeds::SeedError> {
+        use crate::front2::tables::head::{FreezeError, cell_of};
+        let Some(known) = self.known else { return Ok(crate::front2::heads::Seeded::Lower) };
+        let Ok(cell) = cell_of(self.names, need) else { return Ok(crate::front2::heads::Seeded::Lower) };
+        let error = match known.known(cell) {
+            Known::Bytes(_) => FreezeError::Unfrozen { need: cell },
+            Known::Refused(why) => FreezeError::NotTheirs { want: cell, why },
+            Known::Invalid(error) => FreezeError::KnownProvider { want: cell, error },
+            Known::Freeze => return Ok(crate::front2::heads::Seeded::Lower),
+        };
+        Err(self.refuse(KnownHeadFailure::new(cell, error)))
     }
 }
 
@@ -363,14 +421,17 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
         scratch: Alloc<'static>,
     ) -> Result<crate::front2::heads::Seeded, crate::front2::tables::seeds::SeedError> {
         use crate::front2::heads::{Seeded, Want};
+        if let Some(failure) = self.failure.borrow().as_ref() {
+            return Err(crate::front2::tables::seeds::SeedError::Known(failure.retained()));
+        }
         if crate::front2::tables::seeds::of_the_body(store, need) {
             return Ok(Seeded::Lower);
         }
         let Ok(mut guard) = self.heads.try_borrow_mut() else {
-            return Ok(Seeded::Lower);
+            return self.unavailable(need);
         };
         let Some(heads) = guard.as_mut() else {
-            return Ok(Seeded::Lower);
+            return self.unavailable(need);
         };
         // A member fn's body lowering (`lower_member` -> `own_trait::of_member`) reads its
         // container's head (`store.impls` / `store.trait_defs`), and `track_caller` for a trait
@@ -381,9 +442,9 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
                 let parent = Want::Head(container);
                 if !store.made(parent)
                     && !crate::front2::tables::seeds::of_the_body(store, parent)
-                    && crate::front2::tables::head::seed(self.names, None, parent, heads, store, keys, scratch).is_err()
+                    && let Err(error) = crate::front2::tables::head::seed(self.names, None, parent, heads, store, keys, scratch)
                 {
-                    return Ok(Seeded::Lower);
+                    return self.seed_error(heads, error);
                 }
                 if let Some(imp) = store.impls.get(&checker_of(container))
                     && let Some(trait_) = imp.trait_
@@ -392,16 +453,16 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
                     let trait_head = Want::Head(trait_lib);
                     if !store.made(trait_head)
                         && !crate::front2::tables::seeds::of_the_body(store, trait_head)
-                        && crate::front2::tables::head::seed(self.names, None, trait_head, heads, store, keys, scratch).is_err()
+                        && let Err(error) = crate::front2::tables::head::seed(self.names, None, trait_head, heads, store, keys, scratch)
                     {
-                        return Ok(Seeded::Lower);
+                        return self.seed_error(heads, error);
                     }
                     let members = Want::Members(trait_lib);
                     if !store.made(members)
                         && !crate::front2::tables::seeds::of_the_body(store, members)
-                        && crate::front2::tables::head::seed(self.names, None, members, heads, store, keys, scratch).is_err()
+                        && let Err(error) = crate::front2::tables::head::seed(self.names, None, members, heads, store, keys, scratch)
                     {
-                        return Ok(Seeded::Lower);
+                        return self.seed_error(heads, error);
                     }
                 }
             }
@@ -409,16 +470,16 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
                 let parent = Want::Head(container);
                 if !store.made(parent)
                     && !crate::front2::tables::seeds::of_the_body(store, parent)
-                    && crate::front2::tables::head::seed(self.names, None, parent, heads, store, keys, scratch).is_err()
+                    && let Err(error) = crate::front2::tables::head::seed(self.names, None, parent, heads, store, keys, scratch)
                 {
-                    return Ok(Seeded::Lower);
+                    return self.seed_error(heads, error);
                 }
             }
             _ => {}
         }
         match crate::front2::tables::head::seed(self.names, None, need, heads, store, keys, scratch) {
             Ok(seeded) => Ok(seeded),
-            Err(_) => Ok(Seeded::Lower),
+            Err(error) => self.seed_error(heads, error),
         }
     }
 }
@@ -503,8 +564,18 @@ impl<'n> LazyProgram<'n> {
     /// `alloc` is `'static` because the head store's tables are (`Store::new`).
     pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], entry: Option<ItemKey>, alloc: Alloc<'static>) -> Result<LazyProgram<'n>, Front2Refusal> {
         let front = Front2::new(names, frame, user, alloc).map_err(Front2Refusal::Front)?;
-        Self::over(front, entry, alloc, false)
+        Self::over(front, entry, alloc, false, None)
     }
+}
+
+/// The inputs of a records-backed program, including its optional exact head-record source.
+pub struct RecordsOpts<'n, 'c> {
+    pub records: &'n crate::front2::source::Records<'n>,
+    pub frame: &'n blaze_mem::Frame,
+    pub lang_crates: &'c [usize],
+    pub entry: Option<ItemKey>,
+    pub known_heads: Option<&'n dyn KnownHeads>,
+    pub alloc: Alloc<'static>,
 }
 
 impl<'n> LazyProgram<'n, &'n crate::front2::source::Records<'n>> {
@@ -513,15 +584,10 @@ impl<'n> LazyProgram<'n, &'n crate::front2::source::Records<'n>> {
     /// it. What a record could not answer is in `records.errors()`: the CALLER reads it after
     /// each `check_one` (the seam has no source), and a body checked over a log that is not
     /// empty is void.
-    pub fn from_records(
-        records: &'n crate::front2::source::Records<'n>,
-        frame: &'n blaze_mem::Frame,
-        lang_crates: &[usize],
-        entry: Option<ItemKey>,
-        alloc: Alloc<'static>,
-    ) -> Result<LazyProgram<'n, &'n crate::front2::source::Records<'n>>, Front2Refusal> {
+    pub fn from_records(opts: RecordsOpts<'n, '_>) -> Result<LazyProgram<'n, &'n crate::front2::source::Records<'n>>, Front2Refusal> {
+        let RecordsOpts { records, frame, lang_crates, entry, known_heads, alloc } = opts;
         let front = Front2::from_records(records, frame, lang_crates).map_err(Front2Refusal::Front)?;
-        Self::over(front, entry, alloc, true)
+        Self::over(front, entry, alloc, true, known_heads)
     }
 
     /// The run's sources a body's macro calls expand with (the crate's environment, texts and
@@ -534,7 +600,7 @@ impl<'n> LazyProgram<'n, &'n crate::front2::source::Records<'n>> {
 }
 
 impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
-    fn over(front: Front2<'n, S>, entry: Option<ItemKey>, alloc: Alloc<'static>, seeded_heads: bool) -> Result<LazyProgram<'n, S>, Front2Refusal> {
+    fn over(front: Front2<'n, S>, entry: Option<ItemKey>, alloc: Alloc<'static>, seeded_heads: bool, known_heads: Option<&'n dyn KnownHeads>) -> Result<LazyProgram<'n, S>, Front2Refusal> {
         let sized = front.index.lang("sized");
         let pointers = super::super::receiver::Pointers::find(&front.index, front.resolver);
         let mut store = Store::new(sized, front.frame, alloc);
@@ -562,13 +628,15 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 scratch: alloc,
                 alloc,
                 consts: Some(consts_eval),
-                known: None,
+                known: known_heads,
                 owners: None,
             });
             let seed: &'n LazySeed<'n, S> = front.frame.alloc(LazySeed {
                 names: front.names,
                 heads: RefCell::new(Some(seeded)),
                 consts: consts_cell,
+                known: known_heads,
+                failure: RefCell::new(None),
             });
             store.seeds = Some(seed);
             (Some(seed), Some(Buckets::for_source(front.names, &front.index)))
@@ -623,6 +691,24 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// What the program did so far.
     pub fn counts(&self) -> LazyCounts {
         self.counts
+    }
+
+    pub fn head_counts(&self) -> HeadCounts {
+        let Some(seed) = self.seed else { return HeadCounts::default() };
+        let guard = seed.heads.borrow();
+        let Some(heads) = guard.as_ref() else { return HeadCounts::default() };
+        HeadCounts { taken: heads.taken, lowered: heads.lowered, eval_lowered: heads.eval_lowered, attempts: heads.attempts }
+    }
+
+    /// A known-record failure remains terminal even if an intermediate query normally turns
+    /// an unanswered head into a stale entry or a request to make more source facts.
+    pub fn check_known_heads(&self, item: ItemKey) -> Result<(), LazyRefusal> {
+        if let Some(seed) = self.seed
+            && let Some(failure) = seed.failure.borrow().as_ref()
+        {
+            return Err(LazyRefusal::KnownHead { item, failure: failure.retained() });
+        }
+        Ok(())
     }
 
     /// The front end, for a test that reads the names source (`Records::opened`).

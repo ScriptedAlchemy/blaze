@@ -550,7 +550,8 @@ class Run:
     def build(self, home: str, dist: bool = True, wait: bool = True, project: Path | None = None,
               *, result_gate: Path | None = None, result_unit: str | None = None,
               keep_gate_lease: bool = False, cpus: list[int] | None = None, **extra):
-        self.prepare_modules(home, project or self.project)
+        project = project or self.project
+        self.prepare_modules(home, project)
         if result_gate is not None:
             check(dist, "a result gate belongs to a distributed export")
             if result_gate not in self.result_gates:
@@ -561,10 +562,33 @@ class Run:
             extra["BLAZE_DIST_TEST_RESULT_GATE"] = str(result_gate.resolve())
             if result_unit is not None:
                 extra["BLAZE_DIST_TEST_RESULT_UNIT"] = result_unit
-        process, log_path = self.start_export(home, dist, project or self.project, cpus=cpus, **extra)
+        # Profiles belong to the checkout, not HOME. Only a synchronous export with no
+        # live peer can attribute these files to its numbered log. Latency exports use
+        # start_export directly and retain their profiles outside their own timers.
+        profiles = project / ".blaze" / "v2"
+        exclusive = wait and all(client.poll() is not None for client, _, _ in self.clients)
+        if exclusive:
+            for name in ("profile.txt", "start.txt"):
+                (profiles / name).unlink(missing_ok=True)
+        process, log_path = self.start_export(home, dist, project, cpus=cpus, **extra)
         if not wait:
             return process, log_path
         code = self.wait(process)
+        if exclusive:
+            captured, missing = {}, []
+            for name in ("profile.txt", "start.txt"):
+                source = profiles / name
+                if source.is_file():
+                    saved = Path(log_path).with_suffix(f".{name}")
+                    shutil.copyfile(source, saved)
+                    captured[name] = {"path": str(saved), "sha256": file_hash(saved)}
+                else:
+                    missing.append(name)
+            Path(log_path).with_suffix(".profiles.json").write_text(json.dumps({
+                "command_log": log_path, "project": str(project), "exit": code,
+                "qualification": "exclusive synchronous export; prior profiles removed before launch",
+                "files": captured, "missing": missing,
+            }, indent=2) + "\n")
         return code, Path(log_path).read_text()
 
     def start_export(self, home: str, dist: bool, project: Path, *, cpus: list[int] | None = None,

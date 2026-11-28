@@ -6844,7 +6844,8 @@ fn unmade_cell(error: &FreezeError) -> Unmade {
         FreezeError::NoWant { .. } => Unmade::Unnamed,
         // A cell asked that is no cell, bytes that do not read, or the driver's own signal
         // escaping it: faults of the engine, never of the project's head.
-        FreezeError::NotACell { .. } | FreezeError::Read { .. } | FreezeError::Unfrozen { .. } => Unmade::Engine,
+        FreezeError::NotACell { .. } | FreezeError::Read { .. } | FreezeError::Unfrozen { .. }
+        | FreezeError::KnownProvider { .. } | FreezeError::KnownImport { .. } => Unmade::Engine,
     }
 }
 
@@ -8410,6 +8411,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
                             SeedError::NotFrozen { cell, .. } | SeedError::Unequal { cell }
                             | SeedError::Full { cell, .. } | SeedError::NotInItsUnit { cell, .. }
                             | SeedError::NoMemberCell { cell, .. } => Some(*cell),
+                            SeedError::Known(failure) => Some(failure.want),
                             SeedError::Freeze(_) => unreachable!("freeze handled above"),
                         };
                         Some(Said::Task(TaskError::Seed { body, error }))

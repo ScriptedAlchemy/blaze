@@ -1876,7 +1876,27 @@ fn verify_instance_observed<'n, T: Typing<RecordsProgram<'n>>, O: WalkObserver>(
     entry: &[u8],
     observer: &O,
 ) -> Result<Verdict, RunError> {
+    program.check_known_heads(tabled).map_err(|error| RunError::Front2(Front2Refusal::Lazy(error)))?;
+    let verdict = verify_instance_reads(program, typing, state, checks, tabled, name, entry, observer);
+    // A missing current-source answer can make an old entry stale. A refused saved head
+    // invalidates this program instead, including an indirect ADT or constant question
+    // whose ordinary miss path erased the immediate error. Never turn that into recompilation.
+    program.check_known_heads(tabled).map_err(|error| RunError::Front2(Front2Refusal::Lazy(error)))?;
+    verdict
+}
+
+fn verify_instance_reads<'n, T: Typing<RecordsProgram<'n>>, O: WalkObserver>(
+    program: &mut RecordsProgram<'n>,
+    typing: &mut T,
+    state: &mut MakerState,
+    checks: &mut CheckCount,
+    tabled: ItemKey,
+    name: &[u8],
+    entry: &[u8],
+    observer: &O,
+) -> Result<Verdict, RunError> {
     let first = verify_ready(program, typing, state, checks, tabled, entry, observer)?;
+    program.check_known_heads(tabled).map_err(|error| RunError::Front2(Front2Refusal::Lazy(error)))?;
     if first == Verdict::Holds {
         return Ok(first);
     }
@@ -2011,6 +2031,7 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>, O: WalkObserver>(
                     program.head_row(item).is_err()
                 };
                 if failed {
+                    program.check_known_heads(tabled).map_err(|error| RunError::Front2(Front2Refusal::Lazy(error)))?;
                     return Ok(stale);
                 }
                 continue;
@@ -2021,6 +2042,7 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>, O: WalkObserver>(
                     program.object_table(item).is_err()
                 };
                 if failed {
+                    program.check_known_heads(tabled).map_err(|error| RunError::Front2(Front2Refusal::Lazy(error)))?;
                     return Ok(stale);
                 }
                 continue;
@@ -2034,6 +2056,7 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>, O: WalkObserver>(
                     return Err(refused(&*program, CodeRecordError::Reads(ReadsError::Question)));
                 };
                 let definer = if crate::front2::tait::of_alias(index) { program.alias_definer(item).ok() } else { Some(item) };
+                program.check_known_heads(tabled).map_err(|error| RunError::Front2(Front2Refusal::Lazy(error)))?;
                 if let Some(owner) = definer
                     && !owners.contains(&owner)
                 {
@@ -2047,6 +2070,7 @@ fn verify_ready<'n, T: Typing<RecordsProgram<'n>>, O: WalkObserver>(
                     program.make_static_value(item).is_err()
                 };
                 if failed {
+                    program.check_known_heads(tabled).map_err(|error| RunError::Front2(Front2Refusal::Lazy(error)))?;
                     return Ok(stale);
                 }
                 continue;
@@ -3064,6 +3088,8 @@ pub struct Maker<'n, G: Grant = Fixture, T: Typing<RecordsProgram<'n>> = SecondC
     /// The proof the maker's makes are handed: a type only.
     grant: core::marker::PhantomData<fn(&G)>,
     names: NamesRecords<'n>,
+    /// Current, validated frozen heads available before the lazy program is constructed.
+    known_heads: Option<&'n dyn crate::front2::tables::head::KnownHeads>,
     entry: Option<ItemKey>,
     /// Where its program starts: the front's roots' say (run/special.rs `MakerStart`).
     start: crate::run::special::MakerStart,
@@ -3081,6 +3107,18 @@ pub struct Maker<'n, G: Grant = Fixture, T: Typing<RecordsProgram<'n>> = SecondC
     plant: ReadPlant,
 }
 
+/// The explicit start and record capabilities of a maker. A known-head provider must remain
+/// valid for the same source lifetime as `names`; it is consulted only when a head is needed.
+pub struct MakerOpts<'n, 'b, T> {
+    pub names: NamesRecords<'n>,
+    pub entry: Option<ItemKey>,
+    pub start: crate::run::special::MakerStart,
+    pub typing: T,
+    pub builder: &'b Builder,
+    pub known_heads: Option<&'n dyn crate::front2::tables::head::KnownHeads>,
+    pub alloc: Alloc<'static>,
+}
+
 impl<'n> Maker<'n, Fixture, SecondCheck> {
     /// The maker over `names`. `entry`: the checker key of the fn the process starts at, as
     /// `LazyProgram::from_records` takes it (nothing lowers it until a make asks). `builder`:
@@ -3093,14 +3131,14 @@ impl<'n> Maker<'n, Fixture, SecondCheck> {
     /// another start takes [`Maker::of_roots`]; a walk reading another typing,
     /// [`Maker::typed`].
     pub fn new(names: NamesRecords<'n>, entry: Option<ItemKey>, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n> {
-        Maker::starting(names, entry, crate::run::special::MakerStart::ByRule, SecondCheck, builder, alloc)
+        Maker::starting(MakerOpts { names, entry, start: crate::run::special::MakerStart::ByRule, typing: SecondCheck, builder, known_heads: None, alloc })
     }
 }
 
 impl<'n, T: Typing<RecordsProgram<'n>>> Maker<'n, Fixture, T> {
     /// [`Maker::new`] with the body's checked columns from `typing`: the oracle's two sides.
     pub fn typed(names: NamesRecords<'n>, entry: Option<ItemKey>, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, Fixture, T> {
-        Maker::starting(names, entry, crate::run::special::MakerStart::ByRule, typing, builder, alloc)
+        Maker::starting(MakerOpts { names, entry, start: crate::run::special::MakerStart::ByRule, typing, builder, known_heads: None, alloc })
     }
 }
 
@@ -3111,7 +3149,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// `typing`: where each body's checked columns come from (production: [`SecondCheck`]
     /// until the check keeps its typed record; then [`FromRecord`]).
     pub fn of_roots(names: NamesRecords<'n>, entry: Option<ItemKey>, roots: &crate::run::special::Roots<'_>, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {
-        Self::starting(names, entry, roots.maker_start, typing, builder, alloc)
+        Self::starting(MakerOpts { names, entry, start: roots.maker_start, typing, builder, known_heads: None, alloc })
     }
 
     /// [`Maker::of_roots`] for the `entry` and `start` read off those roots beforehand
@@ -3119,8 +3157,8 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// test_drive.rs `CodePool`, D194: a code worker's maker over its own names records, for the
     /// start the asking test's roots said), so its roots are not made again. Equal to `of_roots`
     /// over roots whose `maker_start` is `start`: that one reads nothing else of them.
-    pub fn of_start(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {
-        Self::starting(names, entry, start, typing, builder, alloc)
+    pub fn of_start(opts: MakerOpts<'n, '_, T>) -> Maker<'n, G, T> {
+        Self::starting(opts)
     }
 
     /// Which start class this maker was made for (`MakerKind::ByRule(entry)` or
@@ -3168,11 +3206,13 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         }
     }
 
-    fn starting(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, typing: T, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n, G, T> {
+    fn starting(opts: MakerOpts<'n, '_, T>) -> Maker<'n, G, T> {
+        let MakerOpts { names, entry, start, typing, builder, known_heads, alloc } = opts;
         Maker {
             typing,
             grant: core::marker::PhantomData,
             names,
+            known_heads,
             entry,
             start,
             made: None,
@@ -3218,6 +3258,11 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// The checks the makes cost so far.
     pub fn checks(&self) -> CheckCount {
         self.checks
+    }
+
+    /// Frozen-head reuse and source lowering in this maker's lazy program.
+    pub fn head_counts(&self) -> crate::front2::program::lazy::HeadCounts {
+        self.made.as_ref().map(|(program, _)| program.head_counts()).unwrap_or_default()
     }
 
     /// Entries proved from this maker's already verified read answers.
@@ -3282,13 +3327,16 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         self.program()?.site_shown(item, site)
     }
 
-    /// The refusal of a make over records whose log is not empty, naming its first error.
+    /// The refusal of a make over unanswered source records or a failed saved-head import.
     fn void(&self, tabled: ItemKey) -> Option<RunError> {
         let log = self.names.records.log();
         let errors = log.errors();
-        let first = errors.first()?;
-        let first = std::format!("{first}").into_boxed_str();
-        Some(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, first, kept: errors.len(), dropped: log.dropped() })))
+        if let Some(first) = errors.first() {
+            let first = std::format!("{first}").into_boxed_str();
+            return Some(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, first, kept: errors.len(), dropped: log.dropped() })));
+        }
+        self.made.as_ref().and_then(|(program, _)| program.check_known_heads(tabled).err())
+            .map(|error| RunError::Front2(Front2Refusal::Lazy(error)))
     }
 
     /// The program made on the first call, then the one instance.
@@ -3547,7 +3595,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// item that make is of).
     fn construct(&mut self, tabled: ItemKey) -> Result<(), RunError> {
         if self.made.is_none() {
-            let program = program_of(self.names, self.entry, self.start, self.alloc)?;
+            let program = program_of(self.names, self.entry, self.start, self.known_heads, self.alloc)?;
             self.checks.constructed += 1;
             // A lazy program holds no checked body when made: 0, counted as the claim reads it.
             self.checks.by_construction += (0..program.fn_count()).filter(|&c| program.function(c).body.is_some()).count();
@@ -3564,9 +3612,11 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
 
 /// The lazy program over `names`, its body sources set and its start decided: the one way a
 /// maker's program is made ([`Maker`]'s first make, and the test double [`FromRecord::rechecked`]).
-fn program_of<'n>(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, alloc: Alloc<'static>) -> Result<RecordsProgram<'n>, RunError> {
+fn program_of<'n>(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, known_heads: Option<&'n dyn crate::front2::tables::head::KnownHeads>, alloc: Alloc<'static>) -> Result<RecordsProgram<'n>, RunError> {
     let NamesRecords { records, frame, lang_crates, body_sources } = names;
-    let mut program = RecordsProgram::from_records(records, frame, lang_crates, entry, alloc).map_err(RunError::Front2)?;
+    let mut program = RecordsProgram::from_records(crate::front2::program::lazy::RecordsOpts {
+        records, frame, lang_crates, entry, known_heads, alloc,
+    }).map_err(RunError::Front2)?;
     if let Some(sources) = body_sources {
         program.set_body_sources(sources);
     }
@@ -3585,7 +3635,7 @@ impl<'n> FromRecord<RecheckedRecords<'n>> {
     /// a lazy program of its own over `names` (the same records, start and entry as the maker
     /// it serves; [`Maker::new`]'s start rule), handed over as a typed record would hand them.
     pub fn rechecked(names: NamesRecords<'n>, entry: Option<ItemKey>, alloc: Alloc<'static>) -> Result<FromRecord<RecheckedRecords<'n>>, RunError> {
-        let program = program_of(names, entry, crate::run::special::MakerStart::ByRule, alloc)?;
+        let program = program_of(names, entry, crate::run::special::MakerStart::ByRule, None, alloc)?;
         Ok(FromRecord(crate::front2::program::lazy::typed::Rechecked::new(program, alloc)))
     }
 }

@@ -22,7 +22,7 @@
 use blaze_build::{OverflowChecks, Panic};
 use blaze_id::ItemKey as LibKey;
 use blaze_ladder::crates::{Inputs, Toolchain};
-use blaze_ladder::front2::program::{Front2Program, lazy::LazyProgram};
+use blaze_ladder::front2::program::{Front2Program, lazy::{LazyProgram, RecordsOpts}};
 use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, Records};
 use blaze_ladder::program_texts::ProgramTexts;
 use blaze_ladder::refusal::SourceFile;
@@ -139,7 +139,7 @@ fn with_programs_kept<R: Send + 'static>(text: &'static str, drop_call_parts: bo
         let kept: &Kept<'_> = if drop_call_parts { frame.alloc(without_call_parts(kept)) } else { kept };
         let log = frame.alloc(Log::new(&["ladder"], a));
         let records = frame.alloc(Records::new(frame.alloc_slice_copy(&[c.key]), kept, log, frame, a));
-        let mut lazy = LazyProgram::from_records(records, frame, &[0], Some(entry), a).unwrap_or_else(|e| panic!("lazy program: {e}"));
+        let mut lazy = LazyProgram::from_records(RecordsOpts { records, frame, lang_crates: &[0], entry: Some(entry), known_heads: None, alloc: a }).unwrap_or_else(|e| panic!("lazy program: {e}"));
         lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).unwrap_or_else(|e| panic!("lazy entry: {e}"));
         lazy.check_one(entry).unwrap_or_else(|e| panic!("checking main: {e}")).expect("main has a body");
         let result = inspect(&names, &whole, &mut lazy);

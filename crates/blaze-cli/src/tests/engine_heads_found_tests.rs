@@ -167,7 +167,7 @@ fn read_all(table: &HeadsOnce<Records>, features: u8, g: Alloc<'static>, when: &
         match table.known(cell(at)) {
             Known::Bytes(bytes) if bytes == freeze(cell(at), features, g) => {}
             Known::Bytes(_) => return Err(oracle("a reader was handed other bytes than its cell's freeze")),
-            Known::Freeze | Known::Refused(_) => return Err(oracle(when)),
+            Known::Freeze | Known::Refused(_) | Known::Invalid(_) => return Err(oracle(when)),
         }
     }
     Ok(())
@@ -202,6 +202,7 @@ fn command(tape: &Tape, store: &mut ModelStore, features: u8, plant: Plant, heap
             Known::Bytes(bytes) if bytes == freeze(want, features, g) => {}
             Known::Bytes(_) => return Err(oracle("a reader was handed other bytes than its cell's freeze")),
             Known::Refused(_) => return Err(oracle("a closed dependency head was refused")),
+            Known::Invalid(_) => return Err(oracle("a closed dependency head's record was invalid")),
             Known::Freeze => {
                 let Keyed::Closed { key, names_at, .. } = table.keyed(want) else {
                     return Err(oracle("a closed dependency's cell has no key"));

@@ -27,7 +27,7 @@ use blaze_code::record::{CodeRecord, CodeView, NO_TARGET, PositionPart, Site, Si
 use blaze_export::{Data, DataPlace, DataWord, Entry, ExportError, Exported, Function, Panic, Platform, ProgramIn, Tier, TlsRuntime};
 use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, entry_of, statics};
-use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker, RecordsProgram, Typing};
+use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker, MakerOpts, RecordsProgram, Typing};
 use blaze_ladder::run::special::{EntryForm, MakerStart, ProductRoots, Special, SpecialMade, library_roots, make_special, run_roots};
 use blaze_ladder::run::RunError;
 use blaze_own::{AString, AVec, Alloc, Box, Bump, Erased, String, Vec};
@@ -981,6 +981,14 @@ fn export_program<'f>(
     let maker_procs = crate::job_texts::MadeOnce::new(|| inputs.make());
     let procs = crate::job_texts::Procs::ByNeed(&maker_procs);
 
+    // The snapshot owns the bytes; this stack-owned finder only classifies current crates
+    // and derives the same Signature keys used by checking. It precedes names so both are
+    // borrowed for the maker's lifetime, and its small crate list drops with this export.
+    let known_heads = crate::engine_seeds::DependencyFinder::new(
+        found.snapshot(),
+        crate::engine_seeds::crates_by(list, &|name| (standing.names)(name).map(|input| input.at), heap.shared()),
+        standing.tools[blaze_drive::Kind::Signature.index()],
+    );
     let names = run_names::names_of(cx, root, &found, owner, &mut *standing.store, &mut facts.bodies, &mut read, env, &pack_dirs, procs, &seen, frame, heap).map_err(CliError::RunNames)?;
 
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Roots));
@@ -1013,7 +1021,10 @@ fn export_program<'f>(
     // Planning, the publisher and final placement share the same witnessed facts.
     // Ordinary run/test and non-distributed/release export keep their original ids.
     let ids = checked_export.as_ref().map_or(ids, |(_, checked)| checked.ids());
-    let mut maker = Maker::of_start(names, maker_entry, maker_start, ByKind::new(typed.over(ids)), &builder, heap.alloc());
+    let mut maker = Maker::of_start(MakerOpts {
+        names, entry: maker_entry, start: maker_start, typing: ByKind::new(typed.over(ids)),
+        builder: &builder, known_heads: Some(&known_heads), alloc: heap.alloc(),
+    });
     let mut codes = HomeCodeStore::new(lent);
     let mut export_id = blaze_ids::Hasher::new("blaze export program root 1");
     export_id.part(picked.package.as_bytes())
@@ -1139,6 +1150,7 @@ fn export_program<'f>(
     phases.export_verified_from_answers = Some(maker.verified_from_answers());
     phases.export_distributed_reach = dist_reach.as_ref().map(|_| cached);
     phases.export_read_preparation = Some(maker.read_preparation());
+    phases.export_heads = Some(maker.head_counts());
 
     // Assemble `ProgramIn` functions and data (zero-copy for cached positionless records).
     let mut functions: AVec<'_, Function<'_>> = Vec::with_capacity_in(outcomes.len() + 2, alloc);

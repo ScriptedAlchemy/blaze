@@ -147,7 +147,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// names bound (the reach walk also visits fns used as values, fn pointers included).
     fn check_one_by(&mut self, key: ItemKey, typer: super::fill::Typer<'_>) -> Result<Option<(usize, Checked<'static>)>, crate::run::RunError> {
         use crate::run::RunError;
-        let body = self.check_one_key_by(key, typer).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
+        self.check_known_heads(key).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
+        let checked = self.check_one_key_by(key, typer);
+        self.check_known_heads(key).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
+        let body = checked.map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
         if let Some((_, checked)) = &body {
             let values = checked.expr_defs.column::<1>().iter().filter_map(|d| match *d {
                 tc::Def::Fn(k) => Some(k),
@@ -243,12 +246,13 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// As `Front2Program::make_asked`: the fills the instance questions' worlds noted, made
     /// as the body check makes its own (check.rs `make_all`).
     fn make_asked(&mut self, i: usize) -> Result<bool, crate::run::RunError> {
+        let owner = self.rows.key[i];
+        self.check_known_heads(owner).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))?;
         if let Some(why) = self.internal_bindings.get_mut().refused.take() {
             return Err(crate::run::RunError::Front2(why));
         }
         let fills = core::mem::replace(self.asked.get_mut(), Vec::new_in(Global));
         let mut gaps = core::mem::replace(self.asked_gaps.get_mut(), Vec::new_in(Global));
-        let owner = self.rows.key[i];
         let function: Box<str> = Box::from(self.rows.str(self.rows.path[i]));
         if fills.is_empty() {
             // Nothing to make: a question the world refused (a refused candidate impl) is the
@@ -272,17 +276,20 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         // `ConstFail::Nested` (or an anonymous constant filed as "this caller has no constant
         // evaluator"): the instance refused. Never called inside an evaluation (`const_at` is
         // one seam call with the evaluator taken there), so this is no nested evaluation.
-        let mut records = Records {
-            names: self.front.names,
-            keys: &mut self.front.keys,
-            index: &self.front.index,
-            store: &mut self.store,
-            buckets: &mut self.buckets,
-            order: BuildOrder::AsAsked,
-            consts: Some((&mut self.consts, self.prepared)),
+        let made = {
+            let mut records = Records {
+                names: self.front.names,
+                keys: &mut self.front.keys,
+                index: &self.front.index,
+                store: &mut self.store,
+                buckets: &mut self.buckets,
+                order: BuildOrder::AsAsked,
+                consts: Some((&mut self.consts, self.prepared)),
+            };
+            crate::front2::check::make_all(&mut records, fills, owner)
         };
-        crate::front2::check::make_all(&mut records, fills, owner)
-            .map_err(|error| crate::run::RunError::Front2(crate::front2::program::Front2Refusal::Asked { function, error }))?;
+        self.check_known_heads(owner).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))?;
+        made.map_err(|error| crate::run::RunError::Front2(crate::front2::program::Front2Refusal::Asked { function, error }))?;
         Ok(true)
     }
 
@@ -449,7 +456,10 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     }
 
     fn head_row(&mut self, key: ItemKey) -> Result<Option<usize>, crate::run::RunError> {
-        self.head_row_key(key).map(Some).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))
+        self.check_known_heads(key).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))?;
+        let row = self.head_row_key(key);
+        self.check_known_heads(key).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))?;
+        row.map(Some).map_err(|e| crate::run::RunError::Front2(Front2Refusal::Lazy(e)))
     }
 
     fn done(&mut self, i: usize) {

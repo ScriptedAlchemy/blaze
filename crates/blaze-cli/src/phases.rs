@@ -59,6 +59,8 @@ pub struct Phases {
     pub(crate) export_distributed_reach: Option<usize>,
     /// The maker's cumulative row visits, including any distributed completion before export.
     pub(crate) export_read_preparation: Option<blaze_ladder::run::make_one::ReadPreparation>,
+    /// The export source's existing frozen-head counters, sampled after the complete walk.
+    pub(crate) export_heads: Option<blaze_ladder::front2::program::lazy::HeadCounts>,
     /// The cleanup line's part known before the commit after the answer (store/roots.rs
     /// `CleanupLine::before_commit`), for a profile written before that commit (main.rs).
     pub(crate) cleanup: Option<crate::store::roots::BeforeCommit>,
@@ -178,6 +180,7 @@ impl Phases {
             export_verified_from_answers: None,
             export_distributed_reach: None,
             export_read_preparation: None,
+            export_heads: None,
             cleanup: None,
             published: None,
             held: Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) },
@@ -210,6 +213,7 @@ impl Phases {
         self.export_verified_from_answers = None;
         self.export_distributed_reach = None;
         self.export_read_preparation = None;
+        self.export_heads = None;
         self.cleanup = None;
         self.published = None;
         self.held = Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) };
@@ -484,6 +488,9 @@ impl fmt::Display for Phases {
         if let Some(count) = self.export_read_preparation {
             writeln!(f, "export       maker read preparation: {} rows prepared, {} known rows reused", count.prepared, count.reused)?;
         }
+        if let Some(count) = self.export_heads {
+            writeln!(f, "export       heads: {} taken, {} lowered, {} lowered for constants, {} attempts", count.taken, count.lowered, count.eval_lowered, count.attempts)?;
+        }
         if let Some(cleanup) = self.cleanup {
             writeln!(f, "{cleanup}")?;
         }
@@ -629,13 +636,18 @@ mod tests {
         let start = StartTally { placed: 0, answered: 0, data: 0, positioned: 0, resolved: 0, built: Built::Head, held: ListHeld::None };
         let lowerings = LoweringCounts { bodies_lowered: 7, lower_again: 2, forks: 1, typing: None };
         phases.code_records = Some(RunTally { codes: Tally::default(), start, lowerings, walk: None });
+        assert!(phases.export_heads.is_none());
+        phases.export_heads = Some(blaze_ladder::front2::program::lazy::HeadCounts { taken: 11, lowered: 3, eval_lowered: 2, attempts: 5 });
         let profile = std::format!("{phases}");
         assert!(profile.lines().any(|line| line == "run          bodies lowered 7, lower_again calls 2, forks 1"), "{profile}");
+        assert!(profile.lines().any(|line| line == "export       heads: 11 taken, 3 lowered, 2 lowered for constants, 5 attempts"), "{profile}");
         let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("the simulated context");
         let err = io.need_err().expect("stderr");
         phases.write_lowering_stats(&cx, &err).unwrap();
         err.flush(&cx).unwrap();
         io.script(|host| assert_eq!(host.err.as_slice(), b"blaze: bodies lowered 7, lower_again calls 2, forks 1\n")).expect("the simulated host");
+        phases.reset();
+        assert!(phases.export_heads.is_none());
     }
 
     /// A bstd wait in a phase is in that phase's use when it is marked through the command's

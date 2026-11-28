@@ -10,7 +10,7 @@ use blaze_ladder::crates::{Inputs, Toolchain};
 use blaze_ladder::front::{At, FnKind};
 use blaze_ladder::front2::keys::{MemberKind, checker_of, member_key_of};
 use blaze_ladder::front2::internal_symbol::{InternalRefused, definition};
-use blaze_ladder::front2::program::{Front2Program, Front2Refusal, lazy::LazyProgram};
+use blaze_ladder::front2::program::{Front2Program, Front2Refusal, lazy::{LazyProgram, RecordsOpts}};
 use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::task::{BodyFrame, Make, MakeRefused, check_body};
@@ -246,7 +246,7 @@ fn with_programs<R: Send + 'static>(text: &'static str, inspect: impl for<'n> Fn
         let kept = keep(&names, frame, a);
         let log = frame.alloc(Log::new(&["ladder"], a));
         let records = frame.alloc(Records::new(frame.alloc_slice_copy(&[c.key]), kept, log, frame, a));
-        let mut lazy = LazyProgram::from_records(records, frame, &[0], Some(entry), a).unwrap_or_else(|e| panic!("lazy program: {e}"));
+        let mut lazy = LazyProgram::from_records(RecordsOpts { records, frame, lang_crates: &[0], entry: Some(entry), known_heads: None, alloc: a }).unwrap_or_else(|e| panic!("lazy program: {e}"));
         lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).unwrap_or_else(|e| panic!("lazy entry: {e}"));
         lazy.check_one(entry).unwrap_or_else(|e| panic!("checking main: {e}")).expect("main has a body");
         let result = inspect(&names, &whole, &mut lazy);
@@ -419,7 +419,7 @@ fn compare_binding(provider: &'static str, plant: bool) {
         let log = frame.alloc(Log::new(&["ladder", "provider"], a));
         let kept = keep(from, frame, a);
         let records = frame.alloc(Records::new(frame.alloc_slice_copy(&[crates[0].key, crates[1].key]), kept, log, frame, a));
-        let mut lazy = LazyProgram::from_records(records, frame, &[0], Some(entry), a).expect("lazy fixture");
+        let mut lazy = LazyProgram::from_records(RecordsOpts { records, frame, lang_crates: &[0], entry: Some(entry), known_heads: None, alloc: a }).expect("lazy fixture");
         lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).expect("exported main");
         let checked = lazy.check_one(entry);
 
@@ -570,7 +570,7 @@ pub extern "C" fn main() -> i32 {
             let kept = keep(&names, frame, a);
             let log = frame.alloc(Log::new(&["ladder", "panic_unwind", "panic_abort"], a));
             let records = frame.alloc(Records::new(frame.alloc_slice_copy(&crates.map(|c| c.key)), kept, log, frame, a));
-            let mut lazy = LazyProgram::from_records(records, frame, &[0], Some(entry), a).expect("lazy program");
+            let mut lazy = LazyProgram::from_records(RecordsOpts { records, frame, lang_crates: &[0], entry: Some(entry), known_heads: None, alloc: a }).expect("lazy program");
             lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).expect("exported main");
             let (i, checked) = lazy.check_one(entry).expect("check main").expect("main has a body");
             for symbol in ["__rust_start_panic", "__rust_panic_cleanup"] {

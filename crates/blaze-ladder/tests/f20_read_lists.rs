@@ -160,11 +160,14 @@ fn logged(records: &Records<'_>) -> Vec<String> {
     records.errors().iter().map(|e| e.to_string()).collect()
 }
 
+#[path = "f20_read_lists/known_heads.rs"]
+mod known_heads;
+
 mod member_index_preparation {
     use super::*;
     use blaze_ladder::front2::keys::{MemberKind, member_key_of};
     use blaze_ladder::front2::program::Front2Refusal;
-    use blaze_ladder::front2::program::lazy::{LazyProgram, LazyRefusal};
+    use blaze_ladder::front2::program::lazy::{LazyProgram, LazyRefusal, RecordsOpts};
     use blaze_ladder::front2::source::{MemberWant, SourceError};
     use blaze_ladder::run::RunError;
     use blaze_ladder::seam::FrontEnd;
@@ -309,7 +312,7 @@ pub extern \"C-unwind\" fn main() -> i32 { 0 }
             assert!(names.records.errors().is_empty());
 
             let key = member_key_of(checker_of(selected[0].owner), MemberKind::Fn, "selected");
-            let mut program = LazyProgram::from_records(names.records, names.frame, names.lang_crates, None, alloc()).expect("the lazy program");
+            let mut program = LazyProgram::from_records(RecordsOpts { records: names.records, frame: names.frame, lang_crates: names.lang_crates, entry: None, known_heads: None, alloc: alloc() }).expect("the lazy program");
             assert_eq!(load.counts(), [reads, reads], "constructing the program does not open either member's expansion");
             let row = program.head_row(key).expect("the selected head loads").expect("the selected function has a row");
             assert_eq!(program.function(row).key, key);
@@ -360,10 +363,10 @@ pub extern \"C-unwind\" fn main() -> i32 { 0 }
             let affected = match plant { Plant::Missing(call) | Plant::Changed(call) => call, Plant::None => unreachable!() };
             let key = member_key_of(checker_of(selected[0].owner), MemberKind::Fn, "selected");
             if affected == calls[0] {
-                let mut program = LazyProgram::from_records(names.records, names.frame, names.lang_crates, None, alloc()).expect("the lazy program");
+                let mut program = LazyProgram::from_records(RecordsOpts { records: names.records, frame: names.frame, lang_crates: names.lang_crates, entry: None, known_heads: None, alloc: alloc() }).expect("the lazy program");
                 assert!(program.head_row(key).is_err(), "the actual selected head must refuse {plant:?} after {want:?}");
             } else if want == MemberWant::NameOnly {
-                let mut program = LazyProgram::from_records(names.records, names.frame, names.lang_crates, None, alloc()).expect("the lazy program");
+                let mut program = LazyProgram::from_records(RecordsOpts { records: names.records, frame: names.frame, lang_crates: names.lang_crates, entry: None, known_heads: None, alloc: alloc() }).expect("the lazy program");
                 let row = program.head_row(key).expect("the unrelated missing text does not refuse the selected head").expect("the selected function has a row");
                 assert_eq!(program.function(row).key, key);
                 assert_eq!(load.counts(), [1, 0]);

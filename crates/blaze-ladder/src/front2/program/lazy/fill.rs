@@ -385,14 +385,21 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// as make_from's ADT rounds do. `asker` names the step of this file that asked (rule
     /// 19): a refusal says who asked which want for which item.
     fn make_want(&mut self, want: Want, item: ItemKey, asker: &'static str) -> Result<(), LazyRefusal> {
+        self.check_known_heads(item)?;
         let mut lens = 0;
         loop {
             let names = self.front.names;
-            match self.store.ensure(names, &mut self.front.keys, want) {
+            let made = self.store.ensure(names, &mut self.front.keys, want);
+            self.check_known_heads(item)?;
+            match made {
                 Err(HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
                     lens += 1;
-                    let mut r = self.records(true);
-                    if let Err(e) = eval_len(&mut r, c) {
+                    let evaluated = {
+                        let mut r = self.records(true);
+                        eval_len(&mut r, c)
+                    };
+                    self.check_known_heads(item)?;
+                    if let Err(e) = evaluated {
                         return Err(LazyRefusal::Head { item: self.refused_shown(item), why: format!("{asker} asked {want:?}: the constant {c:x} its head names: {e:?}").into_boxed_str() });
                     }
                 }

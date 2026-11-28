@@ -49,7 +49,7 @@ use core::time::Duration;
 use blaze_id::ItemKey as LibKey;
 use blaze_ids::{ContentId, Hasher};
 use blaze_ladder::code_records::Builder;
-use blaze_ladder::run::make_one::{ByKind, Maker, NamesRecords};
+use blaze_ladder::run::make_one::{ByKind, Maker, MakerOpts, NamesRecords};
 use blaze_ladder::run::special::Roots;
 use blaze_ladder::run::special::test_roots::test_roots;
 use blaze_launch::wire::run::Symbol;
@@ -2554,7 +2554,10 @@ impl KeptMakers for SuiteMakers<'_> {
         let tables = self.tables;
         let maker = self.makers.of(job, || {
             let reader = typed.reader(cx, side.crates.snapshot(), tables);
-            let mut maker = Maker::of_start(names, job.entry, job.start, ByKind::new(reader), &side.builder, tables);
+            let mut maker = Maker::of_start(MakerOpts {
+                names, entry: job.entry, start: job.start, typing: ByKind::new(reader),
+                builder: &side.builder, known_heads: None, alloc: tables,
+            });
             maker.watch(side.make_watch);
             Ok(maker)
         })?;

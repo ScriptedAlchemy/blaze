@@ -63,7 +63,7 @@ use blaze_ids::ContentId;
 use blaze_ladder::front2::heads::Want;
 use blaze_ladder::front2::item_shown::ItemShown;
 use blaze_ladder::front2::source::{NamesSource, Records};
-use blaze_ladder::front2::tables::head::{FreezeError, FrozenHead, Known, KnownHeads, NotTheirs, VERSION, WANT_BYTES, cell_id as head_cell_id, want_bytes};
+use blaze_ladder::front2::tables::head::{FreezeError, FrozenHead, Known, KnownError, KnownHeads, NotTheirs, VERSION, WANT_BYTES, cell_id as head_cell_id, want_bytes};
 use blaze_ladder::front2::tables::seeds::{BodyLocals, MOST_CELLS, RequestHeads, SeedError};
 pub(crate) use blaze_ladder::front2::tables::seeds::RequestSeed as BodySeed;
 use blaze_own::{Alloc, SharedAlloc};
@@ -174,9 +174,16 @@ pub(crate) fn crates_of(list: &CrateList<'static>, names: crate::engine_names::N
 /// [`crates_of`] in the caller's allocator (lane H9: the Heads stage's finder of dependency
 /// heads, engine_heads_once.rs `HeadsOnce::find_dependencies`).
 pub(crate) fn crates_in(list: &CrateList<'static>, names: &NamesStage<'_>, alloc: SharedAlloc<'static>) -> blaze_own::Vec<CrateAt, SharedAlloc<'static>> {
+    let names = crate::engine_names::NamesInputs::ran(names);
+    crates_by(list, &|name| names.input_of(name).map(|input| input.at), alloc)
+}
+
+/// The same closed dependency classification over the caller's current names RECORD keys.
+/// Export borrows the standing answer's keys and snapshot; it does not reconstruct a scope
+/// digest or keep a second head table.
+pub(crate) fn crates_by(list: &CrateList<'static>, names_at: &dyn Fn(Name) -> Option<Key>, alloc: SharedAlloc<'static>) -> blaze_own::Vec<CrateAt, SharedAlloc<'static>> {
     let mut crates: blaze_own::Vec<CrateAt, SharedAlloc<'static>> = blaze_own::Vec::new_in(alloc);
-    // The Heads phases' (the phase path's): the stage's entries alone.
-    each_crate(list, crate::engine_names::NamesInputs::ran(names), &mut |one| crates.push(one));
+    each_crate_by(list, names_at, &mut |one| crates.push(one));
     close(list, &mut crates);
     crates.sort_unstable_by_key(|one| one.prefix);
     crates
@@ -267,6 +274,12 @@ impl<A: core::alloc::Allocator + Send + Sync> HeadRecords for Snapshot<A> {
     }
 }
 
+impl HeadRecords for &crate::store::StoreSnapshot {
+    fn record(&self, key: Key) -> Result<Option<&[u8]>, Unreadable> {
+        self.get(key).map_err(|_| Unreadable)
+    }
+}
+
 /// How a cell's crate stands to the rule "a dependency head is valid by its key".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Keyed {
@@ -306,6 +319,25 @@ impl<R: HeadRecords> DependencyFinder<R> {
         match at.names_at {
             Some(names_at) => Keyed::Closed { key: dependency_key(names_at, cell, self.tool), names_at, scope: blaze_drive::key::crate_scope_name(&at.key) },
             None => Keyed::Unkeyed,
+        }
+    }
+}
+
+/// Read-only reuse of checked dependency heads by the exporter. Only a closed crate has a
+/// key sufficient to accept its frozen head; an open or absent head is computed by the
+/// caller's existing source. A present but unreadable or mismatched record is terminal.
+impl<R: HeadRecords> KnownHeads for DependencyFinder<R> {
+    fn known(&self, cell: Want) -> Known<'_> {
+        let Keyed::Closed { key, names_at, .. } = self.keyed(cell) else {
+            return Known::Freeze;
+        };
+        match self.records.record(key) {
+            Ok(Some(bytes)) => match self.records.head(bytes, names_at, cell) {
+                Ok(head) => Known::Bytes(head),
+                Err(why) => Known::Invalid(KnownError::Invalid { key, why }),
+            },
+            Ok(None) => Known::Freeze,
+            Err(Unreadable) => Known::Invalid(KnownError::Unreadable { key }),
         }
     }
 }
@@ -1519,6 +1551,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
                 Ok(KnownFrozen::Refused(why))
             }
             Known::Freeze => Ok(KnownFrozen::Freeze),
+            Known::Invalid(error) => Err(FreezeError::KnownProvider { want: cell, error }),
         }
     }
 }
@@ -1552,7 +1585,7 @@ impl<'t> KnownHeads for StretchHeads<'t, '_, '_> {
                     memo.insert(key, CachedKnown::Refused(why));
                 }
             }
-            Known::Freeze => {}
+            Known::Freeze | Known::Invalid(_) => {}
         }
         resolved
     }
@@ -1634,6 +1667,9 @@ impl RequestTable<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod export_heads_tests;
 
 #[cfg(test)]
 mod renew_tests {
