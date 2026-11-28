@@ -1,0 +1,259 @@
+name: Read original distributed validation receipts
+
+on:
+  push:
+    branches: [validation/distributed-readonly-receipts]
+    paths: [.github/workflows/distributed-readonly-receipts.yaml]
+
+permissions:
+  contents: none
+  actions: read
+
+jobs:
+  receipts:
+    name: Verify and print original validation receipts
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 12
+    steps:
+      - name: Read the three exact original artifacts
+        timeout-minutes: 11
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout -k 10s 600s python3 - <<'PY'
+          import contextlib, hashlib, io, json, os, signal, stat, urllib.error
+          import urllib.parse, urllib.request, zipfile
+          from pathlib import PurePosixPath
+          
+          PINS = [{"role":"canonical","id":15242701805,"name":"publication-canonical-release-smoke-arm64","size":95217,"sha256":"9b145eb760b148c5dfc191d1162ae80a7de5618c1ba3e264493c9fcc4c6348de"},{"role":"drop-candidate","id":15243111420,"name":"publication-lazy-boolean-candidate","size":28787,"sha256":"866b8bb2532ccd0590dba1931dd304969314403da3e8b678a202f97b2bfa2922"},{"role":"drop-old","id":15243187293,"name":"publication-lazy-boolean-old-compiler","size":26151,"sha256":"c3bf4a864109c11a97cbfc0a5cf609ca24a975a52643d87646e26f0b5ed9a7f9"}]
+          RUN = 46093805674
+          HEAD = "c26770486896313738d29b9420c52a4df57583f9"
+          CANDIDATE = {"commit": "868de5bc7c7496556e3108a87b689c9280382d8c",
+                       "tree": "a376fc7a8433ebedbcc4ca35f1c596d9bbaab8aa"}
+          OLD = {"commit": "089b5f009ab48241a0c0e0fdfc22d9b08edf9398",
+                 "tree": "659b50805f637c8b34414173b73848deae807f6a"}
+          REPO = "ScriptedAlchemy/blaze"
+          API = "https://api.github.com/repos/" + REPO
+          MAX_ZIP = 2 * 1024 * 1024
+          MAX_FILE = 256 * 1024
+          MAX_OUTPUT = 2 * 1024 * 1024
+          stage, output_bytes = "start", 0
+          
+          def emit(value):
+              global output_bytes
+              encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+              size = len(encoded.encode()) + 1
+              if size > 65536 or output_bytes + size > MAX_OUTPUT:
+                  raise ValueError("output limit")
+              output_bytes += size
+              print(encoded, flush=True)
+          
+          def alarm(signum, frame):
+              raise TimeoutError("bounded request")
+          
+          signal.signal(signal.SIGALRM, alarm)
+          
+          @contextlib.contextmanager
+          def budget(seconds):
+              signal.setitimer(signal.ITIMER_REAL, seconds)
+              try:
+                  yield
+              finally:
+                  signal.setitimer(signal.ITIMER_REAL, 0)
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, fp, code, msg, headers, newurl):
+                  return None
+          
+          api_opener = urllib.request.build_opener(NoRedirect())
+          storage_opener = urllib.request.build_opener(NoRedirect())
+          
+          def api_request(path):
+              assert path.startswith("/actions/")
+              return urllib.request.Request(API + path, headers={
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+          
+          def api_json(path):
+              with budget(25):
+                  with api_opener.open(api_request(path), timeout=20) as response:
+                      assert response.status == 200
+                      raw = response.read(1024 * 1024 + 1)
+              assert len(raw) <= 1024 * 1024
+              return json.loads(raw)
+          
+          def storage_url(url):
+              parsed = urllib.parse.urlsplit(url)
+              host = parsed.hostname or ""
+              assert parsed.scheme == "https" and parsed.username is None and parsed.password is None
+              assert parsed.port in (None, 443) and not parsed.fragment
+              assert (host.endswith(".blob.core.windows.net")
+                      or host.endswith(".actions.githubusercontent.com")
+                      or host.endswith(".s3.amazonaws.com")
+                      or (".s3." in host and host.endswith(".amazonaws.com")))
+              return url
+          
+          def original_zip(pin):
+              # Never follow an authenticated API redirect. Only this API request carries the token.
+              with budget(25):
+                  try:
+                      response = api_opener.open(api_request(f"/actions/artifacts/{pin['id']}/zip"), timeout=20)
+                  except urllib.error.HTTPError as error:
+                      try:
+                          assert error.code in (302, 303, 307, 308)
+                          location = error.headers["Location"]
+                      finally:
+                          error.close()
+                  else:
+                      response.close()
+                      raise ValueError("expected artifact redirect")
+              # Fresh requests to storage have no Authorization header. Bounded redirects are not retries.
+              with budget(60):
+                  for hop in range(3):
+                      request = urllib.request.Request(storage_url(location))
+                      try:
+                          response = storage_opener.open(request, timeout=20)
+                      except urllib.error.HTTPError as error:
+                          try:
+                              assert error.code in (302, 303, 307, 308) and hop < 2
+                              location = urllib.parse.urljoin(location, error.headers["Location"])
+                          finally:
+                              error.close()
+                          continue
+                      with response:
+                          assert response.status == 200
+                          if response.headers.get("Content-Length") is not None:
+                              assert int(response.headers["Content-Length"]) == pin["size"]
+                          raw = response.read(pin["size"] + 1)
+                      assert len(raw) == pin["size"] <= MAX_ZIP
+                      assert hashlib.sha256(raw).hexdigest() == pin["sha256"]
+                      return raw
+              raise ValueError("redirect limit")
+          
+          def members(archive):
+              rows = archive.infolist()
+              assert len(rows) <= 4096 and sum(row.file_size for row in rows) <= 32 * 1024 * 1024
+              result = {}
+              for row in rows:
+                  path = PurePosixPath(row.filename)
+                  assert row.filename == row.orig_filename
+                  assert not path.is_absolute() and ".." not in path.parts
+                  assert "\\" not in row.filename and "\0" not in row.filename
+                  assert row.filename not in result and not row.flag_bits & 1
+                  assert row.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                  mode = stat.S_IFMT(row.external_attr >> 16)
+                  assert mode in (0, stat.S_IFREG, stat.S_IFDIR)
+                  assert row.file_size <= 16 * 1024 * 1024
+                  result[row.filename] = row
+              return result
+          
+          def read_member(archive, rows, suffix, pin):
+              matches = [name for name, row in rows.items()
+                         if not row.is_dir() and (name == suffix or name.endswith("/" + suffix))]
+              if not matches:
+                  emit({"kind": "missing-original-file", "artifact_id": pin["id"], "requested": suffix})
+                  return None
+              assert len(matches) == 1, "ambiguous requested member"
+              name = matches[0]
+              assert rows[name].file_size <= MAX_FILE
+              with archive.open(rows[name]) as stream:
+                  data = stream.read(MAX_FILE + 1)
+              assert len(data) == rows[name].file_size <= MAX_FILE
+              emit({"kind": "original-file", "artifact_id": pin["id"], "path": name,
+                    "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+              return data
+          
+          def show_file(archive, rows, suffix, pin, kind):
+              data = read_member(archive, rows, suffix, pin)
+              if data is None:
+                  return
+              if kind == "json":
+                  value = json.loads(data)
+                  omitted = []
+                  if suffix in ("exec/result.json", "exec/supervisor.json"):
+                      keys = {"schema", "scope", "passed", "complete", "returncode", "command_status",
+                              "commands", "compiler", "error", "stop"}
+                      omitted = sorted(set(value) - keys)
+                      value = {key: value[key] for key in keys if key in value}
+                  emit({"kind": "original-json", "artifact_id": pin["id"], "requested": suffix,
+                        "omitted_top_level_keys": omitted, "value": value})
+                  if suffix in ("blaze-build.json", "blaze-build.original.json", "blaze-build.after.json"):
+                      expected = OLD if pin["role"] == "drop-old" else CANDIDATE
+                      assert value["source"] == expected
+              else:
+                  # Emit every character of the small original command log, including all diagnostics.
+                  # Numbered fragments preserve line endings; nothing is filtered or silently omitted.
+                  text = data.decode("utf-8")
+                  for line_number, line in enumerate(text.splitlines(keepends=True), 1):
+                      for offset in range(0, len(line), 2048):
+                          emit({"kind": "original-text-fragment", "artifact_id": pin["id"],
+                                "requested": suffix, "line": line_number, "offset_chars": offset,
+                                "text": line[offset:offset + 2048]})
+          
+          def main():
+              global stage
+              assert os.environ["GITHUB_REPOSITORY"] == REPO
+              assert os.environ["GITHUB_EVENT_NAME"] == "push"
+              assert os.environ["GITHUB_REF"] == "refs/heads/validation/distributed-readonly-receipts"
+              stage = "original-run-metadata"
+              run = api_json(f"/actions/runs/{RUN}")
+              assert (run["id"], run["head_sha"], run["run_attempt"]) == (RUN, HEAD, 1)
+              assert run["repository"]["full_name"] == REPO
+              assert run["path"] == ".github/workflows/distributed-linux-smoke.yaml"
+              emit({"kind": "original-run", "run_id": RUN, "workflow_head": HEAD,
+                    "status": run["status"], "conclusion": run["conclusion"],
+                    "candidate_source": CANDIDATE,
+                    "scope": "Read original bytes only; no checkout, build, test, or acceptance inference."})
+              canonical = [
+                  ("blaze-build.json", "json"), ("manifest-sha256.txt", "text"),
+                  ("source.txt", "text"), ("validation.txt", "text"),
+                  ("archive-sha256.txt", "text"),
+                  ("identity-before-smoke.log", "text"), ("identity-after-smoke.log", "text"),
+                  ("smoke-logs/hello-test.out", "text"), ("smoke-logs/hello-test.err", "text"),
+                  ("hello-smoke.txt", "text"), ("hello-smoke-verify.txt", "text"),
+                  ("quote-identity.txt", "text"), ("binaries.before.txt", "text"),
+                  ("binaries.after-verify.txt", "text"), ("source-after.txt", "text"),
+              ]
+              drop = [
+                  ("exec/lazy-boolean-drop-order.log", "text"),
+                  ("exec/lazy-boolean-drop-order.stderr", "text"),
+                  ("observer.exit", "text"), ("receipt.json", "json"),
+                  ("exec-input.json", "json"), ("observer.stdout", "text"), ("observer.stderr", "text"),
+                  ("identity-before-fixture.log", "text"), ("identity-after-fixture.log", "text"),
+                  ("exec/result.json", "json"), ("exec/supervisor.json", "json"),
+                  ("blaze-build.original.json", "json"), ("blaze-build.after.json", "json"),
+                  ("fixture.json", "json"), ("source.before.txt", "text"), ("source.after.txt", "text"),
+                  ("binaries.before.sha256", "text"), ("binaries.after.sha256", "text"),
+                  ("binaries.after-verify.txt", "text"),
+              ]
+              for pin in PINS:
+                  stage = pin["role"] + ":metadata"
+                  metadata = api_json(f"/actions/artifacts/{pin['id']}")
+                  assert metadata["id"] == pin["id"] and metadata["name"] == pin["name"]
+                  assert metadata["size_in_bytes"] == pin["size"] <= MAX_ZIP
+                  assert metadata["digest"] == "sha256:" + pin["sha256"] and metadata["expired"] is False
+                  assert metadata["workflow_run"]["id"] == RUN and metadata["workflow_run"]["head_sha"] == HEAD
+                  stage = pin["role"] + ":zip"
+                  raw = original_zip(pin)
+                  emit({"kind": "verified-original-artifact", **pin, "run_id": RUN,
+                        "original": f"https://github.com/{REPO}/actions/runs/{RUN}/artifacts/{pin['id']}"})
+                  with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                      rows = members(archive)
+                      for suffix, kind in (canonical if pin["role"] == "canonical" else drop):
+                          stage = pin["role"] + ":" + suffix
+                          show_file(archive, rows, suffix, pin, kind)
+              emit({"kind": "relay-complete", "run_id": RUN, "artifacts": [pin["id"] for pin in PINS],
+                    "acceptance_inferred": False, "output_bytes_before_record": output_bytes})
+          
+          try:
+              main()
+          except Exception as error:
+              # Never render exception text: HTTP errors can contain signed storage URLs.
+              print(json.dumps({"kind": "relay-error", "stage": stage,
+                                "error_type": type(error).__name__}), flush=True)
+              raise SystemExit(1)
+          PY
