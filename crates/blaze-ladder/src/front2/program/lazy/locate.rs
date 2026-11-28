@@ -36,6 +36,7 @@ use super::*;
 use crate::front2::keys::member_key_of;
 use crate::front2::lower_made::{LowerTarget, lower_made};
 use crate::front2::nested_exports::{Reading, Top, Unkeyed, walk_every};
+use crate::front2::source::MemberWant;
 use crate::front2::start::Entry2;
 use blaze_surface::{ItemDetail, ItemKind};
 
@@ -179,7 +180,8 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 put(member_key_of(ck, MemberKind::Ctor, ""), MemberRow { container, kind: MemberKind::Ctor, name: "" });
                 continue;
             }
-            names.each_member(container, &mut |m| {
+            // Indexing uses only kind/name; the requested head validates its own current text.
+            names.each_member_matching(container, &mut |_, _| MemberWant::NameOnly, &mut |m| {
                 let (Some(name), Some(kind)) = (m.name, member_kind(m.kind)) else { return };
                 put(member_key_of(ck, kind, name), MemberRow { container, kind, name });
             });
