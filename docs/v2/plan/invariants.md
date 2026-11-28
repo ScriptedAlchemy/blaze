@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-375 invariants, 47 refinements, 13 reference models.
-By level: 301 tested, 105 simulated, 1 model-checked, 15 proved.
+378 invariants, 47 refinements, 13 reference models.
+By level: 301 tested, 108 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -188,6 +188,8 @@ By level: 301 tested, 105 simulated, 1 model-checked, 15 proved.
   Controls: `liveness_recorded_before_acceptance`.
 - **`every_success_has_one_immutable_full_manifest`** *simulated* (`crates/blaze-dist/src/jobs/publication_tests.rs`): a published-work execution reports success only after full output is uploaded, its immutable manifest is accepted unchanged, and delivery to subscribers completes; a later attempt cannot replace the accepted record and a later worker verdict cannot supersede it.
   Controls: `an_early_done_plant`, `a_late_worker_verdict_plant`.
+- **`resolution_and_delivery_preserve_one_accepted_result`** *simulated* (`crates/blaze-dist/src/jobs/resolution_tests.rs`): current-attempt absence resolution gates actual grants and full-tail readiness; accepted output remains discoverable without subscribers until durable delivery, and delivery preserves terminals. Full tails are counted by complete result identity across executions; only an unmirrored coordinator restart permits recomputation of accepted output.
+  Controls: `admission_and_delivery_faults`.
 - **`retirement_preserves_survivors_and_exact_assignment_ownership`** *simulated* (`crates/blaze-dist/src/jobs/retirement_tests.rs`): retiring an owned assignment fences its work without ending another subscriber or releasing capacity before its exact stop acknowledgment; stale retirement, unowned retirement and stale acknowledgments cannot affect a replacement assignment.
   Controls: `leaving_without_retirement`, `release_without_a_pending_stop`, `a_stale_retirement_of_the_replacement_lead`, `a_stale_acknowledgment_of_a_reused_slot`, `an_unowned_retirement`, `retired_work_kept_under_its_old_lease`, `promotion_erasing_the_continuing_owner`, `cleanup_using_only_the_last_observed_attempt`, `a_stale_claimed_helper_misclassified_as_unclaimed`.
 - **`cancellation_cleans_a_promotion_the_worker_has_not_observed`** *simulated* (`crates/blaze-dist/src/jobs/retirement_tests.rs`): cancellation before a worker observes its promotion releases only that continuing owner's stopped slot, using a fresh exact token within the existing attempt bound; stale requests and other owners cannot take it or follow it into a new execution.
@@ -198,9 +200,13 @@ By level: 301 tested, 105 simulated, 1 model-checked, 15 proved.
 ### blaze-dist-local
 
 - **`a_failed_heartbeat_cannot_publish_a_successful_tail`** *tested* (`crates/blaze-dist-local/src/agent.rs`): a final compiler refusal retains its diagnostic and remains terminal under every local policy despite a concurrent heartbeat failure; a successful tail cannot hide a failed or panicking heartbeat worker.
-  Controls: `a_dropped_heartbeat_failure`, `a_compiler_refusal_reclassified_as_transport_loss`.
+  Controls: `a_dropped_heartbeat_failure`, `a_compiler_refusal_reclassified_as_transport_loss`, `forgotten_publication_and_ownership_observations`.
+- **`accepted_publication_and_known_loss_guard_later_compiler_calls`** *simulated* (`crates/blaze-dist-local/src/agent.rs`): observing an accepted publication permanently prevents local fallback for that request, and ownership loss observed before completion prevents its tail callback.
+  Controls: `a_dropped_heartbeat_failure`, `a_compiler_refusal_reclassified_as_transport_loss`, `forgotten_publication_and_ownership_observations`.
 - **`execution_bindings_retain_cleanup_without_sliding_replay_or_expiry`** *simulated* (`crates/blaze-dist-local/src/coordinator/lifetime_tests.rs`): verified work retains its bounded cleanup lifetime across coalesced deadline changes; replay keeps the exact request and response identity, refused limits publish no transition prefix, and neither reconnect nor a new lifetime revives expiry.
   Controls: `a_missing_verified_execution_binding`, `a_sliding_session_ceiling`, `a_lost_reply_with_changed_replay_identity`, `different_bytes_reusing_a_replay_identity`.
+- **`accepted_output_outlives_subscribers_and_is_deliverable_at_capacity`** *simulated* (`crates/blaze-dist-local/src/coordinator/publication_tests.rs`): accepted output survives original subscriber/session/terminal expiry; full metadata capacity still permits lookup and exact delivery under a new request's own bounded lifetime, without changing an old terminal or losing replay identity.
+  Controls: `an_accepted_result_using_only_its_hello_lifetime`.
 - **`scope_completion_obligations_survive_handle_disposition_and_failed_starts`** *tested* (`crates/blaze-dist-local/src/sys/scope_tests.rs`): every live callback retains a scope obligation independently of its handle, and failed starts release theirs exactly once.
   Controls: `completion_owned_by_a_forgotten_handle`.
 

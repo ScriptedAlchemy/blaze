@@ -99,13 +99,13 @@ impl Sim {
             },
             alloc,
         );
-        let first = jobs.submit(0, &request(1), need(), &mut Vec::new_in(alloc)).unwrap();
+        let first = attached_for_test(jobs.submit(0, &request(1), need(), &mut Vec::new_in(alloc)));
         let (lead, attempt) = jobs
             .claim(0, first.execution, LEAD, &mut Vec::new_in(alloc))
             .unwrap()
             .map(|(executor, attempt)| (WireString::from_str_in(executor, alloc), attempt))
             .unwrap();
-        let leaving = jobs.submit(0, &request(1), need(), &mut Vec::new_in(alloc)).unwrap();
+        let leaving = attached_for_test(jobs.submit(0, &request(1), need(), &mut Vec::new_in(alloc)));
         let (helper, helped) = jobs
             .claim(0, first.execution, HELPER, &mut Vec::new_in(alloc))
             .unwrap()
@@ -372,7 +372,7 @@ impl Sim {
     fn reuse(&mut self) -> Result<(), WireString> {
         let alloc = self.alloc;
         let next =
-            self.jobs.submit(self.now, &request(2), need(), &mut Vec::new_in(alloc)).unwrap();
+            attached_for_test(self.jobs.submit(self.now, &request(2), need(), &mut Vec::new_in(alloc)));
         let claimed = self
             .jobs
             .claim(self.now, next.execution, STRANGER, &mut Vec::new_in(alloc))
@@ -571,7 +571,7 @@ fn cancel_before_observing_promotion(
             alloc,
         ));
     }
-    let next = sim.jobs.submit(sim.now, &request(2), need(), &mut Vec::new_in(alloc)).unwrap();
+    let next = attached_for_test(sim.jobs.submit(sim.now, &request(2), need(), &mut Vec::new_in(alloc)));
     let (executor, attempt) = sim
         .jobs
         .claim(sim.now, next.execution, STRANGER, &mut Vec::new_in(alloc))

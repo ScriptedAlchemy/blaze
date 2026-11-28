@@ -1,4 +1,4 @@
-//! Local transport version 5. This carrier version is independent of the selected global
+//! Local transport version 6. This carrier version is independent of the selected global
 //! wire codec and terminal contract version 2. Every body is one canonical CBOR value.
 //!
 //! Version 2 changed who names a session. Version 1 echoed a client-chosen session ID in
@@ -13,6 +13,8 @@
 //! exact-slot owned lookup observes promotions without claiming unrelated assignments.
 //! Verified execution bindings also retain their carrier lifetime through bounded work and
 //! cleanup; this does not revive an expired session or permit cross-session request replay.
+//! Version 6 resolves the authoritative cache under the current lead attempt before work
+//! starts, and returns retained accepted results without creating subscriber lifetimes.
 
 use blaze_own::Vec;
 use blaze_wire::job_terminal_v2::SubscriberTerminalV2;
@@ -24,7 +26,7 @@ use blaze_wire::{
 };
 
 /// Carrier protocol version; not blaze-wire's global codec version.
-pub const TRANSPORT_VERSION: u32 = 5;
+pub const TRANSPORT_VERSION: u32 = 6;
 
 wire_struct! {
     /// Creates a lifetime with `resume: None, epoch: None`, where `nonce` makes a retried
@@ -193,6 +195,7 @@ wire_enum! {
         DeliverPublication => 16 (DeliverPublication),
         RetireAssignment => 17 (RetireAssignment),
         OwnedAssignment => 18 (OwnedAssignment),
+        ResolvePublication => 19 (ResolvePublication),
     }
 }
 wire_struct! {
@@ -210,6 +213,45 @@ wire_struct! {
         0 => executor: Option<WireString>,
         1 => attempt: Attempt,
         2 => lead: bool,
+        3 => admission: AdmissionState,
+    }
+}
+wire_struct! {
+    /// Snapshot of a resolved flight. Actual work requests revalidate this identity in
+    /// the coordinator; a wire value alone grants no authority to another attempt.
+    CompileReady {
+        0 => execution: ExecutionId,
+        1 => attempt: Attempt,
+    }
+}
+wire_struct! {
+    /// An immutable accepted result, independent of any original subscriber's terminal.
+    /// A requester may finish durable delivery without acquiring a worker assignment.
+    AcceptedPublication {
+        0 => content: JobContent,
+        1 => execution: ExecutionId,
+        2 => accepted_attempt: Attempt,
+        3 => packs: WireVec<PackRef>,
+        4 => delivered: bool,
+    }
+}
+wire_enum! {
+    /// Current flight readiness. Helpers wait while the lead resolves the cache.
+    AdmissionState {
+        Resolving => 0 (Ack),
+        Compile => 1 (CompileReady),
+        Accepted => 2 (AcceptedPublication),
+    }
+}
+wire_struct! {
+    /// Completes the current lead's authoritative cache lookup. None establishes absence
+    /// only for this attempt; Some resolves from a validated durable manifest.
+    ResolvePublication {
+        0 => content: JobContent,
+        1 => execution: ExecutionId,
+        2 => attempt: Attempt,
+        3 => executor: WireString,
+        4 => packs: Option<WireVec<PackRef>>,
     }
 }
 wire_struct! {
@@ -304,6 +346,8 @@ wire_enum! {
         Packs => 11 (CommittedPacks),
         Publication => 12 (Publication),
         OwnedAssignment => 13 (OwnedAssignmentAnswer),
+        AcceptedPublication => 14 (AcceptedPublication),
+        AdmissionState => 15 (AdmissionState),
     }
 }
 wire_struct! {

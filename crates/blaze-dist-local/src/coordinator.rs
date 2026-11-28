@@ -3,7 +3,10 @@
 use core::alloc::Allocator;
 
 use blaze_dist::Refusal;
-use blaze_dist::jobs::{AssignmentToken, Effect, ExecState, Execution, Jobs};
+use blaze_dist::jobs::{
+    AcceptedPublication as CoreAcceptedPublication, AdmissionState as CoreAdmissionState,
+    AssignmentToken, Effect, ExecState, Execution, Jobs, SubmitAnswer,
+};
 use blaze_own::{BTreeMap, BTreeSet, Vec};
 use blaze_wire::{
     Ack, Digest, ErrorCode, ExecutionId, JobRequest, Limits, WireAlloc, WireError, WireString,
@@ -128,6 +131,29 @@ fn owned_claimant(session: &Digest, label: &Digest) -> Digest {
     blaze_wire::digest_of_encoded_name("blaze/local-claim-owner", &bytes)
 }
 
+fn accepted_publication(value: CoreAcceptedPublication) -> AcceptedPublication {
+    AcceptedPublication {
+        content: value.content,
+        execution: value.execution,
+        accepted_attempt: value.accepted_attempt,
+        packs: value.packs,
+        delivered: value.delivered,
+    }
+}
+
+fn admission_state(value: CoreAdmissionState) -> AdmissionState {
+    match value {
+        CoreAdmissionState::Resolving => AdmissionState::Resolving(Ack {}),
+        CoreAdmissionState::Compile(permit) => AdmissionState::Compile(CompileReady {
+            execution: permit.execution(),
+            attempt: permit.attempt(),
+        }),
+        CoreAdmissionState::Accepted(value) => {
+            AdmissionState::Accepted(accepted_publication(value))
+        }
+    }
+}
+
 /// The execution whose identity the route must validate before a successful binding.
 fn referenced_execution(command: &Command) -> Option<(ExecutionId, blaze_wire::JobContent)> {
     Some(match command {
@@ -147,6 +173,7 @@ fn referenced_execution(command: &Command) -> Option<(ExecutionId, blaze_wire::J
         Command::Packs(r) | Command::Publication(r) => (r.execution, r.content),
         Command::CommitPublication(r) => (r.execution, r.content),
         Command::DeliverPublication(r) => (r.execution, r.content),
+        Command::ResolvePublication(r) => (r.execution, r.content),
     })
 }
 
@@ -443,8 +470,10 @@ impl Coordinator {
         };
         let execution = match &answer {
             Answer::Error(_)
+            | Answer::AcceptedPublication(_)
             | Answer::Claimed(Claimed { executor: None, .. })
             | Answer::KillAck(KillAnswer { accepted: false }) => None,
+            Answer::Ack(_) if matches!(&request.command, Command::DeliverPublication(_)) => None,
             Answer::Binding(binding) => Some(binding.subscription.execution),
             _ => referenced_execution(&request.command).map(|(id, _)| id),
         };
@@ -544,6 +573,21 @@ impl Coordinator {
         Ok(())
     }
 
+    fn publication_size(&self, packs: &WireVec<blaze_wire::PackRef>) -> Result<(), WireError> {
+        let bytes = encode(packs, self.alloc).len();
+        if bytes > self.config.work_bytes {
+            return Err(error(ErrorCode::Busy, "publication-retention-capacity", self.alloc));
+        }
+        // Every accepted record must remain returnable both directly and inside a claim.
+        // Admission creates only "exec:{u64}" labels (at most 25 bytes). Including that
+        // label and maximum scalar encodings, the largest nested reply adds 181 bytes.
+        // The transport vector test holds that envelope below this 256-byte reserve.
+        if bytes.saturating_add(256) > usize::try_from(self.config.max_frame).unwrap_or(usize::MAX) {
+            return Err(error(ErrorCode::Busy, "publication-response-capacity", self.alloc));
+        }
+        Ok(())
+    }
+
     fn route(
         &mut self,
         now: u64,
@@ -557,11 +601,15 @@ impl Coordinator {
                 .execution(id)
                 .filter(|e| e.content == content)
                 .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?;
-            let ceiling = self.execution_ceiling(execution)?;
-            if execution.deadline().is_some_and(|deadline| deadline > ceiling) {
-                return Err(error(ErrorCode::Malformed, "execution-deadline-limit", self.alloc));
+            // Delivery consumes an immutable accepted handle, not an old subscription's
+            // lifetime. The current request already passed its own live-session check.
+            if !matches!(command, Command::DeliverPublication(_)) {
+                let ceiling = self.execution_ceiling(execution)?;
+                if execution.deadline().is_some_and(|deadline| deadline > ceiling) {
+                    return Err(error(ErrorCode::Malformed, "execution-deadline-limit", self.alloc));
+                }
+                self.session_work_limit(session, ceiling)?;
             }
-            self.session_work_limit(session, ceiling)?;
         }
         match command {
             Command::Submit(s) => {
@@ -574,7 +622,8 @@ impl Coordinator {
                     .jobs
                     .executions()
                     .find(|e| e.content == s.content && !matches!(e.state(), ExecState::Ended(_)));
-                let ceiling = match running {
+                let accepted = self.jobs.has_accepted_for(s.content);
+                let ceiling = match running.filter(|_| !accepted) {
                     Some(execution) => self.execution_ceiling(execution)?,
                     None => now
                         .checked_add(self.config.max_execution_ms)
@@ -589,10 +638,11 @@ impl Coordinator {
                         self.alloc,
                     ));
                 }
-                self.session_work_limit(session, ceiling)?;
-                // An equal live job adds an interest to the existing execution. A retained
-                // terminal instead creates a new execution with its own subscriber budget.
-                if running.is_none()
+                let session_deadline = if accepted { req.deadline_ms } else { ceiling };
+                self.session_work_limit(session, session_deadline)?;
+                // Accepted output allocates no execution or subscriber. Its lookup must
+                // remain available when the records retaining it fill these capacities.
+                if !accepted && running.is_none()
                     && self.jobs.executions().count() >= self.config.max_executions
                 {
                     return Err(error(
@@ -601,32 +651,47 @@ impl Coordinator {
                         self.alloc,
                     ));
                 }
-                if running.is_some_and(|e| e.subscribers().count() >= self.config.max_subscribers) {
+                if !accepted
+                    && running.is_some_and(|e| e.subscribers().count() >= self.config.max_subscribers)
+                {
                     return Err(error(
                         ErrorCode::Busy,
                         "subscriber-retention-capacity",
                         self.alloc,
                     ));
                 }
-                let a = self
+                let answer = self
                     .jobs
                     .submit(now, &req, s.need.clone(), out)
                     .map_err(|(r, retry)| r.to_wire(retry, self.alloc))?;
-                self.units.insert(a.execution, req.unit);
-                self.jobs.tick(now, out);
-                let attempt = self
-                    .jobs
-                    .execution(a.execution)
-                    .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?
-                    .attempt();
-                Ok(Answer::Binding(Binding {
-                    subscription: Subscription {
-                        content: a.content,
-                        execution: a.execution,
-                        subscriber: a.subscriber,
-                    },
-                    attempt,
-                }))
+                match answer {
+                    SubmitAnswer::Attached(a) => {
+                        self.units.insert(a.execution, req.unit);
+                        self.jobs.tick(now, out);
+                        let attempt = self
+                            .jobs
+                            .execution(a.execution)
+                            .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?
+                            .attempt();
+                        Ok(Answer::Binding(Binding {
+                            subscription: Subscription {
+                                content: a.content,
+                                execution: a.execution,
+                                subscriber: a.subscriber,
+                            },
+                            attempt,
+                        }))
+                    }
+                    SubmitAnswer::Accepted(value) => {
+                        // This request owns its delivery budget, not an old subscriber's
+                        // deadline. It acquires no subscription to that old execution.
+                        let until = req.deadline_ms.saturating_add(self.config.owner_cleanup_ms);
+                        if let Some(live) = self.sessions.get_mut(&session) {
+                            live.expires = live.expires.max(until.min(live.maximum_expires));
+                        }
+                        Ok(Answer::AcceptedPublication(accepted_publication(value)))
+                    }
+                }
             }
             Command::Subscribe(s) => {
                 let execution = self
@@ -843,12 +908,31 @@ impl Coordinator {
                     .execution(c.execution)
                     .ok_or_else(|| Refusal::NoExecution.to_wire(None, self.alloc))?;
                 let lead = claimed.as_ref().is_some_and(|(who, _)| e.lead() == Some(who.as_str()));
+                let admission = admission_state(e.admission_state());
                 Ok(Answer::Claimed(match claimed {
                     Some((executor, attempt)) => {
-                        Claimed { executor: Some(executor), attempt, lead }
+                        Claimed { executor: Some(executor), attempt, lead, admission }
                     }
-                    None => Claimed { executor: None, attempt: e.attempt(), lead },
+                    None => Claimed { executor: None, attempt: e.attempt(), lead, admission },
                 }))
+            }
+            Command::ResolvePublication(p) => {
+                self.work(p.content, p.execution, p.attempt)?;
+                if let Some(packs) = &p.packs {
+                    self.publication_size(packs)?;
+                }
+                let state = self
+                    .jobs
+                    .resolve_publication(
+                        now,
+                        p.execution,
+                        p.executor.as_str(),
+                        p.attempt,
+                        p.packs.as_deref(),
+                        out,
+                    )
+                    .map_err(|r| r.to_wire(None, self.alloc))?;
+                Ok(Answer::AdmissionState(admission_state(state)))
             }
             Command::Packs(p) => {
                 if self.jobs.execution(p.execution).is_none_or(|e| e.content != p.content) {
@@ -869,13 +953,7 @@ impl Coordinator {
             }
             Command::CommitPublication(p) => {
                 self.work(p.content, p.execution, p.attempt)?;
-                if encode(&p.packs, self.alloc).len() > self.config.work_bytes {
-                    return Err(error(
-                        ErrorCode::Busy,
-                        "publication-retention-capacity",
-                        self.alloc,
-                    ));
-                }
+                self.publication_size(&p.packs)?;
                 self.jobs
                     .commit_publication(
                         now,
@@ -928,6 +1006,9 @@ impl Coordinator {
 
 #[cfg(test)]
 mod lifetime_tests;
+
+#[cfg(test)]
+mod publication_tests;
 
 #[cfg(test)]
 mod tests {

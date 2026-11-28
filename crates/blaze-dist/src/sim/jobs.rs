@@ -405,7 +405,7 @@ impl World {
             })
             .map(|e| e.id);
         match answer {
-            Ok(answer) => {
+            Ok(jobs::SubmitAnswer::Attached(answer)) => {
                 self.subscribers.insert(answer.subscriber, (answer.execution, req.deadline_ms));
                 match running {
                     Some(id) if id != answer.execution => {
@@ -436,6 +436,12 @@ impl World {
                             .push_back(answer.execution);
                     }
                 }
+            }
+            Ok(jobs::SubmitAnswer::Accepted(_)) => {
+                return Err(self.violation(
+                    "completion",
+                    format_args!("work-protocol admission returned a published manifest"),
+                ));
             }
             // A unit of a revision its pull request replaced: only a pull request has revisions.
             Err((Refusal::Superseded, _)) if matches!(namespace, Namespace::Pr(_)) => {}

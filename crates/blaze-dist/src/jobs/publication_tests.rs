@@ -44,7 +44,18 @@ fn execution(alloc: WireAlloc) -> Execution {
 }
 
 fn join(e: &mut Execution, now: u64, alloc: WireAlloc) {
+    if e.publication().is_some() || e.refused {
+        return;
+    }
     let lead = WireString::from_str_in(e.lead().unwrap(), alloc);
+    let resolved = e.resolve_publication(
+        now,
+        lead.as_str(),
+        e.attempt(),
+        None,
+        &mut Vec::new_in(alloc),
+    );
+    assert!(matches!(resolved, Ok(AdmissionState::Compile(_))));
     e.join(
         now,
         lead.as_str(),
