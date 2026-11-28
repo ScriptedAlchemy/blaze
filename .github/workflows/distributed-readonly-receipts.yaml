@@ -1,4 +1,4 @@
-name: Read original benchmark receipts
+name: Read original final production receipts
 
 on:
   push:
@@ -11,11 +11,11 @@ permissions:
 
 jobs:
   receipts:
-    name: Verify and print the original benchmark receipts
+    name: Verify and print the original final production receipts
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 12
     steps:
-      - name: Read the exact original benchmark artifact
+      - name: Read the exact original final production artifact
         timeout-minutes: 11
         env:
           GH_TOKEN: ${{ github.token }}
@@ -27,14 +27,14 @@ jobs:
           import urllib.parse, urllib.request, zipfile
           from pathlib import PurePosixPath
           
-          PINS = [{"role":"benchmark","id":15249129690,"name":"blaze-46108319982-1-primary-evidence","size":98795077,"sha256":"098128781b5fdfd22d0fd8839a95c3722945b9855673eeed03a27387fae43168"}]
-          RUN = 46108319982
-          HEAD = "f863d6a6fcd31e0286a92fe18bd8194292fca628"
-          CANDIDATE = {"commit": "f863d6a6fcd31e0286a92fe18bd8194292fca628",
-                       "tree": "5688cd16fda44f32fd2f4890d366496615a4ecd2"}
+          PINS = [{"role":"source-protocol","id":15250528399,"name":"production-acceptance-evidence","size":23340017,"sha256":"d67e9deadd73baae7b01bc253b2cf97da634196b1a9c3a506a7bdd5b71c71bcc"}]
+          RUN = 46107355019
+          HEAD = "d300f1ee123b4ba5cf74e78fefe6791fec1ece4e"
+          CANDIDATE = {"commit": "8863223bdc560b54827238fad43e985ac64d80a3",
+                       "tree": "ffc4a0a1186eed389246391f1ce82baeedee27ce"}
           REPO = "ScriptedAlchemy/blaze"
           API = "https://api.github.com/repos/" + REPO
-          MAX_ZIP = 128 * 1024 * 1024
+          MAX_ZIP = 64 * 1024 * 1024
           MAX_FILE = 1024 * 1024
           MAX_OBSERVER = 8 * 1024 * 1024
           MAX_OUTPUT = 4 * 1024 * 1024
@@ -188,7 +188,7 @@ jobs:
                       value = {key: value[key] for key in keys if key in value}
                   emit({"kind": "original-json", "artifact_id": pin["id"], "requested": suffix,
                         "omitted_top_level_keys": omitted, "value": value})
-                  if PurePosixPath(suffix).name in ("blaze-build.json", "blaze-build.original.json", "blaze-build.after.json"):
+                  if suffix in ("blaze-build.json", "blaze-build.original.json", "blaze-build.after.json"):
                       assert value["source"] == CANDIDATE
               else:
                   # Emit every character of the small original command log, including all diagnostics.
@@ -215,15 +215,14 @@ jobs:
                     "status": run["status"], "conclusion": run["conclusion"],
                     "candidate_source": CANDIDATE,
                     "scope": "Read original bytes only; no checkout, build, test, or acceptance inference."})
-              # Read the three retained benchmark reports and their sealed source identity.
-              # Numbered fragments preserve every original report byte without a large JSON record.
+              # Read only retained original source evidence. Print complete test logs;
+              # disclose the omitted large observer trace fields explicitly.
               source = [
-                  ("worker-sample-1/three-host-latency.json", "text"),
-                  ("worker-sample-2/three-host-latency.json", "text"),
-                  ("worker-sample-3/three-host-latency.json", "text"),
-                  ("host-evidence/blaze-build.json", "json"),
-                  ("host-evidence/identity-before.log", "text"),
-                  ("host-evidence/identity-after.log", "text"),
+                  ("exec/blaze-dist.log", "text"), ("exec/blaze-dist-local.log", "text"),
+                  ("exec/blaze-wire.log", "text"), ("exec/blaze-serve.log", "text"),
+                  ("exec-input.json", "json"), ("exec/input.json", "json"),
+                  ("exec/result.json", "json"), ("exec/supervisor.json", "json"),
+                  ("blaze-build.json", "json"),
               ]
               missing = []
               for pin in PINS:
