@@ -137,7 +137,7 @@ fn by_need_scope_defers_dependency_opens_and_matches_opened_answers() {
         let n = blaze_scope::names_record::encode(c, g).expect("names record");
         let i = blaze_scope::items_record::encode(c, g).expect("items record");
         let split = blaze_scope::expansion_records::write(c, g).expect("expansions");
-        let payload = crate::names::sections::write(0, [&[], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[]]);
+        let payload = crate::names::sections::write(0, [&[], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[], &[]]);
         let rec = crate::front_load::crate_records(
             blaze_drive::key::crate_scope_name(&inputs[idx].key),
             &payload,

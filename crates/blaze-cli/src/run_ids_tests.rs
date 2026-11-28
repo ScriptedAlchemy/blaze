@@ -1128,6 +1128,64 @@ fn instance_inputs_follow_the_callable_proof_and_keep_other_items_at_crate_grain
     assert_eq!(other_after, inputs(2, 3, true).0);
 }
 
+#[test]
+fn distributed_inputs_replace_only_the_witnessed_workspace_scope_output() {
+    let crates = table([1; 32]);
+    let owner = CrateItemKey(ContentId([APP; 32]));
+    let scope = blaze_drive::key::crate_scope_name(&owner);
+    let build = |crates: &Table, out, owners| {
+        let mut today = std::vec![(Name::unit_graph(), GRAPH_OUT), (blaze_drive::key::owners_of(main_body().file), owners), (scope, out)];
+        today.sort_unstable_by_key(|(name, _)| *name);
+        ids_with(ToolchainId([7; 32]), crates, &today)
+    };
+    let retained = build(&crates, ContentId([81; 32]), OWNERS_OUT);
+    let fresh = build(&crates, ContentId([82; 32]), OWNERS_OUT);
+    let witnessed = ContentId([83; 32]);
+    let projected = |ids: &RunIds<'_>, witness| {
+        let mut hash = Hasher::new(TABLE_KEY_DOMAIN);
+        ids.hash_export_inputs(&mut hash, |key| (key == owner).then_some(witness));
+        hash.finish()
+    };
+    assert_ne!(retained.crates, fresh.crates, "the two local scopes store different derived outputs");
+    assert_eq!(retained.bodies, fresh.bodies, "the complete checked body table is equal");
+    assert_ne!(retained.crate_fact(item(APP, 2)), fresh.crate_fact(item(APP, 2)), "ordinary runtime reads retain the stored scope value");
+    assert_eq!(projected(&retained, witnessed), projected(&fresh, witnessed), "equal semantic witnesses join the distributed contexts");
+    assert_ne!(projected(&retained, witnessed), projected(&fresh, ContentId([84; 32])), "a changed witness remains an input");
+
+    let body_edit = build(&crates, ContentId([82; 32]), ContentId([85; 32]));
+    assert_ne!(fresh.bodies, body_edit.bodies, "a changed owner fact changes the actual body identity");
+    assert_ne!(projected(&fresh, witnessed), projected(&body_edit, witnessed), "normalization preserves all body bytes");
+    let dependency_edit = build(&table([2; 32]), ContentId([82; 32]), OWNERS_OUT);
+    assert_ne!(projected(&fresh, witnessed), projected(&dependency_edit, witnessed), "a locked dependency keeps its exact grain digest");
+
+    // No projection preserves the original hash transcript, including its table lengths.
+    let mut original = Hasher::new(TABLE_KEY_DOMAIN);
+    original.part(retained.crates).part(retained.bodies);
+    let mut exact = Hasher::new(TABLE_KEY_DOMAIN);
+    retained.hash_export_inputs(&mut exact, |_| None);
+    assert_eq!(original.finish(), exact.finish());
+
+    let mut scopes = std::vec::Vec::new();
+    retained.each_workspace_scope(|key| scopes.push(key));
+    assert_eq!(scopes, [owner]);
+    let unknown = ids(ToolchainId([7; 32]), &crates);
+    let mut unknown_scopes = std::vec::Vec::new();
+    unknown.each_workspace_scope(|key| unknown_scopes.push(key));
+    assert!(unknown_scopes.is_empty(), "a workspace without a known scope is never normalized");
+
+    for ids in [&retained, &unknown] {
+        for (row, grain) in ids.crates.as_chunks::<CRATE_ROW>().0.iter().zip(ids.grains.iter().copied()) {
+            let exported = export_crate_row(row, grain, &|_| Some(witnessed));
+            if grain == GrainTag::Workspace {
+                assert_eq!(exported[..80], row[..80], "prefix, full crate key, grain, padding and fact are exact");
+                assert_eq!(exported[80..], witnessed.0, "only the witnessed scope digest changes");
+            } else {
+                assert_eq!(exported, *row, "toolchain, locked and unknown-workspace rows retain every byte");
+            }
+        }
+    }
+}
+
 /// The table of `n` members, built with the caps `most`.
 fn members_ids(n: usize, most: Most) -> Result<RunIds<'static>, RunIdsError<'static>> {
     let io = Io::simulated(SimWorld::new(3, Limits::USUAL));

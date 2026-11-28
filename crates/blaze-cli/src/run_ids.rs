@@ -1802,6 +1802,16 @@ fn crate_row(b: &[u8], tag: GrainTag) -> CrateRow {
     CrateRow { prefix, key, grain }
 }
 
+fn export_crate_row(row: &[u8; CRATE_ROW], grain: GrainTag, workspace: &impl Fn(CrateItemKey) -> Option<ContentId>) -> [u8; CRATE_ROW] {
+    let mut out = *row;
+    if grain == GrainTag::Workspace
+        && let Some(digest) = workspace(crate_row(row, grain).key)
+    {
+        out[80..112].copy_from_slice(&digest.0);
+    }
+    out
+}
+
 fn put_body_row<A: core::alloc::Allocator>(out: &mut Vec<u8, A>, row: &BodyRow) {
     out.extend_from_slice(&row.item.0.to_be_bytes());
     out.extend_from_slice(&row.key.0);
@@ -1988,19 +1998,37 @@ pub(crate) struct RunIds<'a> {
 impl<'a> RunIds<'a> {
     /// Canonically ordered crate facts, body identities and checked verdicts. The
     /// consumer checks each reached instance's current recipe against its proof.
-    pub(crate) fn hash_export_inputs(&self, hash: &mut blaze_ids::Hasher) {
-        hash.part(self.crates).part(self.bodies);
+    pub(crate) fn hash_export_inputs(&self, hash: &mut blaze_ids::Hasher, workspace: impl Fn(CrateItemKey) -> Option<ContentId>) {
+        // Keep the exact table framing and every field except a witnessed
+        // workspace scope's derived output. Runtime crate facts are untouched.
+        hash.update(&u64::try_from(self.crates.len()).unwrap_or(u64::MAX).to_le_bytes());
+        for (row, grain) in self.crates.as_chunks::<CRATE_ROW>().0.iter().zip(self.grains.iter().copied()) {
+            hash.update(&export_crate_row(row, grain, &workspace));
+        }
+        hash.part(self.bodies);
     }
 
     /// The exact rows hashed above, for bounded distributed-input diagnostics. Keys
     /// identify rows independently of their position; the complete bytes retain the
     /// verdict, text and check identity that a work-plan summary does not report.
-    pub(crate) fn each_export_input(&self, mut each: impl FnMut(&'static str, &[u8], &[u8])) {
-        for row in self.crates.chunks_exact(CRATE_ROW) {
-            each("run_ids.crate", &row[..8], row);
+    pub(crate) fn each_export_input(&self, workspace: impl Fn(CrateItemKey) -> Option<ContentId>, mut each: impl FnMut(&'static str, &[u8], &[u8])) {
+        for (row, grain) in self.crates.as_chunks::<CRATE_ROW>().0.iter().zip(self.grains.iter().copied()) {
+            let row = export_crate_row(row, grain, &workspace);
+            each("run_ids.crate", &row[..8], &row);
         }
         for row in self.bodies.chunks_exact(BODY_ROW) {
             each("run_ids.body", &row[..16], row);
+        }
+    }
+
+    /// Workspace scopes whose coarse facts exist in this checked table. The
+    /// exporter must obtain a complete witness for each; an absent witness is an
+    /// error at that boundary, never a claim that the scope ran no opaque calls.
+    pub(crate) fn each_workspace_scope(&self, mut each: impl FnMut(CrateItemKey)) {
+        for (row, grain) in self.crates.as_chunks::<CRATE_ROW>().0.iter().zip(self.grains.iter().copied()) {
+            if grain == GrainTag::Workspace {
+                each(crate_row(row, grain).key);
+            }
         }
     }
 

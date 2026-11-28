@@ -822,6 +822,9 @@ pub struct CrateNames<'a> {
     pub tables: Tables<'a>,
     pub made: HashMap<ItemKey, MadeModule<'a>, Alloc<'a>>,
     pub expansions: HashMap<ItemKey, Expansion<'a>, Alloc<'a>>,
+    /// Actual opaque proc expansions, sorted by call and output. Their canonical
+    /// output includes origins and outside reads; source alone cannot reproduce it.
+    pub opaque_outputs: AVec<'a, OpaqueOutput>,
     /// Each module's finished scope and the read list it is valid by.
     pub done: HashMap<ItemKey, Resolved<'a, &'a str>, Alloc<'a>>,
     /// The written modules by group (E4, cells/groups.rs): one record per strongly connected
@@ -839,6 +842,13 @@ pub struct CrateNames<'a> {
     /// Each `link_name`/`export_name` value written as a macro call, expanded at its item's
     /// place: one row per item and attribute, sorted ([`crate::attr_values::row`] reads one).
     pub values: AVec<'a, crate::attr_values::ValueRow<'a>>,
+}
+
+/// One proc call's complete expansion value, independent of local record placement.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct OpaqueOutput {
+    pub call: ItemKey,
+    pub digest: ContentId,
 }
 
 /// A body whose blocks a crate solve left to the body's own solve (D189 step 4).
@@ -1732,7 +1742,10 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let failed = core::mem::replace(&mut fill.failed, HashMap::new_in(alloc));
     let report = fill.report;
 
-    let Run { files, tables, expansions, made, notes: run_notes, new_modules: _, block_places: _, prepares: _, held: held_bodies } = run;
+    let Run { files, tables, expansions, opaque_outputs, made, notes: run_notes, new_modules: _, block_places: _, prepares: _, held: held_bodies } = run;
+    let mut opaque_outputs = held(opaque_outputs.into_inner(), "opaque expansion outputs");
+    opaque_outputs.sort_unstable();
+    opaque_outputs.dedup();
     // The held bodies (D189 step 4), by key (the fill's threads held them in no fixed order),
     // each with its cut of its module's textual sequence.
     let mut bodies: AVec<'a, HeldBody<'a>> = AVec::new_in(alloc);
@@ -1768,6 +1781,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         tables: tables_all,
         made,
         expansions: held(expansions.into_inner(), "expansions"),
+        opaque_outputs,
         done,
         groups,
         failed,
@@ -2100,7 +2114,7 @@ pub fn solve_held_body_scratch<'a, S: SourceTexts<'a>>(
     macros.dedup();
     let questions = asked.take();
     let deps = crate::asked::encode(c.key, &[], &questions, alloc);
-    let Run { files: _, tables, expansions, made, notes, new_modules: _, block_places: _, held: _, prepares: _ } = run;
+    let Run { files: _, tables, expansions, opaque_outputs: _, made, notes, new_modules: _, block_places: _, held: _, prepares: _ } = run;
     Ok(BodySolved {
         scopes,
         made_outside,
@@ -2849,6 +2863,7 @@ struct Run<'a> {
     files: Mutex<FileSet<'a>>,
     tables: RwLock<Tables<'a>>,
     expansions: Mutex<HashMap<ItemKey, Expansion<'a>, Alloc<'a>>>,
+    opaque_outputs: Mutex<AVec<'a, OpaqueOutput>>,
     made: RwLock<HashMap<ItemKey, MadeModule<'a>, Alloc<'a>>>,
     notes: Mutex<AVec<'a, NamesNote<'a>>>,
     /// Made modules the fill has not been told of yet.
@@ -2876,6 +2891,7 @@ impl<'a> Run<'a> {
             files: Mutex::new(files),
             tables: RwLock::new(tables),
             expansions: Mutex::new(HashMap::new_in(alloc)),
+            opaque_outputs: Mutex::new(AVec::new_in(alloc)),
             made: RwLock::new(HashMap::new_in(alloc)),
             notes: Mutex::new(AVec::new_in(alloc)),
             new_modules: Mutex::new(AVec::new_in(alloc)),
@@ -3974,6 +3990,16 @@ fn expand_call<'a, S: SourceTexts<'a>>(
     expansion
     }
     };
+    // Capture the actual opaque value after both the execution and kept-answer
+    // paths. The canonical expansion encoding includes tokens, hygiene, origins,
+    // nested calls, holes, outside reads and diagnostics. Synthetic block text is
+    // derived from source and does not enter this opaque-output witness.
+    if matches!(mac.body, MacroBody::Proc { .. }) {
+        let mut output = blaze_ids::Hasher::new("blaze-scope opaque expansion output 1");
+        output.id(&own_key.0);
+        expansion.encode(&mut output);
+        held(run.opaque_outputs.lock(), "opaque expansion outputs").push(OpaqueOutput { call, digest: output.finish() });
+    }
     // A call whose expansion holds an error FAILED (the Reference, "Macros By Example": if no
     // rule matches, "an error is reported"): it writes nothing, and what it might have written
     // is unknown because of it, never absent (rules 19 and 54). Returning `None` stores it

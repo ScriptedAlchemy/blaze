@@ -1,0 +1,14 @@
+{
+  "id": "pr83-context-scope-history",
+  "date": "2026-11-28",
+  "who": "Jamarcus, cache-identity and protocol-validation lanes",
+  "where": "crates/blaze-cli/src/engine_dist/reach_inputs.rs",
+  "what": "Run 46120488242's dev intact-cache consumer scheduled app compilation. Its complete 486-row receipt differed from the producer only in mathy's stored CrateScope output, repeated in Program and RunIds. All 335 body rows and every source leaf agreed.",
+  "cost": "Fresh consumers could not reuse a completed dev publication despite equal checked body and source inputs; the production acceptance gate failed.",
+  "cause": "The context hashed a derived whole-scope output that can retain synthetic expression-macro text from the last names solve. A body edit may preserve Surface and correctly retain that scope while a fresh solve renders the current synthetic text. The artifact proves the differing scope; the new real-resolver regression targets this causal class.",
+  "class": "A shareable verification key includes valid local derivation history instead of a complete portable semantic input witness.",
+  "prevention": "Workspace export contexts use semantic task source, validated cell observations and a mandatory persisted opaque-output witness. Exact proc expansion outputs, origins, external reads, link values and current proc-module outputs remain inputs, as do full source leaves, body tables, scripts and closed crate grains. Runtime RunIds are unchanged.",
+  "workaround": "None: missing or old witnesses are refused, and cache assertions, source identity gates and verification remain required.",
+  "fix": "Scope form 8, source domain 21 and distributed context domain 2 are implemented with resolver, persistence and projection controls. Native execution and intact-cache acceptance on the final tree remain required.",
+  "state": "open"
+}

@@ -14,6 +14,6 @@
   "class": "A fault-injection control depends on unrelated wall-clock startup before it observes the injected transition.",
   "prevention": "The production loop delegates its unchanged tick, accept, read and write ordering to one turn. The test drives exactly three injected transient errors with a real hello already queued, proves the welcome reaches the peer, rejects a fatal error, and checks cancellation before another turn. Existing concurrent Client/server controls remain in tests/unix.rs.",
   "workaround": "None: no additional timeout, retry, ignored test or substituted protocol implementation.",
-  "fix": "One-turn fixture and fatal-error/cancellation controls written; source-built protocol execution on the final tree remains required.",
-  "state": "open"
+  "fix": "One-turn fixture and fatal-error/cancellation controls passed native ARM64 and source-built execution in run 46120488242, tree fe3859b920da54c052a8ff788f5546a81bec397b. All 392 source-built distributed protocol tests and 112 required controls executed successfully. The old handshake failure's underlying timing cause remains unproven; the narrower fixture now observes its own injected transition directly.",
+  "state": "fixed"
 }

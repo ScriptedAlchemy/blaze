@@ -3,18 +3,25 @@
 
 use core::fmt::Write as _;
 
+use blaze_drive::Name;
+use blaze_engine::{CellId, last::LastAnswer};
+use blaze_id::CrateItemKey;
 use blaze_ids::{ContentId, Hasher};
+use blaze_own::{AVec, Alloc};
 use blaze_wire::json::hex;
 use blaze_wire::{WireAlloc, WireString};
 
 use crate::{engine_check::Standing, run_ids::RunIds, run_names::Program, sweep::{Leaf, LeafKind}};
 use super::DistError;
 
-const DOMAIN: &str = "blaze distributed dev verification inputs 1";
+const DOMAIN: &str = "blaze distributed dev verification inputs 2";
+const SCOPE_DOMAIN: &str = "blaze distributed dev scope inputs 1";
 const EVIDENCE_DOMAIN: &str = "blaze distributed dev verification evidence 1";
 const MOST_ROWS: usize = 4096;
 const MOST_KEY_BYTES: usize = 256;
 const MOST_VALUE_BYTES: usize = 256;
+const MOST_SCOPES: usize = 1 << 20;
+const MOST_SCOPE_READS: usize = 1 << 20;
 
 pub(crate) fn context(
     standing: &Standing<'_, '_>,
@@ -22,14 +29,119 @@ pub(crate) fn context(
     ids: &RunIds<'_>,
     report_path: Option<&str>,
 ) -> Result<ContentId, DistError> {
+    let inputs = Inputs::new(standing, program, ids)?;
+    let workspace = |key| inputs.scope(key);
     let context = digest(
         IdentityInputs { producers: standing.producers.digest(), toolchain: &standing.toolchain.0, tools: &standing.tools },
-        |hash| program.hash_export_inputs(hash),
-        |hash| ids.hash_export_inputs(hash),
+        |hash| {
+            program.hash_export_inputs(hash, &workspace);
+            inputs.hash_modules(hash);
+        },
+        |hash| ids.hash_export_inputs(hash, &workspace),
         (0..standing.leaves.len()).map(|index| (standing.leaves.path(index), standing.leaves.row(index))),
     );
-    write_evidence(report_path, standing.heap, |alloc| evidence(standing, program, ids, context, alloc))?;
+    write_evidence(report_path, standing.heap, |alloc| evidence(standing, program, ids, &inputs, context, alloc))?;
     Ok(context)
+}
+
+struct ScopeInput<'a> {
+    key: CrateItemKey,
+    source: ContentId,
+    outputs: ContentId,
+    reads: AVec<'a, (CellId, ContentId)>,
+    digest: ContentId,
+}
+
+struct Inputs<'a> {
+    scopes: AVec<'a, ScopeInput<'a>>,
+    modules: AVec<'a, (Name, ContentId)>,
+}
+
+impl<'a> Inputs<'a> {
+    fn new(standing: &Standing<'_, '_>, program: &Program, ids: &RunIds<'_>) -> Result<Inputs<'a>, DistError> {
+        let alloc: Alloc<'a> = standing.heap.alloc();
+        let mut keys = AVec::new_in(alloc);
+        ids.each_workspace_scope(|key| keys.push(key));
+        keys.sort_unstable();
+        keys.dedup();
+        let refuse = |name: Name, what: &str| DistError::Compile {
+            shown: blaze_own::format_in!(standing.heap.alloc(), "cannot witness distributed verification inputs for {name}: {what}"),
+        };
+        if keys.len() > MOST_SCOPES {
+            return Err(refuse(Name::unit_graph(), "more than the bounded workspace scope count"));
+        }
+        let rows = standing.rows();
+        let mut scopes = AVec::with_capacity_in(keys.len(), alloc);
+        for key in keys {
+            let name = blaze_drive::key::crate_scope_name(&key);
+            let row = rows.row_facts(name).map_err(|_| refuse(name, "the stored scope row was refused"))?
+                .ok_or_else(|| refuse(name, "the checked scope has no row"))?;
+            if row.failed {
+                return Err(refuse(name, "the checked scope failed"));
+            }
+            let output_cell = CellId { of: name, cell: crate::engine_tasks::CONTEXT_OUTPUTS };
+            let mut defines = rows.defines(name).ok_or_else(|| refuse(name, "the scope has no defined cells"))?;
+            if !defines.any(|(id, _)| id == output_cell) {
+                return Err(refuse(name, "the scope lacks its context output witness; rebuild it with the current compiler"));
+            }
+            let outputs = rows.cell(&output_cell);
+            let observed = rows.observations(name).map_err(|_| refuse(name, "the stored scope reads were refused"))?
+                .ok_or_else(|| refuse(name, "the checked scope has no read transcript"))?;
+            if observed.len() > MOST_SCOPE_READS {
+                return Err(refuse(name, "more than the bounded scope read count"));
+            }
+            let mut reads = AVec::with_capacity_in(observed.len(), alloc);
+            reads.extend(observed);
+            reads.sort_unstable();
+            let digest = scope_digest(row.source, outputs, &reads);
+            scopes.push(ScopeInput { key, source: row.source, outputs, reads, digest });
+        }
+        let mut names = AVec::new_in(alloc);
+        program.each_macro_input(|name| names.push(name));
+        names.sort_unstable();
+        names.dedup();
+        if names.len() > MOST_SCOPES {
+            return Err(refuse(Name::unit_graph(), "more than the bounded proc-module count"));
+        }
+        let mut modules = AVec::with_capacity_in(names.len(), alloc);
+        for name in names {
+            let row = rows.row_facts(name).map_err(|_| refuse(name, "the proc-module row was refused"))?
+                .ok_or_else(|| refuse(name, "the checked proc module has no row"))?;
+            if row.failed {
+                return Err(refuse(name, "the checked proc module failed"));
+            }
+            modules.push((name, row.out));
+        }
+        if rows.refusal().is_some() {
+            return Err(refuse(Name::unit_graph(), "the stored answer refused a witness read"));
+        }
+        Ok(Inputs { scopes, modules })
+    }
+
+    fn scope(&self, key: CrateItemKey) -> Option<ContentId> {
+        self.scopes.binary_search_by_key(&key, |scope| scope.key).ok()
+            .and_then(|at| self.scopes.get(at)).map(|scope| scope.digest)
+    }
+
+    fn hash_modules(&self, hash: &mut Hasher) {
+        hash.update(&u64::try_from(self.modules.len()).unwrap_or(u64::MAX).to_le_bytes());
+        for (name, out) in &self.modules {
+            hash.id(&name.subject).id(out);
+        }
+    }
+}
+
+/// A scope is valid by its semantic source and the current values of its read
+/// transcript. `reads` is sorted by (cell, value). The opaque-output witness is
+/// mandatory: proc outputs and macro-valued link attributes are not source alone.
+/// Neither the local record key, generation nor derived whole-scope output enters.
+pub(crate) fn scope_digest(source: ContentId, outputs: ContentId, reads: &[(CellId, ContentId)]) -> ContentId {
+    let mut hash = Hasher::new(SCOPE_DOMAIN);
+    hash.id(&source).id(&outputs).update(&u64::try_from(reads.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for (id, saw) in reads {
+        hash.part(id.of.kind.name().as_bytes()).id(&id.of.subject).update(&id.cell.0).id(saw);
+    }
+    hash.finish()
 }
 
 struct IdentityInputs<'a> {
@@ -77,10 +189,11 @@ fn write_evidence(
 }
 
 /// A receipt is requested only through the existing distributed report option.
-/// The key's byte stream above is unchanged. Each section has a complete digest;
+/// Each section has a complete digest;
 /// row detail has explicit count and byte bounds, including for large workspaces.
-fn evidence(standing: &Standing<'_, '_>, program: &Program, ids: &RunIds<'_>, context: ContentId, alloc: WireAlloc) -> WireString {
+fn evidence(standing: &Standing<'_, '_>, program: &Program, ids: &RunIds<'_>, inputs: &Inputs<'_>, context: ContentId, alloc: WireAlloc) -> WireString {
     let mut report = Report::new(context, alloc);
+    let workspace = |key| inputs.scope(key);
     report.section("producers", |hash| { hash.id(&standing.producers.digest()); });
     report.section("toolchain", |hash| { hash.update(&standing.toolchain.0); });
     report.section("tools", |hash| {
@@ -88,8 +201,9 @@ fn evidence(standing: &Standing<'_, '_>, program: &Program, ids: &RunIds<'_>, co
             hash.id(&tool.0);
         }
     });
-    report.section("program", |hash| program.hash_export_inputs(hash));
-    report.section("run_ids", |hash| ids.hash_export_inputs(hash));
+    report.section("program", |hash| program.hash_export_inputs(hash, &workspace));
+    report.section("run_ids", |hash| ids.hash_export_inputs(hash, &workspace));
+    report.section("macro_modules", |hash| inputs.hash_modules(hash));
     report.section("leaves", |hash| {
         for index in 0..standing.leaves.len() {
             standing.leaves.row(index).hash_state(standing.leaves.path(index), hash);
@@ -124,8 +238,25 @@ fn evidence(standing: &Standing<'_, '_>, program: &Program, ids: &RunIds<'_>, co
         };
         report.row(kind, standing.leaves.path(index).as_bytes(), &value);
     }
-    program.each_export_input(|kind, key, value| report.row(kind, key, value));
-    ids.each_export_input(|kind, key, value| report.row(kind, key, value));
+    for scope in &inputs.scopes {
+        report.row("scope.source", &scope.key.0.0, &scope.source.0);
+        report.row("scope.context_outputs", &scope.key.0.0, &scope.outputs.0);
+        report.row("scope.inputs", &scope.key.0.0, &scope.digest.0);
+        for (id, saw) in &scope.reads {
+            let mut key = blaze_wire::WireVec::new_in(alloc);
+            key.extend_from_slice(&scope.key.0.0);
+            key.extend_from_slice(id.of.kind.name().as_bytes());
+            key.push(0);
+            key.extend_from_slice(&id.of.subject.0);
+            key.extend_from_slice(&id.cell.0);
+            report.row("scope.read", &key, &saw.0);
+        }
+    }
+    for (name, out) in &inputs.modules {
+        report.row("macro_module", &name.subject.0, &out.0);
+    }
+    program.each_export_input(&workspace, |kind, key, value| report.row(kind, key, value));
+    ids.each_export_input(&workspace, |kind, key, value| report.row(kind, key, value));
     report.finish()
 }
 
@@ -189,6 +320,54 @@ impl Report {
 mod tests {
     use super::*;
     use crate::sweep::{Leaf, LeafKind, Stamp};
+
+    #[test]
+    fn scope_witness_keeps_the_source_and_every_observed_semantic_input() {
+        let source = ContentId([21; 32]);
+        let outputs = ContentId([22; 32]);
+        let mut reads = [
+            (CellId { of: Name::new(blaze_drive::Kind::CrateScope, ContentId([23; 32])), cell: crate::engine_tasks::EXPORTS }, ContentId([24; 32])),
+            (CellId { of: Name::new(blaze_drive::Kind::Script, ContentId([25; 32])), cell: crate::engine_tasks::WHOLE }, ContentId([26; 32])),
+            (CellId { of: Name::new(blaze_drive::Kind::Given, ContentId([27; 32])), cell: crate::engine_tasks::WHOLE }, ContentId([28; 32])),
+        ];
+        reads.sort_unstable();
+        let before = scope_digest(source, outputs, &reads);
+        assert_ne!(before, scope_digest(ContentId([29; 32]), outputs, &reads), "the task's semantic source remains an input");
+        assert_ne!(before, scope_digest(source, ContentId([30; 32]), &reads), "opaque results and macro-valued link attributes remain inputs");
+        for (changed, _) in reads {
+            let after = reads.map(|(id, saw)| (id, if id == changed { ContentId([31; 32]) } else { saw }));
+            assert_ne!(before, scope_digest(source, outputs, &after), "each dependency export, script output and observed environment value remains an input");
+        }
+        let other_subject = reads.map(|(mut id, saw)| {
+            id.of.subject = ContentId([32; 32]);
+            (id, saw)
+        });
+        assert_ne!(before, scope_digest(source, outputs, &other_subject), "equal values from other tasks are different observations");
+        let other_cell = reads.map(|(mut id, saw)| {
+            id.cell = crate::engine_tasks::DATA;
+            (id, saw)
+        });
+        assert_ne!(before, scope_digest(source, outputs, &other_cell), "the observed cell's identity is part of the transcript");
+    }
+
+    #[test]
+    fn checked_proc_module_bytes_remain_inputs_beside_the_scope_witness() {
+        let alloc = blaze_own::testing::bump().alloc();
+        let mut inputs = Inputs { scopes: AVec::new_in(alloc), modules: AVec::new_in(alloc) };
+        let digest = |inputs: &Inputs<'_>| {
+            let mut hash = Hasher::new(DOMAIN);
+            inputs.hash_modules(&mut hash);
+            hash.finish()
+        };
+        let empty = digest(&inputs);
+        let module = Name::new(blaze_drive::Kind::MacroModule, ContentId([33; 32]));
+        inputs.modules.push((module, ContentId([34; 32])));
+        let before = digest(&inputs);
+        assert_ne!(before, empty, "a checked proc module cannot disappear from the context");
+        inputs.modules.clear();
+        inputs.modules.push((module, ContentId([35; 32])));
+        assert_ne!(before, digest(&inputs), "different compiled wasm changes the context even with the same scope output");
+    }
 
     #[test]
     fn leaf_identity_survives_a_different_checkout_but_tracks_its_source() {

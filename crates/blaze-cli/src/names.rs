@@ -55,8 +55,10 @@ pub(crate) mod test_marks;
 pub(crate) mod metered;
 mod scope;
 pub(crate) mod sections;
+#[cfg(test)]
+mod context_witness_tests;
 
-// The subject and source domains name the payload's form ([`sections::FORM`] 6) and its producer:
+// The subject and source domains name the payload's form ([`sections::FORM`] 8) and its producer:
 // an old home's records (form 1: exports then inner; form 2: no tests section; "3": form 3 by
 // the old name fill, before blaze-scope's cell core became the writer; "4": form 3, without the
 // expansion texts; "5": an out of the names record alone, see [`OUT_DOMAIN`]; "6": a names
@@ -77,7 +79,9 @@ pub(crate) mod sections;
 // blaze-edition binary roots (engine_names.rs `finish`, rule 21) and expansion record keys in
 // `OUT_DOMAIN` 3. Source 19: `CrateScope` form 7 (32-byte `NameCell` rows + columnar `ItemsRecord` v14).
 // Source 20 records the sites and findings of conflicting named imports.
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 20";
+// Source 21: payload form 8 carries the opaque-output witness. A retained scope
+// written without that witness must resolve once; absence never means no proc calls.
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 21";
 /// The out: the names record, the crate's expansion record keys (`EXPANSIONS_OUT_DOMAIN`), AND
 /// the checkout files the crate holds ([`crate_out`]). "1" was the names record alone, but a
 /// body's check reads its crate's items record to find which crate owns its file (body_types.rs
@@ -89,6 +93,7 @@ const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 20";
 /// moves `CrateScope`'s `WHOLE` out too.
 const OUT_DOMAIN: &str = "blaze-cli crate scope out 3";
 const EXPANSIONS_OUT_DOMAIN: &str = "blaze-cli crate scope expansions out 1";
+const CONTEXT_OUTPUTS_DOMAIN: &str = "blaze-cli crate scope context outputs 1";
 /// The rule named by resolver refusals from both check drivers.
 pub(crate) const RULE: &str = "names.rs";
 
@@ -402,6 +407,20 @@ struct ScopeRecord {
     /// Position-independent digest of `(call, record_key)` over the expansions directory, folded
     /// into `CrateScope`'s `out` (`OUT_DOMAIN` 3) so expansion body edits move `WHOLE` (rule 21).
     expansions_out: ContentId,
+    #[cfg(test)]
+    context_outputs: ContentId,
+}
+
+/// Values whose meaning cannot be reconstructed from the scope's source/read
+/// transcript alone. Proc outputs include their full origins and observed reads.
+/// The link table retains macro-valued `link_name` and `export_name` results too.
+fn context_outputs(names: &blaze_scope::resolve::CrateNames<'_>, links: &[u8]) -> ContentId {
+    let mut hash = blaze_ids::Hasher::new(CONTEXT_OUTPUTS_DOMAIN);
+    hash.part(links).update(&u64::try_from(names.opaque_outputs.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for output in &names.opaque_outputs {
+        hash.id(&output.call.0).id(&output.digest);
+    }
+    hash.finish()
 }
 
 /// A section of a resolved crate's record that could not be written: the crate's failure.
@@ -610,6 +629,10 @@ fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope:
     } else {
         append_section(&mut payload, &mut places, 7, &[]);
     }
+    // Section 8 is required even for an empty opaque set. It is independent of
+    // historical synthetic body-block expansion text kept by an unchanged Surface.
+    let context_outputs = context_outputs(done.names, section_slice(&payload, &places, 6));
+    append_section(&mut payload, &mut places, 8, &context_outputs.0);
     metered.trim_scratch();
     if let Some(head) = payload.get_mut(..sections::HEAD) {
         if let Some(dst) = head.get_mut(0..4) {
@@ -636,7 +659,7 @@ fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope:
     }
     #[cfg(test)]
     sections::watch_tests(crate_name, &payload, section_slice(&payload, &places, 4));
-    Ok(ScopeRecord { payload, findings, unresolved, tests_refused, test_marks, expansions: extras, expansions_out })
+    Ok(ScopeRecord { payload, findings, unresolved, tests_refused, test_marks, expansions: extras, expansions_out, #[cfg(test)] context_outputs })
 }
 
 /// No binding was found for this segment of a `use` or macro path.
