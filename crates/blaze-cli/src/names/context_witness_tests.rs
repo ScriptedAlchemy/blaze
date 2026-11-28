@@ -6,17 +6,15 @@
 use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
-use std::string::String;
-use std::sync::Mutex;
-use std::vec::Vec;
 
+use blaze_core::lock::Lock;
 use blaze_drive::{Name, Seen};
 use blaze_engine::CellId;
 use blaze_expand::{HostAsk, HostError, HostWhy, MacroDefinition, ProcCall, ProcKind, Produced, ReadAnswer, ReadKind, Reads, TokenOrigin, Transparency, lex};
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_ids::ContentId;
 use blaze_ids::producer::{Expander, ProducerId, Producers};
-use blaze_own::{AVec, Alloc, Bump, Erased};
+use blaze_own::{AString, AVec, Alloc, Bump, Erased, SharedAlloc, Vec};
 use blaze_scope::crate_scope::{CrateScope, Kept, Ready, Solved, resolve_crate, resolve_kept};
 use blaze_scope::graph::Sysroot;
 use blaze_scope::items_record::ItemsRecord;
@@ -117,12 +115,12 @@ impl<'a> SourceTexts<'a> for Fixture {
 
 struct Snapshot {
     surface: ContentId,
-    exports: Vec<u8>,
-    inner: Vec<u8>,
+    exports: AVec<'static, u8>,
+    inner: AVec<'static, u8>,
     record: ScopeRecord,
     blocks: usize,
-    opaque: Vec<(ItemKey, ContentId)>,
-    declarations: Vec<(String, ItemKind)>,
+    opaque: AVec<'static, (ItemKey, ContentId)>,
+    declarations: AVec<'static, (AString<'static>, ItemKind)>,
 }
 
 fn snapshot(fixture: Fixture) -> Snapshot {
@@ -159,10 +157,12 @@ fn snapshot(fixture: Fixture) -> Snapshot {
 }
 
 fn capture<'a>(fixture: &Fixture, done: &CrateScope<'a>, cx: &Cx, metered: &Metered<'_>, bump: Bump<'a>) -> Snapshot {
+    let alloc = blaze_own::testing::heap().alloc();
     assert!(!done.names.notes.iter().any(|note| matches!(note, NamesNote::Expand { .. })), "the fixture's calls expand: {:?}", done.names.notes);
     let surface = blaze_file_items::outline(fixture.source, Edition::E2021, bump.alloc()).surface();
     let blocks = done.names.made.values().filter(|module| module.info.name.is_some_and(|name| name.starts_with("__blaze_block_"))).count();
-    let opaque = done.names.opaque_outputs.iter().map(|row| (row.call, row.digest)).collect();
+    let mut opaque = AVec::with_capacity_in(done.names.opaque_outputs.len(), alloc);
+    opaque.extend(done.names.opaque_outputs.iter().map(|row| (row.call, row.digest)));
     let record = scope_record(
         cx, NonZeroU32::MIN, done, "fixture", true, true,
         &blaze_scope::waits_on::WaitsOn::of(done.names, &[], bump.alloc()),
@@ -176,11 +176,17 @@ fn capture<'a>(fixture: &Fixture, done: &CrateScope<'a>, cx: &Cx, metered: &Mete
         "a restored scope serves the exact witness that the resolver wrote",
     );
     let items = ItemsRecord::open(aligned(parts.items, bump), bump.alloc()).expect("the written item table");
-    let declarations = (0..items.items()).filter_map(|index| {
+    let mut declarations = AVec::new_in(alloc);
+    declarations.extend((0..items.items()).filter_map(|index| {
         let row = items.identity_at(index).expect("an item identity").expect("an existing item");
-        row.name.map(|name| (String::from(name), row.kind))
-    }).collect();
-    Snapshot { surface, exports: Vec::from(&done.record[..]), inner: Vec::from(&done.inner[..]), record, blocks, opaque, declarations }
+        row.name.map(|name| (AString::from_str_in(name, alloc), row.kind))
+    }));
+    Snapshot {
+        surface,
+        exports: AVec::from_slice_in(&done.record[..], alloc),
+        inner: AVec::from_slice_in(&done.inner[..], alloc),
+        record, blocks, opaque, declarations,
+    }
 }
 
 fn witness(snapshot: &Snapshot, outputs: ContentId) -> ContentId {
@@ -265,7 +271,7 @@ impl<'a> SourceTexts<'a> for CountedFixture {
 /// Whole scopes always resolve. Only the expansion sets cross between the two solves.
 struct ExpansionSets<'a> {
     prior: &'a [Option<&'a [u8]>; 2],
-    made: Mutex<[Vec<u8>; 2]>,
+    made: Lock<[Vec<u8, SharedAlloc<'static>>; 2]>,
 }
 
 impl Kept for ExpansionSets<'_> {
@@ -284,13 +290,14 @@ impl Kept for ExpansionSets<'_> {
     }
 
     fn expansions_made(&self, krate: usize, bytes: &[u8]) {
-        let mut made = self.made.lock().expect("the fixture's expansion sets");
+        let mut made = self.made.lock();
         let slot = made.get_mut(krate).expect("one of the fixture's two crates");
-        *slot = Vec::from(bytes);
+        slot.clear();
+        slot.extend_from_slice(bytes);
     }
 }
 
-fn kept_snapshot(answer: ProcAnswer, prior: &[Option<&[u8]>; 2]) -> (Snapshot, [Vec<u8>; 2], usize) {
+fn kept_snapshot(answer: ProcAnswer, prior: &[Option<&[u8]>; 2]) -> (Snapshot, [Vec<u8, SharedAlloc<'static>>; 2], usize) {
     let io = Io::simulated(SimWorld::new(71, Limits::USUAL));
     let cx = io.cx(BUDGET, TASK_FRAME).expect("the kept scope-record test context");
     let home = Frame::new(Tag::Nameres).expect("the kept resolver frame");
@@ -314,14 +321,15 @@ fn kept_snapshot(answer: ProcAnswer, prior: &[Option<&[u8]>; 2]) -> (Snapshot, [
         },
     ];
     let sources = CountedFixture { fixture: Fixture { source: CALLER, answer: Some(answer) }, runs: AtomicUsize::new(0) };
-    let sets = ExpansionSets { prior, made: Mutex::new([Vec::new(), Vec::new()]) };
+    let alloc = blaze_own::testing::heap().shared();
+    let sets = ExpansionSets { prior, made: Lock::new("context witness expansion sets", [Vec::new_in(alloc), Vec::new_in(alloc)]) };
     let (solved, _) = resolve_kept(&crates, Sysroot::default(), &sources, &metered, &Ready::serial(Duration::from_secs(30)), &sets, bump)
         .unwrap_or_else(|error| panic!("the fixture resolves through its kept expansion sets: {error:?}"));
     let Some(Solved::Solved(done)) = solved.first() else {
         panic!("the fixture's whole scope must resolve in both passes");
     };
     let snapshot = capture(&sources.fixture, done, &cx, &metered, bump);
-    (snapshot, sets.made.into_inner().expect("the completed fixture expansion sets"), sources.runs.load(Ordering::Relaxed))
+    (snapshot, sets.made.into_inner(), sources.runs.load(Ordering::Relaxed))
 }
 
 #[test]

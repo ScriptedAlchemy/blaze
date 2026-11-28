@@ -1130,11 +1130,12 @@ fn instance_inputs_follow_the_callable_proof_and_keep_other_items_at_crate_grain
 
 #[test]
 fn distributed_inputs_replace_only_the_witnessed_workspace_scope_output() {
+    let alloc = blaze_own::testing::heap().alloc();
     let crates = table([1; 32]);
     let owner = CrateItemKey(ContentId([APP; 32]));
     let scope = blaze_drive::key::crate_scope_name(&owner);
     let build = |crates: &Table, out, owners| {
-        let mut today = std::vec![(Name::unit_graph(), GRAPH_OUT), (blaze_drive::key::owners_of(main_body().file), owners), (scope, out)];
+        let mut today = [(Name::unit_graph(), GRAPH_OUT), (blaze_drive::key::owners_of(main_body().file), owners), (scope, out)];
         today.sort_unstable_by_key(|(name, _)| *name);
         ids_with(ToolchainId([7; 32]), crates, &today)
     };
@@ -1165,11 +1166,11 @@ fn distributed_inputs_replace_only_the_witnessed_workspace_scope_output() {
     retained.hash_export_inputs(&mut exact, |_| None);
     assert_eq!(original.finish(), exact.finish());
 
-    let mut scopes = std::vec::Vec::new();
+    let mut scopes = AVec::new_in(alloc);
     retained.each_workspace_scope(|key| scopes.push(key));
     assert_eq!(scopes, [owner]);
     let unknown = ids(ToolchainId([7; 32]), &crates);
-    let mut unknown_scopes = std::vec::Vec::new();
+    let mut unknown_scopes = AVec::new_in(alloc);
     unknown.each_workspace_scope(|key| unknown_scopes.push(key));
     assert!(unknown_scopes.is_empty(), "a workspace without a known scope is never normalized");
 

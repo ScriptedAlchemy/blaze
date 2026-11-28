@@ -31,6 +31,95 @@ fn completion_verification_counts_exclude_grants_and_refuse_invalid_deltas() {
     }
 }
 
+/// The publisher's diagnostic stages follow the build's earlier span paths. This public
+/// hook/report test runs with the CLI tests: the former 64-row bound loses every stage here.
+/// Later overflow must retain those stages, conserve all usage and allocate no event memory.
+#[test]
+fn late_span_stages_are_retained_and_overflow_conserves_usage_without_allocating() {
+    use bstd::telemetry::{Brief, Cell, CellOpts, Exit, Field, Level, Report, ReportOpts, SpanPath};
+
+    const NAMES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    const STAGES: [&str; 18] = [
+        "check runnable proof",
+        "decode declarations",
+        "decode entry and known answers",
+        "decode entry read list",
+        "discover declarations",
+        "load verification dependencies",
+        "load verification heads",
+        "lookup stored entry",
+        "make missing entry",
+        "manage coroutine layouts",
+        "prepare constant values",
+        "prepare read questions",
+        "publish completion values",
+        "recheck read answers",
+        "recipe from current facts",
+        "record verified entry",
+        "store made entry",
+        "verify stored entry",
+    ];
+    let counting = blaze_own::testing::Counting::new(blaze_own::testing::TestHeap);
+    {
+        let mut cell = Cell::new(CellOpts { worker: 0, level: Level::Spans }, &counting).expect("a fixed worker telemetry cell");
+        let allocations = counting.allocations();
+        let reserved = counting.live_bytes();
+        let mut used = Brief::ZERO;
+        used.v[Field::Allocs as usize] = 3;
+        used.v[Field::HeapBytes as usize] = 24;
+        let mut wall = 0;
+        let mut close = |parent: &SpanPath, name| {
+            let (slot, _) = cell.span_open(parent, name, wall, Brief::ZERO).expect("one sequential span has a free slot");
+            wall += 7;
+            cell.span_close(slot, wall, used);
+        };
+        for first in NAMES {
+            for second in NAMES {
+                close(&SpanPath::ROOT.child(first), second);
+            }
+        }
+        let publisher = SpanPath::ROOT.child("publisher");
+        for name in STAGES {
+            close(&publisher, name);
+        }
+        // Fill past the new bound, then revisit every stage while the table is full.
+        for first in NAMES {
+            for second in NAMES {
+                close(&SpanPath::ROOT.child("after").child(first), second);
+            }
+        }
+        for name in STAGES {
+            close(&publisher, name);
+        }
+        cell.stop(wall);
+        assert_eq!(cell.unrecorded(), 0, "all 164 opens and closes reached their hooks");
+        assert_eq!(cell.open_spans(), 0);
+        assert_eq!(counting.allocations(), allocations, "recording span hooks must not allocate");
+        assert_eq!(counting.live_bytes(), reserved, "event hooks keep their original reservation");
+
+        // Report merging may allocate, after the event-allocation assertions above.
+        let mut report = Report::new(ReportOpts { level: Level::Spans, most_workers: 1 }, &counting).expect("a one-worker report");
+        report.merge(&blaze_meter::Tally::ZERO, &cell).expect("the worker's telemetry merges once");
+        report.finish(Exit::Returned).expect("the completed telemetry report");
+        for name in STAGES {
+            let path = publisher.child(name);
+            let row = report.spans().iter().find(|row| row.path.same(&path)).expect("a retained late publisher stage, lost with the old 64-row bound");
+            assert_eq!((row.count, row.wall_ns, row.sum.get(Field::Allocs), row.sum.get(Field::HeapBytes)), (2, 14, 6, 48));
+        }
+        assert_eq!(report.spans().len(), 128, "the worker keeps a fixed 128-row reservation");
+        assert_eq!(report.other_span().count, 18, "all 18 distinct paths beyond the reservation are accounted for");
+        let mut total = (0, 0, 0, 0);
+        for row in report.spans().iter().chain(core::iter::once(report.other_span())) {
+            total.0 += row.count;
+            total.1 += row.wall_ns;
+            total.2 += row.sum.get(Field::Allocs);
+            total.3 += row.sum.get(Field::HeapBytes);
+        }
+        assert_eq!(total, (164, 7 * 164, 3 * 164, 24 * 164));
+    }
+    counting.check().expect("the worker telemetry and report freed every reservation");
+}
+
 fn process(sim: Sim, nonce: u64) -> Lent<Sim, StoreAlloc> {
     let alloc = blaze_own::testing::heap().alloc();
     let cfg = config(
