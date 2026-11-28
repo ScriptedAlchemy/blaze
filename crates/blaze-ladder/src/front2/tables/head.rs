@@ -65,8 +65,7 @@ use blaze_engine::CellId;
 use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_id::ItemKey as LibKey;
 use blaze_ids::ContentId;
-use blaze_own::{AVec, Alloc, Arc};
-use std::alloc::Global;
+use blaze_own::{AVec, Alloc, Arc, SharedAlloc};
 use blaze_surface::{ItemKind, RecordBytes};
 use blaze_typeck::{ItemKey, PortableTys};
 
@@ -229,20 +228,32 @@ pub enum FreezeError {
     /// A known record did not decode or import. Its original typed cause survives a parent
     /// freeze's retained failure and may never be replaced by lowering the same head.
     KnownImport { failure: KnownHeadFailure },
+    /// A served head's provenance column or known-source capability is missing. No source
+    /// fallback is valid after this internal source invariant has failed.
+    Provenance { want: Want },
 }
 
 /// A failed known head invalidates the program that tried to import it. The error alone is
 /// shared, so parents and the program guard retain the same typed cause without copying it.
-/// Its allocation belongs to the explicit global heap, not a freezer's resettable scratch.
+/// Its allocation belongs to the caller's durable allocation domain, never a freezer's
+/// resettable scratch.
 #[derive(Debug)]
 pub struct KnownHeadFailure {
     pub want: Want,
-    error: Arc<FreezeError, Global>,
+    error: Arc<FreezeError, SharedAlloc<'static>>,
 }
 
+// These errors are retained in cross-worker task reports. Their allocator capability must
+// preserve the same sharing contract as the errors they wrap.
+const _: fn() = || {
+    fn shared<T: Send + Sync>() {}
+    shared::<FreezeError>();
+    shared::<super::seeds::SeedError>();
+};
+
 impl KnownHeadFailure {
-    pub(crate) fn new(want: Want, error: FreezeError) -> Self {
-        Self { want, error: Arc::new_in(error, Global) }
+    pub(crate) fn new(want: Want, error: FreezeError, alloc: SharedAlloc<'static>) -> Self {
+        Self { want, error: Arc::new_in(error, alloc) }
     }
 
     pub fn error(&self) -> &FreezeError {
@@ -255,18 +266,19 @@ impl KnownHeadFailure {
 }
 
 impl FreezeError {
-    fn known_import(want: Want, error: FreezeError) -> Self {
+    fn known_import(want: Want, error: FreezeError, alloc: SharedAlloc<'static>) -> Self {
         match error {
             error @ (FreezeError::KnownProvider { .. } | FreezeError::KnownImport { .. }) => error,
-            error => FreezeError::KnownImport { failure: KnownHeadFailure::new(want, error) },
+            error => FreezeError::KnownImport { failure: KnownHeadFailure::new(want, error, alloc) },
         }
     }
 
-    pub(crate) fn known_failure(&self) -> Option<KnownHeadFailure> {
+    pub(crate) fn known_failure(&self, alloc: SharedAlloc<'static>) -> Option<KnownHeadFailure> {
         match self {
-            FreezeError::KnownProvider { want, error } => Some(KnownHeadFailure::new(*want, FreezeError::KnownProvider { want: *want, error: *error })),
+            FreezeError::KnownProvider { want, error } => Some(KnownHeadFailure::new(*want, FreezeError::KnownProvider { want: *want, error: *error }, alloc)),
             FreezeError::KnownImport { failure } => Some(failure.retained()),
-            FreezeError::NotTheirs { want, why } => Some(KnownHeadFailure::new(*want, FreezeError::NotTheirs { want: *want, why: *why })),
+            FreezeError::NotTheirs { want, why } => Some(KnownHeadFailure::new(*want, FreezeError::NotTheirs { want: *want, why: *why }, alloc)),
+            FreezeError::Provenance { want } => Some(KnownHeadFailure::new(*want, FreezeError::Provenance { want: *want }, alloc)),
             _ => None,
         }
     }
@@ -300,6 +312,7 @@ impl core::fmt::Display for FreezeError {
             FreezeError::NotTheirs { why, .. } => write!(f, "{}", why.said()),
             FreezeError::KnownProvider { want, error } => write!(f, "known head {want:?}: {error}"),
             FreezeError::KnownImport { failure } => write!(f, "{failure}"),
+            FreezeError::Provenance { want } => write!(f, "frozen head {want:?}: its retained provenance is missing or inconsistent"),
         }
     }
 }
@@ -1038,8 +1051,13 @@ pub fn seed<'n, N: NamesSource<'n>, H: HeadSource>(names: N, own: Option<Want>, 
         let frozen = source.frozen(cell)?;
         file_frozen(names, cell, frozen, store, keys, scratch)
     };
-    imported.map_err(|error| if source.known_record(cell) { FreezeError::known_import(cell, error) } else { error })?;
-    Ok(Seeded::Filed)
+    match imported {
+        Ok(()) => Ok(Seeded::Filed),
+        Err(error) => Err(match source.known_record(cell)? {
+            Some(alloc) => FreezeError::known_import(cell, error, alloc),
+            None => error,
+        }),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1072,8 +1090,13 @@ fn seed_cached<'n, N: NamesSource<'n>, H: HeadSource>(
             file_frozen_verified(names, cell, frozen, store, keys, cache, scratch)
         }
     };
-    imported.map_err(|error| if source.known_record(cell) { FreezeError::known_import(cell, error) } else { error })?;
-    Ok(Seeded::Filed)
+    match imported {
+        Ok(()) => Ok(Seeded::Filed),
+        Err(error) => Err(match source.known_record(cell)? {
+            Some(alloc) => FreezeError::known_import(cell, error, alloc),
+            None => error,
+        }),
+    }
 }
 
 fn want_cache_key(cell: Want) -> (u8, LibKey, ItemKey) {
@@ -1739,10 +1762,10 @@ pub trait HeadSource {
     /// [`freeze_seeded`] that asked it): its record cannot be asked for, so a seeded store
     /// lowers what it needs of it (a source may count each such answer).
     fn open(&mut self, want: Want) -> bool;
-    /// Whether this already-served cell came from the known-record provider. A failed import
-    /// of those bytes is terminal even when its caller was freezing a previously absent head.
-    fn known_record(&self, _want: Want) -> bool {
-        false
+    /// The durable error allocator when this already-served cell came from known records.
+    /// A failed import is terminal even while freezing a previously absent parent head.
+    fn known_record(&self, _want: Want) -> Result<Option<SharedAlloc<'static>>, FreezeError> {
+        Ok(None)
     }
 }
 
@@ -2004,7 +2027,7 @@ pub struct SeededHeads<'n, 'a, N> {
     pub reentered: u32,
     /// The frozen heads known before this source freezes a cell itself (the request's, seeds.rs
     /// `RequestHeads`): a cell it knows is copied in, never frozen again.
-    known: Option<&'a (dyn KnownHeads + 'a)>,
+    known: Option<KnownSource<'a>>,
     /// For each kept cell (at its index in `kept`), whether it was copied from `known`.
     from_known: AVec<'a, bool>,
     /// The cells copied from `known`.
@@ -2085,6 +2108,21 @@ pub trait KnownHeads {
     fn known(&self, cell: Want) -> Known<'_>;
 }
 
+/// Known records together with the caller's durable allocation domain for terminal errors.
+/// The error allocator must outlive returned errors and support cross-worker error reports;
+/// it is never a freezer's resettable scratch allocation.
+#[derive(Clone, Copy)]
+pub struct KnownSource<'a> {
+    pub heads: &'a dyn KnownHeads,
+    pub errors: SharedAlloc<'static>,
+}
+
+impl KnownSource<'_> {
+    fn provenance(self, want: Want) -> FreezeError {
+        FreezeError::known_import(want, FreezeError::Provenance { want }, self.errors)
+    }
+}
+
 /// What [`KnownHeads::known`] answers of one cell.
 #[derive(Clone, Copy, Debug)]
 pub enum Known<'k> {
@@ -2158,7 +2196,7 @@ pub struct SeededHeadsOpts<'n, 'a, N> {
     /// The heads known before a freeze ([`KnownHeads`]); `None`: every cell is frozen here. A
     /// cell taken from it keeps no reads ([`HeadCells::cell`] answers it with none), so a head
     /// task, whose read list is its source's, takes none.
-    pub known: Option<&'a (dyn KnownHeads + 'a)>,
+    pub known: Option<KnownSource<'a>>,
     /// Who the names reads made now belong to (front2 tables/owned_reads.rs): each attempt of
     /// a cell's freeze is entered as that cell's and left after, so a recorder with owners keeps
     /// every cell's reads apart and one source serves many head tasks. `None`: no one is told
@@ -2265,30 +2303,48 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
     /// Ordinary source-freeze failures return `None`; a parent never hides a failed known
     /// dependency. The retained failure table bounds the chain walk.
     pub fn known_failure(&self, error: &FreezeError) -> Option<KnownHeadFailure> {
-        if let Some(failure) = error.known_failure() {
+        // Structural provenance failures are constructed by KnownSource::provenance as
+        // already-owned KnownImport errors, so no missing provider can turn one into Lower.
+        if let FreezeError::KnownImport { failure } = error {
+            return Some(failure.retained());
+        }
+        let known = self.known?;
+        if let Some(failure) = error.known_failure(known.errors) {
             return Some(failure);
         }
         let FreezeError::Again { want, .. } = error else { return None };
         let mut cell = *want;
         for _ in 0..=self.failed.len() {
             match self.failure(cell) {
-                Some((CellFailure::Own(error), _)) => return error.known_failure(),
+                Some((CellFailure::Own(error), _)) => return error.known_failure(known.errors),
                 Some((CellFailure::Needs(need), _)) => cell = need,
                 Some((CellFailure::Refused { want, why }, _)) => {
-                    return FreezeError::NotTheirs { want, why }.known_failure();
+                    return FreezeError::NotTheirs { want, why }.known_failure(known.errors);
                 }
                 None => {
                     // A provider's pre-existing Failed cell is not frozen here and therefore
                     // has no local failure row; its immutable provider retains its reason.
-                    return match self.known.map(|known| known.known(cell)) {
-                        Some(Known::Refused(why)) => FreezeError::NotTheirs { want: cell, why }.known_failure(),
-                        Some(Known::Invalid(error)) => FreezeError::KnownProvider { want: cell, error }.known_failure(),
+                    return match known.heads.known(cell) {
+                        Known::Refused(why) => FreezeError::NotTheirs { want: cell, why }.known_failure(known.errors),
+                        Known::Invalid(error) => FreezeError::KnownProvider { want: cell, error }.known_failure(known.errors),
                         _ => None,
                     };
                 }
             }
         }
         None
+    }
+
+    /// `known` is immutable. Without it, `made` can only append source-frozen rows, so no
+    /// known provenance is possible. With it, a missing parallel column is structural and
+    /// retains its typed error in that capability's durable allocation domain.
+    fn provenance(&self, want: Want, at: usize) -> Result<Option<SharedAlloc<'static>>, FreezeError> {
+        let Some(known) = self.known else { return Ok(None) };
+        match self.from_known.get(at) {
+            Some(true) => Ok(Some(known.errors)),
+            Some(false) => Ok(None),
+            None => Err(known.provenance(want)),
+        }
     }
 
     /// Each cell that failed from mark `from` on ([`SeededHeads::failed_len`]), in the order
@@ -2329,7 +2385,7 @@ impl<'n, 'a, N: NamesSource<'n>> SeededHeads<'n, 'a, N> {
         // Known already (the request's table, another worker's freeze): copied in, so its
         // bytes are read like a cell frozen here, and never frozen again.
         // Not the asker's to freeze: refused by the knower's words, never frozen here.
-        let bytes = match self.known.map(|known| known.known(want)) {
+        let bytes = match self.known.map(|known| known.heads.known(want)) {
             Some(Known::Bytes(bytes)) => Some(bytes),
             Some(Known::Refused(why)) => return Err(FreezeError::NotTheirs { want, why }),
             Some(Known::Invalid(error)) => return Err(FreezeError::KnownProvider { want, error }),
@@ -2605,10 +2661,14 @@ pub trait HeadCells: HeadSource {
 impl<'n, N: NamesSource<'n>> HeadCells for SeededHeads<'n, '_, N> {
     fn cell(&mut self, want: Want) -> Result<(FrozenHead<'_>, CellReads<'_>), FreezeError> {
         let at = self.made(want)?;
+        let known = self.provenance(want, at)?;
         let (_, bytes) = &self.kept.cells[at];
         let frozen = FrozenHead::read(bytes).map_err(|error| {
             let error = FreezeError::Read { want, error };
-            if self.from_known[at] { FreezeError::known_import(want, error) } else { error }
+            match known {
+                Some(alloc) => FreezeError::known_import(want, error, alloc),
+                None => error,
+            }
         })?;
         Ok((frozen, CellReads { heads: &self.reads[at][..], consts: &self.values[at][..] }))
     }
@@ -2617,10 +2677,14 @@ impl<'n, N: NamesSource<'n>> HeadCells for SeededHeads<'n, '_, N> {
 impl<'n, N: NamesSource<'n>> HeadSource for SeededHeads<'n, '_, N> {
     fn frozen(&mut self, want: Want) -> Result<FrozenHead<'_>, FreezeError> {
         let at = self.made(want)?;
+        let known = self.provenance(want, at)?;
         let (_, bytes) = &self.kept.cells[at];
         FrozenHead::read(bytes).map_err(|error| {
             let error = FreezeError::Read { want, error };
-            if self.from_known[at] { FreezeError::known_import(want, error) } else { error }
+            match known {
+                Some(alloc) => FreezeError::known_import(want, error, alloc),
+                None => error,
+            }
         })
     }
 
@@ -2630,8 +2694,10 @@ impl<'n, N: NamesSource<'n>> HeadSource for SeededHeads<'n, '_, N> {
         open
     }
 
-    fn known_record(&self, want: Want) -> bool {
-        self.at.get(&want_bytes(want)).is_some_and(|&at| self.from_known[at])
+    fn known_record(&self, want: Want) -> Result<Option<SharedAlloc<'static>>, FreezeError> {
+        let Some(known) = self.known else { return Ok(None) };
+        let at = self.at.get(&want_bytes(want)).copied().ok_or_else(|| known.provenance(want))?;
+        self.provenance(want, at)
     }
 }
 

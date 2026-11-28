@@ -82,7 +82,6 @@ impl SeedError {
     pub fn of_freeze(error: FreezeError) -> SeedError {
         match error {
             FreezeError::KnownImport { failure } => SeedError::Known(failure),
-            FreezeError::KnownProvider { want, error } => SeedError::Known(KnownHeadFailure::new(want, FreezeError::KnownProvider { want, error })),
             FreezeError::NotTheirs { want, why: NotTheirs::OtherUnits { said } } => SeedError::NotInItsUnit { cell: want, said },
             FreezeError::NotTheirs { want, why: NotTheirs::NoCell { said } } => SeedError::NoMemberCell { cell: want, said },
             // `NotTheirs::Failed` among them: the project's head, said by its task's reason.
@@ -382,7 +381,7 @@ pub struct RequestSeed<'k, 'n, 'a, N, H> {
     body_locals: BodyLocals,
 }
 
-/// What a [`RequestSeed`] is made over. `freezer` is made with `known: Some(heads)`, so a
+/// What a [`RequestSeed`] is made over. `freezer`'s known-source capability names `heads`, so a
 /// freeze takes every need the request knows.
 pub struct RequestSeedOpts<'k, 'n, 'a, N, H> {
     pub names: N,

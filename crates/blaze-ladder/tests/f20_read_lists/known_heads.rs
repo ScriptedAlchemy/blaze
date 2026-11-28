@@ -16,7 +16,7 @@ use blaze_ladder::front2::program::Front2Refusal;
 use blaze_ladder::front2::program::lazy::{HeadCounts, LazyProgram, LazyRefusal, RecordsOpts};
 use blaze_ladder::front2::receiver::Pointers;
 use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, MemberWant, NamesSource, Records, SourceError};
-use blaze_ladder::front2::tables::head::{FreezeError, FrozenError, HeadSource, Known, KnownError, KnownHeads, NotTheirs, SeededHeads, SeededHeadsOpts, StoreConsts};
+use blaze_ladder::front2::tables::head::{FreezeError, FrozenError, HeadSource, Known, KnownError, KnownHeads, KnownSource, NotTheirs, SeededHeads, SeededHeadsOpts, StoreConsts};
 use blaze_ladder::run::RunError;
 use blaze_ladder::run::make_one::{Maker, MakerOpts, NamesRecords, RecordsProgram, SecondCheck, walk_records};
 use blaze_ladder::run::special::MakerStart;
@@ -168,7 +168,7 @@ impl KnownHeads for Provider<'_> {
 fn program<'n>(names: NamesRecords<'n>, provider: &'n dyn KnownHeads) -> RecordsProgram<'n> {
     LazyProgram::from_records(RecordsOpts {
         records: names.records, frame: names.frame, lang_crates: names.lang_crates, entry: None,
-        known_heads: Some(provider), alloc: alloc(),
+        known_heads: Some(KnownSource { heads: provider, errors: blaze_own::testing::heap().shared() }), alloc: alloc(),
     }).expect("the consuming lazy program")
 }
 
@@ -409,7 +409,7 @@ fn a_known_callee_failure_cannot_become_a_stale_code_entry() {
         let b = builder();
         let mut maker: Maker<'_> = Maker::of_start(MakerOpts {
             names, entry: Some(caller.tabled), start: MakerStart::ByRule, typing: SecondCheck,
-            builder: &b, known_heads: Some(&provider), alloc: alloc(),
+            builder: &b, known_heads: Some(KnownSource { heads: &provider, errors: blaze_own::testing::heap().shared() }), alloc: alloc(),
         });
         let refused = maker.verify(caller.tabled, &caller.name, entry).expect_err("provider failure is neither Holds nor Stale");
         assert_cause(&refused, supply, callee);
@@ -439,7 +439,7 @@ fn known_heads_preserve_body_local_lowering_and_emitted_entries() {
         let b = builder();
         let mut maker: Maker<'_> = Maker::of_start(MakerOpts {
             names, entry: Some(ids.entry), start: MakerStart::ByRule, typing: SecondCheck,
-            builder: &b, known_heads: Some(&provider), alloc: alloc(),
+            builder: &b, known_heads: Some(KnownSource { heads: &provider, errors: blaze_own::testing::heap().shared() }), alloc: alloc(),
         });
         let mut store = MemoryStore::new_in(alloc());
         let (walk, _) = walk_records(ids.entry, &ids, &mut store, &b, &producer(), &mut maker, alloc()).expect("the walk containing a body-local function and a constant");
@@ -556,7 +556,7 @@ fn a_known_macro_member_still_requires_current_text_and_nested_origins() {
             let b = builder();
             let mut maker: Maker<'_> = Maker::of_start(MakerOpts {
                 names, entry: Some(key), start: MakerStart::ByRule, typing: SecondCheck,
-                builder: &b, known_heads: Some(&provider), alloc: alloc(),
+                builder: &b, known_heads: Some(KnownSource { heads: &provider, errors: blaze_own::testing::heap().shared() }), alloc: alloc(),
             });
             assert!(matches!(maker.verify(key, &[], &[]),
                 Err(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, .. }))) if tabled == key),

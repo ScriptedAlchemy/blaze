@@ -3089,7 +3089,7 @@ pub struct Maker<'n, G: Grant = Fixture, T: Typing<RecordsProgram<'n>> = SecondC
     grant: core::marker::PhantomData<fn(&G)>,
     names: NamesRecords<'n>,
     /// Current, validated frozen heads available before the lazy program is constructed.
-    known_heads: Option<&'n dyn crate::front2::tables::head::KnownHeads>,
+    known_heads: Option<crate::front2::tables::head::KnownSource<'n>>,
     entry: Option<ItemKey>,
     /// Where its program starts: the front's roots' say (run/special.rs `MakerStart`).
     start: crate::run::special::MakerStart,
@@ -3115,7 +3115,7 @@ pub struct MakerOpts<'n, 'b, T> {
     pub start: crate::run::special::MakerStart,
     pub typing: T,
     pub builder: &'b Builder,
-    pub known_heads: Option<&'n dyn crate::front2::tables::head::KnownHeads>,
+    pub known_heads: Option<crate::front2::tables::head::KnownSource<'n>>,
     pub alloc: Alloc<'static>,
 }
 
@@ -3612,7 +3612,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
 
 /// The lazy program over `names`, its body sources set and its start decided: the one way a
 /// maker's program is made ([`Maker`]'s first make, and the test double [`FromRecord::rechecked`]).
-fn program_of<'n>(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, known_heads: Option<&'n dyn crate::front2::tables::head::KnownHeads>, alloc: Alloc<'static>) -> Result<RecordsProgram<'n>, RunError> {
+fn program_of<'n>(names: NamesRecords<'n>, entry: Option<ItemKey>, start: crate::run::special::MakerStart, known_heads: Option<crate::front2::tables::head::KnownSource<'n>>, alloc: Alloc<'static>) -> Result<RecordsProgram<'n>, RunError> {
     let NamesRecords { records, frame, lang_crates, body_sources } = names;
     let mut program = RecordsProgram::from_records(crate::front2::program::lazy::RecordsOpts {
         records, frame, lang_crates, entry, known_heads, alloc,

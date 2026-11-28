@@ -987,7 +987,7 @@ fn export_program<'f>(
     let known_heads = crate::engine_seeds::DependencyFinder::new(
         found.snapshot(),
         crate::engine_seeds::crates_by(list, &|name| (standing.names)(name).map(|input| input.at), heap.shared()),
-        standing.tools[blaze_drive::Kind::Signature.index()],
+        crate::engine_seeds::tool_of(&crate::engine_store::tools(&standing.tools)),
     );
     let names = run_names::names_of(cx, root, &found, owner, &mut *standing.store, &mut facts.bodies, &mut read, env, &pack_dirs, procs, &seen, frame, heap).map_err(CliError::RunNames)?;
 
@@ -1023,7 +1023,9 @@ fn export_program<'f>(
     let ids = checked_export.as_ref().map_or(ids, |(_, checked)| checked.ids());
     let mut maker = Maker::of_start(MakerOpts {
         names, entry: maker_entry, start: maker_start, typing: ByKind::new(typed.over(ids)),
-        builder: &builder, known_heads: Some(&known_heads), alloc: heap.alloc(),
+        builder: &builder,
+        known_heads: Some(blaze_ladder::front2::tables::head::KnownSource { heads: &known_heads, errors: heap.shared() }),
+        alloc: heap.alloc(),
     });
     let mut codes = HomeCodeStore::new(lent);
     let mut export_id = blaze_ids::Hasher::new("blaze export program root 1");

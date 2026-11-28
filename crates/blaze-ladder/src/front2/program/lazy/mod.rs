@@ -46,7 +46,7 @@ use blaze_hash::HashMap as Map;
 use blaze_own::{AString, AVec};
 
 use crate::front2::source::NamesSource;
-use crate::front2::tables::head::{Known, KnownHeadFailure, KnownHeads};
+use crate::front2::tables::head::{Known, KnownHeadFailure, KnownSource};
 
 /// Why the lazy program did not answer, naming the method or step and the item (rule 19).
 #[derive(Debug)]
@@ -357,7 +357,7 @@ struct LazySeed<'n, S> {
     names: S,
     heads: RefCell<Option<crate::front2::tables::head::SeededHeads<'n, 'n, S>>>,
     consts: &'n RefCell<Option<LazyConsts<'n, S>>>,
-    known: Option<&'n dyn KnownHeads>,
+    known: Option<KnownSource<'n>>,
     /// The first actual known-record failure, retained until this program is dropped. This
     /// is an invalid-session cause, never a flag permitting a different source path.
     failure: RefCell<Option<KnownHeadFailure>>,
@@ -402,13 +402,13 @@ impl<'n, S: NamesSource<'n>> LazySeed<'n, S> {
         use crate::front2::tables::head::{FreezeError, cell_of};
         let Some(known) = self.known else { return Ok(crate::front2::heads::Seeded::Lower) };
         let Ok(cell) = cell_of(self.names, need) else { return Ok(crate::front2::heads::Seeded::Lower) };
-        let error = match known.known(cell) {
+        let error = match known.heads.known(cell) {
             Known::Bytes(_) => FreezeError::Unfrozen { need: cell },
             Known::Refused(why) => FreezeError::NotTheirs { want: cell, why },
             Known::Invalid(error) => FreezeError::KnownProvider { want: cell, error },
             Known::Freeze => return Ok(crate::front2::heads::Seeded::Lower),
         };
-        Err(self.refuse(KnownHeadFailure::new(cell, error)))
+        Err(self.refuse(KnownHeadFailure::new(cell, error, known.errors)))
     }
 }
 
@@ -574,7 +574,7 @@ pub struct RecordsOpts<'n, 'c> {
     pub frame: &'n blaze_mem::Frame,
     pub lang_crates: &'c [usize],
     pub entry: Option<ItemKey>,
-    pub known_heads: Option<&'n dyn KnownHeads>,
+    pub known_heads: Option<KnownSource<'n>>,
     pub alloc: Alloc<'static>,
 }
 
@@ -600,7 +600,7 @@ impl<'n> LazyProgram<'n, &'n crate::front2::source::Records<'n>> {
 }
 
 impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
-    fn over(front: Front2<'n, S>, entry: Option<ItemKey>, alloc: Alloc<'static>, seeded_heads: bool, known_heads: Option<&'n dyn KnownHeads>) -> Result<LazyProgram<'n, S>, Front2Refusal> {
+    fn over(front: Front2<'n, S>, entry: Option<ItemKey>, alloc: Alloc<'static>, seeded_heads: bool, known_heads: Option<KnownSource<'n>>) -> Result<LazyProgram<'n, S>, Front2Refusal> {
         let sized = front.index.lang("sized");
         let pointers = super::super::receiver::Pointers::find(&front.index, front.resolver);
         let mut store = Store::new(sized, front.frame, alloc);
