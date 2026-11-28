@@ -17,6 +17,27 @@ identities and verdicts, graph, scripts, compiler and toolchain inputs remain.
 Locked and toolchain crate outputs remain exact. Ordinary runtime `RunIds` facts
 and all fetched-entry recipe validation remain unchanged.
 
+The distributed context domain is version 3. Version 2 normalized only the
+context's hash transcript; its publications are ineligible for the checked-view
+recipe protocol even when all other inputs agree. Scope payload form 8 and
+scope source domain 21 retain their existing meaning.
+
+The exporter builds one checked identity containing both the context and its
+`RunIds` view. A validated workspace scope witness replaces that view's crate
+fact and its matching `today` fact together. The context hashes the view's
+actual rows, and planning, the publisher's walk, Maker typing and final placement
+all use that same view. A hash-only projection is insufficient: a generic
+instance name may contain a workspace ADT whose coarse crate fact contributes to
+the recipe checked at placement. Equal publication contexts must not leave that
+recipe dependent on the local scope output.
+
+Only the small crate and current-fact tables are copied into the command's bump.
+Body identities, checked verdicts, proof slots, read sources and walked edges
+remain shared with the original view. A missing witness or an absent or
+inconsistent matching current fact refuses the export. Unknown workspace,
+locked and toolchain grains remain exact; ordinary run/test and release exports
+retain their original view.
+
 The read transcript alone is insufficient for opaque proc macros. The resolver
 captures each actual proc expansion's canonical output, including tokens,
 origins, outside reads and call identity, after either execution or reuse of a
@@ -46,6 +67,9 @@ edit preserves Surface and names but changes synthetic expansion bytes; the
 portable context must match retained and fresh scopes for that same final source.
 Controls move source, private names, dependency reads, scripts, proc-module bytes,
 and opaque generated const/static/signature data, origins and outside reads.
-Persistence checks refuse the prior form and a missing witness. The complete
+Persistence checks refuse the prior form and a missing witness. The
+`RunIds` and instance-key control requires raw retained/fresh recipes to differ,
+the checked views' recipes to agree, and a changed semantic witness to move the
+recipe. Body proofs and closed-grain controls remain unchanged. The complete
 distributed acceptance then compares an edited warm producer with a fresh home
 and requires zero compilation from its intact cache.

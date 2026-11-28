@@ -2,6 +2,8 @@
 //! carries this beside the exact entries it checked. The unit's identity binds the
 //! checked input and selected roots, and the committed pack binds the bytes.
 
+use core::fmt;
+
 use blaze_code::record::Symbol;
 use blaze_dist_local::pack::Value;
 use blaze_ids::ContentId;
@@ -36,6 +38,31 @@ pub(crate) enum Step {
     Keyed { recipe: CodeKey, key: CodeKey, content: CodeKey },
     Unkeyed(CodeKey),
     Stub,
+}
+
+/// A placement refusal carries only fixed-width identities and row counts. Formatting
+/// writes directly to its caller; it does not collect names or an unbounded read list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Mismatch {
+    MissingRow { row: usize, rows: usize },
+    Item { expected: ItemKey, actual: ItemKey },
+    Symbol { expected: Symbol, actual: Symbol },
+    MalformedRow,
+    MissingRecipe { expected: CodeKey },
+    Recipe { expected: CodeKey, actual: CodeKey },
+}
+
+impl fmt::Display for Mismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::MissingRow { row, rows } => write!(f, "row {row} is absent from the publication's {rows} rows"),
+            Self::Item { expected, actual } => write!(f, "item differs: published {:032x}, current {:032x}", expected.0, actual.0),
+            Self::Symbol { expected, actual } => write!(f, "symbol differs: published {:x}, current {:x}", ContentId(expected.0), ContentId(actual.0)),
+            Self::MalformedRow => f.write_str("the stored reachability row is malformed"),
+            Self::MissingRecipe { expected } => write!(f, "current inputs have no recipe; published {:x}", expected.0),
+            Self::Recipe { expected, actual } => write!(f, "recipe differs: published {:x}, current {:x}", expected.0, actual.0),
+        }
+    }
 }
 
 pub(super) struct Writer(Value);
@@ -127,17 +154,25 @@ impl Closure {
         tabled: ItemKey,
         symbol: Symbol,
         recipe_of: impl FnOnce() -> Option<CodeKey>,
-    ) -> Option<Step> {
+    ) -> Result<Step, Mismatch> {
         let (rows, _) = self.bytes[32..].as_chunks::<ROW>();
-        let row = rows.get(index)?;
-        if row[1..17] != tabled.0.to_le_bytes() || row[17..49] != symbol.0 {
-            return None;
+        let row = rows.get(index).ok_or(Mismatch::MissingRow { row: index, rows: rows.len() })?;
+        if row[1..17] != tabled.0.to_le_bytes() {
+            let expected = ItemKey(u128::from_le_bytes(*row[1..17].first_chunk().ok_or(Mismatch::MalformedRow)?));
+            return Err(Mismatch::Item { expected, actual: tabled });
         }
-        let step = step(row)?;
-        if let Step::Keyed { recipe, .. } = step && recipe_of() != Some(recipe) {
-            return None;
+        if row[17..49] != symbol.0 {
+            let expected = Symbol(*row[17..49].first_chunk().ok_or(Mismatch::MalformedRow)?);
+            return Err(Mismatch::Symbol { expected, actual: symbol });
         }
-        Some(step)
+        let step = step(row).ok_or(Mismatch::MalformedRow)?;
+        if let Step::Keyed { recipe, .. } = step {
+            let actual = recipe_of().ok_or(Mismatch::MissingRecipe { expected: recipe })?;
+            if actual != recipe {
+                return Err(Mismatch::Recipe { expected: recipe, actual });
+            }
+        }
+        Ok(step)
     }
 }
 
@@ -172,14 +207,26 @@ mod tests {
         };
         let closure = Closure::read(unit, &mut bundle(), heap).unwrap();
         assert_eq!(closure.len(), 3);
-        assert_eq!(closure.at(0, owner, symbol, || Some(recipe)), Some(keyed));
-        assert_eq!(closure.at(1, ItemKey(5), Symbol([6; 32]), || None), Some(Step::Stub));
-        assert_eq!(closure.at(2, ItemKey(8), Symbol([8; 32]), || None), Some(Step::Unkeyed(content)));
-        assert_eq!(closure.at(0, owner, symbol, || Some(other_recipe)), None);
-        assert_eq!(closure.at(0, ItemKey(5), symbol, || Some(recipe)), None);
-        assert_eq!(closure.at(0, owner, Symbol([6; 32]), || Some(recipe)), None);
-        assert_eq!(closure.at(1, owner, symbol, || Some(recipe)), None);
-        assert_eq!(closure.at(3, owner, symbol, || Some(recipe)), None);
+        assert_eq!(closure.at(0, owner, symbol, || Some(recipe)), Ok(keyed));
+        assert_eq!(closure.at(1, ItemKey(5), Symbol([6; 32]), || None), Ok(Step::Stub));
+        assert_eq!(closure.at(2, ItemKey(8), Symbol([8; 32]), || None), Ok(Step::Unkeyed(content)));
+        assert_eq!(closure.at(0, owner, symbol, || Some(other_recipe)), Err(Mismatch::Recipe { expected: recipe, actual: other_recipe }));
+        assert_eq!(closure.at(0, owner, symbol, || None), Err(Mismatch::MissingRecipe { expected: recipe }));
+        assert_eq!(closure.at(0, ItemKey(5), symbol, || Some(recipe)), Err(Mismatch::Item { expected: owner, actual: ItemKey(5) }));
+        assert_eq!(closure.at(0, owner, Symbol([6; 32]), || Some(recipe)), Err(Mismatch::Symbol { expected: symbol, actual: Symbol([6; 32]) }));
+        assert_eq!(closure.at(1, owner, symbol, || Some(recipe)), Err(Mismatch::Item { expected: ItemKey(5), actual: owner }));
+        assert_eq!(closure.at(3, owner, symbol, || Some(recipe)), Err(Mismatch::MissingRow { row: 3, rows: 3 }));
+
+        let recipes = core::cell::Cell::new(0);
+        let recipe_of = || { recipes.set(recipes.get() + 1); Some(recipe) };
+        assert!(closure.at(0, ItemKey(5), symbol, recipe_of).is_err());
+        assert!(closure.at(0, owner, Symbol([6; 32]), recipe_of).is_err());
+        assert!(closure.at(3, owner, symbol, recipe_of).is_err());
+        assert_eq!(closure.at(1, ItemKey(5), Symbol([6; 32]), recipe_of), Ok(Step::Stub));
+        assert_eq!(closure.at(2, ItemKey(8), Symbol([8; 32]), recipe_of), Ok(Step::Unkeyed(content)));
+        assert_eq!(recipes.get(), 0, "only an identity-matched keyed row asks for its current recipe");
+        assert_eq!(closure.at(0, owner, symbol, recipe_of), Ok(keyed));
+        assert_eq!(recipes.get(), 1);
 
         assert!(Closure::read([9; 32], &mut bundle(), heap).is_err());
         let mut altered = bundle();
@@ -187,6 +234,9 @@ mod tests {
         assert!(Closure::read(unit, &mut altered, heap).is_err());
         let mut altered = bundle();
         altered.get_mut(&receipt.key).unwrap().1.pop();
+        assert!(Closure::read(unit, &mut altered, heap).is_err());
+        let mut altered = bundle();
+        altered.get_mut(&receipt.key).unwrap().1[32] = 255;
         assert!(Closure::read(unit, &mut altered, heap).is_err());
         let mut altered = bundle();
         altered.get_mut(&recipe.0.0).unwrap().1[0] ^= 1;
@@ -197,5 +247,51 @@ mod tests {
         let mut altered = bundle();
         altered.remove(&content.0.0);
         assert!(Closure::read(unit, &mut altered, heap).is_err());
+    }
+
+    #[test]
+    fn mismatch_diagnostics_keep_full_identities_in_bounded_stack_space() {
+        struct Text {
+            bytes: [u8; 256],
+            len: usize,
+        }
+        impl fmt::Write for Text {
+            fn write_str(&mut self, text: &str) -> fmt::Result {
+                let end = self.len.checked_add(text.len()).ok_or(fmt::Error)?;
+                self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?.copy_from_slice(text.as_bytes());
+                self.len = end;
+                Ok(())
+            }
+        }
+        let expected = CodeKey(ContentId([255; 32]));
+        let actual = CodeKey(ContentId([254; 32]));
+        assert!(core::mem::size_of::<Mismatch>() <= 80, "a refusal owns no variable-length data");
+        for mismatch in [
+            Mismatch::MissingRow { row: usize::MAX, rows: usize::MAX },
+            Mismatch::Item { expected: ItemKey(u128::MAX), actual: ItemKey(u128::MAX) },
+            Mismatch::Symbol { expected: Symbol(expected.0.0), actual: Symbol(actual.0.0) },
+            Mismatch::MalformedRow,
+            Mismatch::MissingRecipe { expected },
+            Mismatch::Recipe { expected, actual },
+        ] {
+            let mut shown = Text { bytes: [0; 256], len: 0 };
+            fmt::write(&mut shown, format_args!("{mismatch}")).expect("every cause fits the fixed stack buffer");
+            let text = core::str::from_utf8(&shown.bytes[..shown.len]).expect("diagnostics use ASCII names and identities");
+            assert!(!text.is_empty());
+            if matches!(mismatch, Mismatch::Symbol { .. } | Mismatch::MissingRecipe { .. } | Mismatch::Recipe { .. }) {
+                assert!(text.contains("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"), "the published identity is full-width");
+            }
+            if matches!(mismatch, Mismatch::Symbol { .. } | Mismatch::Recipe { .. }) {
+                assert!(text.contains("fefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefe"), "the current identity is full-width");
+            }
+        }
+        let mut shown = Text { bytes: [0; 256], len: 0 };
+        let zeros = Mismatch::Recipe { expected: CodeKey(ContentId([0; 32])), actual: CodeKey(ContentId([1; 32])) };
+        fmt::write(&mut shown, format_args!("{zeros}")).expect("leading-zero identities fit the same stack buffer");
+        assert_eq!(
+            &shown.bytes[..shown.len],
+            b"recipe differs: published 0000000000000000000000000000000000000000000000000000000000000000, current 0101010101010101010101010101010101010101010101010101010101010101",
+            "leading zero bytes are retained in both complete identities",
+        );
     }
 }

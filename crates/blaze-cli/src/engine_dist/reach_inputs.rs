@@ -7,14 +7,14 @@ use blaze_drive::Name;
 use blaze_engine::{CellId, last::LastAnswer};
 use blaze_id::CrateItemKey;
 use blaze_ids::{ContentId, Hasher};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Bump};
 use blaze_wire::json::hex;
 use blaze_wire::{WireAlloc, WireString};
 
 use crate::{engine_check::Standing, run_ids::RunIds, run_names::Program, sweep::{Leaf, LeafKind}};
 use super::DistError;
 
-const DOMAIN: &str = "blaze distributed dev verification inputs 2";
+const DOMAIN: &str = "blaze distributed dev verification inputs 3";
 const SCOPE_DOMAIN: &str = "blaze distributed dev scope inputs 1";
 const EVIDENCE_DOMAIN: &str = "blaze distributed dev verification evidence 1";
 const MOST_ROWS: usize = 4096;
@@ -23,25 +23,46 @@ const MOST_VALUE_BYTES: usize = 256;
 const MOST_SCOPES: usize = 1 << 20;
 const MOST_SCOPE_READS: usize = 1 << 20;
 
-pub(crate) fn context(
+/// One validated identity for the publication and every recipe used to produce
+/// or consume it. The ordinary runtime table remains a separate unchanged view.
+pub(crate) struct CheckedExport<'a> {
+    ids: RunIds<'a>,
+    context: ContentId,
+}
+
+impl<'a> CheckedExport<'a> {
+    pub(crate) fn ids(&self) -> RunIds<'a> {
+        self.ids
+    }
+
+    pub(crate) fn context(&self) -> ContentId {
+        self.context
+    }
+}
+
+pub(crate) fn checked_export<'a>(
     standing: &Standing<'_, '_>,
     program: &Program,
-    ids: &RunIds<'_>,
+    ids: RunIds<'a>,
     report_path: Option<&str>,
-) -> Result<ContentId, DistError> {
-    let inputs = Inputs::new(standing, program, ids)?;
+    bump: Bump<'a>,
+) -> Result<CheckedExport<'a>, DistError> {
+    let inputs = Inputs::new(standing, program, &ids)?;
     let workspace = |key| inputs.scope(key);
+    let ids = ids.for_checked_export(&workspace, bump).map_err(|why| DistError::Compile {
+        shown: blaze_own::format_in!(standing.heap.alloc(), "cannot prepare checked distributed export ids: {why}"),
+    })?;
     let context = digest(
         IdentityInputs { producers: standing.producers.digest(), toolchain: &standing.toolchain.0, tools: &standing.tools },
         |hash| {
             program.hash_export_inputs(hash, &workspace);
             inputs.hash_modules(hash);
         },
-        |hash| ids.hash_export_inputs(hash, &workspace),
+        |hash| ids.hash_export_inputs(hash),
         (0..standing.leaves.len()).map(|index| (standing.leaves.path(index), standing.leaves.row(index))),
     );
-    write_evidence(report_path, standing.heap, |alloc| evidence(standing, program, ids, &inputs, context, alloc))?;
-    Ok(context)
+    write_evidence(report_path, standing.heap, |alloc| evidence(standing, program, &ids, &inputs, context, alloc))?;
+    Ok(CheckedExport { ids, context })
 }
 
 struct ScopeInput<'a> {
@@ -202,7 +223,7 @@ fn evidence(standing: &Standing<'_, '_>, program: &Program, ids: &RunIds<'_>, in
         }
     });
     report.section("program", |hash| program.hash_export_inputs(hash, &workspace));
-    report.section("run_ids", |hash| ids.hash_export_inputs(hash, &workspace));
+    report.section("run_ids", |hash| ids.hash_export_inputs(hash));
     report.section("macro_modules", |hash| inputs.hash_modules(hash));
     report.section("leaves", |hash| {
         for index in 0..standing.leaves.len() {
@@ -256,7 +277,7 @@ fn evidence(standing: &Standing<'_, '_>, program: &Program, ids: &RunIds<'_>, in
         report.row("macro_module", &name.subject.0, &out.0);
     }
     program.each_export_input(&workspace, |kind, key, value| report.row(kind, key, value));
-    ids.each_export_input(&workspace, |kind, key, value| report.row(kind, key, value));
+    ids.each_export_input(|kind, key, value| report.row(kind, key, value));
     report.finish()
 }
 

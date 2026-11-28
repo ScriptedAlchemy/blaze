@@ -1128,43 +1128,65 @@ fn instance_inputs_follow_the_callable_proof_and_keep_other_items_at_crate_grain
     assert_eq!(other_after, inputs(2, 3, true).0);
 }
 
-#[test]
-fn distributed_inputs_replace_only_the_witnessed_workspace_scope_output() {
-    let alloc = blaze_own::testing::heap().alloc();
-    let crates = table([1; 32]);
+fn export_scope_ids(crates: &Table, out: ContentId, owners: ContentId) -> RunIds<'static> {
     let owner = CrateItemKey(ContentId([APP; 32]));
     let scope = blaze_drive::key::crate_scope_name(&owner);
-    let build = |crates: &Table, out, owners| {
-        let mut today = [(Name::unit_graph(), GRAPH_OUT), (blaze_drive::key::owners_of(main_body().file), owners), (scope, out)];
-        today.sort_unstable_by_key(|(name, _)| *name);
-        ids_with(ToolchainId([7; 32]), crates, &today)
-    };
-    let retained = build(&crates, ContentId([81; 32]), OWNERS_OUT);
-    let fresh = build(&crates, ContentId([82; 32]), OWNERS_OUT);
+    let mut today = [(Name::unit_graph(), GRAPH_OUT), (blaze_drive::key::owners_of(main_body().file), owners), (scope, out)];
+    today.sort_unstable_by_key(|(name, _)| *name);
+    ids_with(ToolchainId([7; 32]), crates, &today)
+}
+
+fn export_recipe_builder() -> blaze_ladder::code_records::Builder {
+    use blaze_ladder::code_records::{Builder, PanicStrategy, Settings, TierName};
+
+    Builder {
+        isa: blaze_emit::Isa { os: blaze_emit::Os::Linux, lse: true },
+        tier: TierName::Reference,
+        settings: Settings { overflow_checks: blaze_ladder::run::OverflowChecks::On, debug_assertions: false, panic: PanicStrategy::Unwind },
+        toolchain: ToolchainId([7; 32]),
+        producer: blaze_ids::producer::Producers::for_tests(b"checked export recipe").get::<blaze_ids::producer::CodeBuilder>(),
+        edition: edition::PackageEdition::of_manifest("2024").unwrap(),
+    }
+}
+
+#[test]
+fn checked_export_replaces_the_workspace_scope_and_its_current_fact_together() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let bump = blaze_own::testing::bump();
+    let crates = table([1; 32]);
+    let owner = CrateItemKey(ContentId([APP; 32]));
+    let retained = export_scope_ids(&crates, ContentId([81; 32]), OWNERS_OUT);
+    let fresh = export_scope_ids(&crates, ContentId([82; 32]), OWNERS_OUT);
     let witnessed = ContentId([83; 32]);
-    let projected = |ids: &RunIds<'_>, witness| {
+    let project = |ids: RunIds<'static>, witness| ids.for_checked_export(|key| (key == owner).then_some(witness), bump).unwrap();
+    let hash = |ids: &RunIds<'_>| {
         let mut hash = Hasher::new(TABLE_KEY_DOMAIN);
-        ids.hash_export_inputs(&mut hash, |key| (key == owner).then_some(witness));
+        ids.hash_export_inputs(&mut hash);
         hash.finish()
     };
+    let retained_export = project(retained, witnessed);
+    let fresh_export = project(fresh, witnessed);
     assert_ne!(retained.crates, fresh.crates, "the two local scopes store different derived outputs");
     assert_eq!(retained.bodies, fresh.bodies, "the complete checked body table is equal");
     assert_ne!(retained.crate_fact(item(APP, 2)), fresh.crate_fact(item(APP, 2)), "ordinary runtime reads retain the stored scope value");
-    assert_eq!(projected(&retained, witnessed), projected(&fresh, witnessed), "equal semantic witnesses join the distributed contexts");
-    assert_ne!(projected(&retained, witnessed), projected(&fresh, ContentId([84; 32])), "a changed witness remains an input");
+    assert_eq!(hash(&retained_export), hash(&fresh_export), "equal semantic witnesses join the distributed contexts");
+    assert_ne!(hash(&retained_export), hash(&project(fresh, ContentId([84; 32]))), "a changed witness remains an input");
+    let fact = retained.crate_fact(item(APP, 2)).unwrap().fact;
+    for ids in [retained_export, fresh_export] {
+        assert_eq!(ids.crate_fact(item(APP, 2)), Some(Read { fact, digest: witnessed.0 }));
+        assert_eq!(ids.today(&fact), Some(witnessed.0), "recipe facts and current answers agree");
+    }
 
-    let body_edit = build(&crates, ContentId([82; 32]), ContentId([85; 32]));
+    let body_edit = export_scope_ids(&crates, ContentId([82; 32]), ContentId([85; 32]));
     assert_ne!(fresh.bodies, body_edit.bodies, "a changed owner fact changes the actual body identity");
-    assert_ne!(projected(&fresh, witnessed), projected(&body_edit, witnessed), "normalization preserves all body bytes");
-    let dependency_edit = build(&table([2; 32]), ContentId([82; 32]), OWNERS_OUT);
-    assert_ne!(projected(&fresh, witnessed), projected(&dependency_edit, witnessed), "a locked dependency keeps its exact grain digest");
+    assert_ne!(hash(&fresh_export), hash(&project(body_edit, witnessed)), "normalization preserves all body bytes");
+    let dependency_edit = export_scope_ids(&table([2; 32]), ContentId([82; 32]), OWNERS_OUT);
+    assert_ne!(hash(&fresh_export), hash(&project(dependency_edit, witnessed)), "a locked dependency keeps its exact grain digest");
 
-    // No projection preserves the original hash transcript, including its table lengths.
+    // The hasher always consumes the actual view, including its table lengths.
     let mut original = Hasher::new(TABLE_KEY_DOMAIN);
     original.part(retained.crates).part(retained.bodies);
-    let mut exact = Hasher::new(TABLE_KEY_DOMAIN);
-    retained.hash_export_inputs(&mut exact, |_| None);
-    assert_eq!(original.finish(), exact.finish());
+    assert_eq!(original.finish(), hash(&retained));
 
     let mut scopes = AVec::new_in(alloc);
     retained.each_workspace_scope(|key| scopes.push(key));
@@ -1174,16 +1196,155 @@ fn distributed_inputs_replace_only_the_witnessed_workspace_scope_output() {
     unknown.each_workspace_scope(|key| unknown_scopes.push(key));
     assert!(unknown_scopes.is_empty(), "a workspace without a known scope is never normalized");
 
-    for ids in [&retained, &unknown] {
-        for (row, grain) in ids.crates.as_chunks::<CRATE_ROW>().0.iter().zip(ids.grains.iter().copied()) {
-            let exported = export_crate_row(row, grain, &|_| Some(witnessed));
+    for ids in [retained, unknown] {
+        let exported = project(ids, witnessed);
+        assert!(core::ptr::eq(ids.bodies, exported.bodies), "body bytes remain the same immutable view");
+        assert!(core::ptr::eq(ids.verdicts, exported.verdicts));
+        assert!(core::ptr::eq(ids.slots, exported.slots), "the projection does not create new proof slots");
+        assert!(core::ptr::eq(ids.edges, exported.edges));
+        for ((row, projected), grain) in ids.crates.as_chunks::<CRATE_ROW>().0.iter()
+            .zip(exported.crates.as_chunks::<CRATE_ROW>().0).zip(ids.grains.iter().copied())
+        {
             if grain == GrainTag::Workspace {
-                assert_eq!(exported[..80], row[..80], "prefix, full crate key, grain, padding and fact are exact");
-                assert_eq!(exported[80..], witnessed.0, "only the witnessed scope digest changes");
+                assert_eq!(projected[..80], row[..80], "prefix, full crate key, grain, padding and fact are exact");
+                assert_eq!(projected[80..], witnessed.0, "only the witnessed scope digest changes");
             } else {
-                assert_eq!(exported, *row, "toolchain, locked and unknown-workspace rows retain every byte");
+                assert_eq!(projected, row, "toolchain, locked and unknown-workspace rows retain every byte");
             }
         }
+        for (read, projected) in ids.today.iter().zip(exported.today) {
+            if read.fact == fact {
+                assert_eq!(projected, &Read { fact, digest: witnessed.0 });
+            } else {
+                assert_eq!(projected, read, "all other current facts remain exact");
+            }
+        }
+    }
+
+    let scope = blaze_drive::key::crate_scope_name(&owner);
+    assert!(matches!(retained.for_checked_export(|_| None, bump), Err(RunIdsError::EngineAnswer { name, .. }) if name == scope));
+    let mut missing = Vec::from_slice_in(retained.today, bump);
+    missing.retain(|read| read.fact != fact);
+    let missing = RunIds { today: missing.into_bump_slice(), ..retained };
+    assert!(matches!(missing.for_checked_export(|_| Some(witnessed), bump), Err(RunIdsError::EngineAnswer { name, .. }) if name == scope));
+    let mut moved = Vec::from_slice_in(retained.today, bump);
+    moved.iter_mut().find(|read| read.fact == fact).unwrap().digest = [84; 32];
+    let moved = RunIds { today: moved.into_bump_slice(), ..retained };
+    assert!(matches!(moved.for_checked_export(|_| Some(witnessed), bump), Err(RunIdsError::TwoDigests { fact: actual }) if actual == fact));
+}
+
+#[test]
+fn checked_export_instance_recipes_ignore_scope_history_and_keep_semantic_inputs() {
+    use blaze_ladder::body_ids::instance_key;
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let bump = blaze_own::testing::bump();
+    let crates = table([1; 32]);
+    let retained = export_scope_ids(&crates, ContentId([81; 32]), OWNERS_OUT);
+    let fresh = export_scope_ids(&crates, ContentId([82; 32]), OWNERS_OUT);
+    let owner = CrateItemKey(ContentId([APP; 32]));
+    let witness = |outputs| crate::engine_dist::reach_inputs::scope_digest(ContentId([83; 32]), outputs, &[]);
+    let outputs = ContentId([84; 32]);
+    let project = |ids: RunIds<'static>, outputs| ids.for_checked_export(|key| (key == owner).then_some(witness(outputs)), bump).unwrap();
+    let builder = export_recipe_builder();
+    let tabled = item(CORE, 9);
+    let name = |adt: ItemKey| {
+        let mut name = AVec::new_in(alloc);
+        name.extend_from_slice(&tabled.0.to_le_bytes());
+        name.extend_from_slice(&1u32.to_le_bytes());
+        name.extend_from_slice(&1u32.to_le_bytes());
+        name.push(12); // One ADT type node, no children, then its argument reference.
+        name.extend_from_slice(&adt.0.to_le_bytes());
+        name.extend_from_slice(&0u32.to_le_bytes());
+        name.extend_from_slice(&0u32.to_le_bytes());
+        name
+    };
+    let recipe = |ids: &RunIds<'_>, name: &[u8]| {
+        let symbol = blaze_ladder::symbols::fn_symbol_of_name(name);
+        instance_key(symbol, tabled, name, ids, &builder, &builder.producer, alloc).expect("the instance has all current input facts")
+    };
+    let workspace_name = name(item(APP, 2));
+    assert_ne!(recipe(&retained, &workspace_name), recipe(&fresh, &workspace_name), "the raw scope outputs reproduce the cross-home recipe mismatch");
+    assert_eq!(recipe(&project(retained, outputs), &workspace_name), recipe(&project(fresh, outputs), &workspace_name), "the same checked witness gives the same real instance recipe");
+    assert_ne!(recipe(&project(fresh, outputs), &workspace_name), recipe(&project(fresh, ContentId([85; 32])), &workspace_name), "a changed opaque output witness changes the recipe");
+
+    let closed_name = name(item(DEP_B, 2));
+    assert_eq!(recipe(&retained, &closed_name), recipe(&project(fresh, outputs), &closed_name), "workspace normalization does not move a closed-only recipe");
+    let changed_dependency = export_scope_ids(&table([2; 32]), ContentId([82; 32]), OWNERS_OUT);
+    assert_ne!(recipe(&project(fresh, outputs), &closed_name), recipe(&project(changed_dependency, outputs), &closed_name), "the dependency's exact closure remains in a closed recipe");
+}
+
+#[test]
+fn checked_export_reuses_fine_callable_proofs_and_their_original_read_source() {
+    struct Moved;
+    impl BodyReads for Moved {
+        fn proof(&self, check: Name, most: u32) -> Result<Proof, Unread> {
+            if most == 0 {
+                return Err(Unread::TooManyReads { check, count: 1, most });
+            }
+            let mut fold = ProofFold::new(check);
+            fold.read(&[86; 32], &ContentId([87; 32]), &ContentId([88; 32]));
+            Ok(fold.finish())
+        }
+    }
+
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).unwrap();
+    let crates = table([1; 32]);
+    let body = main_body();
+    let proof = Counted::new(None);
+    let asked = Asked::default();
+    let mut changed_proof = Counted::new(None);
+    changed_proof.each = 4;
+    let changed_asked = Asked::default();
+    let missing_proof = Counted::new(Some(body.check));
+    let missing_asked = Asked::default();
+    let moved_proof = Moved;
+    let moved_asked = Asked::default();
+    let previous = export_scope_ids(&crates, ContentId([81; 32]), OWNERS_OUT);
+    let ids = RunIds::new(&cx, ToolchainId([7; 32]), &crates, &tools(), &[body], &[], &mut Cleanly, Some(&previous), Most::USUAL, blaze_own::testing::bump()).unwrap();
+    let ids = ids.reading::<ByNeed>(ReadsFrom::new(&proof, &asked, Most::USUAL)).unwrap();
+    let projected = ids.for_checked_export(|_| Some(ContentId([82; 32])), blaze_own::testing::bump()).unwrap();
+    assert_eq!(ids.runnable(body.item).unwrap(), projected.runnable(body.item).unwrap());
+    assert_eq!(ids.checked(body.item), projected.checked(body.item));
+    assert_eq!(ids.instance_fact(body.item), projected.instance_fact(body.item), "a standing callable keeps its finer body proof");
+    let original = ids.body_check(body.item).unwrap();
+    let exported = projected.body_check(body.item).unwrap();
+    assert_eq!(original.key, exported.key);
+    assert_eq!(original.reads, exported.reads);
+    for read in original.reads {
+        assert_eq!(ids.today(&read.fact), projected.today(&read.fact));
+    }
+    assert_eq!(proof.asked.borrow().as_slice(), &[body.check], "both views share one settled proof from the original source");
+    assert_ne!(ids.instance_fact(item(APP, 2)), projected.instance_fact(item(APP, 2)), "only the coarse workspace fallback is projected");
+
+    let changed = RunIds::new(&cx, ToolchainId([7; 32]), &crates, &tools(), &[body], &[], &mut Cleanly, Some(&previous), Most::USUAL, blaze_own::testing::bump()).unwrap();
+    let changed = changed.reading::<ByNeed>(ReadsFrom::new(&changed_proof, &changed_asked, Most::USUAL)).unwrap();
+    let changed = changed.for_checked_export(|_| Some(ContentId([82; 32])), blaze_own::testing::bump()).unwrap();
+    assert_ne!(projected.instance_fact(body.item), changed.instance_fact(body.item), "changed fine body reads remain an input under an equal scope witness");
+
+    let missing = RunIds::new(&cx, ToolchainId([7; 32]), &crates, &tools(), &[body], &[], &mut Cleanly, Some(&previous), Most::USUAL, blaze_own::testing::bump()).unwrap();
+    let missing = missing.reading::<ByNeed>(ReadsFrom::new(&missing_proof, &missing_asked, Most::USUAL)).unwrap();
+    let missing_export = missing.for_checked_export(|_| Some(ContentId([82; 32])), blaze_own::testing::bump()).unwrap();
+    for view in [missing, missing_export] {
+        assert!(matches!(view.runnable(body.item), Err(NotRunnable::Unread(Unread::NoRow { check })) if check == body.check), "a missing proof remains a typed refusal");
+        assert_eq!(view.instance_fact(body.item), view.crate_fact(body.item), "the failed fine proof retains this view's coarse fallback");
+    }
+
+    let moved = RunIds::new(&cx, ToolchainId([7; 32]), &crates, &tools(), &[body], &[], &mut Cleanly, Some(&previous), Most::USUAL, blaze_own::testing::bump()).unwrap();
+    let moved = moved.reading::<ByNeed>(ReadsFrom::new(&moved_proof, &moved_asked, Most::USUAL)).unwrap();
+    let moved_export = moved.for_checked_export(|_| Some(ContentId([82; 32])), blaze_own::testing::bump()).unwrap();
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut name = AVec::new_in(alloc);
+    name.extend_from_slice(&body.item.0.to_le_bytes());
+    name.extend_from_slice(&0u32.to_le_bytes());
+    let symbol = blaze_ladder::symbols::fn_symbol_of_name(&name);
+    let builder = export_recipe_builder();
+    for view in [moved, moved_export] {
+        let read = view.body_check(body.item).unwrap().reads[0];
+        assert_ne!(view.today(&read.fact), Some(read.digest), "projecting a scope must not turn a stale body proof into a current proof");
+        assert!(blaze_ladder::body_ids::instance_key(symbol, body.item, &name, &view, &builder, &builder.producer, alloc).is_none());
+        assert_eq!(view.instance_fact(body.item), view.crate_fact(body.item), "a stale fine proof keeps this view's coarse fallback");
     }
 }
 

@@ -664,10 +664,10 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
             let tabled = walk.tabled(row);
             let symbol = walk.symbol(row);
             let kind = walk.kind(row);
-            let bad_closure = || box_err(
+            let bad_closure = |why: &'static str| box_err(
                 ExportCliError::Walk {
                     symbol: symbol.0,
-                    shown: owned_fmt(format_args!("distributed reachability disagrees at row {row}"), frame, heap.alloc()),
+                    shown: owned_fmt(format_args!("distributed reachability disagrees at row {row}: {why}"), frame, heap.alloc()),
                 },
                 heap,
             );
@@ -676,12 +676,18 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
                 box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
             })?;
             let expected = closure.map(|closure| {
-                closure.at(row, tabled, symbol, || scratch.key_for(&walk, row, ids, builder)).ok_or_else(bad_closure)
+                closure.at(row, tabled, symbol, || scratch.key_for(&walk, row, ids, builder)).map_err(|why| box_err(
+                    ExportCliError::Walk {
+                        symbol: symbol.0,
+                        shown: owned_fmt(format_args!("distributed reachability disagrees at row {row}: {why}"), frame, heap.alloc()),
+                    },
+                    heap,
+                ))
             }).transpose()?;
             if let Some(reach::Step::Keyed { key, .. }) = expected {
                 let entry = codes.get(key)
                     .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
-                    .ok_or_else(bad_closure)?;
+                    .ok_or_else(|| bad_closure("the publication's checked code entry is missing"))?;
                 walk.follow_checked::<RunError>(row, key, entry, MOST_WALKED, &mut scratch)
                     .map_err(|why| box_err(ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
                 cached += 1;
@@ -692,21 +698,21 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
                 Ok(one) => match one.stepped {
                     Stepped::Found(key) => {
                         if expected.is_some() {
-                            return Err(bad_closure());
+                            return Err(bad_closure("an unkeyed or stub receipt row found a keyed entry"));
                         }
                         cached += 1;
                         outcomes.push(RowOutcome::Keyed(key));
                     }
                     Stepped::Made(key) => {
                         if expected.is_some() {
-                            return Err(bad_closure());
+                            return Err(bad_closure("an unkeyed or stub receipt row made a keyed entry"));
                         }
                         compiled += 1;
                         outcomes.push(RowOutcome::Keyed(key));
                     }
                     Stepped::Unkeyed(_) => {
                         if expected.is_some_and(|step| step != reach::Step::Unkeyed(blaze_ladder::code_records::content_key(scratch.made()))) {
-                            return Err(bad_closure());
+                            return Err(bad_closure("the current unkeyed entry differs from the receipt's step or content"));
                         }
                         unkeyed += 1;
                         let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
@@ -716,7 +722,7 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
                 },
                 Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
                     if expected.is_some_and(|step| step != reach::Step::Stub) {
-                        return Err(bad_closure());
+                        return Err(bad_closure("the current walk produced a stub for a non-stub receipt row"));
                     }
                     let msg = bstd::mem::format_in!(frame, "blaze export: called unbuilt function: {why}");
                     let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
@@ -735,7 +741,7 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
             return Err(box_err(
                 ExportCliError::Walk {
                     symbol: [0; 32],
-                    shown: owned_fmt(format_args!("distributed reachability has rows outside the selected roots"), frame, heap.alloc()),
+                    shown: owned_fmt(format_args!("distributed reachability contains extra receipt rows outside the selected roots"), frame, heap.alloc()),
                 },
                 heap,
             ));
@@ -998,6 +1004,15 @@ fn export_program<'f>(
         }
         ProductRoots::Library(_) => (None, MakerStart::Library),
     };
+    let checked_export = match dist.filter(|_| !release) {
+        Some(config) => Some((config, crate::engine_dist::reach_inputs::checked_export(
+            &standing, program_found, ids, config.report.as_deref(), bump,
+        ).map_err(|error| box_err(ExportCliError::Dist(error), heap))?)),
+        None => None,
+    };
+    // Planning, the publisher and final placement share the same witnessed facts.
+    // Ordinary run/test and non-distributed/release export keep their original ids.
+    let ids = checked_export.as_ref().map_or(ids, |(_, checked)| checked.ids());
     let mut maker = Maker::of_start(names, maker_entry, maker_start, ByKind::new(typed.over(ids)), &builder, heap.alloc());
     let mut codes = HomeCodeStore::new(lent);
     let mut export_id = blaze_ids::Hasher::new("blaze export program root 1");
@@ -1026,7 +1041,7 @@ fn export_program<'f>(
     // Optional distributed compilation pass over workspace crates (D11).
     let mut dist_fp: Option<blaze_wire::Digest> = None;
     let mut dist_reach = None;
-    if let Some(dist_cfg) = dist.filter(|_| !release) {
+    if let Some((dist_cfg, checked)) = &checked_export {
         let _dist_span = cx.span("export: distributed dev code");
         let mut dist_store = crate::engine_dist::DistStore::new(&mut codes, dist_cfg.wire_alloc);
         let (outcome, fp) = crate::engine_dist::run_distributed(
@@ -1041,8 +1056,7 @@ fn export_program<'f>(
             &mut dist_store,
             &roots,
             native_export.key,
-            crate::engine_dist::reach_inputs::context(&standing, program_found, &ids, dist_cfg.report.as_deref())
-                .map_err(|error| box_err(ExportCliError::Dist(error), heap))?,
+            checked.context(),
             release,
             output_path,
             alloc,
