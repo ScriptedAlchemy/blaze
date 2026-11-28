@@ -1,8 +1,9 @@
 # distv2 acceptance
 
 `../distv2.py` builds the fixture with real Blaze daemons and checks actual artifacts and native
-server packs. It never creates acceptance artifacts itself. `selfcheck.py` exercises only the
-Python evidence oracles with small synthetic inputs; passing it is not distributed acceptance.
+server packs. It never creates acceptance artifacts itself. `selfcheck.py` exercises the
+Python evidence oracles and the benchmark's kernel affinity contract; passing it is not
+distributed acceptance and starts no Blaze processes.
 
 A run needs a **new, empty scratch directory**. Earlier runs, logs and artifacts are never wiped.
 It retains `provenance.json` (source commit/tree/patch, fixture digest, all three binary hashes,
@@ -76,6 +77,27 @@ In GitHub, restrict the `blaze-distributed-hosts` environment to that branch and
 gh workflow run blaze.yaml --repo ScriptedAlchemy/blaze --ref "<trusted-branch>" -f three_hosts=true
 ```
 
+For latency, dispatch with `-f three_host_benchmark=true`. Three paired repetitions
+compare a solo export with the primary's export on the same runner while two remote
+helpers participate. Each benchmark session pins itself to two CPUs from its allowed Linux
+affinity before starting any children or background services. Compiler descendants inherit
+that mask; the primary's coordinator and cache share its budget. Each remote helper pins
+its own session independently. Missing affinity support, a refused or changed mask, or a
+cgroup CPU quota below two CPUs refuses the comparison. The benchmark requires the full
+cgroup v2 hierarchy to be readable so an unlimited leaf cannot conceal a tighter parent cap.
+
+Each repetition starts with fresh project state and a staged toolchain, then edits one
+private function and exports again using the same home and output path. Solo and distributed
+order alternates; there are no extra export warmups. The timer runs from export launch to
+command exit. CI checks the resulting binary and stdout against solo after timing. The job
+summary gives medians and the primary evidence archive includes a schema-2
+`three-host-latency.json` for each repetition. Its identities retain configured worker count,
+kernel affinity, cgroup membership, every ancestor's `cpu.max` and effective cpuset, and the
+tightest quota. Each timed identity also records the body-pool size from its retained
+`profile.txt`, which must equal the requested worker count. This is the pool size, not the
+number of workers busy on a one-function edit. The CPU mask limits placement; it does not
+claim dedicated hardware or eliminate interference from other host work.
+
 The runners pin SSH keys for that attempt. The coordinator and cache are reached through
 SSH forwards and listen only locally. The harness holds each participant's first real grant
 before letting the workers publish. The proof checks distinct hosts, disjoint compiled function
@@ -92,6 +114,14 @@ The acceptance harness reads these fields from the compiler, worker and coordina
 - `attempt`: final successful attempt number, or `-1` when no execution was joined.
 - `publication_attempt`: the attempt that first accepted the immutable manifest; it can be
   older than `attempt` when a replacement lead delivers that accepted record.
+- `completed_here`: whether this worker finished the unit by running its completion step.
+- `verified_reach_rows`, `verified_reach_digest`: the count and content digest of the verified
+  reachability record used to place the final dev artifact. The dev acceptance edits the private
+  `main` body and lets one warm worker publish the final unit before another warm worker requests
+  it. Both artifacts must match solo in bytes and stdout. The primary must hit the helper's
+  publication and report no local emission. The harness counts keyed rows in the native packs and
+  requires the primary's `start.txt` to report placing exactly those rows. Benchmark samples retain
+  the completion flag and verified placement count alongside work counters and timings per participant.
 - `work_compiled_keys`, `tail_compiled_keys`: arrays of actual compiled **store template keys**
   as lowercase hex, counted by `compiled_for_work` and `tail_compiled`, respectively. Include every
   real compile, even a duplicate; do not deduplicate these arrays or include store hits. These let

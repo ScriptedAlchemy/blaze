@@ -24,8 +24,8 @@ use blaze_emit::{Isa, Os};
 use blaze_id::{CrateItemKey, ItemKey as LibKey};
 use blaze_ids::producer::{CodeBuilder, ProducerId, Producers};
 use blaze_ids::{ContentId, Hasher};
-use blaze_ladder::body_ids::{BodyId, BodyIds, Counts, How, Read, Stepped};
-use blaze_ladder::code_records::reads::{ReadKind, ReadPlant};
+use blaze_ladder::body_ids::{BodyId, BodyIds, Counts, How, Make, Read, Stepped, WalkObserver};
+use blaze_ladder::code_records::reads::{ReadKind, ReadPlant, Verdict};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, EntryView, MemoryStore, Settings, TierName};
 use blaze_ladder::crates::{Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::keys::checker_of;
@@ -160,6 +160,234 @@ fn logged(records: &Records<'_>) -> Vec<String> {
     records.errors().iter().map(|e| e.to_string()).collect()
 }
 
+#[path = "f20_read_lists/known_heads.rs"]
+mod known_heads;
+
+mod member_index_preparation {
+    use super::*;
+    use blaze_ladder::front2::keys::{MemberKind, member_key_of};
+    use blaze_ladder::front2::program::Front2Refusal;
+    use blaze_ladder::front2::program::lazy::{LazyProgram, LazyRefusal, RecordsOpts};
+    use blaze_ladder::front2::source::{MemberWant, SourceError};
+    use blaze_ladder::run::RunError;
+    use blaze_ladder::seam::FrontEnd;
+    use core::cell::Cell;
+
+    const MEMBERS: &str = "
+struct Selected;
+struct Unrelated;
+macro_rules! selected_member { () => { pub fn selected() {} }; }
+macro_rules! selected_impl { ($t:ident) => { impl $t { selected_member!(); } }; }
+selected_impl!(Selected);
+macro_rules! unrelated_member { () => { pub fn unrelated() {} }; }
+impl Unrelated { unrelated_member!(); }
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 { 0 }
+";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Metadata<'n> {
+        owner: LibKey,
+        key: LibKey,
+        kind: ItemKind,
+        name: Option<&'n str>,
+        written_by: Option<LibKey>,
+    }
+
+    fn metadata<'n>(records: &'n Records<'n>, want: MemberWant) -> blaze_own::AVec<'n, Metadata<'n>> {
+        let mut containers = blaze_own::Vec::new_in(alloc());
+        assert!(records.each_item(0, &mut |key, _| {
+            if matches!(records.kind_of_item(key), Some(ItemKind::Trait | ItemKind::Impl)) {
+                containers.push(key);
+            }
+        }));
+        let mut rows = blaze_own::Vec::new_in(alloc());
+        for owner in containers {
+            records.each_member_matching(owner, &mut |_, _| want, &mut |m| {
+                rows.push(Metadata { owner, key: m.key, kind: m.kind, name: m.name, written_by: m.written_by });
+            });
+        }
+        rows.sort_unstable_by_key(|row| (row.owner, row.key));
+        rows
+    }
+
+    fn targets(f: &Fixture) -> [Metadata<'static>; 2] {
+        let rows = metadata(reader(f).records, MemberWant::NameOnly);
+        ["selected", "unrelated"].map(|name| {
+            let mut found = rows.iter().filter(|row| row.kind == ItemKind::Function && row.name == Some(name));
+            let row = *found.next().expect("the named member is in the fixture");
+            assert!(found.next().is_none(), "one fixture member has this name");
+            row
+        })
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Plant {
+        None,
+        Missing(LibKey),
+        Changed(LibKey),
+    }
+
+    struct MemberLoad<'a> {
+        kept: &'a Kept,
+        calls: [LibKey; 2],
+        reads: [Cell<usize>; 2],
+        file_reads: Cell<usize>,
+        file_bytes: Cell<usize>,
+        plant: Plant,
+    }
+
+    impl<'a> MemberLoad<'a> {
+        fn new(kept: &'a Kept, calls: [LibKey; 2], plant: Plant) -> Self {
+            Self { kept, calls, reads: core::array::from_fn(|_| Cell::new(0)), file_reads: Cell::new(0), file_bytes: Cell::new(0), plant }
+        }
+
+        fn counts(&self) -> [usize; 2] {
+            self.reads.each_ref().map(Cell::get)
+        }
+    }
+
+    impl<'n> Load<'n> for MemberLoad<'_> {
+        fn names(&self, krate: usize) -> Option<&'n [u8]> { self.kept.names(krate) }
+        fn items(&self, krate: usize) -> Option<&'n [u8]> { self.kept.items(krate) }
+        fn file(&self, krate: usize, path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'n str> {
+            let text = self.kept.file(krate, path)?;
+            self.file_reads.set(self.file_reads.get() + 1);
+            self.file_bytes.set(self.file_bytes.get() + text.len());
+            Some(text)
+        }
+        fn expansion(&self, krate: usize, call: LibKey) -> Option<LoadedExpansion<'n>> {
+            for (watched, count) in self.calls.iter().zip(&self.reads) {
+                if *watched == call {
+                    count.set(count.get() + 1);
+                }
+            }
+            if matches!(self.plant, Plant::Missing(key) if key == call) {
+                return None;
+            }
+            let mut read = self.kept.expansion(krate, call)?;
+            if matches!(self.plant, Plant::Changed(key) if key == call) {
+                read.text = "pub fn changed_expansion() {}";
+            }
+            Some(read)
+        }
+    }
+
+    /// NameOnly keeps the member index's inputs; the real selected head opens its own text.
+    /// WithText restores the unrelated read while yielding the same metadata.
+    #[test]
+    fn member_metadata_keeps_index_inputs_without_opening_member_texts() {
+        let f = fixture(MEMBERS);
+        let selected = targets(&f);
+        let calls = selected.map(|row| row.written_by.expect("each member was written by its own macro call"));
+        assert_ne!(calls[0], calls[1], "distinct expansion records make text reads observable");
+        let expected = metadata(reader(&f).records, MemberWant::WithText);
+        for want in [MemberWant::NameOnly, MemberWant::WithText] {
+            let load = MemberLoad::new(&f.kept, calls, Plant::None);
+            let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the reader's frame");
+            // These owners and every retained cache use the same frame: no skipped heap
+            // destructor when the arena releases Log/Records together (as macro_written_names).
+            let memory = blaze_own::Erased::new(&frame);
+            let records_alloc = memory.handle();
+            let log = frame.alloc(Log::new(f.crate_names, records_alloc));
+            let records = &*frame.alloc(Records::new(f.keys, &load, log, &frame, records_alloc));
+            let names = NamesRecords { records, frame: &frame, lang_crates: &LANG_CRATES, body_sources: None };
+            let before = names.records.opened();
+            assert_eq!(metadata(names.records, want), expected, "the same kind/name/container and expansion provenance");
+            let opened = names.records.opened();
+            let reads = usize::from(want == MemberWant::WithText);
+            assert_eq!(load.counts(), [reads, reads]);
+            // The file-written macro-call placeholder needs its current FileItems range;
+            // NameOnly avoids generated member texts, not that containing file check.
+            let files = load.file_reads.get();
+            let file_bytes = load.file_bytes.get();
+            assert_eq!(files, 1, "the member row opens its one containing file");
+            if want == MemberWant::NameOnly {
+                assert_eq!(opened.items.texts, before.items.texts + files);
+                assert_eq!(opened.items.text_bytes, before.items.text_bytes + file_bytes);
+            } else {
+                assert!(opened.items.texts >= before.items.texts + files + 2);
+                assert!(opened.items.text_bytes > before.items.text_bytes + file_bytes);
+            }
+            assert!(names.records.errors().is_empty());
+
+            let key = member_key_of(checker_of(selected[0].owner), MemberKind::Fn, "selected");
+            let mut program = LazyProgram::from_records(RecordsOpts { records: names.records, frame: names.frame, lang_crates: names.lang_crates, entry: None, known_heads: None, alloc: alloc() }).expect("the lazy program");
+            assert_eq!(load.counts(), [reads, reads], "constructing the program does not open either member's expansion");
+            let row = program.head_row(key).expect("the selected head loads").expect("the selected function has a row");
+            assert_eq!(program.function(row).key, key);
+            let head_reads = [1, reads];
+            assert_eq!(load.counts(), head_reads, "the requested head opens only its own member expansion");
+            let text = program.function(row).text;
+            let marks = blaze_ladder::front2::item_site::head_marks(names.records, selected[0].owner, "selected", ItemKind::Function, text)
+                .expect("the selected member's marks").expect("the fixture's nested member expansion has an origin column");
+            let saved = f.kept.expansion(0, calls[0]).expect("the selected expansion is retained");
+            assert_eq!(marks.text, saved.text);
+            assert!(blaze_scope::expansion_origins::offset_in(marks.text, text).is_some());
+            assert!(matches!(blaze_ladder::front2::item_site::member_marks(names.records, selected[0].owner, None, text),
+                Err(blaze_ladder::front2::item_site::MarksLost::NotInText { .. })), "the container's expansion is not the selected member's origin");
+            assert_eq!(program.head_row(key).expect("the retained head"), Some(row));
+            assert_eq!(load.counts(), head_reads, "the retained head adds no source reads");
+            assert!(names.records.errors().is_empty());
+        }
+    }
+
+    /// Metadata is no proof of text: an old record must refuse a missing or changed selected
+    /// expansion. Conversely, NameOnly can list an unrelated member without opening its text;
+    /// restoring WithText exposes the planted missing source through its normal typed error.
+    #[test]
+    fn member_metadata_does_not_prove_selected_or_unrelated_text() {
+        let f = fixture(MEMBERS);
+        let selected = targets(&f);
+        let calls = selected.map(|row| row.written_by.expect("a member macro call"));
+        let expected = metadata(reader(&f).records, MemberWant::NameOnly);
+        for (plant, want) in [Plant::Missing(calls[0]), Plant::Changed(calls[0]), Plant::Missing(calls[1])]
+            .into_iter().flat_map(|plant| [MemberWant::NameOnly, MemberWant::WithText].map(|want| (plant, want)))
+        {
+            let load = MemberLoad::new(&f.kept, calls, plant);
+            let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the reader's frame");
+            let memory = blaze_own::Erased::new(&frame);
+            let records_alloc = memory.handle();
+            let log = frame.alloc(Log::new(f.crate_names, records_alloc));
+            let records = &*frame.alloc(Records::new(f.keys, &load, log, &frame, records_alloc));
+            let names = NamesRecords { records, frame: &frame, lang_crates: &LANG_CRATES, body_sources: None };
+            let rows = metadata(names.records, want);
+            if want == MemberWant::NameOnly {
+                assert_eq!(rows, expected);
+                assert_eq!(load.counts(), [0, 0]);
+                assert!(names.records.errors().is_empty(), "metadata asks no expansion text");
+            } else {
+                assert_ne!(rows, expected, "WithText cannot yield the member whose expansion was refused");
+                assert!(!names.records.errors().is_empty());
+            }
+            let affected = match plant { Plant::Missing(call) | Plant::Changed(call) => call, Plant::None => unreachable!() };
+            let key = member_key_of(checker_of(selected[0].owner), MemberKind::Fn, "selected");
+            if affected == calls[0] {
+                let mut program = LazyProgram::from_records(RecordsOpts { records: names.records, frame: names.frame, lang_crates: names.lang_crates, entry: None, known_heads: None, alloc: alloc() }).expect("the lazy program");
+                assert!(program.head_row(key).is_err(), "the actual selected head must refuse {plant:?} after {want:?}");
+            } else if want == MemberWant::NameOnly {
+                let mut program = LazyProgram::from_records(RecordsOpts { records: names.records, frame: names.frame, lang_crates: names.lang_crates, entry: None, known_heads: None, alloc: alloc() }).expect("the lazy program");
+                let row = program.head_row(key).expect("the unrelated missing text does not refuse the selected head").expect("the selected function has a row");
+                assert_eq!(program.function(row).key, key);
+                assert_eq!(load.counts(), [1, 0]);
+                assert!(names.records.errors().is_empty(), "the selected head does not ask the unrelated expansion");
+                let _ = metadata(names.records, MemberWant::WithText);
+                assert!(load.counts()[1] > 0, "restoring the unused read must expose its missing source");
+            }
+            assert!(names.records.errors().iter().any(|error| match (plant, error) {
+                (Plant::Missing(want), SourceError::Items { error: items_record::ItemsRecordError::Gone { call: Some(got), .. }, .. }) => want == *got,
+                (Plant::Changed(want), SourceError::Items { error: items_record::ItemsRecordError::Stale { call: Some(got), .. }, .. }) => want == *got,
+                _ => false,
+            }), "the source error must name the planted expansion, {plant:?}");
+            let b = builder();
+            let mut maker = Maker::new(names, Some(key), &b, alloc());
+            assert!(matches!(maker.verify(key, &[], &[]),
+                Err(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, .. }))) if tabled == Some(key)),
+                "the source log must void verification before entry decoding");
+        }
+    }
+}
+
 const READS: [Read; 1] = [Read { fact: [3; 32], digest: [4; 32] }];
 
 /// The command's stand-in (the module doc): each free fn's and static's key from its own text.
@@ -255,6 +483,128 @@ fn walk(f: &Fixture, store: &mut MemoryStore<'static>, plant: ReadPlant) -> Walk
         .map(|row| Row { tabled: walk.tabled(row), name: walk.name(row).to_vec(), key: walk.key(row), found: matches!(walk.how(row), How::Done(Stepped::Found(_))) })
         .collect();
     Walked { counts, rows }
+}
+
+fn shared_constants(shared: usize, other: usize) -> Fixture {
+    let body = blaze_own::format_in!(alloc(),
+        "const SHARED: usize = {shared};\n\nconst OTHER: usize = {other};\n\n\
+         fn known() -> usize {{\n    SHARED\n}}\n\n\
+         fn mixed() -> usize {{\n    SHARED + OTHER\n}}\n\n\
+         #[unsafe(no_mangle)]\npub extern \"C-unwind\" fn main() -> i32 {{\n    (known() + mixed()) as i32\n}}\n"
+    );
+    fixture(body.as_str())
+}
+
+fn verify_row(maker: &mut Maker<'static>, row: &Row, store: &MemoryStore<'static>) -> Verdict {
+    let Some(key) = row.key else { panic!("the fixture's row must have a code key") };
+    let bytes = match store.get(key) {
+        Ok(Some(bytes)) => bytes,
+        other => panic!("the fixture's code record: {other:?}"),
+    };
+    match maker.verify(row.tabled, &row.name, bytes) {
+        Ok(Some(verdict)) => verdict,
+        other => panic!("the fixture's verification: {other:?}"),
+    }
+}
+
+/// Removing the earlier proof with a fresh maker prepares both constants. Keeping it prepares
+/// only the other constant, while the real verifier still accepts the same complete read list.
+#[test]
+fn partially_known_read_lists_prepare_only_unanswered_rows() {
+    let f = shared_constants(2, 3);
+    let ids = ids_of(&f);
+    let mut store = MemoryStore::new_in(alloc());
+    let made = walk(&f, &mut store, ReadPlant::None);
+    let known = made.of(fn_named(&f, "known"));
+    let mixed = made.of(fn_named(&f, "mixed"));
+    let b = builder();
+    let mut maker = Maker::new(reader(&f), Some(ids.entry), &b, alloc());
+    assert_eq!(verify_row(&mut maker, known, &store), Verdict::Holds);
+    let before = maker.read_preparation();
+    assert_eq!(verify_row(&mut maker, mixed, &store), Verdict::Holds);
+    let after = maker.read_preparation();
+    let prepared = after.prepared - before.prepared;
+    let reused = after.reused - before.reused;
+    assert!(prepared > 0, "the second entry must contain an unanswered preparation row");
+    assert!(reused > 0, "the second entry must reuse a proved preparation row");
+
+    let mut fresh = Maker::new(reader(&f), Some(ids.entry), &b, alloc());
+    assert_eq!(verify_row(&mut fresh, mixed, &store), Verdict::Holds);
+    let control = fresh.read_preparation();
+    assert_eq!(control.reused, 0, "a fresh maker has no earlier proof to reuse");
+    assert_eq!(control.prepared, prepared + reused, "removing the proof must restore its preparation work");
+    println!("partial read preparation: retained maker prepared {prepared}, reused {reused}; fresh maker {control:?}");
+}
+
+/// A shared question with a different stored answer and an unknown question whose dependency
+/// changed both leave the entry stale. Neither case may seed the still-unproved other answer.
+#[test]
+fn partially_known_read_lists_still_reject_changed_answers() {
+    let before = shared_constants(2, 3);
+    let mut old_store = MemoryStore::new_in(alloc());
+    let old = walk(&before, &mut old_store, ReadPlant::None);
+    let old_mixed = old.of(fn_named(&before, "mixed"));
+
+    for (shared, other) in [(5, 3), (2, 7)] {
+        let after = shared_constants(shared, other);
+        let ids = ids_of(&after);
+        let mut today_store = MemoryStore::new_in(alloc());
+        let today = walk(&after, &mut today_store, ReadPlant::None);
+        let known = today.of(fn_named(&after, "known"));
+        let mixed = today.of(fn_named(&after, "mixed"));
+        let b = builder();
+        let mut maker = Maker::new(reader(&after), Some(ids.entry), &b, alloc());
+        assert_eq!(verify_row(&mut maker, known, &today_store), Verdict::Holds);
+        assert!(matches!(verify_row(&mut maker, old_mixed, &old_store), Verdict::Stale { kind: ReadKind::Const, .. }), "an edited constant must invalidate the old entry");
+        let rejected = maker.read_preparation();
+        assert_eq!(verify_row(&mut maker, mixed, &today_store), Verdict::Holds);
+        assert!(maker.read_preparation().prepared > rejected.prepared, "the refused entry must not prove its unknown constant for the next entry");
+        println!("partial read invalidation: SHARED={shared}, OTHER={other}; stale entry refused, today's entry held");
+    }
+}
+
+/// Observation sees the real verification stages and preserves both acceptance and rejection,
+/// including the fact that a rejected read list must not seed later preparation proofs.
+#[test]
+fn observed_verification_preserves_read_answers_and_preparation() {
+    struct Seen<'a>(&'a core::cell::Cell<usize>);
+    impl<'a> WalkObserver for Seen<'a> {
+        type Span = Seen<'a>;
+
+        fn span(&self, _name: &'static str) -> Self::Span {
+            self.0.set(self.0.get() + 1);
+            Seen(self.0)
+        }
+    }
+
+    let before = shared_constants(2, 3);
+    let mut old_store = MemoryStore::new_in(alloc());
+    let old = walk(&before, &mut old_store, ReadPlant::None);
+    let old_mixed = old.of(fn_named(&before, "mixed"));
+    let spans = core::cell::Cell::new(0);
+    let observer = Seen(&spans);
+    for (shared, other) in [(2, 3), (5, 3), (2, 7)] {
+        let after = shared_constants(shared, other);
+        let ids = ids_of(&after);
+        let mut today_store = MemoryStore::new_in(alloc());
+        let today = walk(&after, &mut today_store, ReadPlant::None);
+        let known = today.of(fn_named(&after, "known"));
+        let mixed = today.of(fn_named(&after, "mixed"));
+        let b = builder();
+        let mut plain = Maker::new(reader(&after), Some(ids.entry), &b, alloc());
+        let mut observed = Maker::new(reader(&after), Some(ids.entry), &b, alloc());
+        for (row, store) in [(known, &today_store), (old_mixed, &old_store), (mixed, &today_store)] {
+            let key = row.key.expect("the fixture's code key");
+            let bytes = store.get(key).expect("the fixture's store").expect("the fixture's entry");
+            let expected = verify_row(&mut plain, row, store);
+            let actual = observed.verify_observed(key, key, row.tabled, &row.name, bytes, &observer)
+                .expect("the observed verifier").expect("the observed verdict");
+            assert_eq!(actual, expected, "SHARED={shared}, OTHER={other}");
+            assert_eq!(observed.read_preparation(), plain.read_preparation());
+            assert_eq!(observed.verified_from_answers(), plain.verified_from_answers());
+        }
+    }
+    assert!(spans.get() > 0, "the equality control must exercise an observing strategy");
 }
 
 /// The rows of `fresh` whose entry `kept` holds under another key: stale code served.

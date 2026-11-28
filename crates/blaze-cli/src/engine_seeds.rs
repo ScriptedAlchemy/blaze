@@ -63,7 +63,7 @@ use blaze_ids::ContentId;
 use blaze_ladder::front2::heads::Want;
 use blaze_ladder::front2::item_shown::ItemShown;
 use blaze_ladder::front2::source::{NamesSource, Records};
-use blaze_ladder::front2::tables::head::{FreezeError, FrozenHead, Known, KnownHeads, NotTheirs, VERSION, WANT_BYTES, cell_id as head_cell_id, want_bytes};
+use blaze_ladder::front2::tables::head::{FreezeError, FrozenHead, Known, KnownError, KnownHeads, NotTheirs, VERSION, WANT_BYTES, cell_id as head_cell_id, want_bytes};
 use blaze_ladder::front2::tables::seeds::{BodyLocals, MOST_CELLS, RequestHeads, SeedError};
 pub(crate) use blaze_ladder::front2::tables::seeds::RequestSeed as BodySeed;
 use blaze_own::{Alloc, SharedAlloc};
@@ -76,6 +76,8 @@ use crate::engine_head_notes::Failed;
 use crate::engine_heads::{HeadAt, Owners, Subjects};
 use crate::engine_names::NamesStage;
 use crate::store::{CommandStore, Sharing, Store as _};
+
+pub(crate) mod publish;
 
 /// Where a request's bodies take their heads from: the one seam (rule 78), each tested equal
 /// (engine_check_tests.rs `engine_check_checks_bodies_from_frozen_heads`).
@@ -174,9 +176,16 @@ pub(crate) fn crates_of(list: &CrateList<'static>, names: crate::engine_names::N
 /// [`crates_of`] in the caller's allocator (lane H9: the Heads stage's finder of dependency
 /// heads, engine_heads_once.rs `HeadsOnce::find_dependencies`).
 pub(crate) fn crates_in(list: &CrateList<'static>, names: &NamesStage<'_>, alloc: SharedAlloc<'static>) -> blaze_own::Vec<CrateAt, SharedAlloc<'static>> {
+    let names = crate::engine_names::NamesInputs::ran(names);
+    crates_by(list, &|name| names.input_of(name).map(|input| input.at), alloc)
+}
+
+/// The same closed dependency classification over the caller's current names RECORD keys.
+/// Export borrows the standing answer's keys and snapshot; it does not reconstruct a scope
+/// digest or keep a second head table.
+pub(crate) fn crates_by(list: &CrateList<'static>, names_at: &dyn Fn(Name) -> Option<Key>, alloc: SharedAlloc<'static>) -> blaze_own::Vec<CrateAt, SharedAlloc<'static>> {
     let mut crates: blaze_own::Vec<CrateAt, SharedAlloc<'static>> = blaze_own::Vec::new_in(alloc);
-    // The Heads phases' (the phase path's): the stage's entries alone.
-    each_crate(list, crate::engine_names::NamesInputs::ran(names), &mut |one| crates.push(one));
+    each_crate_by(list, names_at, &mut |one| crates.push(one));
     close(list, &mut crates);
     crates.sort_unstable_by_key(|one| one.prefix);
     crates
@@ -267,6 +276,12 @@ impl<A: core::alloc::Allocator + Send + Sync> HeadRecords for Snapshot<A> {
     }
 }
 
+impl HeadRecords for &crate::store::StoreSnapshot {
+    fn record(&self, key: Key) -> Result<Option<&[u8]>, Unreadable> {
+        self.get(key).map_err(|_| Unreadable)
+    }
+}
+
 /// How a cell's crate stands to the rule "a dependency head is valid by its key".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Keyed {
@@ -294,6 +309,14 @@ impl<R: HeadRecords> DependencyFinder<R> {
         DependencyFinder { records, crates, tool }
     }
 
+    pub(crate) fn crates(&self) -> &[CrateAt] {
+        &self.crates
+    }
+
+    pub(crate) fn tool(&self) -> Tool {
+        self.tool
+    }
+
     /// Cell `cell`'s standing (by its item key's crate prefix: unique in a list, blaze-surface
     /// crate_graph.rs `PrefixClash`).
     pub(crate) fn keyed(&self, cell: Want) -> Keyed {
@@ -306,6 +329,25 @@ impl<R: HeadRecords> DependencyFinder<R> {
         match at.names_at {
             Some(names_at) => Keyed::Closed { key: dependency_key(names_at, cell, self.tool), names_at, scope: blaze_drive::key::crate_scope_name(&at.key) },
             None => Keyed::Unkeyed,
+        }
+    }
+}
+
+/// Read-only reuse of checked dependency heads by the exporter. Only a closed crate has a
+/// key sufficient to accept its frozen head; an open or absent head is computed by the
+/// caller's existing source. A present but unreadable or mismatched record is terminal.
+impl<R: HeadRecords> KnownHeads for DependencyFinder<R> {
+    fn known(&self, cell: Want) -> Known<'_> {
+        let Keyed::Closed { key, names_at, .. } = self.keyed(cell) else {
+            return Known::Freeze;
+        };
+        match self.records.record(key) {
+            Ok(Some(bytes)) => match self.records.head(bytes, names_at, cell) {
+                Ok(head) => Known::Bytes(head),
+                Err(why) => Known::Invalid(KnownError::Invalid { key, why }),
+            },
+            Ok(None) => Known::Freeze,
+            Err(Unreadable) => Known::Invalid(KnownError::Unreadable { key }),
         }
     }
 }
@@ -326,9 +368,11 @@ struct Fresh {
 }
 
 /// Why heads frozen this request were not put (rule 53: every head frozen now is put or
-/// counted here, so `put + member + unlisted + no_names == frozen`).
+/// counted here, so `put + duplicates + local + member + unlisted + no_names == frozen`).
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct NotPut {
+    /// A body-local head whose identity belongs to its owning body, not a closed crate alone.
+    pub(crate) local: u32,
     /// A member crate's head frozen at a seed: placed as a dependency's, as its crate has no
     /// file among the members' outlines (engine_heads.rs `Subjects`; `Owners::place`). Never a
     /// head a macro wrote: that is its entry's head task's, or its reader is refused by name
@@ -424,8 +468,8 @@ pub(crate) fn profile(counts: &SeedCounts, into: &mut blaze_own::String<&Frame>)
     );
     let _ = write!(
         into,
-        "heads: frozen now and not put: {} a member crate's placed as a dependency's (no file of it among the members' outlines), {} of no crate of the list, {} of a crate with no names record",
-        counts.not_put.member, counts.not_put.unlisted, counts.not_put.no_names
+        "heads: frozen now and not put: {} body-local, {} a member crate's placed as a dependency's (no file of it among the members' outlines), {} of no crate of the list, {} of a crate with no names record",
+        counts.not_put.local, counts.not_put.member, counts.not_put.unlisted, counts.not_put.no_names
     );
     let _ = writeln!(into);
     crate::engine_heads::unit_profile(&counts.units, into);
@@ -673,8 +717,7 @@ pub(crate) struct RequestTable<'p> {
     names: CrateNames<'p>,
     tool: Tool,
     /// Whether the dependency heads root existed when the request began, and how many keys it held.
-    had_root: bool,
-    listed_from_root: usize,
+    root_state: publish::RootState,
     /// Additional dependency head keys from the Heads stage (`list_too`), empty on warm edits.
     added_listed: blaze_own::Vec<Key, SharedAlloc<'static>>,
     /// What was read of the head tasks' records, by member cell.
@@ -787,15 +830,7 @@ impl<'p> RequestTable<'p> {
         tool: Tool,
         heap: &'static blaze_own::Heap,
     ) -> Result<RequestTable<'p>, CliError> {
-        let (had_root, listed_from_root) = match store.named(root)? {
-            Some(keys) => {
-                if keys.len() % 32 != 0 {
-                    return Err(CliError::Text { what: "the dependency heads' root lists bytes that are no whole keys (engine_seeds.rs `root_name`)" });
-                }
-                (true, keys.len() / 32)
-            }
-            None => (false, 0),
-        };
+        let root_state = publish::RootState::read(store, root)?;
         let shared = heap.shared();
         Ok(RequestTable {
             snapshot: store.snapshot_in(shared)?,
@@ -803,8 +838,7 @@ impl<'p> RequestTable<'p> {
             crates,
             names,
             tool,
-            had_root,
-            listed_from_root,
+            root_state,
             added_listed: blaze_own::Vec::new_in(shared),
             members: blaze_core::SharedMapBy::new_in("engine.member heads read from their head tasks' records", shared),
             taken: blaze_core::SharedSetBy::new_in("engine.member heads taken", shared),
@@ -994,7 +1028,6 @@ impl<'p> RequestTable<'p> {
         bodies: SeedTally,
     ) -> Result<SeedCounts, CliError> {
         let cx = cx.span("engine: the dependency heads frozen now, put");
-        let (crates, tool) = (&self.crates[..], self.tool);
         // A head record that did not read as its form stops the request here (rule 3): its
         // bodies were not given it, and nothing is put over it.
         if let Some(why) = self.members.pin().iter().find_map(|(_, read)| match read {
@@ -1015,97 +1048,33 @@ impl<'p> RequestTable<'p> {
         }
         let g = self.heap.alloc();
         let fresh = self.fresh.pin();
-        let mut puts: blaze_own::Vec<(Key, bool, blaze_own::Vec<u8, Alloc<'static>>), Alloc<'static>> = blaze_own::Vec::new_in(g);
-        let mut not_put = NotPut::default();
-        for (_, one) in fresh.iter() {
-            // Only a dependency's: a member's head moves with its crate's every edit, so it
-            // stays the request's. Its crate is the one the freezing worker's names gave
-            // (`RequestHeads::publish`), never guessed from the cell key's bytes.
-            let Some(krate) = one.krate.and_then(|key| crate_keyed(crates, key)) else {
-                not_put.unlisted = not_put.unlisted.saturating_add(1);
-                continue;
-            };
-            // A member's, or a dependency's whose closure holds a member (lane H9: not valid by
-            // its key, [`CrateAt::closed`]): counted with the members'.
-            if !krate.closed {
-                not_put.member = not_put.member.saturating_add(1);
-                continue;
-            }
-            let Some(names_at) = self.names_of(&krate) else {
-                not_put.no_names = not_put.no_names.saturating_add(1);
-                continue;
-            };
-            let mut payload = blaze_own::Vec::with_capacity_in(KEY_BYTES + one.bytes.len(), g);
-            payload.extend_from_slice(&names_at.0.0);
-            payload.extend_from_slice(one.bytes);
-            puts.push((dependency_key(names_at, one.cell, tool), krate.toolchain, payload));
-        }
-        puts.sort_unstable_by_key(|(key, _, _)| *key);
-        puts.dedup_by_key(|(key, _, _)| *key);
-        for (key, is_toolchain, payload) in puts.iter() {
-            // Its payload is this vector's, freed below: none held after the merge.
-            ledger.put(Stage::Bodies, *key, &[payload.as_slice()], 0);
-            store.put(&cx, *key, payload.as_slice())?;
-            if *is_toolchain {
-                store.keep_with_toolchain(*key)?;
-            }
-        }
-        const RENEW_SENTINEL: blaze_toolchain::ToolchainId = blaze_toolchain::ToolchainId(*b"blaze-renew-no-toolchain-root\0\0\0");
-        let mut unlisted = 0u32;
-        let listed_count;
-        // Set again by every request that lists heads, not only one that puts some: a root a
-        // command reaches is renewed (store/roots.rs), so heads every checkout reads never expire
-        // while one reads them. When nothing new was added to a live root (the common warm-edit
-        // case), renew the root in O(1) without probing, sorting, or hashing all listed keys.
-        if puts.is_empty() && self.added_listed.is_empty() && self.had_root && self.listed_from_root <= MOST_CELLS {
-            listed_count = self.listed_from_root;
-            if self.listed_from_root > 0 && !store.renew_one(root)? {
-                return Err(CliError::Text { what: "the dependency heads' root expired before merge (engine_seeds.rs `merge`)" });
-            }
-        } else if !puts.is_empty() || !self.added_listed.is_empty() || self.listed_from_root > 0 {
-            let mut keys: blaze_own::Vec<Key, Alloc<'static>> = blaze_own::Vec::with_capacity_in(self.listed_from_root + self.added_listed.len() + puts.len(), g);
-            if let Some(existing) = store.named(root)? {
-                if existing.len() % 32 != 0 {
-                    return Err(CliError::Text { what: "the dependency heads' root lists bytes that are no whole keys (engine_seeds.rs `root_name`)" });
-                }
-                for chunk in existing.chunks_exact(32) {
-                    let mut key = [0u8; 32];
-                    key.copy_from_slice(chunk);
-                    keys.push(Key(ContentId(key)));
-                }
-            } else if self.had_root && self.listed_from_root > 0 {
-                return Err(CliError::Text { what: "the dependency heads' root expired before merge (engine_seeds.rs `merge`)" });
-            }
-            if !self.added_listed.is_empty() {
-                keys.extend_from_slice(&self.added_listed);
-                keys.sort_unstable();
-                keys.dedup();
-            }
-            listed_count = keys.len();
-            keys.extend(puts.iter().map(|(key, _, _)| *key));
-            keys.sort_unstable();
-            keys.dedup();
-            // Rule 18: the root lists at most a table's cells; past it, counted and said.
-            if keys.len() > MOST_CELLS {
-                unlisted = u32::try_from(keys.len() - MOST_CELLS).unwrap_or(u32::MAX);
-                keys.truncate(MOST_CELLS);
-            }
-            store.pin(root, &keys)?;
-        } else {
-            listed_count = 0;
-        }
+        let frozen = u32::try_from(fresh.len()).unwrap_or(u32::MAX);
+        let names = |at: &CrateAt| self.names_of(at);
+        let batch = publish::Batch::stage(publish::StageOpts {
+            heads: fresh.iter().map(|(_, one)| publish::FreshHead { cell: one.cell, krate: one.krate, bytes: one.bytes }),
+            crates: &self.crates,
+            names: &names,
+            tool: self.tool,
+            alloc: g,
+        }).map_err(CliError::HeadPublication)?;
+        // Fresh bytes live in the request heap independently of the map's read guard.
+        drop(fresh);
+        let published = batch.commit(publish::CommitOpts {
+            cx: &cx, store, root, prior: self.root_state, added: &self.added_listed,
+            stage: Stage::Bodies, ledger,
+        })?;
         Ok(SeedCounts {
             table: self.heads.count(),
             taken: u32::try_from(self.taken.pin().len()).unwrap_or(u32::MAX),
             read: u32::try_from(self.read.pin().len()).unwrap_or(u32::MAX),
             found,
-            frozen: u32::try_from(fresh.len()).unwrap_or(u32::MAX),
+            frozen,
             twice: self.twice.load(Ordering::Relaxed),
-            listed: u32::try_from(listed_count).unwrap_or(u32::MAX),
+            listed: published.listed,
             looked,
-            put: u32::try_from(puts.len()).unwrap_or(u32::MAX),
-            unlisted,
-            not_put,
+            put: published.put,
+            unlisted: published.unlisted,
+            not_put: published.not_put,
             fresh: fresh_digest(&self.fresh, g),
             bodies,
             // The Heads stage's, set by the command after the merge (engine_check.rs).
@@ -1519,6 +1488,7 @@ impl<'t, 's, 'n> StretchHeads<'t, 's, 'n> {
                 Ok(KnownFrozen::Refused(why))
             }
             Known::Freeze => Ok(KnownFrozen::Freeze),
+            Known::Invalid(error) => Err(FreezeError::KnownProvider { want: cell, error }),
         }
     }
 }
@@ -1552,7 +1522,7 @@ impl<'t> KnownHeads for StretchHeads<'t, '_, '_> {
                     memo.insert(key, CachedKnown::Refused(why));
                 }
             }
-            Known::Freeze => {}
+            Known::Freeze | Known::Invalid(_) => {}
         }
         resolved
     }
@@ -1634,6 +1604,12 @@ impl RequestTable<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod export_heads_tests;
+
+#[cfg(test)]
+mod export_publish_tests;
 
 #[cfg(test)]
 mod renew_tests {

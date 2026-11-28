@@ -12,6 +12,10 @@ on:
         description: Run one distributed build on three GitHub-hosted ARM64 machines
         type: boolean
         default: false
+      three_host_benchmark:
+        description: Compare unpaused solo and three-machine dev exports after a cold start and a private edit
+        type: boolean
+        default: false
 
 concurrency:
   # A pull request's newer push cancels its run before. Main runs one push at a time: a push
@@ -786,6 +790,22 @@ jobs:
             fi
           done
           exit "$first_failure"
+      # Keep failed fault runs inspectable before the later migration and protocol suites finish.
+      - name: keep distributed fault evidence before later suites
+        if: ${{ !cancelled() && steps.handoff.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: distributed-fault-evidence
+          path: |
+            ${{ runner.temp }}/dist-evidence
+            ${{ runner.temp }}/source-binaries/blaze-build.json
+            ${{ runner.temp }}/blaze-fs/dist-*/provenance.json
+            ${{ runner.temp }}/blaze-fs/dist-*/source.patch
+            ${{ runner.temp }}/blaze-fs/dist-*/logs
+            ${{ runner.temp }}/blaze-fs/dist-*/gates
+            ${{ runner.temp }}/blaze-fs/dist-*/artifacts.json
+            ${{ runner.temp }}/blaze-fs/dist-*/final-artifacts.json
+          if-no-files-found: warn
       - name: both complete fault runs used unchanged binaries and source
         id: distributed
         run: |
@@ -892,7 +912,7 @@ jobs:
           if-no-files-found: warn
 
   three-hosts:
-    if: github.event_name == 'workflow_dispatch' && inputs.three_hosts
+    if: github.event_name == 'workflow_dispatch' && (inputs.three_hosts || inputs.three_host_benchmark)
     needs: source-compiler
     permissions:
       contents: read
@@ -902,6 +922,8 @@ jobs:
     with:
       source: ${{ github.sha }}
       source_run: ${{ github.run_id }}
+      proof: ${{ inputs.three_hosts }}
+      benchmark: ${{ inputs.three_host_benchmark }}
 
   ci:
     name: ci

@@ -48,6 +48,10 @@
 //! crate's fact. A workspace callable with a standing BodyCheck contributes its task key and
 //! observed inputs to the instance name, including when it owns a closure in a type argument.
 //! Other items retain their crate fact.
+//! Checked distributed dev exports use [`RunIds::for_checked_export`] to replace a known
+//! workspace scope's crate fact and matching current fact with its validated semantic witness.
+//! That one view is hashed into the publication and used by every instance recipe; the stored
+//! ordinary runtime table and the fine body proofs remain unchanged.
 //!
 //! THE TABLE IS A RECORD (the FORM below): written once per walk at the command's certificate
 //! ([`table_key`]: the certificate, the toolchain and every kind's tool) through the one store
@@ -1986,6 +1990,70 @@ pub(crate) struct RunIds<'a> {
 }
 
 impl<'a> RunIds<'a> {
+    /// The checked export's view of these ids. `workspace` supplies the complete
+    /// semantic witnesses validated by `engine_dist::reach_inputs`; every known
+    /// workspace scope must have one. Its crate fact and matching current fact
+    /// move together, so context hashing and instance recipes read the same value.
+    /// Body rows, verdicts, proof slots, read sources and edges stay shared exactly.
+    /// This view is not written back as the ordinary runtime table.
+    pub(crate) fn for_checked_export(
+        self,
+        workspace: impl Fn(CrateItemKey) -> Option<ContentId>,
+        bump: Bump<'a>,
+    ) -> Result<Self, RunIdsError<'static>> {
+        let mut crates = Vec::with_capacity_in(self.crates.len(), bump);
+        let mut today = Vec::from_slice_in(self.today, bump);
+        for (row, grain) in self.crates.as_chunks::<CRATE_ROW>().0.iter().zip(self.grains.iter().copied()) {
+            let mut projected = *row;
+            if let CrateRow { key, grain: CrateGrain::Workspace(Some(read)), .. } = crate_row(row, grain) {
+                let name = blaze_drive::key::crate_scope_name(&key);
+                let digest = workspace(key).ok_or(RunIdsError::EngineAnswer {
+                    name, what: "the checked export has no semantic scope witness",
+                })?;
+                let current = today.binary_search_by_key(&read.fact, |row| row.fact).ok()
+                    .and_then(|at| today.get_mut(at)).ok_or(RunIdsError::EngineAnswer {
+                        name, what: "the checked export's workspace scope has no matching current fact",
+                    })?;
+                if current.digest != read.digest {
+                    return Err(RunIdsError::TwoDigests { fact: read.fact });
+                }
+                projected[80..112].copy_from_slice(&digest.0);
+                current.digest = digest.0;
+            }
+            crates.extend_from_slice(&projected);
+        }
+        Ok(Self { crates: crates.into_bump_slice(), today: today.into_bump_slice(), ..self })
+    }
+
+    /// Canonically ordered crate facts, body identities and checked verdicts. The
+    /// checked export hashes the same view its instance recipes consume.
+    pub(crate) fn hash_export_inputs(&self, hash: &mut blaze_ids::Hasher) {
+        hash.part(self.crates).part(self.bodies);
+    }
+
+    /// The exact rows hashed above, for bounded distributed-input diagnostics. Keys
+    /// identify rows independently of their position; the complete bytes retain the
+    /// verdict, text and check identity that a work-plan summary does not report.
+    pub(crate) fn each_export_input(&self, mut each: impl FnMut(&'static str, &[u8], &[u8])) {
+        for row in self.crates.chunks_exact(CRATE_ROW) {
+            each("run_ids.crate", &row[..8], row);
+        }
+        for row in self.bodies.chunks_exact(BODY_ROW) {
+            each("run_ids.body", &row[..16], row);
+        }
+    }
+
+    /// Workspace scopes whose coarse facts exist in this checked table. The
+    /// exporter must obtain a complete witness for each; an absent witness is an
+    /// error at that boundary, never a claim that the scope ran no opaque calls.
+    pub(crate) fn each_workspace_scope(&self, mut each: impl FnMut(CrateItemKey)) {
+        for (row, grain) in self.crates.as_chunks::<CRATE_ROW>().0.iter().zip(self.grains.iter().copied()) {
+            if grain == GrainTag::Workspace {
+                each(crate_row(row, grain).key);
+            }
+        }
+    }
+
     /// The body ids of a command: `toolchain` the cut it opened, `crates` the `UnitGraph`
     /// record's crate list, `tools` its kinds' tools (home.rs `tools`), `workspace` the bodies
     /// of the checkout and `edges` the tree they were found by ([`workspace_of`]'s), and `answer`

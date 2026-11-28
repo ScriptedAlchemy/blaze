@@ -131,6 +131,11 @@ pub(crate) const EXPORTS: Cell = Cell([4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 /// without unnecessarily invalidating Rust-module readers.
 pub(crate) const DATA: Cell = Cell([5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
+/// A workspace `CrateScope`'s complete opaque-output witness, stored in payload
+/// form 8. Together with its source and validated reads it keys portable dev
+/// verification; unlike the fine-grained name table this cell keeps all 256 bits.
+pub(crate) const CONTEXT_OUTPUTS: Cell = Cell([6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
 /// The surface digest an outline record lists (its `Surface` part's source), or `None` for a
 /// record with no surface (a data file).
 pub(crate) fn surface_of<A: core::alloc::Allocator + Copy>(record: &Record<A>) -> Option<ContentId> {

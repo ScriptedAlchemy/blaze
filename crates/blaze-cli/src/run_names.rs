@@ -22,7 +22,8 @@
 
 use core::fmt;
 
-use blaze_drive::{Input, Key, Name};
+use blaze_drive::{Input, Key, Kind, Name};
+use blaze_id::CrateItemKey;
 use blaze_ids::{ContentId, Hasher};
 use blaze_ladder::front2::body_host::Sourced;
 use blaze_ladder::front2::source::{Log, Records};
@@ -493,6 +494,49 @@ pub(crate) struct Program {
 }
 
 impl Program {
+    /// Values visible to the maker. Workspace scopes use the caller's witnessed
+    /// semantic inputs; closed scopes and script outputs retain their exact values.
+    /// The stored names rows themselves remain unchanged for ordinary runtime reads.
+    pub(crate) fn hash_export_inputs(&self, hash: &mut blaze_ids::Hasher, workspace: impl Fn(CrateItemKey) -> Option<ContentId>) {
+        hash.id(&self.graph.out).id(&self.list.key(self.owner).0);
+        for (scopes, inputs) in [(true, &self.crates), (false, &self.scripts)] {
+            hash.update(&u64::try_from(inputs.len()).unwrap_or(u64::MAX).to_le_bytes());
+            for (at, input) in inputs.iter() {
+                let key = self.list.key(*at);
+                let out = if scopes { workspace(key).unwrap_or(input.out) } else { input.out };
+                hash.id(&key.0).id(&out);
+            }
+        }
+    }
+
+    /// The values consumed by `hash_export_inputs`, labelled for a distributed
+    /// context mismatch. These are content identities, never local record keys.
+    pub(crate) fn each_export_input(&self, workspace: impl Fn(CrateItemKey) -> Option<ContentId>, mut each: impl FnMut(&'static str, &[u8], &[u8])) {
+        each("program.graph", &[], &self.graph.out.0);
+        each("program.owner", &[], &self.list.key(self.owner).0.0);
+        for (kind, scopes, inputs) in [("program.crate", true, &self.crates), ("program.script", false, &self.scripts)] {
+            for (at, input) in inputs.iter() {
+                let key = self.list.key(*at);
+                let out = if scopes { workspace(key).unwrap_or(input.out) } else { input.out };
+                each(kind, &key.0.0, &out.0);
+                if scopes && workspace(key).is_some() {
+                    each("program.crate_stored_output", &key.0.0, &input.out.0);
+                }
+            }
+        }
+    }
+
+    /// Actual proc-module tasks in this program's checked closure, including those
+    /// whose declarations reach it through another crate. Unrelated graph units
+    /// are not queried. Their wasm outputs supplement each scope's opaque witness.
+    pub(crate) fn each_macro_input(&self, mut each: impl FnMut(Name)) {
+        for (at, _) in &self.crates {
+            if self.list.proc_macro(*at) {
+                each(Name::new(Kind::MacroModule, crate::macros::subject_of(self.list.package(*at), self.list.version(*at))));
+            }
+        }
+    }
+
     /// The program's crates for its native image (engine_native.rs `image_for`): its own crate
     /// first, then every other crate of its check scope, each by its key and its names row.
     /// Read from the one crate list this program already holds: the unit graph is not read

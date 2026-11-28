@@ -56,7 +56,7 @@ use blaze_ladder::front2::project_records::{BodySource, index_outlined_by_chain,
 use blaze_ladder::front2::source::NamesSource;
 use blaze_ladder::front2::tables::cost::{Cost, Gauge};
 use blaze_ladder::front2::heads::Want;
-use blaze_ladder::front2::tables::head::{CellFailure, ConstValues, FreezeError, NotTheirs, SeededHeads, SeededHeadsOpts, cell_id as head_cell_id};
+use blaze_ladder::front2::tables::head::{CellFailure, ConstValues, FreezeError, KnownSource, NotTheirs, SeededHeads, SeededHeadsOpts, cell_id as head_cell_id};
 use blaze_ladder::front2::tables::recorder::{PlacedCell, ReadSink, Recorder, RecorderOpts, TableRead};
 use blaze_ladder::front2::tables::seeds::{HeadSeed, RequestSeedOpts, SeedError};
 use blaze_ladder::front2::tables::task::{BodyFrame, ReadIds, ReadKeyer, Said as Line, SaidWhat, StretchStore, StretchStoreOpts, TaskError, WorkBytes, check_body_item};
@@ -6844,7 +6844,8 @@ fn unmade_cell(error: &FreezeError) -> Unmade {
         FreezeError::NoWant { .. } => Unmade::Unnamed,
         // A cell asked that is no cell, bytes that do not read, or the driver's own signal
         // escaping it: faults of the engine, never of the project's head.
-        FreezeError::NotACell { .. } | FreezeError::Read { .. } | FreezeError::Unfrozen { .. } => Unmade::Engine,
+        FreezeError::NotACell { .. } | FreezeError::Read { .. } | FreezeError::Unfrozen { .. }
+        | FreezeError::KnownProvider { .. } | FreezeError::KnownImport { .. } | FreezeError::Provenance { .. } => Unmade::Engine,
     }
 }
 
@@ -7551,6 +7552,7 @@ struct LazyBodySeed<'k, 'r, 'm, 'n, 't> {
     fb: blaze_own::Bump<'n>,
     fa: blaze_own::Alloc<'n>,
     g: blaze_own::Alloc<'static>,
+    head_errors: SharedAlloc<'static>,
     freeze_alloc: blaze_own::Alloc<'static>,
     freeze_reset: &'r blaze_ladder::front2::tables::head::FreezeReset<'r, 'm>,
     freeze_exhausted: &'k core::cell::Cell<Option<(usize, usize)>>,
@@ -7610,7 +7612,7 @@ impl<'k, 'r, 'm, 'n, 't> LazyBodySeed<'k, 'r, 'm, 'n, 't> {
         // (engine_heads.rs `heads_of`): without them this freezer would write other bytes
         // under a dependency head's key (rule 21; lane H9).
         let pointers = pointers.unwrap_or_else(|| blaze_ladder::front2::receiver::Pointers::find(index, blaze_ladder::resolve::Paths { names: self.tables }));
-        let freezer = SeededHeads::new(SeededHeadsOpts { names: self.names, sized, pointers, frame: self.frame, scratch: self.freeze_alloc, alloc: self.fa, consts, known: Some(self.heads), owners: None });
+        let freezer = SeededHeads::new(SeededHeadsOpts { names: self.names, sized, pointers, frame: self.frame, scratch: self.freeze_alloc, alloc: self.fa, consts, known: Some(KnownSource { heads: self.heads, errors: self.head_errors }), owners: None });
         self.frame.alloc(crate::engine_seeds::BodySeed::new(RequestSeedOpts { names: self.names, heads: self.heads, freezer, body_locals: self.body_locals }))
     }
 
@@ -7854,6 +7856,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
             fb,
             fa,
             g,
+            head_errors: shared.heap.shared(),
             freeze_alloc,
             freeze_reset,
             freeze_exhausted: &freeze_exhausted,
@@ -8410,6 +8413,7 @@ fn run_stretch_with<'d, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
                             SeedError::NotFrozen { cell, .. } | SeedError::Unequal { cell }
                             | SeedError::Full { cell, .. } | SeedError::NotInItsUnit { cell, .. }
                             | SeedError::NoMemberCell { cell, .. } => Some(*cell),
+                            SeedError::Known(failure) => Some(failure.want),
                             SeedError::Freeze(_) => unreachable!("freeze handled above"),
                         };
                         Some(Said::Task(TaskError::Seed { body, error }))

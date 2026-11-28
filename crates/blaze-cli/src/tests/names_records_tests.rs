@@ -42,7 +42,7 @@ impl LoadItems<'static> for OneItems {
 /// names first and `reader`'s from `filed`'s record as the store hands it back: that payload,
 /// kept by the names step's test watch, is what this test reads.
 ///
-/// 1. `sections` of it gives five sections (the tests section empty: a plain library); the names section, through `RecordNames`, answers
+/// 1. `sections` of it gives nine sections (the tests section empty: a plain library); the names section, through `RecordNames`, answers
 ///    the path `crate::m::f` in the value namespace from `filed`'s root (two segments
 ///    consumed: the Rust Reference, "Paths", `crate` names the crate root), and `crate::m` in
 ///    the type namespace as a module;
@@ -113,7 +113,7 @@ fn a_crate_scope_record_files_its_names_and_items() {
     // 3. Cut short at every section boundary: a typed refusal.
     let start = payload.as_ptr().addr();
     let mut cuts = std::vec::Vec::from([0, HEAD - 1, HEAD]);
-    for part in [parts.exports, parts.inner, parts.names, parts.items, parts.tests, parts.expansions, parts.links, parts.cells] {
+    for part in Section::ALL.map(|section| parts.part(section)) {
         let at = part.as_ptr().addr() - start;
         cuts.extend([at, at + part.len()]);
     }
@@ -124,11 +124,10 @@ fn a_crate_scope_record_files_its_names_and_items() {
             other => panic!("a payload cut at byte {cut} of {} was not refused as short: {other:?}", payload.len()),
         }
     }
-    // The last section is cut: the cell table, never empty in a resolved crate's record (its
-    // root's cell at least: blaze-scope names_cells.rs).
+    // The last section is cut: the mandatory full-width output witness.
     assert!(
-        matches!(sections(&payload[..payload.len() - 1]), Err(SectionsError::Short { section: Section::Cells, .. })),
-        "one byte off the end is the cell table cut short"
+        matches!(sections(&payload[..payload.len() - 1]), Err(SectionsError::Short { section: Section::ContextOutputs, .. })),
+        "one byte off the end is the context output witness cut short"
     );
     let mut longer = payload.clone();
     longer.push(0);
@@ -139,6 +138,13 @@ fn a_crate_scope_record_files_its_names_and_items() {
     let mut prev = payload.clone();
     prev[4] = 6;
     assert!(matches!(sections(&prev), Err(SectionsError::Form { form: 6, .. })), "previous form 6 is refused");
+    prev[4] = 7;
+    assert!(matches!(sections(&prev), Err(SectionsError::Form { form: 7, .. })), "form 7 has no opaque-output witness and is refused");
+    assert_eq!(parts.context_outputs.len(), 32, "a scope without proc calls still writes a witness");
+    let empty = crate::names::sections::write(0, [&[]; crate::names::sections::SECTIONS]);
+    let missing = sections(&empty).expect("a failed scope's empty sections are structurally valid");
+    assert_eq!(missing.context_outputs(), Err(SectionsError::ContextOutputs { len: 0 }), "a missing witness is not an empty effect set");
+    assert!(crate::names::sections::cell_of(&empty, crate::engine_tasks::CONTEXT_OUTPUTS).is_err(), "a missing witness cannot be served as absent or zero");
 }
 
 /// The tests record filed as the fifth section of a TEST unit's `CrateScope` payload (test.md,
@@ -152,7 +158,7 @@ fn a_crate_scope_record_files_its_names_and_items() {
 /// `should_panic` "input string ... must appear within the panic message". So: the payload's
 /// `sections` give a non-empty tests section; `TestsRecord::open` of it lists exactly the three
 /// tests in path order (`boom`, `tests::fast`, `tests::slow`) with their flags, and not the
-/// plain `helper`; the payload, written again from its own five sections, is the same bytes
+/// plain `helper`; the payload, written again from its own sections, is the same bytes
 /// (the round trip); and the plain unit's payload (the first test) has an empty tests section.
 ///
 /// A names step that drops the tests record (form 2's four sections) fails at "no payload with
@@ -212,6 +218,6 @@ fn a_test_units_payload_files_its_tests_record() {
     assert!(record.find("helper").unwrap_or_else(|e| panic!("find: {e}")).is_none(), "`helper` is no test");
 
     // The round trip: the payload written again from its own sections is the same bytes.
-    let again = write_payload(parts.unresolved, [parts.exports, parts.inner, parts.names, parts.items, parts.tests, parts.expansions, parts.links, parts.cells]);
-    assert_eq!(again.as_slice(), payload.as_slice(), "the payload written from its eight sections differs from the one filed");
+    let again = write_payload(parts.unresolved, Section::ALL.map(|section| parts.part(section)));
+    assert_eq!(again.as_slice(), payload.as_slice(), "the payload written from its nine sections differs from the one filed");
 }

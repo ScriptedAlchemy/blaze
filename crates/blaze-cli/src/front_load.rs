@@ -855,7 +855,7 @@ mod tests {
             let n = blaze_scope::names_record::encode(c, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.name));
             let i = blaze_scope::items_record::encode(c, g).unwrap_or_else(|e| panic!("items record of `{}`: {e:?}", c.name));
             let split = blaze_scope::expansion_records::write(c, g).unwrap_or_else(|e| panic!("expansions of `{}`: {e}", c.name));
-            out.push(sections::write(0, [&[], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[]]));
+            out.push(sections::write(0, [&[], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[], &[]]));
         }
         out
     }

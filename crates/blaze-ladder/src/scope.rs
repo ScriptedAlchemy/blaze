@@ -199,6 +199,7 @@ impl LazyRefusal {
             | LazyRefusal::LocalNotBuilt { .. }
             | LazyRefusal::Diagnostic { .. }
             | LazyRefusal::Head { .. }
+            | LazyRefusal::KnownHead { .. }
             | LazyRefusal::Adt { .. }
             | LazyRefusal::Const { .. }
             | LazyRefusal::NotLazyYet { .. }

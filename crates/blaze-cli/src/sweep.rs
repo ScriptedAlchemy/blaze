@@ -336,6 +336,12 @@ impl Leaf {
     pub(crate) fn state(&self) -> (u8, ContentId) {
         (self.flags & (AT_MOD_RS | ABSENT | BOTH), self.id)
     }
+
+    /// Hash the logical path and observed value after the sweep has established it.
+    pub(crate) fn hash_state(&self, path: &str, hash: &mut blaze_ids::Hasher) {
+        let (flags, id) = self.state();
+        hash.update(&[self.kind as u8, flags]).part(path.as_bytes()).id(&id);
+    }
 }
 
 /// A bug the sweep's test plants, to show the test catches it.
@@ -410,8 +416,7 @@ pub fn units_source<'r>(rows: impl Iterator<Item = (&'r str, &'r Leaf)>, frame: 
     sorted.sort_unstable_by(|a, b| (a.1.kind, a.0).cmp(&(b.1.kind, b.0)));
     let mut h = blaze_ids::Hasher::new(UNITS_SOURCE_DOMAIN);
     for (path, leaf) in sorted.iter() {
-        let (flags, id) = leaf.state();
-        h.update(&[leaf.kind as u8, flags]).part(path.as_bytes()).update(&id.0);
+        leaf.hash_state(path, &mut h);
     }
     h.finish()
 }

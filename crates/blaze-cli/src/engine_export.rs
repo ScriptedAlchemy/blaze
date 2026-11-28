@@ -27,7 +27,7 @@ use blaze_code::record::{CodeRecord, CodeView, NO_TARGET, PositionPart, Site, Si
 use blaze_export::{Data, DataPlace, DataWord, Entry, ExportError, Exported, Function, Panic, Platform, ProgramIn, Tier, TlsRuntime};
 use blaze_ladder::body_ids::{self, RowKind, Scratch, Stepped, Walk};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, entry_of, statics};
-use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker, RecordsProgram, Typing};
+use blaze_ladder::run::make_one::{ByKind, MOST_WALKED, Maker, MakerOpts, RecordsProgram, Typing};
 use blaze_ladder::run::special::{EntryForm, MakerStart, ProductRoots, Special, SpecialMade, library_roots, make_special, run_roots};
 use blaze_ladder::run::RunError;
 use blaze_own::{AString, AVec, Alloc, Box, Bump, Erased, String, Vec};
@@ -43,6 +43,7 @@ use bstd::report::Code;
 use crate::body_types::{SyncPackDirs, TreesSeen};
 use crate::code_store::HomeCodeStore;
 use crate::engine_check::{Standing, check_for_start};
+use crate::engine_dist::reach;
 use crate::engine_records::EngineRecords;
 use crate::engine_start::{RunProcs, StartError, body_ids, end_procs, start_facts, write_start_profile};
 use crate::phases::Phases;
@@ -82,6 +83,8 @@ pub enum ExportCliError {
     },
     /// Stepping an instance/static/TLS row in the reachability walk failed.
     Walk { symbol: [u8; 32], shown: AString<'static> },
+    /// Completing the maker's source-frozen heads refused its source or a known import.
+    Heads(Box<RunError, Alloc<'static>>),
     /// Whole-program cross-function LIR inlining and LTO emission failed.
     Lto { shown: AString<'static> },
     /// Making a special record (TLS getter or ender) failed.
@@ -143,6 +146,7 @@ impl fmt::Display for ExportCliError {
                 Hex(symbol)
             ),
             ExportCliError::Walk { symbol, shown } => write!(f, "blaze export: compiling symbol {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
+            ExportCliError::Heads(error) => write!(f, "blaze export: completing frozen dependency heads: {error}"),
             ExportCliError::Lto { shown } => write!(f, "blaze export: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::Special { what, shown } => write!(f, "blaze export: building {what}: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::Store { symbol, shown } => write!(f, "blaze export: reading code entry {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
@@ -628,6 +632,7 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
     codes: &mut dyn CodeStore,
     roots: &ProductRoots<'_>,
     tier: Tier,
+    closure: Option<&reach::Closure>,
     alloc: Alloc<'a>,
     frame: &Frame,
     heap: &'static blaze_own::Heap,
@@ -651,28 +656,67 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
 
     let mut next_row = 0usize;
     {
-        let _walk_span = cx.span("export: walk reachable functions");
+        let _walk_span = cx.span(if closure.is_some() {
+            "export: place checked distributed reachability"
+        } else {
+            "export: walk reachable functions"
+        });
         while next_row < walk.len() {
             let row = next_row;
             next_row += 1;
             let tabled = walk.tabled(row);
             let symbol = walk.symbol(row);
             let kind = walk.kind(row);
+            let bad_closure = |why: &'static str| box_err(
+                ExportCliError::Walk {
+                    symbol: symbol.0,
+                    shown: owned_fmt(format_args!("distributed reachability disagrees at row {row}: {why}"), frame, heap.alloc()),
+                },
+                heap,
+            );
             let proof = ids.runnable(tabled).map_err(|why| {
                 let krate = crate_of_item(list, tabled, heap.alloc());
                 box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
             })?;
+            let expected = closure.map(|closure| {
+                closure.at(row, tabled, symbol, || scratch.key_for(&walk, row, ids, builder)).map_err(|why| box_err(
+                    ExportCliError::Walk {
+                        symbol: symbol.0,
+                        shown: owned_fmt(format_args!("distributed reachability disagrees at row {row}: {why}"), frame, heap.alloc()),
+                    },
+                    heap,
+                ))
+            }).transpose()?;
+            if let Some(reach::Step::Keyed { key, .. }) = expected {
+                let entry = codes.get(key)
+                    .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
+                    .ok_or_else(|| bad_closure("the publication's checked code entry is missing"))?;
+                walk.follow_checked::<RunError>(row, key, entry, MOST_WALKED, &mut scratch)
+                    .map_err(|why| box_err(ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
+                cached += 1;
+                outcomes.push(RowOutcome::Keyed(key));
+                continue;
+            }
             match walk.one(row, ids, codes, builder, &builder.producer, maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
                 Ok(one) => match one.stepped {
                     Stepped::Found(key) => {
+                        if expected.is_some() {
+                            return Err(bad_closure("an unkeyed or stub receipt row found a keyed entry"));
+                        }
                         cached += 1;
                         outcomes.push(RowOutcome::Keyed(key));
                     }
                     Stepped::Made(key) => {
+                        if expected.is_some() {
+                            return Err(bad_closure("an unkeyed or stub receipt row made a keyed entry"));
+                        }
                         compiled += 1;
                         outcomes.push(RowOutcome::Keyed(key));
                     }
                     Stepped::Unkeyed(_) => {
+                        if expected.is_some_and(|step| step != reach::Step::Unkeyed(blaze_ladder::code_records::content_key(scratch.made()))) {
+                            return Err(bad_closure("the current unkeyed entry differs from the receipt's step or content"));
+                        }
                         unkeyed += 1;
                         let mut copied: AVec<'_, u8> = Vec::with_capacity_in(scratch.made().len(), alloc);
                         copied.extend_from_slice(scratch.made());
@@ -680,6 +724,9 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
                     }
                 },
                 Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
+                    if expected.is_some_and(|step| step != reach::Step::Stub) {
+                        return Err(bad_closure("the current walk produced a stub for a non-stub receipt row"));
+                    }
                     let msg = bstd::mem::format_in!(frame, "blaze export: called unbuilt function: {why}");
                     let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
                     stubs += 1;
@@ -692,6 +739,15 @@ pub(crate) fn prepare_export<'a, 'n, T: Typing<RecordsProgram<'n>>>(
                     ));
                 }
             }
+        }
+        if closure.is_some_and(|closure| closure.len() != next_row) {
+            return Err(box_err(
+                ExportCliError::Walk {
+                    symbol: [0; 32],
+                    shown: owned_fmt(format_args!("distributed reachability contains extra receipt rows outside the selected roots"), frame, heap.alloc()),
+                },
+                heap,
+            ));
         }
     }
 
@@ -928,6 +984,15 @@ fn export_program<'f>(
     let maker_procs = crate::job_texts::MadeOnce::new(|| inputs.make());
     let procs = crate::job_texts::Procs::ByNeed(&maker_procs);
 
+    // The snapshot owns the bytes; this stack-owned finder only classifies current crates
+    // and derives the same Signature keys used by checking. It precedes names so both are
+    // borrowed for the maker's lifetime, and its small crate list drops with this export.
+    let head_tools = crate::engine_store::tools(&standing.tools);
+    let known_heads = crate::engine_seeds::DependencyFinder::new(
+        found.snapshot(),
+        crate::engine_seeds::crates_by(list, &|name| (standing.names)(name).map(|input| input.at), heap.shared()),
+        crate::engine_seeds::tool_of(&head_tools),
+    );
     let names = run_names::names_of(cx, root, &found, owner, &mut *standing.store, &mut facts.bodies, &mut read, env, &pack_dirs, procs, &seen, frame, heap).map_err(CliError::RunNames)?;
 
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Roots));
@@ -951,7 +1016,21 @@ fn export_program<'f>(
         }
         ProductRoots::Library(_) => (None, MakerStart::Library),
     };
-    let mut maker = Maker::of_start(names, maker_entry, maker_start, ByKind::new(typed.over(ids)), &builder, heap.alloc());
+    let checked_export = match dist.filter(|_| !release) {
+        Some(config) => Some((config, crate::engine_dist::reach_inputs::checked_export(
+            &standing, program_found, ids, config.report.as_deref(), bump,
+        ).map_err(|error| box_err(ExportCliError::Dist(error), heap))?)),
+        None => None,
+    };
+    // Planning, the publisher and final placement share the same witnessed facts.
+    // Ordinary run/test and non-distributed/release export keep their original ids.
+    let ids = checked_export.as_ref().map_or(ids, |(_, checked)| checked.ids());
+    let mut maker = Maker::of_start(MakerOpts {
+        names, entry: maker_entry, start: maker_start, typing: ByKind::new(typed.over(ids)),
+        builder: &builder,
+        known_heads: Some(blaze_ladder::front2::tables::head::KnownSource { heads: &known_heads, errors: heap.shared() }),
+        alloc: heap.alloc(),
+    });
     let mut codes = HomeCodeStore::new(lent);
     let mut export_id = blaze_ids::Hasher::new("blaze export program root 1");
     export_id.part(picked.package.as_bytes())
@@ -978,10 +1057,12 @@ fn export_program<'f>(
 
     // Optional distributed compilation pass over workspace crates (D11).
     let mut dist_fp: Option<blaze_wire::Digest> = None;
-    if let Some(dist_cfg) = dist.filter(|_| !release) {
+    let mut dist_reach = None;
+    if let Some((dist_cfg, checked)) = &checked_export {
         let _dist_span = cx.span("export: distributed dev code");
         let mut dist_store = crate::engine_dist::DistStore::new(&mut codes, dist_cfg.wire_alloc);
         let (outcome, fp) = crate::engine_dist::run_distributed(
+            cx,
             dist_cfg,
             names,
             closure.as_slice(),
@@ -992,6 +1073,7 @@ fn export_program<'f>(
             &mut dist_store,
             &roots,
             native_export.key,
+            checked.context(),
             release,
             output_path,
             alloc,
@@ -1008,8 +1090,9 @@ fn export_program<'f>(
                 end_procs(cx, &maker_procs, standing.err, "export")?;
                 return Ok(unchanged());
             }
-            crate::engine_dist::DistExportOutcome::Completed { .. } => {
+            crate::engine_dist::DistExportOutcome::Completed { reach, .. } => {
                 dist_fp = Some(fp);
+                dist_reach = Some(reach);
             }
             crate::engine_dist::DistExportOutcome::FallbackLocal => {
                 if let Some(path) = receipt_path {
@@ -1068,9 +1151,12 @@ fn export_program<'f>(
     };
     let PreparedExport { walk, outcomes, tls, compiled, cached, unkeyed, stubs, lto_bodies, lto_inlined } = match native_prepared {
         Some(prepared) => prepared,
-        None => prepare_export(cx, list, &ids, &builder, &mut maker, &mut codes, &roots, tier, alloc, frame, heap, after_walk)?,
+        None => prepare_export(cx, list, &ids, &builder, &mut maker, &mut codes, &roots, tier, dist_reach.as_ref(), alloc, frame, heap, after_walk)?,
     };
     phases.export_verified_from_answers = Some(maker.verified_from_answers());
+    phases.export_distributed_reach = dist_reach.as_ref().map(|_| cached);
+    phases.export_read_preparation = Some(maker.read_preparation());
+    phases.export_heads = Some(maker.head_counts());
 
     // Assemble `ProgramIn` functions and data (zero-copy for cached positionless records).
     let mut functions: AVec<'_, Function<'_>> = Vec::with_capacity_in(outcomes.len() + 2, alloc);
@@ -1265,13 +1351,34 @@ fn export_program<'f>(
     drop(data);
     drop(seen_data);
     let walked = codes.reached();
-    let toolchain_made = codes.toolchain_made();
+    let mut toolchain_made = codes.toolchain_made();
     drop(codes);
+    {
+        let head_cx = cx.span("export: publish frozen dependency heads");
+        // Consuming completion checks the names log and every known-head failure after all
+        // code/source-position reads. It owns the detached freezer: no RefCell guard crosses
+        // the writer's I/O, and only source-frozen cells carry forward to the next command.
+        let finished = maker.finish_heads().map_err(|why| box_err(ExportCliError::Heads(Box::new_in(why, heap.alloc())), heap))?;
+        let head_names = |krate: &crate::engine_seeds::CrateAt| krate.names_at;
+        let batch = crate::engine_seeds::publish::Batch::stage(crate::engine_seeds::publish::StageOpts {
+            heads: finished.heads().map(|head| crate::engine_seeds::publish::FreshHead { cell: head.cell, krate: head.krate, bytes: head.bytes }),
+            crates: known_heads.crates(), names: &head_names, tool: known_heads.tool(), alloc,
+        }).map_err(CliError::HeadPublication)?;
+        let head_root = crate::engine_seeds::root_name(&head_tools, frame);
+        let prior = crate::engine_seeds::publish::RootState::read(&*standing.store, head_root.as_str())?;
+        toolchain_made.extend(batch.toolchain_keys().map(|key| blaze_cas::Key(key.0)));
+        let mut ledger = crate::engine_store::Ledger::new();
+        phases.export_head_publication = Some(batch.commit(crate::engine_seeds::publish::CommitOpts {
+            cx: &head_cx, store: &mut *standing.store, root: head_root.as_str(), prior, added: &[],
+            stage: blaze_engine::Stage::Heads, ledger: &mut ledger,
+        })?);
+    }
     crate::store::roots::keep_export(lent, &export_id, &walked)
         .map_err(|why| box_err(ExportCliError::KeepCode(why), heap))?;
-    if let Err(why) = crate::store::roots::keep_toolchain(lent, builder.toolchain, &toolchain_made, &[]) {
-        standing.err.line(cx, format_args!("blaze export: warning: toolchain code was not kept: {why}")).map_err(CliError::Out)?;
-    }
+    toolchain_made.sort_unstable();
+    toolchain_made.dedup();
+    crate::store::roots::keep_toolchain(lent, builder.toolchain, &toolchain_made, &[])
+        .map_err(|why| box_err(ExportCliError::KeepCode(why), heap))?;
 
     write_executable(cx, fs, output_path, exe_bytes.as_slice(), heap)?;
     if let (Some(path), Some(keys)) = (receipt_path, receipt_keys) {

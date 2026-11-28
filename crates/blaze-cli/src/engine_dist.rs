@@ -32,11 +32,11 @@ use blaze_dist_local::blobs::Blobs;
 use blaze_dist_local::pack::{Value, ValueRef};
 use blaze_dist_local::sys::{append_file, path_is_file, random_id, read_file, write_file};
 use blaze_ids::ContentId;
-use blaze_ladder::body_ids::{self, BodyIds, RowKind, Scratch, Stepped, Walk};
+use blaze_ladder::body_ids::{self, BodyIds, RowKind, Scratch, Stepped, Walk, WalkObserver};
 use blaze_ladder::code_records::{Builder, CodeClass, CodeKey, CodeStore, PanicStrategy, StoreError};
 use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::run::RunError;
-use blaze_ladder::run::make_one::{MOST_WALKED, Maker, NamesRecords, RecordsProgram, Typing};
+use blaze_ladder::run::make_one::{MOST_WALKED, Maker, NamesRecords, ReadPreparation, RecordsProgram, Typing};
 use blaze_ladder::run::special::{EntryForm, ProductRoots};
 use blaze_ladder::symbols::{encode_instance, fn_symbol_of_name};
 use blaze_own::{AString, AVec, Alloc, BTreeMap, BTreeSet, String, Vec, format_in};
@@ -50,10 +50,14 @@ use blaze_wire::{
 };
 use bstd::env::{Env, VarName};
 use bstd::mem::Frame;
+use bstd::Cx;
 
 use crate::code_store::HomeCodeStore;
 use crate::engine_seeds::CrateAt;
 use crate::run_ids::RunIds;
+
+pub(crate) mod reach;
+pub(crate) mod reach_inputs;
 
 #[cfg(feature = "llvm")]
 pub(crate) mod prepared;
@@ -803,6 +807,33 @@ fn write_unit_plans<'a>(report_path: Option<&str>, plans: impl Iterator<Item = P
     let _ = write_file(file.as_str(), body.as_bytes());
 }
 
+/// Verification work done in this executor's completion walks only. These are row and
+/// entry visits, including repeated preparation passes, not time or distinct-body counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TailVerification {
+    reads: ReadPreparation,
+    entries_from_answers: usize,
+}
+
+impl TailVerification {
+    /// Add one completion's difference without attributing earlier grants or later placement
+    /// to it. A reset or overflow refuses the report instead of wrapping a misleading count.
+    fn add_delta(&mut self, before: Self, after: Self) -> Option<()> {
+        let prepared = after.reads.prepared.checked_sub(before.reads.prepared)?;
+        let reused = after.reads.reused.checked_sub(before.reads.reused)?;
+        let entries = after.entries_from_answers.checked_sub(before.entries_from_answers)?;
+        let next = Self {
+            reads: ReadPreparation {
+                prepared: self.reads.prepared.checked_add(prepared)?,
+                reused: self.reads.reused.checked_add(reused)?,
+            },
+            entries_from_answers: self.entries_from_answers.checked_add(entries)?,
+        };
+        *self = next;
+        Some(())
+    }
+}
+
 /// Appends one JSONL unit report row to `BLAZE_DIST_REPORT`.
 #[expect(clippy::too_many_arguments, reason = "explicit report row fields, zero hidden globals")]
 fn append_report_row(
@@ -814,6 +845,9 @@ fn append_report_row(
     from_store: usize,
     instances: usize,
     tail_compiled_keys: &[Digest],
+    reach: Option<&reach::Closure>,
+    completed_here: bool,
+    verification: TailVerification,
     alloc: WireAlloc,
 ) {
     let Some(path) = report_path else { return };
@@ -826,13 +860,16 @@ fn append_report_row(
     let pub_attempt = arrived.publication_attempt.and_then(|v| i64::try_from(v).ok()).unwrap_or(-1);
     let work_keys = json_digests(arrived.compiled_keys.as_slice(), alloc);
     let tail_keys = json_digests(tail_compiled_keys, alloc);
+    let reach_digest = hex(reach.map_or(&[][..], |closure| closure.digest.as_slice()));
     let mut line = WireString::new_in(alloc);
     let _ = write!(
         line,
         concat!(
             "{{\"unit\":\"{}\",\"source\":\"{}\",\"execution\":{},\"joined\":{},\"grants\":{},",
             "\"compiled_for_work\":{},\"stored_for_work\":{},\"arrived\":{},\"tail_compiled\":{},\"from_store\":{},\"instances\":{},",
-            "\"unit_digest\":\"{}\",\"attempt\":{},\"publication_attempt\":{},\"work_compiled_keys\":{},\"tail_compiled_keys\":{}}}\n",
+            "\"unit_digest\":\"{}\",\"attempt\":{},\"publication_attempt\":{},\"work_compiled_keys\":{},\"tail_compiled_keys\":{},",
+            "\"verified_reach_rows\":{},\"verified_reach_digest\":\"{}\",\"completed_here\":{},",
+            "\"tail_prepared_reads\":{},\"tail_reused_reads\":{},\"tail_known_entries\":{}}}\n",
         ),
         unit_name,
         source,
@@ -841,7 +878,7 @@ fn append_report_row(
         arrived.grants,
         arrived.compiled_here,
         arrived.stored_here,
-        arrived.values.len(),
+        arrived.values.len() + usize::from(reach.is_some()),
         tail_compiled,
         from_store,
         instances,
@@ -850,6 +887,12 @@ fn append_report_row(
         pub_attempt,
         work_keys.as_str(),
         tail_keys.as_str(),
+        reach.map_or(0, reach::Closure::len),
+        reach_digest,
+        completed_here,
+        verification.reads.prepared,
+        verification.reads.reused,
+        verification.entries_from_answers,
     );
     let _ = append_file(path, line.as_bytes());
 }
@@ -859,7 +902,7 @@ pub(crate) enum DistExportOutcome {
     /// Output executable is already up to date (exact fingerprint hit); no unit was run.
     NoOp,
     /// Distributed units finished; `DistStore` holds all committed/compiled records for export.
-    Completed { compiled: usize, cached: usize },
+    Completed { compiled: usize, cached: usize, reach: reach::Closure },
     /// Coordinator was unavailable under `BLAZE_DIST_LOCAL=fallback`; caller runs local walk.
     FallbackLocal,
 }
@@ -898,8 +941,31 @@ pub(crate) fn write_output_fingerprint(output_path: &str, fp: &Digest, alloc: Wi
     let _ = write_file(fp_path.as_str(), expected.as_bytes());
 }
 
+/// Detailed publisher stages use the existing bounded, allocation-aware telemetry only when
+/// a distributed report was requested. The compiler owns no clock or reporting collection.
+struct WalkProfile<'a>(Option<&'a Cx>);
+
+struct WalkProfileSpan(Option<Cx>);
+
+impl WalkObserver for WalkProfile<'_> {
+    type Span = WalkProfileSpan;
+
+    fn span(&self, name: &'static str) -> Self::Span {
+        WalkProfileSpan(self.0.map(|cx| cx.span(name)))
+    }
+}
+
+impl WalkObserver for WalkProfileSpan {
+    type Span = WalkProfileSpan;
+
+    fn span(&self, name: &'static str) -> Self::Span {
+        WalkProfileSpan(self.0.as_ref().map(|cx| cx.span(name)))
+    }
+}
+
 /// `Granted` implementation for one workspace crate unit.
 struct UnitExecutor<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>> {
+    cx: &'a Cx,
     plan: &'a CratePlan<'a>,
     ids: &'a RunIds<'b>,
     builder: &'a Builder,
@@ -913,6 +979,8 @@ struct UnitExecutor<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>> {
     tail_from_store: usize,
     tail_instances: usize,
     tail_compiled_keys: WireVec<Digest>,
+    tail_verification: TailVerification,
+    profile_walk: bool,
     ran_complete: bool,
     result_gate: Option<agent::TestResultGate<'a>>,
 }
@@ -1000,6 +1068,13 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
         if !self.plan.is_final {
             return Ok(());
         }
+        let before = TailVerification {
+            reads: self.maker.read_preparation(),
+            entries_from_answers: self.maker.verified_from_answers(),
+        };
+        let span = self.cx.span("export: verify distributed reachability at publisher");
+        let observer = WalkProfile(if self.profile_walk { Some(&span) } else { None });
+        let mut closure = reach::Writer::new(self.plan.unit.spec, self.wire_alloc);
         self.store.clear_tracking();
         let mut walk = Walk::new_in(self.scratch_alloc);
         for i in 0..self.roots.len() {
@@ -1017,12 +1092,15 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
             next_row += 1;
             let tabled = walk.tabled(row);
             let kind = walk.kind(row);
-            let proof = self.ids.runnable(tabled).map_err(|why| {
-                let mut s = String::new_in(self.heap.alloc());
-                let _ = write!(s, "tail item not runnable: {why}");
-                DistError::Compile { shown: s }
-            })?;
-            match walk.one(
+            let proof = {
+                let _span = observer.span("check runnable proof");
+                self.ids.runnable(tabled).map_err(|why| {
+                    let mut s = String::new_in(self.heap.alloc());
+                    let _ = write!(s, "tail item not runnable: {why}");
+                    DistError::Compile { shown: s }
+                })?
+            };
+            match walk.one_observed(
                 row,
                 self.ids,
                 self.store,
@@ -1033,6 +1111,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                 &body_ids::EntryForm,
                 MOST_WALKED,
                 &mut scratch,
+                &observer,
             ) {
                 Ok(one) => {
                     self.tail_instances += 1;
@@ -1046,11 +1125,31 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                         }
                         Stepped::Unkeyed(_) => {}
                     }
+                    let _span = observer.span("record verified entry");
+                    let entry = match one.stepped {
+                        Stepped::Found(key) | Stepped::Made(key) => {
+                            let recipe = scratch.queried().ok_or_else(|| {
+                                reach::refused(self.heap, self.plan.unit.spec, "lost the checked instance key")
+                            })?;
+                            let content = if recipe == key {
+                                let bytes = self.store.get(key).map_err(DistError::Store)?
+                                    .ok_or(DistError::Store(StoreError::Failed { key, what: "missing verified reachability entry" }))?;
+                                blaze_ladder::code_records::content_key(bytes)
+                            } else {
+                                key
+                            };
+                            reach::Step::Keyed { recipe, key, content }
+                        }
+                        Stepped::Unkeyed(_) => reach::Step::Unkeyed(blaze_ladder::code_records::content_key(scratch.made())),
+                    };
+                    closure.push(tabled, walk.symbol(row), entry);
                 }
                 Err(why)
                     if row >= root_count
                         && kind == RowKind::Instance
-                        && why.scope() == blaze_ladder::scope::Scope::One => {}
+                        && why.scope() == blaze_ladder::scope::Scope::One => {
+                    closure.push(tabled, walk.symbol(row), reach::Step::Stub);
+                }
                 Err(why) => {
                     let mut s = String::new_in(self.heap.alloc());
                     let _ = write!(s, "tail compile: {why}");
@@ -1058,10 +1157,19 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
                 }
             }
         }
+        let after = TailVerification {
+            reads: self.maker.read_preparation(),
+            entries_from_answers: self.maker.verified_from_answers(),
+        };
+        self.tail_verification.add_delta(before, after).ok_or_else(|| {
+            reach::refused(self.heap, self.plan.unit.spec, "has non-monotonic or overflowing verification counts")
+        })?;
+        let _span = observer.span("publish completion values");
         let tracked = self.store.drain_tracked_values().map_err(DistError::Store)?;
         for val in tracked {
             output(val);
         }
+        output(closure.finish());
         Ok(())
     }
 }
@@ -1070,6 +1178,7 @@ impl<'b, D: Driver, T: Typing<RecordsProgram<'b>>> Granted for UnitExecutor<'_, 
 /// fingerprint, and executes every unit through `blaze_dist_local::agent::ExportBudget`.
 #[expect(clippy::too_many_arguments, reason = "explicit distributed export capabilities")]
 pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgram<'b>>>(
+    cx: &'a Cx,
     dist: &DistConfig,
     names: NamesRecords<'b>,
     closure: &[CrateAt],
@@ -1080,6 +1189,7 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
     store: &'a mut DistStore<'s, 'm, D>,
     roots: &'a ProductRoots<'a>,
     native_image: blaze_drive::Key,
+    checked: ContentId,
     release: bool,
     output_path: &str,
     scratch_alloc: Alloc<'a>,
@@ -1107,12 +1217,15 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             work_names.push(item.key.0.0);
         }
         let is_final = idx == 0;
-        let mut extra: AVec<'a, Digest> = Vec::with_capacity_in(2 + if is_final { prior_digests.len() + 1 } else { 0 }, scratch_alloc);
+        let mut extra: AVec<'a, Digest> = Vec::with_capacity_in(2 + if is_final { prior_digests.len() + 4 } else { 0 }, scratch_alloc);
         extra.push(key.0.0);
         extra.push(data.0);
         if is_final {
             extra.extend_from_slice(prior_digests.as_slice());
             extra.push(program_roots_digest(program_crate_name, roots, builder.settings.panic));
+            extra.push(checked.0);
+            extra.push(native_image.0.0);
+            extra.push(reach::protocol());
         }
         let spec = unit_digest_of(cname, builder, release, work_names.as_slice(), extra.as_slice(), scratch_alloc);
         prior_digests.push(spec);
@@ -1148,10 +1261,12 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
         let cancelled = AtomicBool::new(false);
         let mut total_compiled = 0usize;
         let mut total_cached = 0usize;
+        let mut verified = None;
 
         for (index, plan) in plans.iter().enumerate() {
             let next = plans.get(index + 1).filter(|plan| !plan.is_final).map(|plan| plan.unit.spec);
             let mut exec = UnitExecutor {
+                cx,
                 plan,
                 ids,
                 builder,
@@ -1165,11 +1280,13 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
                 tail_from_store: 0,
                 tail_instances: 0,
                 tail_compiled_keys: WireVec::new_in(wire_alloc),
+                tail_verification: TailVerification::default(),
+                profile_walk: dist.report.is_some(),
                 ran_complete: false,
                 result_gate: dist.result_gate.as_ref()
                     .and_then(|gate| gate.for_unit(plan.unit_name.as_str())),
             };
-            let arrived = match budget.run_with_next(&plan.unit, next, &mut exec, &cancelled) {
+            let mut arrived = match budget.run_with_next(&plan.unit, next, &mut exec, &cancelled) {
                 Ok(arrived) => arrived,
                 Err(err) => match agent::decide(&dist.config.local, err, wire_alloc) {
                     Ok(()) => return Ok((DistExportOutcome::FallbackLocal, fp)),
@@ -1186,11 +1303,17 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
             let tail_compiled = exec.tail_compiled;
             let tail_from_store = exec.tail_from_store;
             let tail_instances = exec.tail_instances;
+            let tail_verification = exec.tail_verification;
+            let completed_here = exec.ran_complete && plan.is_final;
             let tail_keys = exec.tail_compiled_keys;
             let work_compiled = usize::try_from(arrived.compiled_here).unwrap_or(0);
             let work_stored = usize::try_from(arrived.stored_here).unwrap_or(0);
             total_compiled += work_compiled + tail_compiled;
             total_cached += work_stored + tail_from_store;
+            if plan.is_final {
+                let _span = cx.span("export: authenticate distributed reachability entries");
+                verified = Some(reach::Closure::read(plan.unit.spec, &mut arrived.values, heap)?);
+            }
             store.merge_arrived(&arrived.values)?;
             append_report_row(
                 dist.report.as_ref().map(|s| s.as_str()),
@@ -1201,11 +1324,15 @@ pub(crate) fn run_distributed<'a, 'b, 's, 'm, D: Driver, T: Typing<RecordsProgra
                 tail_from_store,
                 tail_instances,
                 tail_keys.as_slice(),
+                verified.as_ref(),
+                completed_here,
+                tail_verification,
                 wire_alloc,
             );
         }
 
-        Ok((DistExportOutcome::Completed { compiled: total_compiled, cached: total_cached }, fp))
+        let reach = verified.ok_or_else(|| reach::refused(heap, fp, "has no program unit"))?;
+        Ok((DistExportOutcome::Completed { compiled: total_compiled, cached: total_cached, reach }, fp))
     })
     .map_err(DistError::PublishedRead)?
 }

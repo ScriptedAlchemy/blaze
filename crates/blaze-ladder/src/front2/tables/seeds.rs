@@ -37,7 +37,7 @@ use blaze_own::{AVec, Alloc};
 use super::super::heads::{Seeded, Store, Want};
 use super::super::keys::Keys;
 use super::super::source::NamesSource;
-use super::head::{CellFailure, FreezeError, FrozenHead, HeadSource, Known, KnownHeads, NotTheirs, SeededHeads, cell_of, file_frozen, seed, want_bytes};
+use super::head::{CellFailure, FreezeError, FrozenHead, HeadSource, Known, KnownHeadFailure, KnownHeads, NotTheirs, SeededHeads, cell_of, file_frozen, seed, want_bytes};
 
 /// What a body's store asks for each head it needs (heads.rs `Store::seeds`).
 pub trait HeadSeed<'n> {
@@ -51,6 +51,9 @@ pub trait HeadSeed<'n> {
 pub enum SeedError {
     /// The cell's record could not be made, read or imported (head.rs).
     Freeze(FreezeError),
+    /// A known record failed at its provider or during import. It may have partly filed the
+    /// store and cannot be answered by lowering the head instead.
+    Known(KnownHeadFailure),
     /// The table holds no frozen record of `cell`, the cell of need `need`: the request froze
     /// too few heads (a fault of the plan, never lowered here).
     NotFrozen { need: Want, cell: Want },
@@ -78,6 +81,7 @@ impl SeedError {
     /// itself and failed). Every other is the freeze's.
     pub fn of_freeze(error: FreezeError) -> SeedError {
         match error {
+            FreezeError::KnownImport { failure } => SeedError::Known(failure),
             FreezeError::NotTheirs { want, why: NotTheirs::OtherUnits { said } } => SeedError::NotInItsUnit { cell: want, said },
             FreezeError::NotTheirs { want, why: NotTheirs::NoCell { said } } => SeedError::NoMemberCell { cell: want, said },
             // `NotTheirs::Failed` among them: the project's head, said by its task's reason.
@@ -90,6 +94,7 @@ impl core::fmt::Display for SeedError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             SeedError::Freeze(e) => write!(f, "{e}"),
+            SeedError::Known(failure) => write!(f, "{failure}"),
             SeedError::NotFrozen { need, cell } => write!(f, "{need:?} needs cell {cell:?}, which the request's frozen heads do not hold (front2 tables/seeds.rs)"),
             SeedError::Unequal { cell } => write!(f, "cell {cell:?} was frozen twice in one request to other bytes: its freeze is not a function of its cell (front2 tables/seeds.rs `RequestHeads::publish`)"),
             SeedError::Full { cell, most } => write!(f, "cell {cell:?}: the request's heads frozen now already hold {most} cells (front2 tables/seeds.rs `RequestHeads::publish`)"),
@@ -376,7 +381,7 @@ pub struct RequestSeed<'k, 'n, 'a, N, H> {
     body_locals: BodyLocals,
 }
 
-/// What a [`RequestSeed`] is made over. `freezer` is made with `known: Some(heads)`, so a
+/// What a [`RequestSeed`] is made over. `freezer`'s known-source capability names `heads`, so a
 /// freeze takes every need the request knows.
 pub struct RequestSeedOpts<'k, 'n, 'a, N, H> {
     pub names: N,
@@ -425,6 +430,7 @@ impl<'n, N: NamesSource<'n>, H: RequestHeads> HeadSeed<'n> for RequestSeed<'_, '
             // Not this stretch's to freeze (a member crate's head its task did not freeze for
             // this unit): refused, typed, before any freeze (rule 3).
             Known::Refused(why) => return Err(SeedError::of_freeze(FreezeError::NotTheirs { want: cell, why })),
+            Known::Invalid(error) => return Err(SeedError::of_freeze(FreezeError::KnownProvider { want: cell, error })),
             Known::Freeze => {}
         }
         // Not known and the stretch's to freeze: frozen here (its needs taken from the request

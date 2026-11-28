@@ -463,6 +463,9 @@ where
                     0,
                     krate.members.len(),
                     &[],
+                    None,
+                    false,
+                    super::TailVerification::default(),
                     wire,
                 );
             }

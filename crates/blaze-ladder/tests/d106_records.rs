@@ -37,6 +37,7 @@ use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::run::OverflowChecks;
 use blaze_ladder::run::make_one::{CheckCount, Maker, NamesRecords, RecordsProgram, walk_records};
+use blaze_ladder::front2::program::lazy::RecordsOpts;
 use blaze_ladder::seam::FrontEnd;
 use blaze_typeck::ExprId;
 use blaze_own::Alloc;
@@ -451,7 +452,7 @@ fn tracked_call(f: &Fixture, want: (u32, u32)) -> Tracked {
     let names = reader(f);
     let here = fn_named(f, "here");
     let main = fn_named(f, "main");
-    let mut program = RecordsProgram::from_records(names.records, names.frame, names.lang_crates, Some(main), alloc()).unwrap_or_else(|e| panic!("the lazy program over records: {e}"));
+    let mut program = RecordsProgram::from_records(RecordsOpts { records: names.records, frame: names.frame, lang_crates: names.lang_crates, entry: Some(main), known_heads: None, alloc: alloc() }).unwrap_or_else(|e| panic!("the lazy program over records: {e}"));
     program.check_one(main).unwrap_or_else(|e| panic!("`main`'s check: {e}")).expect("`main` is a fn of the program");
     let i = program.fn_index(main).expect("`main` has a row once checked");
     let exprs = program.function(i).body.expect("`main`'s body is live until `done`").0.exprs.len() as u32;
@@ -769,7 +770,7 @@ fn trait_object_tables_are_made_over_names_records() {
     let f = fixture_of(&dyn_rung(), blaze_build::Panic::Abort);
     let names = reader(&f);
     let main = fn_named(&f, "main");
-    let mut program = RecordsProgram::from_records(names.records, names.frame, names.lang_crates, Some(main), alloc()).unwrap_or_else(|e| panic!("the lazy program over records: {e}"));
+    let mut program = RecordsProgram::from_records(RecordsOpts { records: names.records, frame: names.frame, lang_crates: names.lang_crates, entry: Some(main), known_heads: None, alloc: alloc() }).unwrap_or_else(|e| panic!("the lazy program over records: {e}"));
     let traits = ["Tr", "Sub", "Base"].map(|t| (t, item_named(&f, ItemKind::Trait, t)));
     for (t, k) in traits {
         assert!(program.object_trait(k).is_none(), "control: `{t}`'s table before any body named it");
@@ -1047,7 +1048,7 @@ fn an_adt_no_body_named_is_a_need_the_lazy_program_fills() {
     let f = fixture(&std::format!("{PROGRAM}{LONE}"));
     let names = reader(&f);
     let main = fn_named(&f, "main");
-    let mut program = RecordsProgram::from_records(names.records, names.frame, names.lang_crates, Some(main), alloc()).unwrap_or_else(|e| panic!("the lazy program over records: {e}"));
+    let mut program = RecordsProgram::from_records(RecordsOpts { records: names.records, frame: names.frame, lang_crates: names.lang_crates, entry: Some(main), known_heads: None, alloc: alloc() }).unwrap_or_else(|e| panic!("the lazy program over records: {e}"));
     program.check_one(main).unwrap_or_else(|e| panic!("`main`'s check: {e}")).expect("a fn of the program");
     let i = program.fn_index(main).expect("`main` has a row");
     let made = |program: &mut RecordsProgram<'static>| program.make_asked(i).unwrap_or_else(|e| panic!("`make_asked`: {e}"));

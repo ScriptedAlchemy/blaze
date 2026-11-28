@@ -90,7 +90,7 @@ use blaze_ladder::front2::by_origin;
 use blaze_ladder::front2::heads::Want;
 use blaze_ladder::front2::keys::{MemberKind, checker_of, member_key_of};
 use blaze_ladder::front2::source::{NamesSource, Records};
-use blaze_ladder::front2::tables::head::{ConstValues, SeededHeads, SeededHeadsOpts, cell_id as head_cell_id, want_bytes};
+use blaze_ladder::front2::tables::head::{ConstValues, KnownSource, SeededHeads, SeededHeadsOpts, cell_id as head_cell_id, want_bytes};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
 use blaze_ladder::front2::tables::task::cell_id;
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
@@ -4507,7 +4507,7 @@ fn heads_of<'p>(
             let both = blaze_ladder::front2::tables::owned_reads::BothOwners { names: &freeze_names, evals: &eval_names };
             let shared = base.reading_into(&freeze_names);
             let mut once_consts = crate::engine_heads_once::OnceConsts::new(base.reading_into(&eval_names), &index, bump, once, job.prefix).with_sources(body_sources);
-            let mut source = SeededHeads::new(SeededHeadsOpts { names: shared, sized, pointers, frame, scratch: scratch_alloc, alloc: scratch_alloc, consts: Some(&mut once_consts as &mut dyn ConstValues<'_>), known: Some(once), owners: Some(&both) });
+            let mut source = SeededHeads::new(SeededHeadsOpts { names: shared, sized, pointers, frame, scratch: scratch_alloc, alloc: scratch_alloc, consts: Some(&mut once_consts as &mut dyn ConstValues<'_>), known: Some(KnownSource { heads: once, errors: heap.shared() }), owners: Some(&both) });
             let job_cx = crate::engine_heads_once::JobCx {
                 base,
                 shared,

@@ -158,30 +158,7 @@ impl<C: Clock> Server<C> {
         let alloc = self.alloc;
         let mut connections = Vec::new_in(alloc);
         while !stop.load(Ordering::Acquire) {
-            let now = self.coordinator.now(self.clock.now_ms());
-            let timed = self.coordinator.tick(now, alloc);
-            self.outcomes(&timed);
-            self.effects.deliver(&mut timed.into_iter());
-            // One accept per loop prevents an accept flood starving existing clients/timers.
-            match self.accept() {
-                Ok(stream) => {
-                    if connections.len() < self.coordinator.config.max_connections {
-                        stream.set_nonblocking(true)?;
-                        connections.push(Connection {
-                            stream,
-                            input: Vec::new_in(alloc),
-                            output: VecDeque::new_in(alloc),
-                            written: 0,
-                            session: None,
-                            last_io: now,
-                            closing: false,
-                        });
-                    }
-                }
-                Err(e) if e.is_transient_accept() => {}
-                Err(e) => return Err(e.into()),
-            }
-            connections.retain_mut(|connection| self.step(now, connection));
+            self.turn(&mut connections)?;
             sleep_ms(1);
         }
         // Deliver stops for every active subscription on orderly shutdown. No automatic ack.
@@ -189,6 +166,35 @@ impl<C: Clock> Server<C> {
         let effects = self.coordinator.shutdown(self.clock.now_ms(), alloc);
         self.outcomes(&effects);
         self.effects.deliver(&mut effects.into_iter());
+        Ok(())
+    }
+
+    fn turn(&mut self, connections: &mut Vec<Connection, WireAlloc>) -> Result<(), Error> {
+        let alloc = self.alloc;
+        let now = self.coordinator.now(self.clock.now_ms());
+        let timed = self.coordinator.tick(now, alloc);
+        self.outcomes(&timed);
+        self.effects.deliver(&mut timed.into_iter());
+        // One accept per loop prevents an accept flood starving existing clients/timers.
+        match self.accept() {
+            Ok(stream) => {
+                if connections.len() < self.coordinator.config.max_connections {
+                    stream.set_nonblocking(true)?;
+                    connections.push(Connection {
+                        stream,
+                        input: Vec::new_in(alloc),
+                        output: VecDeque::new_in(alloc),
+                        written: 0,
+                        session: None,
+                        last_io: now,
+                        closing: false,
+                    });
+                }
+            }
+            Err(e) if e.is_transient_accept() => {}
+            Err(e) => return Err(e.into()),
+        }
+        connections.retain_mut(|connection| self.step(now, connection));
         Ok(())
     }
 
@@ -453,7 +459,7 @@ impl<C: Clock> Drop for Server<C> {
 mod tests {
     use super::*;
     use crate::pack::test_alloc::{Counted, Counts};
-    use crate::sys::{Errno, TempDir, path_exists, spawn};
+    use crate::sys::{Errno, TempDir, path_exists};
     use blaze_dist::admission::{Admission, AdmissionConfig};
     use blaze_dist::jobs::{ExecutionConfig, Jobs};
 
@@ -534,14 +540,50 @@ mod tests {
         for errno in [Errno::Intr, Errno::ConnAborted, Errno::ConnReset] {
             server.accept_errors.push_back(IoError::from_errno(errno));
         }
-        let stop = Arc::new_in(AtomicBool::new(false), alloc);
-        let signal = stop.clone();
-        let thread = spawn(move || server.run(&signal), alloc).unwrap();
-        let connected = crate::client::Client::connect(path.as_str(), random_id().unwrap(), alloc);
-        stop.store(true, Ordering::Release);
-        let result = thread.join().unwrap();
-        assert!(result.is_ok(), "transient accept failure ended the reactor: {result:?}");
-        assert!(connected.is_ok(), "a healthy client could not connect: {:?}", connected.err());
+        // The kernel must keep a real queued hello through each failed accept. Drive the
+        // production turn directly: source-built reactor startup can consume the client's
+        // handshake deadline, and the retained failure does not establish its exact cause.
+        // Concurrent clients are covered by tests/unix.rs.
+        let mut client = UnixStream::connect(path.as_str()).unwrap();
+        client.set_read_timeout(Some(core::time::Duration::from_secs(5))).unwrap();
+        client.set_write_timeout(Some(core::time::Duration::from_secs(5))).unwrap();
+        let request = hello(random_id().unwrap());
+        client.write_all(&frame(&encode(&ClientFrame::Hello(request.clone()), alloc), alloc)).unwrap();
+        let mut connections = Vec::new_in(alloc);
+        for remaining in (0..3).rev() {
+            server.turn(&mut connections).expect("transient accept failure ended the reactor");
+            assert_eq!(server.accept_errors.len(), remaining, "one injected error per turn");
+            assert!(connections.is_empty(), "failed accept cannot create a connection");
+        }
+        server.turn(&mut connections).unwrap();
+        assert_eq!(connections.len(), 1, "the queued healthy client must be accepted");
+        assert!(connections[0].session.is_some(), "the hello must create a bound session");
+        assert!(connections[0].output.is_empty(), "the welcome must reach the socket");
+        let mut header = [0; 4];
+        client.read_exact(&mut header).unwrap();
+        let size = usize::try_from(u32::from_be_bytes(header)).unwrap();
+        assert!(size > 0 && size <= 1 << 20, "bounded welcome frame");
+        let mut bytes = Vec::with_capacity_in(size, alloc);
+        bytes.resize(size, 0);
+        client.read_exact(&mut bytes).unwrap();
+        let ServerFrame::Welcome(welcome) = decode(&bytes, &Limits::DOCUMENTED, alloc).unwrap() else {
+            panic!("the healthy hello did not receive a welcome");
+        };
+        assert_eq!(welcome.transport, request.transport);
+        assert_eq!(welcome.codec, request.codec);
+        assert_eq!(welcome.terminal, request.terminal);
+        assert!(welcome.created);
+        assert_eq!(Some(welcome.session), connections[0].session);
+
+        // Negative control: accepting every error as transient must fail this same path.
+        server.accept_errors.push_back(IoError::from_errno(Errno::BadF));
+        let Err(Error::Io(error)) = server.turn(&mut connections) else {
+            panic!("a fatal accept error must stop the reactor turn");
+        };
+        assert_eq!(error.errno(), Errno::BadF);
+        server.accept_errors.push_back(IoError::from_errno(Errno::BadF));
+        drop(connections);
+        server.run(&AtomicBool::new(true)).expect("shutdown must not start another turn");
         assert!(!path_exists(path.as_str()));
     }
 }

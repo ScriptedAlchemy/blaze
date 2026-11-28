@@ -95,7 +95,7 @@ fn stored() -> std::vec::Vec<Stored> {
         // expansion records are put beside the crate's record (front_load.rs's tests' `payloads`).
         let split = blaze_scope::expansion_records::write(c, g).unwrap_or_else(|e| panic!("expansions of `{}`: {e}", c.name));
         let extras: std::vec::Vec<(Key, std::vec::Vec<u8>)> = split.records.iter().map(|r| (Key(r.key), r.bytes.to_vec())).collect();
-        let payload = sections::write(0, [&[], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[]]);
+        let payload = sections::write(0, [&[], &[], &n[..], &i[..], &[], &split.directory[..], &[], &[], &[]]);
         let parts = sections::sections(&payload).unwrap_or_else(|e| panic!("the sections of `{}`: {e}", c.name));
         let (names_bytes, items_bytes, expansions_bytes) = (parts.names.to_vec(), parts.items.to_vec(), parts.expansions.to_vec());
         let name = blaze_drive::key::crate_scope_name(&c.key);

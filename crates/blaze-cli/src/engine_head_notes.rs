@@ -349,6 +349,7 @@ impl RootKind {
         match error {
             FreezeError::Const { .. } => Self::Constant,
             FreezeError::NotACell { .. } | FreezeError::Read { .. } | FreezeError::Unfrozen { .. }
+            | FreezeError::KnownProvider { .. } | FreezeError::KnownImport { .. } | FreezeError::Provenance { .. }
             | FreezeError::NotTheirs { why: NotTheirs::NoCell { .. } | NotTheirs::OtherUnits { .. }, .. } => Self::Engine,
             _ => Self::Head,
         }
@@ -535,6 +536,12 @@ impl fmt::Display for Reason<'_> {
             FreezeError::Steps { most, .. } => write!(f, "more than {most} freeze attempts"),
             FreezeError::Again { .. } => write!(f, "a head it reads failed when first frozen"),
             FreezeError::NotTheirs { why, .. } => write!(f, "{}", why.said()),
+            FreezeError::KnownProvider { error, .. } => match error {
+                blaze_ladder::front2::tables::head::KnownError::Unreadable { .. } => write!(f, "a saved head record could not be read"),
+                blaze_ladder::front2::tables::head::KnownError::Invalid { why, .. } => write!(f, "a saved head record is invalid: {why}"),
+            },
+            FreezeError::KnownImport { failure } => write!(f, "a saved head could not be imported: {}", Reason(failure.error())),
+            FreezeError::Provenance { .. } => write!(f, "a frozen head's retained source provenance is inconsistent"),
         }
     }
 }

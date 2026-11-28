@@ -515,6 +515,73 @@ class Oracles(unittest.TestCase):
             with self.assertRaises(e.Failed):
                 e.manifest(blobs, UNIT)
 
+    def test_final_reach_handoff_rejects_independent_or_unverified_placement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blobs = Path(directory)
+            (blobs / "packs").mkdir()
+            (blobs / "manifests").mkdir()
+            domain = "blaze distributed dev reachability 1"
+            unit = bytes.fromhex(UNIT)
+            reach_key = blake3(unit, derive_key_context=domain).hexdigest()
+            reach = unit + bytes(145) + b"\x02" + bytes(144)
+            reach_digest = blake3(reach, derive_key_context=domain).hexdigest()
+            name, size = write_pack(blobs, sorted([(KEY, 1, b"compiled"), (reach_key, 2, reach)]))
+            (blobs / "manifests" / UNIT).write_text(f"{name} {size} {e.pack_keys_digest({KEY, reach_key})}\n")
+            events = [
+                {"event": "published", "unit_digest": UNIT, "execution": 7, "attempt": 2, "packs": [name]},
+                {"event": "done", "unit_digest": UNIT, "execution": 7, "attempt": 2, "outcome": "Passed"},
+            ]
+            helper = row(verified_reach_rows=2, verified_reach_digest=reach_digest, completed_here=True)
+            primary = {**helper, "source": "published", "completed_here": False}
+            profile = blobs / "start.txt"
+            placement = "export       1 keyed rows placed from verified distributed reachability\n"
+            profile.write_text(placement)
+            e.verified_reach_handoff(blobs, "mathy", [helper], [primary], events, profile)
+            work = h.distributed_work([row(**primary, from_store=0)], profile)
+            self.assertFalse(work["verified_reachability"][0]["completed_here"])
+            self.assertEqual(work["placed_verified_reach_rows"], 1)
+            for plant, diagnostic in (
+                ({"source": "executed"}, "consume the helper's published final unit"),
+                ({"verified_reach_rows": 0}, "did not report a verified reachability record"),
+                ({"verified_reach_digest": KEY}, "placed different verified reachability records"),
+            ):
+                with self.subTest(plant=plant), self.assertRaisesRegex(e.Failed, diagnostic):
+                    e.verified_reach_handoff(blobs, "mathy", [helper], [{**primary, **plant}], events, profile)
+            with self.assertRaisesRegex(e.Failed, "no accepted full output"):
+                e.verified_reach_handoff(blobs, "mathy", [helper], [primary], events[1:], profile)
+            with self.assertRaisesRegex(e.Failed, "disagrees with the helper's native pack bytes"):
+                e.verified_reach_handoff(blobs, "mathy", [{**helper, "verified_reach_rows": 3}],
+                                         [{**primary, "verified_reach_rows": 3}], events, profile)
+            for planted in ("", placement.replace("1 keyed", "2 keyed")):
+                profile.write_text(planted)
+                with self.subTest(profile=planted), self.assertRaisesRegex(e.Failed, "helper published 1"):
+                    e.verified_reach_handoff(blobs, "mathy", [helper], [primary], events, profile)
+
+    def test_publisher_verification_reports_only_completion_deltas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "start.txt"
+            profile.write_text("")
+            counters = {"tail_prepared_reads": 7, "tail_reused_reads": 11, "tail_known_entries": 5}
+            publisher = row(from_store=0, completed_here=True, **counters)
+            peer = row(unit="dependency", from_store=0, completed_here=False,
+                       **dict.fromkeys(counters, 0))
+            work = h.distributed_work([peer, publisher], profile)
+            self.assertEqual(work["publisher_verification"], [{"unit": "mathy", "unit_digest": UNIT, **counters}])
+            self.assertEqual(h.distributed_work([peer], profile)["publisher_verification"], [])
+            self.assertIsNone(h.distributed_work([row(from_store=0)], profile)["publisher_verification"],
+                              "an older compiler's absent counters must remain unknown")
+            for name in counters:
+                missing = {key: value for key, value in publisher.items() if key != name}
+                for malformed in [missing, *({**publisher, name: value} for value in (-1, True, 1 << 64))]:
+                    with self.subTest(name=name, row=malformed), self.assertRaisesRegex(e.Failed, "invalid publisher verification counter"):
+                        h.distributed_work([malformed], profile)
+                with self.subTest(name=name), self.assertRaisesRegex(e.Failed, "non-publisher reported"):
+                    h.distributed_work([{**peer, name: 1}], profile)
+            with self.assertRaisesRegex(e.Failed, "invalid publisher verification counter"):
+                h.distributed_work([publisher, row(from_store=0, completed_here=False)], profile)
+            with self.assertRaisesRegex(e.Failed, "missing publisher verification ownership"):
+                h.distributed_work([{**publisher, "completed_here": 1}], profile)
+
     def test_publication_keeps_accepting_attempt_and_compares_logical_pack_values(self):
         with tempfile.TemporaryDirectory() as directory:
             blobs = Path(directory)
@@ -866,6 +933,161 @@ def host_test_held(index: int) -> dict:
 
 
 class HostProof(unittest.TestCase):
+    def test_benchmark_sessions_pin_before_preparing_or_spawning_children(self):
+        with tempfile.TemporaryDirectory() as directory:
+            node = {"checkout": directory, "scratch": str(Path(directory) / "session"), "blaze": "/blaze",
+                    "python": sys.executable, "runner": "runner", "socket": "/coordinator", "blobs": "127.0.0.1:80"}
+            worker = h.HostWorker(**node, role="helper", namespace="sample", cores=2, timeout=60, benchmark=True)
+            controller = h.HostController(**node, role="controller", namespace="sample", cores=2, timeout=60,
+                                          benchmark=True, dist_local="/coord", serve="/serve", ssh_config="/config",
+                                          helpers=[h.HostHelper(**node, alias=role) for role in ("helper-1", "helper-2")])
+            for start, request in ((h.host_worker, worker), (h.host_controller, controller)):
+                with (self.subTest(role=request.role),
+                      patch.object(h, "host_pin_cores", side_effect=e.Failed("pin refused")) as pin,
+                      self.assertRaisesRegex(e.Failed, "pin refused")):
+                    start(request)
+                pin.assert_called_once_with(2)
+                self.assertFalse(Path(node["scratch"]).exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the benchmark requires Linux affinity")
+    def test_benchmark_affinity_is_inherited_through_child_and_grandchild_exec(self):
+        # Only the kernel can prove the production launcher preserves the CPU mask
+        # through exec and a new session. A Python probe stands in for the compiler;
+        # never narrow the selfcheck runner itself or start Blaze during a selfcheck.
+        available = sorted(os.sched_getaffinity(0))
+        cores = min(2, len(available))
+        code = """
+import importlib.util, json, os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+spec = importlib.util.spec_from_file_location("distv2_harness", Path(sys.argv[1]) / "distv2.py")
+h = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = h
+spec.loader.exec_module(h)
+cores = int(sys.argv[2])
+h.host_pin_cores(cores)
+root = Path(sys.argv[3])
+given = h.HostWorker(checkout=str(root), scratch=str(root), blaze=str(root / "probe"),
+    python=sys.executable, runner="probe", socket="/unused", blobs="127.0.0.1:80", role="helper",
+    namespace="selfcheck", cores=cores, timeout=10, benchmark=True)
+with (root / "launch.log").open("xb") as log:
+    process = h.host_spawn_export(given, root, root, os.environ.copy(), log)
+try:
+    if process.wait(timeout=10) != 0:
+        raise RuntimeError((root / "launch.log").read_text())
+finally:
+    h.host_stop(process)
+launched = json.loads((root / "launch.log").read_text())
+try:
+    h.host_pin_cores(cores + 1)
+except h.Failed as error:
+    refused = str(error)
+else:
+    refused = None
+print(json.dumps({**launched, "after": h.host_affinity(), "refused": refused}))
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            probe = Path(directory) / "probe"
+            probe.write_text(f"#!{sys.executable}\n"
+                "import json, os, subprocess, sys\n"
+                "grandchild = json.loads(subprocess.check_output([sys.executable, '-c', "
+                "'import json, os; print(json.dumps(sorted(os.sched_getaffinity(0))))'], "
+                "text=True, timeout=5, start_new_session=True))\n"
+                "print(json.dumps({'child': sorted(os.sched_getaffinity(0)), 'grandchild': grandchild}))\n")
+            probe.chmod(0o755)
+            output = subprocess.check_output([sys.executable, "-c", code, str(HARNESS), str(cores), directory],
+                                             text=True, timeout=20, start_new_session=True)
+        observed = json.loads(output)
+        for name in ("child", "grandchild", "after"):
+            self.assertEqual(observed[name], available[:cores])
+        self.assertIn(f"needs {cores + 1} CPUs", observed["refused"])
+        self.assertEqual(sorted(os.sched_getaffinity(0)), available)
+
+    def test_benchmark_refuses_missing_or_ineffective_affinity(self):
+        with patch.object(h.os, "sched_getaffinity", None, create=True), self.assertRaisesRegex(e.Failed, "requires Linux CPU affinity"):
+            h.host_pin_cores(2)
+        with (patch.object(h, "host_affinity", return_value=[3, 5, 7]),
+              patch.object(h.os, "sched_setaffinity", create=True),
+              self.assertRaisesRegex(e.Failed, "kernel did not retain")):
+            h.host_pin_cores(2)
+
+    def test_benchmark_checks_ancestor_quotas_and_effective_cpuset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proc = root / "proc"
+            proc.mkdir()
+            mount = root / "cgroup mount"
+            leaf = mount / "parent" / "leaf"
+            leaf.mkdir(parents=True)
+            (proc / "cgroup").write_text("0::/parent/leaf\n")
+            mounted = str(mount).replace(" ", r"\040")
+            (proc / "mountinfo").write_text(f"1 2 0:3 / {mounted} rw - cgroup2 cgroup rw\n")
+            (mount / "cgroup.controllers").write_text("cpuset cpu io\n")
+            (mount / "cpuset.cpus.effective").write_text("0-7\n")
+            (leaf.parent / "cpuset.cpus.effective").write_text("3,5-6\n")
+            (leaf.parent / "cpu.max").write_text("200000 100000\n")
+            (leaf / "cpu.max").write_text("max 100000\n")
+            result = h.host_cgroup_budget(2, [3, 5], proc=proc)
+            self.assertEqual(result["effective_cpuset"], [3, 5, 6])
+            self.assertEqual(result["effective_cpu_max"],
+                             {"path": str(leaf.parent), "quota_us": 200000, "period_us": 100000})
+            self.assertEqual([row["cpu.max"] for row in result["limits"]],
+                             ["max 100000", "200000 100000", None])
+            # A leaf marked unlimited still inherits the parent's sub-two-core cap.
+            (leaf.parent / "cpu.max").write_text("150000 100000\n")
+            with self.assertRaisesRegex(e.Failed, "allows less than 2 benchmark cores"):
+                h.host_cgroup_budget(2, [3, 5], proc=proc)
+            (leaf.parent / "cpu.max").write_text("max 100000\n")
+            (leaf.parent / "cpuset.cpus.effective").write_text("3\n")
+            with self.assertRaisesRegex(e.Failed, "escapes effective cgroup cpuset"):
+                h.host_cgroup_budget(2, [3, 5], proc=proc)
+            (proc / "mountinfo").write_text("")
+            with self.assertRaisesRegex(e.Failed, "full cgroup v2 hierarchy"):
+                h.host_cgroup_budget(2, [3, 5], proc=proc)
+
+    def test_benchmark_requires_the_reported_body_pool_to_match_the_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "profile.txt"
+            row = "Bodies floor: largest task 1.0 ms `leaf_256`; at 2 workers the same sum would be 1.0 ms\n"
+            profile.write_text(row)
+            self.assertEqual(h.host_body_workers(profile, 2), 2)
+            for changed in (row.replace("at 2 workers", "at 4 workers"), row + row, ""):
+                profile.write_text(changed)
+                with self.subTest(profile=changed), self.assertRaises(e.Failed):
+                    h.host_body_workers(profile, 2)
+
+    def test_benchmark_keeps_primary_latency_and_rejects_a_stale_helper_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            node = {"checkout": directory, "scratch": directory, "blaze": "/blaze", "python": sys.executable,
+                    "runner": "runner", "socket": "/coordinator", "blobs": "127.0.0.1:80"}
+            request = h.load_host(dict(**node, role="controller", namespace="sample", cores=2, timeout=60,
+                                       benchmark=True, solo_first=False, dist_local="/coord", serve="/serve",
+                                       ssh_config="/config", helpers=[dict(alias=role, **node) for role in ("helper-1", "helper-2")]))
+            cold_source, cold_stdout = h.host_fixture(root / "project")
+            edit_source, edit_stdout = h.host_edit_fixture(root / "project")
+            identity = {"runner": "primary", "observed_body_workers": 2,
+                        "resources": {"configured_workers": 2, "sched_affinity": [3, 5]}}
+            solo = {phase: {"source_sha256": source, "artifact": {"stdout": stdout, "sha256": source},
+                            "elapsed_ns": 100, "identity": identity}
+                    for phase, source, stdout in (("cold", cold_source, cold_stdout), ("edit", edit_source, edit_stdout))}
+            h.host_check_latency_edit(solo["cold"], solo["edit"])
+            distributed = {phase: [dict(row, elapsed_ns=elapsed) for elapsed in (75, 40, 95)]
+                           for phase, row in solo.items()}
+            h.host_latency_report(root, request, [{"runner": name} for name in ("primary", "helper-1", "helper-2")],
+                                  solo, distributed)
+            report = json.loads((root / "three-host-latency.json").read_text())
+            self.assertEqual(report["schema"], 2)
+            self.assertEqual(report["phases"]["edit"]["primary_export_ns"], 75)
+            self.assertEqual(report["order"], ["distributed", "solo"])
+            distributed["edit"][2]["identity"] = {**identity, "observed_body_workers": 4}
+            with self.assertRaisesRegex(e.Failed, "workers must match the core budget"):
+                h.host_latency_report(root, request, list(report["hosts"].values()), solo, distributed)
+            distributed["edit"][2]["identity"] = identity
+            distributed["edit"][2]["artifact"] = solo["cold"]["artifact"]
+            with self.assertRaisesRegex(e.Failed, "must match the solo control"):
+                h.host_latency_report(root, request, list(report["hosts"].values()), solo, distributed)
+
     def test_host_helpers_enable_the_result_gate_for_all_holders(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -879,10 +1101,12 @@ class HostProof(unittest.TestCase):
                 patch.object(h, "host_node_identity", return_value={}),
                 patch.object(h, "HostMessages"),
                 patch.object(h, "host_send"),
+                patch.object(h, "host_pin_cores") as pin,
                 patch.object(h, "host_run_export", side_effect=e.Failed("capture launch")) as launch,
                 self.assertRaisesRegex(e.Failed, "capture launch"),
             ):
                 h.host_worker(request)
+            pin.assert_not_called()
             environment = launch.call_args.args[3]
             self.assertEqual(environment["BLAZE_DIST_TEST_RESULT_GATE"], str(root / "helper" / "gate"))
             self.assertEqual(environment["BLAZE_DIST_TEST_RESULT_UNIT"], h.HOST_PACKAGE)

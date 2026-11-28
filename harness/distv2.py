@@ -34,7 +34,8 @@ Checks, each on what the build itself reports (BLAZE_DIST_REPORT) and on running
                  or by another worker, and raw emitted keys are all published
     cold cache   a third process with an empty store takes published units and compiles none
     warm         a build with nothing changed reports no execution
-    edit         one edited function: only what it reaches is worked again
+    edit         one edited function: only what it reaches is worked again; for dev, a
+                 warm primary consumes the final reachability published by the helper
     other PR     another checkout, in a pull request's namespace, with one crate edited: the
                  units it shares with what was published come from the cache, and the edited
                  ones compile; a newer revision of that pull request supersedes an older one
@@ -59,6 +60,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -548,7 +550,8 @@ class Run:
     def build(self, home: str, dist: bool = True, wait: bool = True, project: Path | None = None,
               *, result_gate: Path | None = None, result_unit: str | None = None,
               keep_gate_lease: bool = False, cpus: list[int] | None = None, **extra):
-        self.prepare_modules(home, project or self.project)
+        project = project or self.project
+        self.prepare_modules(home, project)
         if result_gate is not None:
             check(dist, "a result gate belongs to a distributed export")
             if result_gate not in self.result_gates:
@@ -559,10 +562,33 @@ class Run:
             extra["BLAZE_DIST_TEST_RESULT_GATE"] = str(result_gate.resolve())
             if result_unit is not None:
                 extra["BLAZE_DIST_TEST_RESULT_UNIT"] = result_unit
-        process, log_path = self.start_export(home, dist, project or self.project, cpus=cpus, **extra)
+        # Profiles belong to the checkout, not HOME. Only a synchronous export with no
+        # live peer can attribute these files to its numbered log. Latency exports use
+        # start_export directly and retain their profiles outside their own timers.
+        profiles = project / ".blaze" / "v2"
+        exclusive = wait and all(client.poll() is not None for client, _, _ in self.clients)
+        if exclusive:
+            for name in ("profile.txt", "start.txt"):
+                (profiles / name).unlink(missing_ok=True)
+        process, log_path = self.start_export(home, dist, project, cpus=cpus, **extra)
         if not wait:
             return process, log_path
         code = self.wait(process)
+        if exclusive:
+            captured, missing = {}, []
+            for name in ("profile.txt", "start.txt"):
+                source = profiles / name
+                if source.is_file():
+                    saved = Path(log_path).with_suffix(f".{name}")
+                    shutil.copyfile(source, saved)
+                    captured[name] = {"path": str(saved), "sha256": file_hash(saved)}
+                else:
+                    missing.append(name)
+            Path(log_path).with_suffix(".profiles.json").write_text(json.dumps({
+                "command_log": log_path, "project": str(project), "exit": code,
+                "qualification": "exclusive synchronous export; prior profiles removed before launch",
+                "files": captured, "missing": missing,
+            }, indent=2) + "\n")
         return code, Path(log_path).read_text()
 
     def start_export(self, home: str, dist: bool, project: Path, *, cpus: list[int] | None = None,
@@ -723,6 +749,40 @@ def control(run: Run, project: Path | None = None) -> tuple[str, str]:
     return run.behaviour("solo", project)
 
 
+def private_edit_handoff(run: Run, baseline: tuple[str, str]) -> None:
+    source = run.project / "app" / "src" / "main.rs"
+    original = source.read_text()
+    marker = "wrapping_mul(0x100000001b3)"
+    check(original.count(marker) == 1, "the private main body contains one edit marker")
+    edit(source, marker, "wrapping_mul(0x100000001b5)")
+    try:
+        # Both homes are warm. Let the helper publish the edited final unit before the
+        # primary sees this revision, so primary cannot win a lead race.
+        rows_before = {home: len(run.report(home)) for home in ("a", "b")}
+        mark = len(run.events())
+        code, output = run.build("a")
+        require_build(code, output, "private edit helper builds", run.root / "logs" / f"a.{run.sequence}.log")
+        helper = run.report("a")[rows_before["a"]:]
+        helper_events = run.events()[mark:]
+        wanted = control(run)
+        check(wanted[0] != baseline[0] and wanted[1] != baseline[1], "the private body edit changes stdout and artifact bytes")
+        check(run.behaviour("a") == wanted, "the private edit helper equals solo in bytes and behavior")
+
+        start_profile = run.project / ".blaze" / "v2" / "start.txt"
+        start_profile.unlink(missing_ok=True)
+        code, output = run.build("b")
+        require_build(code, output, "private edit primary builds", run.root / "logs" / f"b.{run.sequence}.log")
+        saved_profile = run.root / "logs" / "private-edit-primary.start.txt"
+        shutil.copyfile(start_profile, saved_profile)
+        primary = run.report("b")[rows_before["b"]:]
+        evidence.cached(primary)
+        evidence.verified_reach_handoff(run.root / "blobs", run.given.program, helper, primary, helper_events, saved_profile)
+        evidence.no_local_emission("private edit primary", output)
+        check(run.behaviour("b") == wanted, "the private edit primary consumes helper reachability and equals solo in bytes and behavior")
+    finally:
+        source.write_text(original)
+
+
 def latency_export(run: Run, placements: dict[str, list[int]], projects: dict[str, Path], *,
                    dist: bool) -> list[dict]:
     """Time invocation to successful exit. Qualify that time with the artifact oracle after both exit."""
@@ -829,6 +889,9 @@ def latency_round(run: Run, placements: dict[str, dict[str, list[int]]], modes: 
                   "the changed unit executes through the coordinator")
             evidence.no_duplicate_compile(rows)
             evidence.publication(run.root / "blobs", rows, run.events())
+        for worker in results["two_workers"]["workers"]:
+            home = worker["home"]
+            worker["work"] = distributed_work(run.report(home)[rows_before[home]:], Path(worker["profiles"]["start.txt"]))
         samples.extend(results.values())
     verify_run_identity(run)
     return samples
@@ -1331,6 +1394,8 @@ def main(given: Input) -> None:
         check(code == 0, f"the edit control builds: {text[-400:] if code else ''}")
         check(run.behaviour("a") == run.behaviour("solo"), "the edited artifact equals solo in bytes and behavior")
         edit(edited, 'format!("3 edited:{sum}', 'format!("3:{sum}')
+        if "--release" not in given.args:
+            private_edit_handoff(run, solo)
 
         # A file a unit includes is an input of its keys, and so a new unit: nothing stale is taken.
         included = run.project / "shapes" / "included.txt"
@@ -1429,6 +1494,7 @@ HOST_SEED = 0xCBF29CE484222325
 HOST_PROGRAM_INPUT = 17
 HOST_MESSAGE_LIMIT = 8 << 20
 HOST_PACKAGE = "host_proof"
+HOST_EDIT_LEAF = HOST_LEAVES // 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1453,6 +1519,7 @@ class HostWorker(HostNode):
     namespace: str
     cores: int
     timeout: int
+    benchmark: bool = dataclasses.field(default=False, kw_only=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1461,6 +1528,7 @@ class HostController(HostWorker):
     serve: str
     ssh_config: str
     helpers: list[HostHelper]
+    solo_first: bool = dataclasses.field(default=True, kw_only=True)
 
 
 def load_host(raw: dict) -> HostController | HostWorker:
@@ -1468,6 +1536,7 @@ def load_host(raw: dict) -> HostController | HostWorker:
         evidence.require(isinstance(raw.get("helpers"), list) and len(raw["helpers"]) == 2,
                          "controller requires exactly two SSH helpers")
         given = HostController(**{**raw, "helpers": [HostHelper(**value) for value in raw["helpers"]]})
+        evidence.require(type(given.solo_first) is bool, "solo_first must be a boolean")
         evidence.require([helper.alias for helper in given.helpers] == ["helper-1", "helper-2"],
                          "helpers must use the pinned helper-1 and helper-2 SSH aliases")
         for name in ("dist_local", "serve", "ssh_config"):
@@ -1478,6 +1547,7 @@ def load_host(raw: dict) -> HostController | HostWorker:
         given = HostWorker(**raw)
         evidence.require(given.role in ("primary", "helper"), "role must be controller, primary or helper")
     host_valid_node(given)
+    evidence.require(type(given.benchmark) is bool, "benchmark must be a boolean")
     evidence.require(type(given.cores) is int and given.cores > 0 and type(given.timeout) is int
                      and 0 < given.timeout <= 3600, "cores must be positive and timeout must be 1–3600 seconds")
     evidence.require(isinstance(given.namespace, str) and bool(given.namespace),
@@ -1557,25 +1627,44 @@ def host_stop(process: subprocess.Popen) -> None:
             stream.close()
 
 
+def host_leaf(index: int, salt: int) -> str:
+    return (
+        f"#[inline(never)]\nfn leaf_{index}(n: u64) -> u64 {{ "
+        f"n.wrapping_mul({2 * index + 1}).rotate_left({index % 64}) ^ {salt} }}\n"
+    )
+
+
+def host_leaf_salt(index: int) -> int:
+    return (HOST_SEED * (2 * index + 1)) & HOST_MASK
+
+
+def host_fixture_stdout(*, edited: bool) -> str:
+    expected = HOST_SEED
+    for index in range(HOST_LEAVES):
+        salt = host_leaf_salt(index)
+        if edited and index == HOST_EDIT_LEAF:
+            salt ^= 1
+        shift = index % 64
+        term = HOST_PROGRAM_INPUT * (2 * index + 1) & HOST_MASK
+        term = ((term << shift) | (term >> (64 - shift))) & HOST_MASK
+        expected = ((expected ^ term ^ salt) * HOST_FNV) & HOST_MASK
+    return f"{expected:016x}\n"
+
+
+def host_fixture_digest(path: Path) -> str:
+    identity = hashlib.sha256()
+    for name in ("Cargo.lock", "Cargo.toml", "src/main.rs"):
+        identity.update(name.encode() + b"\0" + bytes.fromhex(file_hash(path / name)))
+    return identity.hexdigest()
+
+
 def host_fixture(path: Path) -> tuple[str, str]:
     (path / "src").mkdir(parents=True)
     files = {
         "Cargo.toml": f'[package]\nname = "{HOST_PACKAGE}"\nversion = "0.1.0"\nedition = "2024"\n',
         "Cargo.lock": f'version = 4\n\n[[package]]\nname = "{HOST_PACKAGE}"\nversion = "0.1.0"\n',
     }
-    source = []
-    expected = HOST_SEED
-    for index in range(HOST_LEAVES):
-        factor = 2 * index + 1
-        salt = (HOST_SEED * factor) & HOST_MASK
-        shift = index % 64
-        source.append(
-            f"#[inline(never)]\nfn leaf_{index}(n: u64) -> u64 {{ "
-            f"n.wrapping_mul({factor}).rotate_left({shift}) ^ {salt} }}\n"
-        )
-        term = HOST_PROGRAM_INPUT * factor & HOST_MASK
-        term = ((term << shift) | (term >> (64 - shift))) & HOST_MASK
-        expected = ((expected ^ term ^ salt) * HOST_FNV) & HOST_MASK
+    source = [host_leaf(index, host_leaf_salt(index)) for index in range(HOST_LEAVES)]
     for start in range(0, HOST_LEAVES, 16):
         source.append(f"#[inline(never)]\nfn group_{start}(n: u64, mut hash: u64) -> u64 {{\n")
         for index in range(start, start + 16):
@@ -1590,11 +1679,19 @@ def host_fixture(path: Path) -> tuple[str, str]:
         source.append(f"    hash = group_{index}(n, hash);\n")
     source.append('    println!("{hash:016x}");\n}\n')
     files["src/main.rs"] = "".join(source)
-    identity = hashlib.sha256()
-    for name, data in sorted(files.items()):
+    for name, data in files.items():
         (path / name).write_text(data)
-        identity.update(name.encode() + b"\0" + bytes.fromhex(file_hash(path / name)))
-    return identity.hexdigest(), f"{expected:016x}\n"
+    return host_fixture_digest(path), host_fixture_stdout(edited=False)
+
+
+def host_edit_fixture(path: Path) -> tuple[str, str]:
+    source = path / "src/main.rs"
+    before = source.read_text()
+    salt = host_leaf_salt(HOST_EDIT_LEAF)
+    old = host_leaf(HOST_EDIT_LEAF, salt)
+    evidence.require(before.count(old) == 1, f"{source}: expected one unedited leaf_{HOST_EDIT_LEAF} body")
+    source.write_text(before.replace(old, host_leaf(HOST_EDIT_LEAF, salt ^ 1), 1))
+    return host_fixture_digest(path), host_fixture_stdout(edited=True)
 
 
 def host_worker_env(root: Path, cores: int) -> dict:
@@ -1613,7 +1710,108 @@ def host_checked_output(command: list[str], *, timeout: int, env: dict | None = 
     return subprocess.check_output(command, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
 
 
+def host_affinity() -> list[int]:
+    evidence.require(sys.platform.startswith("linux") and callable(getattr(os, "sched_getaffinity", None))
+                     and callable(getattr(os, "sched_setaffinity", None)),
+                     "three-host benchmark requires Linux CPU affinity")
+    try:
+        return sorted(os.sched_getaffinity(0))
+    except OSError as error:
+        raise evidence.Failed(f"cannot read benchmark CPU affinity: {error}") from error
+
+
+def host_pin_cores(cores: int) -> None:
+    # Called at session entry, before threads or services: fork and exec inherit this mask.
+    available = host_affinity()
+    evidence.require(len(available) >= cores,
+                     f"benchmark needs {cores} CPUs in the runner affinity; available {available}")
+    selected = available[:cores]
+    try:
+        os.sched_setaffinity(0, selected)
+    except OSError as error:
+        raise evidence.Failed(f"cannot pin benchmark CPU affinity to {selected}: {error}") from error
+    evidence.require(host_affinity() == selected, f"kernel did not retain benchmark CPU affinity {selected}")
+
+
+def host_cpu_list(raw: str) -> set[int]:
+    evidence.require(re.fullmatch(r"[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*", raw) is not None,
+                     f"invalid effective cgroup cpuset: {raw!r}")
+    cpus = set()
+    for part in raw.split(","):
+        first, _, last = part.partition("-")
+        start, end = int(first), int(last or first)
+        evidence.require(start <= end, f"reversed effective cgroup cpuset range: {part}")
+        cpus.update(range(start, end + 1))
+    return cpus
+
+
+def host_cgroup_budget(cores: int, cpus: list[int], *, proc: Path = Path("/proc/self")) -> dict:
+    """Read every visible ancestor limit; a leaf's unlimited cpu.max does not remove its parent's cap."""
+    try:
+        membership = (proc / "cgroup").read_text().strip()
+        groups = [line.removeprefix("0::") for line in membership.splitlines() if line.startswith("0::")]
+        evidence.require(len(groups) == 1 and groups[0].startswith("/") and ".." not in Path(groups[0]).parts,
+                         "benchmark requires a readable cgroup v2 membership")
+        mounts = [line.split(" - ", 1)[0].split() for line in (proc / "mountinfo").read_text().splitlines()
+                  if " - cgroup2 " in line]
+        evidence.require(len(mounts) == 1 and len(mounts[0]) >= 5 and mounts[0][3] == "/",
+                         "benchmark requires the full cgroup v2 hierarchy to check ancestor quotas")
+        mount = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), mounts[0][4])
+        root = Path(mount)
+        controllers = (root / "cgroup.controllers").read_text().split()
+        evidence.require({"cpu", "cpuset"}.issubset(controllers),
+                         "benchmark requires readable cgroup v2 CPU and cpuset controllers")
+        current = root / groups[0].removeprefix("/")
+        evidence.require(root.is_absolute() and current.is_dir(), "benchmark cgroup membership is not visible at its mount")
+        limits = []
+        effective_cpuset = None
+        effective_quota = None
+        while True:
+            row = {"path": str(current)}
+            for name in ("cpu.max", "cpuset.cpus.effective"):
+                try:
+                    row[name] = (current / name).read_text().strip()
+                except FileNotFoundError:
+                    # The root has no cpu.max; a controller not enabled below an ancestor
+                    # adds no child limit. Keep those absences in the retained evidence.
+                    row[name] = None
+            limits.append(row)
+            if row["cpu.max"] is not None:
+                quota, period = row["cpu.max"].split()
+                evidence.require(period.isdecimal() and int(period) > 0 and
+                                 (quota == "max" or (quota.isdecimal() and int(quota) > 0)),
+                                 f"{current}: invalid cpu.max {row['cpu.max']!r}")
+                if quota != "max":
+                    quota_us, period_us = int(quota), int(period)
+                    evidence.require(quota_us >= cores * period_us,
+                                     f"{current}: cpu.max {quota} {period} allows less than {cores} benchmark cores")
+                    if (effective_quota is None or
+                            quota_us * effective_quota["period_us"] < effective_quota["quota_us"] * period_us):
+                        effective_quota = {"path": str(current), "quota_us": quota_us, "period_us": period_us}
+            if row["cpuset.cpus.effective"] is not None:
+                allowed = host_cpu_list(row["cpuset.cpus.effective"])
+                evidence.require(set(cpus).issubset(allowed),
+                                 f"{current}: benchmark affinity {cpus} escapes effective cgroup cpuset {sorted(allowed)}")
+                if effective_cpuset is None:
+                    effective_cpuset = sorted(allowed)
+            if current == root:
+                break
+            current = current.parent
+        evidence.require(effective_cpuset is not None, "benchmark cgroup hierarchy has no effective cpuset evidence")
+        return {"membership": membership, "mount": mount, "controllers": controllers, "limits": limits,
+                "effective_cpuset": effective_cpuset, "effective_cpu_max": effective_quota}
+    except (OSError, ValueError) as error:
+        raise evidence.Failed(f"cannot establish benchmark cgroup CPU budget: {error}") from error
+
+
+def host_resources(cores: int) -> dict:
+    cpus = host_affinity()
+    evidence.require(len(cpus) == cores, f"benchmark requires exactly {cores} pinned CPUs; observed {cpus}")
+    return {"configured_workers": cores, "sched_affinity": cpus, "cgroup": host_cgroup_budget(cores, cpus)}
+
+
 def host_node_identity(given: HostWorker, env: dict, source: str) -> dict:
+    resources = {"resources": host_resources(given.cores)} if given.benchmark else {}
     boot_id = str(UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
     git = ["git", "-C", given.checkout, "rev-parse"]
     triple = json.loads(host_checked_output([given.blaze, "toolchain", "--json"], timeout=given.timeout, env=env))["host"]
@@ -1635,6 +1833,7 @@ def host_node_identity(given: HostWorker, env: dict, source: str) -> dict:
         "workload_sha256": source,
         "triple": triple,
         "cores": given.cores,
+        **resources,
     }
 
 
@@ -1656,13 +1855,19 @@ def host_wait_gate(gate: Path, events_path: Path, process: subprocess.Popen, dea
     raise evidence.Failed(f"no real held batch from {events_path.parent}; see export.log")
 
 
+def host_spawn_export(given: HostWorker, root: Path, project: Path, env: dict, log) -> subprocess.Popen:
+    if given.benchmark:
+        evidence.require(len(host_affinity()) == given.cores, "benchmark CPU affinity changed before export")
+    return subprocess.Popen(
+        [given.blaze, "export", "-p", HOST_PACKAGE, "-o", str(root / "artifact"), "--stats"],
+        cwd=project, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+
 def host_run_export(given: HostWorker, root: Path, project: Path, env: dict) -> subprocess.Popen:
     with (root / "export.log").open("xb") as log:
-        return subprocess.Popen(
-            [given.blaze, "export", "-p", HOST_PACKAGE, "-o", str(root / "artifact"), "--stats"],
-            cwd=project, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        return host_spawn_export(given, root, project, env, log)
 
 
 def host_artifact(root: Path, expected: str, timeout: int) -> dict:
@@ -1672,7 +1877,140 @@ def host_artifact(root: Path, expected: str, timeout: int) -> dict:
     return {"stdout": output, "sha256": file_hash(path)}
 
 
+def host_latency_work(log_path: Path, report_path: Path | None, start_profile: Path) -> dict:
+    prefix = "export stats: "
+    lines = [line.removeprefix(prefix) for line in log_path.read_text().splitlines() if line.startswith(prefix)]
+    evidence.require(len(lines) == 1, f"{log_path}: expected one final export stats line")
+    raw_stats = dict(field.split("=", 1) for field in lines[0].split())
+    stats = {name: int(value) for name, value in raw_stats.items() if name != "wall"}
+    stats["wall_ms"] = int(raw_stats["wall"].removesuffix("ms"))
+    work = {"export_stats": stats}
+    if report_path is None:
+        return work
+    rows = evidence.jsonl(report_path)
+    evidence.require(bool(rows), f"{report_path}: workspace-distributed export reported no units")
+    return {**work, **distributed_work(rows, start_profile)}
+
+
+def distributed_work(rows: list[dict], start_profile: Path) -> dict:
+    for row in rows:
+        evidence.compiled(row)
+        evidence.require(row["source"] in ("executed", "published"), f"{row['unit']}: unknown unit source")
+    work = {name: sums(rows, name) for name in ("grants", "compiled_for_work", "stored_for_work", "tail_compiled", "from_store")}
+    for source in ("executed", "published"):
+        work[f"{source}_units"] = sum(row["source"] == source for row in rows)
+    work["verified_reachability"] = [
+        {name: row[name] for name in ("unit", "unit_digest", "source", "completed_here", "verified_reach_rows", "verified_reach_digest")}
+        for row in rows if row.get("verified_reach_rows", 0) > 0
+    ]
+    counters = ("tail_prepared_reads", "tail_reused_reads", "tail_known_entries")
+    work["publisher_verification"] = None
+    if any(name in row for row in rows for name in counters):
+        for row in rows:
+            evidence.require(type(row.get("completed_here")) is bool,
+                             f"{row['unit']}: missing publisher verification ownership")
+            for name in counters:
+                value = row.get(name)
+                evidence.require(type(value) is int and 0 <= value < 1 << 64,
+                                 f"{row['unit']}: invalid publisher verification counter {name}")
+                evidence.require(row["completed_here"] or value == 0,
+                                 f"{row['unit']}: non-publisher reported completion verification work")
+        work["publisher_verification"] = [
+            {name: row[name] for name in ("unit", "unit_digest", *counters)}
+            for row in rows if row["completed_here"]
+        ]
+    placed = evidence.placed_verified_reach_rows(start_profile)
+    if work["verified_reachability"]:
+        evidence.require(placed is not None, f"{start_profile}: missing verified reachability placement counter")
+    work["placed_verified_reach_rows"] = placed
+    return work
+
+
+def host_body_workers(profile: Path, cores: int) -> int:
+    rows = re.findall(r"^Bodies floor:.*; at ([0-9]+) workers the same sum would be ",
+                      profile.read_text(), re.MULTILINE)
+    evidence.require(len(rows) == 1, f"{profile}: expected one measured body-pool worker count")
+    observed = int(rows[0])
+    evidence.require(observed == cores, f"{profile}: requested {cores} workers but compiler reported {observed}")
+    return observed
+
+
+def host_latency_export(given: HostWorker, root: Path, project: Path, env: dict, phase: str,
+                        source: str, expected: str) -> dict:
+    phase_dir = root / phase
+    phase_dir.mkdir()
+    log_path = phase_dir / "export.log"
+    report_path = None
+    if "BLAZE_DIST_SOCKET" in env:
+        report_path = phase_dir / "report.jsonl"
+        env = {**env, "BLAZE_DIST_REPORT": str(report_path)}
+    state = project / ".blaze" / "v2"
+    profiles = ("profile.txt", "start.txt")
+    for name in profiles:
+        (state / name).unlink(missing_ok=True)
+    with log_path.open("xb") as log:
+        load_before = os.getloadavg()
+        started = time.monotonic_ns()
+        process = host_spawn_export(given, root, project, env, log)
+    try:
+        code = process.wait(timeout=given.timeout)
+        elapsed = time.monotonic_ns() - started
+        load_after = os.getloadavg()
+        evidence.require(code == 0, f"{given.runner}: {phase} export exited {code}; see {log_path}")
+    finally:
+        host_stop(process)
+    artifact = host_artifact(root, expected, given.timeout)
+    evidence.require(host_fixture_digest(project) == source, f"{project}: {phase} fixture changed during export")
+    for name in profiles:
+        shutil.copyfile(state / name, phase_dir / name)
+    work = host_latency_work(log_path, report_path, phase_dir / "start.txt")
+    work["body_pool_workers"] = host_body_workers(phase_dir / "profile.txt", given.cores)
+    work_path = phase_dir / "work.json"
+    host_write_json(work_path, work)
+    evidence_paths = {"log": str(log_path), "work": str(work_path),
+                      **{name: str(phase_dir / name) for name in profiles}}
+    if report_path is not None:
+        evidence_paths.update(report=str(report_path), plans=f"{report_path}.plans")
+    return {
+        "phase": phase, "elapsed_ns": elapsed, "source_sha256": source, "artifact": artifact,
+        "work": work, "evidence": evidence_paths, "load_before": load_before, "load_after": load_after,
+    }
+
+
+def host_check_latency_edit(cold: dict, edited: dict) -> None:
+    evidence.require(cold["source_sha256"] != edited["source_sha256"], "the private body edit did not change fixture bytes")
+    for name in ("stdout", "sha256"):
+        evidence.require(cold["artifact"][name] != edited["artifact"][name],
+                         f"the private body edit did not change artifact {name}")
+
+
+def host_latency_worker(given: HostWorker, root: Path, project: Path, env: dict, identity: dict,
+                        expected: str, controls: HostMessages) -> None:
+    env = {**env, "BLAZE_DIST_SOCKET": given.socket, "BLAZE_DIST_BLOBS": given.blobs,
+           "BLAZE_DIST_LOCAL": "never", "BLAZE_DIST_DEADLINE_SECS": str(given.timeout)}
+    host_send(sys.stdout.buffer, {"phase": "prepared", "identity": identity})
+    source = identity["workload_sha256"]
+    previous = None
+    for phase in ("cold", "edit"):
+        controls.receive(phase, time.monotonic() + given.timeout)
+        result = host_latency_export(given, root, project, env, phase, source, expected)
+        measured = host_node_identity(given, env, source)
+        evidence.require(measured == {**identity, "workload_sha256": source},
+                         f"{given.runner}: measured identity changed during {phase}")
+        result["identity"] = {**measured, "observed_body_workers": result["work"]["body_pool_workers"]}
+        if previous is not None:
+            host_check_latency_edit(previous, result)
+        host_write_json(root / phase / "result.json", result)
+        host_send(sys.stdout.buffer, result)
+        if phase == "cold":
+            previous = result
+            source, expected = host_edit_fixture(project)
+            host_send(sys.stdout.buffer, {"phase": "edit_ready", "source_sha256": source, "expected_stdout": expected})
+
+
 def host_worker(given: HostWorker) -> None:
+    if given.benchmark:
+        host_pin_cores(given.cores)
     root = Path(given.scratch)
     root.mkdir(parents=True, exist_ok=False)
     project = root / "project"
@@ -1681,6 +2019,9 @@ def host_worker(given: HostWorker) -> None:
     identity = host_node_identity(given, env, source)
     host_write_json(root / "identity.json", identity)
     controls = HostMessages(sys.stdin.buffer, "controller")
+    if given.benchmark:
+        host_latency_worker(given, root, project, env, identity, expected, controls)
+        return
     host_send(sys.stdout.buffer, {"phase": "prepared", "identity": identity})
     controls.receive("start", time.monotonic() + given.timeout)
     gate = root / "gate"
@@ -1828,7 +2169,79 @@ def host_connected(address: str) -> bool:
         return False
 
 
+def host_solo_latency(given: HostController, root: Path, project: Path, env: dict,
+                      identity: dict, expected: str) -> dict:
+    cold = host_latency_export(given, root, project, env, "cold", identity["workload_sha256"], expected)
+    source, edited_stdout = host_edit_fixture(project)
+    edit = host_latency_export(given, root, project, env, "edit", source, edited_stdout)
+    edited_identity = host_node_identity(given, env, source)
+    evidence.require(edited_identity == {**identity, "workload_sha256": source},
+                     "solo compiler or host identity changed during timing")
+    host_check_latency_edit(cold, edit)
+    return {"cold": {**cold, "identity": {**identity, "observed_body_workers": cold["work"]["body_pool_workers"]}},
+            "edit": {**edit, "identity": {**edited_identity, "observed_body_workers": edit["work"]["body_pool_workers"]}}}
+
+
+def host_distributed_latency(given: HostController, channels: list, identities: list[dict]) -> dict:
+    def export(phase: str) -> list[dict]:
+        deadline = time.monotonic() + given.timeout
+        # SSH carries the helper controls. Queue them before releasing the local primary.
+        for stream, _, _ in (*channels[1:], channels[0]):
+            host_send(stream, {"phase": phase})
+        return [channel.receive(phase, deadline) for _, channel, _ in channels]
+
+    cold = export("cold")
+    deadline = time.monotonic() + given.timeout
+    edits = [channel.receive("edit_ready", deadline) for _, channel, _ in channels]
+    source = edits[0]["source_sha256"]
+    stdout = edits[0]["expected_stdout"]
+    evidence.require(all(row["source_sha256"] == source and row["expected_stdout"] == stdout for row in edits),
+                     "participants prepared different private-body edits")
+    edit = export("edit")
+    deadline = time.monotonic() + given.timeout
+    for (_, _, child), identity, before, after in zip(channels, identities, cold, edit, strict=True):
+        evidence.require(child.wait(timeout=max(0.001, deadline - time.monotonic())) == 0,
+                         f"{identity['runner']}: worker session failed")
+        expected = {**identity, "observed_body_workers": given.cores}
+        evidence.require(before["identity"] == expected and before["source_sha256"] == identity["workload_sha256"]
+                         and after["identity"] == {**expected, "workload_sha256": source}
+                         and after["source_sha256"] == source and after["artifact"]["stdout"] == stdout,
+                         f"{identity['runner']}: measured host or source differs from the prepared worker")
+        host_check_latency_edit(before, after)
+    return {"cold": cold, "edit": edit}
+
+
+def host_latency_report(root: Path, given: HostController, identities: list[dict], solo: dict,
+                        distributed: dict) -> None:
+    roles = ["primary", *(helper.alias for helper in given.helpers)]
+    order = ["solo", "distributed"] if given.solo_first else ["distributed", "solo"]
+    phases = {}
+    for phase, reference in solo.items():
+        workers = dict(zip(roles, distributed[phase], strict=True))
+        evidence.require(workers["primary"]["identity"] == reference["identity"],
+                         f"{phase}: solo and distributed primary must use the same host and compiler")
+        for role, result in (("solo", reference), *workers.items()):
+            identity = result["identity"]
+            evidence.require(identity["observed_body_workers"] == given.cores
+                             and identity["resources"]["configured_workers"] == given.cores
+                             and len(identity["resources"]["sched_affinity"]) == given.cores,
+                             f"{phase} {role}: configured, pinned and observed workers must match the core budget")
+            evidence.require(result["source_sha256"] == reference["source_sha256"]
+                             and result["artifact"] == reference["artifact"],
+                             f"{phase} {role}: source, artifact bytes and stdout must match the solo control")
+        phases[phase] = {"solo_export_ns": reference["elapsed_ns"],
+                         "primary_export_ns": workers["primary"]["elapsed_ns"],
+                         "solo": reference, "workers": workers}
+    host_write_json(root / "three-host-latency.json", {
+        "schema": 2, "order": order, "hosts": dict(zip(roles, identities, strict=True)), "phases": phases,
+        "timing": "Per-process monotonic wall time on the launching host from export spawn through exit",
+    })
+    print("distv2: unpaused cold and private-body edit exports match solo on all three hosts", flush=True)
+
+
 def host_controller(given: HostController) -> None:
+    if given.benchmark:
+        host_pin_cores(given.cores)
     root = Path(given.scratch)
     root.mkdir(parents=True, exist_ok=False)
     solo_root = root / "solo"
@@ -1836,16 +2249,22 @@ def host_controller(given: HostController) -> None:
     project = solo_root / "project"
     solo_source, expected = host_fixture(project)
     env = host_worker_env(solo_root, given.cores)
-    started = time.monotonic_ns()
-    process = host_run_export(given, solo_root, project, env)
-    try:
-        code = process.wait(timeout=given.timeout)
-        solo_ns = time.monotonic_ns() - started
-        evidence.require(code == 0, f"solo export exited {code}; see {solo_root / 'export.log'}")
-    finally:
-        host_stop(process)
-    solo = host_artifact(solo_root, expected, given.timeout)
-    triple = json.loads(host_checked_output([given.blaze, "toolchain", "--json"], timeout=given.timeout, env=env))["host"]
+    if given.benchmark:
+        solo_identity = host_node_identity(given, env, solo_source)
+        triple = solo_identity["triple"]
+        if given.solo_first:
+            solo = host_solo_latency(given, solo_root, project, env, solo_identity, expected)
+    else:
+        started = time.monotonic_ns()
+        process = host_run_export(given, solo_root, project, env)
+        try:
+            code = process.wait(timeout=given.timeout)
+            solo_ns = time.monotonic_ns() - started
+            evidence.require(code == 0, f"solo export exited {code}; see {solo_root / 'export.log'}")
+        finally:
+            host_stop(process)
+        solo = host_artifact(solo_root, expected, given.timeout)
+        triple = json.loads(host_checked_output([given.blaze, "toolchain", "--json"], timeout=given.timeout, env=env))["host"]
 
     services = []
     channels = []
@@ -1860,9 +2279,10 @@ def host_controller(given: HostController) -> None:
                                      stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         services.append(cache)
         host_wait_ready(cache, lambda: host_connected(given.blobs), time.monotonic() + 30, "native cache")
+        coordinator_env = env if given.benchmark else {**env, "BLAZE_DIST_EVENTS": str(coordinator_events)}
         with (root / "coordinator.log").open("xb") as log:
             coord = subprocess.Popen([given.dist_local, "coordinate", given.socket, triple, "64"],
-                                     env={**env, "BLAZE_DIST_EVENTS": str(coordinator_events)},
+                                     env=coordinator_env,
                                      stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         services.append(coord)
         coordinator_started = True
@@ -1871,7 +2291,8 @@ def host_controller(given: HostController) -> None:
         for index, node in enumerate((primary, *given.helpers)):
             role = "primary" if index == 0 else "helper"
             fields = {field.name: getattr(node, field.name) for field in dataclasses.fields(HostNode)}
-            request = HostWorker(**fields, role=role, namespace=given.namespace, cores=given.cores, timeout=given.timeout)
+            request = HostWorker(**fields, role=role, namespace=given.namespace, cores=given.cores,
+                                 timeout=given.timeout, benchmark=given.benchmark)
             command = [node.python, str(Path(node.checkout) / "harness" / "distv2.py"),
                        json.dumps(dataclasses.asdict(request), separators=(",", ":"))]
             if isinstance(node, HostHelper):
@@ -1889,6 +2310,13 @@ def host_controller(given: HostController) -> None:
                          "the solo and distributed workloads must have identical source")
         host_write_json(root / "hosts.json", identities)
         print("Three distinct runners prepared matching source, compiler and fixture identities", flush=True)
+        if given.benchmark:
+            distributed = host_distributed_latency(given, channels, identities)
+            if not given.solo_first:
+                solo = host_solo_latency(given, solo_root, project, env, solo_identity, expected)
+            host_latency_report(root, given, identities, solo, distributed)
+            return
+
         deadline = time.monotonic() + given.timeout
         host_send(channels[0][0], {"phase": "start"})
         held = [channels[0][1].receive("held", deadline)]

@@ -49,7 +49,7 @@ use core::time::Duration;
 use blaze_id::ItemKey as LibKey;
 use blaze_ids::{ContentId, Hasher};
 use blaze_ladder::code_records::Builder;
-use blaze_ladder::run::make_one::{ByKind, Maker, NamesRecords};
+use blaze_ladder::run::make_one::{ByKind, Maker, MakerOpts, NamesRecords};
 use blaze_ladder::run::special::Roots;
 use blaze_ladder::run::special::test_roots::test_roots;
 use blaze_launch::wire::run::Symbol;
@@ -496,7 +496,7 @@ pub(crate) mod refusal_tests {
         let symbol = [17; 32];
         let item = ItemKey(3);
         let make = |why| ParentError::Walk { symbol, why: WalkError::Make { tabled: item, why } };
-        let void = || RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled: item, first: "no record answers yet".into(), kept: 1, dropped: 0 }));
+        let void = || RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled: Some(item), first: "no record answers yet".into(), kept: 1, dropped: 0 }));
         assert_eq!(instance_site(&make(void())), Some((symbol, Some((item, 0)))));
         let carried = RunError::NotBuilt { refusal: std::boxed::Box::new(void()), not_built: 1, reached: 2 };
         assert_eq!(instance_site(&make(carried)), Some((symbol, Some((item, 0)))), "twin: a carried void is the test's too");
@@ -2554,7 +2554,10 @@ impl KeptMakers for SuiteMakers<'_> {
         let tables = self.tables;
         let maker = self.makers.of(job, || {
             let reader = typed.reader(cx, side.crates.snapshot(), tables);
-            let mut maker = Maker::of_start(names, job.entry, job.start, ByKind::new(reader), &side.builder, tables);
+            let mut maker = Maker::of_start(MakerOpts {
+                names, entry: job.entry, start: job.start, typing: ByKind::new(reader),
+                builder: &side.builder, known_heads: None, alloc: tables,
+            });
             maker.watch(side.make_watch);
             Ok(maker)
         })?;

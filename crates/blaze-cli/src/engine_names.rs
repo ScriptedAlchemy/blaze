@@ -30,7 +30,7 @@ use bstd::task::Class;
 
 use crate::engine_check::{EngineCheckError, Table};
 use crate::engine_records::{EngineRecords, InPlace, ReadError};
-use crate::engine_tasks::{CELLS, EXPORTS, Outlined, WHOLE};
+use crate::engine_tasks::{CELLS, CONTEXT_OUTPUTS, EXPORTS, Outlined, WHOLE};
 use crate::engine_units::{Failure, Published};
 use crate::fetch::FetchEnv;
 use crate::names::{DepExports, Names, Resolution, Resolved, ScopeJob};
@@ -1112,25 +1112,36 @@ pub(crate) fn published_done<'a>(scope: &crate::store::PublishedScope<'_>, alloc
 /// moves only the cells whose digest changed (blaze-engine engine.rs `apply`), so a body that
 /// read none of them is not entered, and a downstream crate's names are not entered when the
 /// exports section is unchanged. Sorted by cell, each once (the engine's merge walk; rule 25).
-fn cells_of<'a>(name: Name, record: &work::Record<SharedAlloc<'_>>, exports: &[u8], table: &[u8], alloc: SharedAlloc<'a>) -> Result<SVec<'a, (Cell, ContentId)>, EngineCheckError> {
+fn cells_of<'a>(name: Name, record: &work::Record<SharedAlloc<'_>>, parts: crate::names::sections::Sections<'_>, alloc: SharedAlloc<'a>) -> Result<SVec<'a, (Cell, ContentId)>, EngineCheckError> {
     const WHAT: &str = "the cells a `CrateScope` task defines (engine_names.rs `cells_of`)";
     // Each list sized once, to the cells it will hold, before its first push: the engine keeps
     // it for the rest of the command, so it is one block of its own length (rule 67's floor),
     // never a vector grown by doubling.
     let sized = |cells: usize| SVec::try_with_capacity_in(cells, alloc).map_err(|_| EngineCheckError::Grow { what: WHAT, had: 0 });
-    let exports_id = exports_digest(exports);
+    let exports_id = exports_digest(parts.exports);
     if !record.reads.iter().any(|(read, _)| read.kind == Kind::Surface) {
         return closed_cells(record.out, exports_id, alloc);
     }
+    // A failed solve writes empty sections so its useful findings and retry reads
+    // can be published. It defines no witness and can never certify an export.
+    let context_outputs = if record.out == work::failed_out() {
+        None
+    } else {
+        Some(parts.context_outputs().map_err(|_| EngineCheckError::CellTable { task: name, what: "has no context output witness; rebuild the scope with the current compiler" })?)
+    };
+    let table = parts.cells;
     let row = blaze_scope::names_cells::TABLE_ROW;
     if table.len() % row != 0 {
         return Err(EngineCheckError::CellTable { task: name, what: "is not whole rows" });
     }
-    // WHOLE, CELLS, EXPORTS, then one cell a row of the table.
-    let mut defines: SVec<'a, (Cell, ContentId)> = sized(3 + table.len() / row)?;
+    // WHOLE, CELLS, EXPORTS, the successful output witness, then the table's rows.
+    let mut defines: SVec<'a, (Cell, ContentId)> = sized(3 + usize::from(context_outputs.is_some()) + table.len() / row)?;
     EngineCheckError::push(&mut defines, (WHOLE, record.out), WHAT)?;
     EngineCheckError::push(&mut defines, (CELLS, ContentId::of(CELLS_DOMAIN, table)), WHAT)?;
     EngineCheckError::push(&mut defines, (EXPORTS, exports_id), WHAT)?;
+    if let Some(outputs) = context_outputs {
+        EngineCheckError::push(&mut defines, (CONTEXT_OUTPUTS, outputs), WHAT)?;
+    }
     let mut last: Option<[u8; 16]> = None;
     for bytes in table.chunks_exact(row) {
         let mut key = [0u8; 16];
@@ -2252,7 +2263,7 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
     reads.sort_unstable_by_key(|row| row.0);
     reads.dedup_by_key(|row| row.0);
     record.parts.push(Part { name: Name::links_of(name), locate: Locate::Source(blaze_ladder::native_links::table_digest(parts.links)), place: 0 });
-    let defines = cells_of(name, &record, parts.exports, parts.cells, alloc)?;
+    let defines = cells_of(name, &record, parts, alloc)?;
     let key = crate::engine_store::record_key(task.key, record.out, &record.reads, payload);
     let done = Done { name, key: task.key, out: record.out, defines, reads, findings: u32::try_from(record.findings.len()).unwrap_or(u32::MAX), failed: false };
     let header = blaze_drive::record::write_plain_head(name, task.planned.source, record.out, &record.reads, payload.len(), scratch);
@@ -2487,6 +2498,31 @@ pub(crate) mod schedule_test {
     use super::*;
     use core::cell::RefCell;
     use std::vec::Vec as List;
+
+    #[test]
+    fn a_failed_scope_keeps_its_cells_but_cannot_supply_a_context_witness() {
+        let alloc = blaze_own::testing::heap().shared();
+        let name = Name::new(Kind::CrateScope, ContentId([91; 32]));
+        let mut record = work::Record::new_in(name, alloc);
+        record.reads.push((Name::new(Kind::Surface, ContentId([92; 32])), ContentId([93; 32])));
+        record.out = work::failed_out();
+        let empty = crate::names::sections::write(0, [&[]; crate::names::sections::SECTIONS]);
+        let parts = crate::names::sections::sections(&empty).expect("the failed scope's sections");
+        let defines = cells_of(name, &record, parts, alloc).expect("publish the original failure");
+        assert_eq!(defines.len(), 3, "the original WHOLE, CELLS and EXPORTS remain");
+        assert!(defines.iter().any(|(cell, out)| *cell == WHOLE && *out == work::failed_out()));
+        assert!(!defines.iter().any(|(cell, _)| *cell == CONTEXT_OUTPUTS), "failure is not an empty opaque set");
+
+        record.out = ContentId([94; 32]);
+        assert!(matches!(cells_of(name, &record, parts, alloc), Err(EngineCheckError::CellTable { .. })), "a successful scope with no witness is refused");
+        let outputs = ContentId([95; 32]);
+        let witnessed = crate::names::sections::write(0, crate::names::sections::Section::ALL.map(|section| {
+            if section == crate::names::sections::Section::ContextOutputs { outputs.0.as_slice() } else { &[] }
+        }));
+        let parts = crate::names::sections::sections(&witnessed).expect("the successful scope's sections");
+        let defines = cells_of(name, &record, parts, alloc).expect("the successful witnessed scope");
+        assert!(defines.iter().any(|(cell, out)| *cell == CONTEXT_OUTPUTS && *out == outputs), "the full-width witness survives the engine cell boundary");
+    }
 
     #[test]
     fn engine_script_names_refuses_readmission_before_and_after_filing() {

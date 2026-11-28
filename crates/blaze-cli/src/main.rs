@@ -220,6 +220,8 @@ pub enum CliError {
     /// The one store under the home refused (store.rs `StoreFailure`: no `HOME`, the open, a
     /// put, the commit).
     Store(store::StoreFailure),
+    /// A source-frozen dependency head could not enter the canonical persistent namespace.
+    HeadPublication(engine_seeds::publish::Invalid),
     /// The running binary carries no linker id, the tool identity every key starts from.
     BuildId(bstd::host::NoBuildId),
     /// The pool could not run or join a batch's tasks (its frame not made, or a wait that
@@ -333,6 +335,7 @@ impl fmt::Display for CliError {
             CliError::HostGrant(error) => write!(f, "{error}"),
             CliError::Remote(error) => write!(f, "{error}"),
             CliError::Store(failure) => write!(f, "{failure}"),
+            CliError::HeadPublication(failure) => write!(f, "{failure}"),
             CliError::BuildId(error) => write!(f, "{error}: blaze keys every record by its own code and will not run without that id"),
             CliError::Pool(error) => write!(f, "{error}"),
             CliError::EngineCheck(error) => write!(f, "check: {error}"),

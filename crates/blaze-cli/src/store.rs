@@ -105,6 +105,11 @@ pub trait Store<'m> {
 
     /// The record at `key`, in place; `None` when there is none.
     fn get(&mut self, cx: &Cx, key: Key) -> Result<Option<Held<'m>>, CliError>;
+    /// The immutable value already visible in this local command, including uncommitted
+    /// puts. Publication uses this preflight without fetching or writing remote records.
+    fn get_local(&mut self, _key: Key) -> Result<Option<Held<'m>>, CliError> {
+        Err(CliError::Text { what: "this store cannot preflight a locally published immutable value" })
+    }
     /// Committed-only in-place lookup: borrows a committed segment for `'m` without pinning any
     /// uncommitted arena. Returns [`Committed::InArena`] when `key` is an uncommitted put.
     fn get_committed(&mut self, cx: &Cx, key: Key) -> Result<Committed<'m>, CliError> {
@@ -170,6 +175,27 @@ pub trait Store<'m> {
     /// toolchain's crates' records, by the answer's save ([`CommandStore::keep_toolchain`]),
     /// renewed with that root. A store with no roots keeps nothing.
     fn keep_with_toolchain(&mut self, key: Key) -> Result<(), CliError>;
+    /// Admit a completed set of toolchain records together. Stores with a queue can merge
+    /// the set once instead of scanning the growing queue for every head.
+    fn keep_with_toolchain_batch(&mut self, keys: &[Key]) -> Result<(), CliError> {
+        for key in keys {
+            self.keep_with_toolchain(*key)?;
+        }
+        Ok(())
+    }
+    /// The keys named by an existing retention root. A store without durable roots refuses
+    /// publication rather than claiming that no prior root exists.
+    fn named(&self, _name: &str) -> Result<Option<&'m [u8]>, CliError> {
+        Err(CliError::Text { what: "this store cannot read dependency head retention roots" })
+    }
+    /// Replace one root's key list at the next commit.
+    fn pin(&mut self, _name: &str, _keys: &[Key]) -> Result<(), CliError> {
+        Err(CliError::Text { what: "this store cannot publish a dependency head retention root" })
+    }
+    /// Renew an existing root without scanning its keys. `false` means the root is absent.
+    fn renew_one(&mut self, _name: &str) -> Result<bool, CliError> {
+        Err(CliError::Text { what: "this store cannot renew a dependency head retention root" })
+    }
     fn has_published_scopes(&self) -> bool { false }
     fn published_scope(&mut self, _cx: &Cx, _task: blaze_engine::Task) -> Result<Option<PublishedScope<'m>>, CliError> { Ok(None) }
     /// What this store's puts cost the process so far (rules 50, 51): the copies of records it
@@ -1164,6 +1190,22 @@ impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
 }
 
 impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
+    fn get_local(&mut self, key: Key) -> Result<Option<Held<'m>>, CliError> {
+        Ok(self.place.get(key)?)
+    }
+
+    fn named(&self, name: &str) -> Result<Option<&'m [u8]>, CliError> {
+        CommandStore::named(self, name)
+    }
+
+    fn pin(&mut self, name: &str, keys: &[Key]) -> Result<(), CliError> {
+        CommandStore::pin(self, name, keys)
+    }
+
+    fn renew_one(&mut self, name: &str) -> Result<bool, CliError> {
+        CommandStore::renew_one(self, name)
+    }
+
     fn commit_for_body_reads(&mut self) -> Result<SharedSnapshot, CliError> {
         self.commit_puts()?;
         self.snapshot()?.ok_or(CliError::Text { what: "the committed body round has no store snapshot" })
@@ -1192,6 +1234,18 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
         let had = self.toolchain_records.len();
         self.toolchain_records.try_reserve(1).map_err(|_| CliError::EngineCheck(crate::engine_check::EngineCheckError::Grow { what: "the store's records of the toolchain alone", had }))?;
         self.toolchain_records.push(key);
+        Ok(())
+    }
+
+    fn keep_with_toolchain_batch(&mut self, keys: &[Key]) -> Result<(), CliError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let had = self.toolchain_records.len();
+        self.toolchain_records.try_reserve(keys.len()).map_err(|_| CliError::EngineCheck(crate::engine_check::EngineCheckError::Grow { what: "the store's records of the toolchain alone", had }))?;
+        self.toolchain_records.extend_from_slice(keys);
+        self.toolchain_records.sort_unstable();
+        self.toolchain_records.dedup();
         Ok(())
     }
 
