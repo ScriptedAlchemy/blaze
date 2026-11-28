@@ -729,7 +729,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// source log and retained known-head refusal both before and after these origin lookups.
     pub(crate) fn take_source_heads(&mut self) -> SourceHeads<'n, S> {
         let heads = self.seed.and_then(|seed| seed.heads.borrow_mut().take());
-        let mut crates = Vec::new_in(self.alloc);
+        let mut crates = blaze_own::Vec::new_in(self.alloc);
         for (cell, _) in heads.as_ref().into_iter().flat_map(|heads| heads.frozen_from(0)) {
             crates.push(self.front.names.crate_of(cell.key()).and_then(|krate| self.front.names.crate_key(krate)));
         }

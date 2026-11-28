@@ -260,7 +260,7 @@ fn toolchain_heads_join_the_existing_queue_once_and_keep_the_same_canonical_reco
         lent.commit().expect("the retained heads commit");
         let name = crate::store::roots::RootName::toolchain(blaze_toolchain::PINNED);
         let indexes = store.named(name.as_str()).expect("the toolchain root").expect("the root was written");
-        let mut kept = Vec::new_in(blaze_own::testing::heap().alloc());
+        let mut kept = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc());
         for index in indexes.as_chunks::<KEY_BYTES>().0 {
             let rows = lent.get(&blaze_cas::Key(ContentId(*index))).expect("the toolchain index").expect("its records are present");
             kept.extend(rows.bytes.as_chunks::<KEY_BYTES>().0.iter().map(|key| Key(ContentId(*key))));
@@ -280,7 +280,7 @@ fn toolchain_heads_join_the_existing_queue_once_and_keep_the_same_canonical_reco
 #[test]
 fn the_root_shape_bound_is_checked_before_allocating_its_union() {
     assert!(matches!(RootState::of(Some(&[0; 31])), Err(Invalid::RootBytes { bytes: 31 })));
-    let mut bytes = Vec::new_in(blaze_own::testing::heap().alloc());
+    let mut bytes = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc());
     bytes.resize((MOST_CELLS + 1) * KEY_BYTES, 0);
     assert!(matches!(RootState::of(Some(&bytes)), Err(Invalid::PastCap { what: "the stored dependency root", cap: MOST_CELLS })));
 }
